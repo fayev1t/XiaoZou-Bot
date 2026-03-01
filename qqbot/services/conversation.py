@@ -1,18 +1,20 @@
 """Conversation service for generating AI responses (second-tier AI)."""
 
-import logging
+import re
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from qqbot.core.llm import LLMConfig, create_llm
+from qqbot.core.logging import get_logger, log_ai_input, log_ai_output
 from qqbot.services.group_member import GroupMemberService
 from qqbot.services.prompt import PromptManager
 from qqbot.services.user import UserService
 from qqbot.services.block_judge import JudgeResult
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
+_SYSTEM_XML_TAG_RE = re.compile(r"</?System-[^>]*>")
 
 
 class ConversationService:
@@ -71,12 +73,11 @@ class ConversationService:
 {judge_result.instruction}
 
 【回复要求】
-- 情绪: {judge_result.emotion}
-- 回复类型: {judge_result.reply_type}"""
+- 情绪: {judge_result.emotion}"""
 
             response_prompt += "\n\n请根据以上信息生成一条自然的群聊回复。注意保持小奏的人格特征。"
 
-            print(f"[conversation] Generating response: {judge_result.reply_type}, {judge_result.emotion}")
+            logger.info(f"[Layer2] 生成回复 | 情绪={judge_result.emotion}")
 
             # Get messages for LLM call
             messages = [
@@ -84,24 +85,34 @@ class ConversationService:
                 HumanMessage(content=response_prompt),
             ]
 
+            # 记录 AI 输入（只记录指导信息，不记录历史上下文和提示词）
+            log_input = f"【指导】{judge_result.instruction}\n【情绪】{judge_result.emotion}"
+            log_ai_input("Layer2", group_id or 0, log_input)
+
             # Call LLM to generate response
             response = await llm.ainvoke(messages)
             generated_text = response.content.strip()
 
+            # 记录 AI 输出
+            log_ai_output("Layer2", group_id or 0, generated_text)
+
+            generated_text = self._strip_system_xml_tags(generated_text)
+
             # Add @mention prefix if replying to a specific person AND should_mention=true
             if (
-                judge_result.reply_type == "person"
-                and judge_result.target_user_id
+                judge_result.target_user_id
                 and judge_result.should_mention
                 and group_id
             ):
                 try:
                     # Get target user info for @ mention
-                    target_user = await UserService.get_user(
-                        session, judge_result.target_user_id
+                    user_service = UserService(session)
+                    member_service = GroupMemberService(session)
+                    target_user = await user_service.get_user(
+                        judge_result.target_user_id
                     )
-                    target_member = await GroupMemberService.get_member(
-                        session, group_id, judge_result.target_user_id
+                    target_member = await member_service.get_member(
+                        group_id, judge_result.target_user_id
                     )
 
                     target_card = (
@@ -140,3 +151,8 @@ class ConversationService:
             logger.error(f"[ConversationService] 【第二层AI】调用出错: {e}", exc_info=True)
             # Return fallback response on error
             return "喵~让我想想..."
+
+    def _strip_system_xml_tags(self, text: str) -> str:
+        cleaned = _SYSTEM_XML_TAG_RE.sub("", text)
+        cleaned = cleaned.strip()
+        return cleaned or "..."

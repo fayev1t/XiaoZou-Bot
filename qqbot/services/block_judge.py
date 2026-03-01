@@ -4,7 +4,6 @@
 """
 
 import json
-import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -12,11 +11,12 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from qqbot.core.llm import LLMConfig
+from qqbot.core.logging import get_logger, log_ai_input, log_ai_output, log_event
 from qqbot.services.message_aggregator import ResponseBlock
 from qqbot.services.prompt import PromptManager
 from qqbot.services.silence_mode import is_silent, set_silent
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class JudgeResult:
@@ -88,7 +88,6 @@ class JudgeResult:
 class ReplyPlan:
     """单次回复的计划"""
 
-    reply_type: str  # "person" / "topic" / "knowledge"
     target_user_id: int | None = None
     emotion: str = "happy"
     instruction: str = ""
@@ -122,7 +121,6 @@ class BlockJudgeResult:
         for r in data.get("replies", []):
             replies.append(
                 ReplyPlan(
-                    reply_type=r.get("reply_type", "topic"),
                     target_user_id=r.get("target_user_id"),
                     emotion=r.get("emotion", "happy"),
                     instruction=r.get("instruction", ""),
@@ -201,15 +199,11 @@ class BlockJudger:
         Returns:
             格式化的消息文本
         """
-        user_names = user_names or {}
+        _ = user_names
         lines = []
 
         for msg in block.messages:
-            user_name = user_names.get(msg.user_id, f"用户{msg.user_id}")
-            mention_tag = " 【@小奏】" if msg.is_bot_mentioned else ""
-            lines.append(
-                f"{msg.user_id}(显示名:{user_name}){mention_tag}: {msg.message_content}"
-            )
+            lines.append(msg.formatted_message)
 
         return "\n".join(lines)
 
@@ -283,8 +277,17 @@ class BlockJudger:
                 HumanMessage(content=user_prompt),
             ]
 
+            # 记录 AI 输入（只记录消息块内容，不记录历史上下文和提示词）
+            log_input = f"【消息块】{block.get_message_count()}条消息，{len(block.get_unique_users())}个用户\n{block_content}"
+            if silence_mode:
+                log_input += "\n【沉默模式】已激活"
+            log_ai_input("Layer1", group_id or 0, log_input)
+
             response = await llm.ainvoke(messages)
             response_text = response.content.strip()
+
+            # 记录 AI 输出
+            log_ai_output("Layer1", group_id or 0, response_text)
 
             # 解析JSON响应
             try:
@@ -340,11 +343,10 @@ class BlockJudger:
                 logger.info(msg, extra={"group_id": group_id})
                 print(msg)
                 for idx, reply_plan in enumerate(result.replies, 1):
-                    msg = f"[block_judge] 【回复 {idx}】类型={reply_plan.reply_type}, 态度={reply_plan.emotion}, @用户={reply_plan.target_user_id}, 需要@={reply_plan.should_mention}"
+                    msg = f"[block_judge] 【回复 {idx}】态度={reply_plan.emotion}, @用户={reply_plan.target_user_id}, 需要@={reply_plan.should_mention}"
                     logger.info(msg, extra={
                         "group_id": group_id,
                         "reply_index": idx,
-                        "reply_type": reply_plan.reply_type,
                         "emotion": reply_plan.emotion,
                         "target_user_id": reply_plan.target_user_id,
                         "should_mention": reply_plan.should_mention,

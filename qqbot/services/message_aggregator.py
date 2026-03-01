@@ -13,14 +13,14 @@
 """
 
 import asyncio
-import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine
 
+from qqbot.core.logging import get_logger, log_ai_input, log_ai_output, log_event
 from qqbot.services.prompt import PromptManager
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -28,7 +28,8 @@ class PendingMessage:
     """待处理的消息"""
 
     user_id: int
-    message_content: str
+    raw_message: str
+    formatted_message: str
     timestamp: float
     event: Any  # GroupMessageEvent
     is_bot_mentioned: bool = False
@@ -130,14 +131,16 @@ class MessageAggregator:
             # 获取历史上下文（从数据库）
             from qqbot.core.database import AsyncSessionLocal
             from qqbot.services.context import ContextManager
+            from qqbot.services.silence_mode import is_silent
 
             history_context = ""
+            silence_mode = is_silent(group_id)
             try:
                 async with AsyncSessionLocal() as session:
-                    history_context = await ContextManager.get_recent_context(
-                        session=session,
+                    context_manager = ContextManager(session)
+                    history_context = await context_manager.get_recent_context(
                         group_id=group_id,
-                        limit=30,  # 与 group_chat.py 中的判断保持一致
+                        limit=20,  # Layer 0: 使用20条背景消息进行初筛判断
                         bot_id=block.messages[0].event.self_id if block.messages else None,
                     )
             except Exception as e:
@@ -145,18 +148,18 @@ class MessageAggregator:
                 history_context = ""
 
             # 格式化块中的消息
-            block_content = "\n".join([
-                f"{msg.user_id}: {msg.message_content}"
-                for msg in block.messages
-            ])
+            block_content = "\n".join(
+                msg.formatted_message for msg in block.messages
+            )
 
-            # 构建AI提示词（包含历史上下文）
+            # 构建AI提示词（包含历史上下文和沉默模式状态）
+            silence_hint = "\n【特殊状态：沉默模式激活】当前群处于沉默模式，只有在被@或有明确问题时才应判断为需要回复。其他闲聊一律判断为需要等待（should_wait=true）。" if silence_mode else ""
             prompt = f"""【历史上下文】（最近消息）
 {history_context if history_context else "暂无历史上下文"}
 
 【当前消息块】（刚接收到的消息，共{len(block.messages)}条）
 {block_content}
-
+{silence_hint}
 {self.prompt_manager.wait_time_judge_prompt}"""
 
             from langchain_openai import ChatOpenAI
@@ -171,6 +174,12 @@ class MessageAggregator:
                 temperature=0.5,
             )
 
+            # 记录 AI 输入（只记录消息块内容，不记录历史上下文和提示词）
+            log_input = f"【消息块】共{len(block.messages)}条\n{block_content}"
+            if silence_mode:
+                log_input += "\n【沉默模式】已激活"
+            log_ai_input("Layer0", group_id, log_input)
+
             response = await llm.ainvoke([
                 HumanMessage(content=prompt)
             ])
@@ -178,6 +187,9 @@ class MessageAggregator:
             # 解析响应
             import json
             response_text = response.content.strip()
+            
+            # 记录 AI 输出
+            log_ai_output("Layer0", group_id, response_text)
             json_start = response_text.find("{")
             json_end = response_text.rfind("}") + 1
 
@@ -240,7 +252,8 @@ class MessageAggregator:
         self,
         group_id: int,
         user_id: int,
-        message_content: str,
+        raw_message: str,
+        formatted_message: str,
         event: Any,
         is_bot_mentioned: bool = False,
     ) -> None:
@@ -253,7 +266,8 @@ class MessageAggregator:
         Args:
             group_id: 群ID
             user_id: 用户ID
-            message_content: 消息内容
+            raw_message: 原始消息内容
+            formatted_message: System-XML 格式内容
             event: 原始事件对象
             is_bot_mentioned: 是否@了机器人
         """
@@ -274,7 +288,8 @@ class MessageAggregator:
             # 创建待处理消息
             pending_msg = PendingMessage(
                 user_id=user_id,
-                message_content=message_content,
+                raw_message=raw_message,
+                formatted_message=formatted_message,
                 timestamp=time.time(),
                 event=event,
                 is_bot_mentioned=is_bot_mentioned,
@@ -287,11 +302,18 @@ class MessageAggregator:
             block.add_message(pending_msg)
 
             if is_new_block:
+                log_event("block_created", group_id=group_id)
                 msg = f"[aggregator] 📦 创建新对话块: 群{group_id}"
                 logger.info(msg, extra={"group_id": group_id})
                 print(msg)
 
-            msg = f"[aggregator] ➕ 消息已加入块 | 群={group_id}, 消息数={block.get_message_count()}, 用户数={len(block.get_unique_users())}, @机器人={block.has_bot_mention()}, 内容={message_content[:30]}"
+            msg = (
+                f"[aggregator] ➕ 消息已加入块 | 群={group_id}, "
+                f"消息数={block.get_message_count()}, "
+                f"用户数={len(block.get_unique_users())}, "
+                f"@机器人={block.has_bot_mention()}, "
+                f"内容={formatted_message[:30]}"
+            )
             logger.info(msg, extra={
                 "group_id": group_id,
                 "message_count": block.get_message_count(),
