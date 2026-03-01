@@ -7,8 +7,8 @@ using a message aggregation system and two-tier AI:
 3. Conversation Service (second-tier): Generates appropriate responses
 
 Execution order (lower priority runs first):
-- Priority 10: event_handlers.py (saves message to database)
-- Priority 50: group_chat.py (this plugin - aggregates and responds)
+- Priority 10: event_handlers.py (saves message and feeds aggregator)
+- Priority 50: group_chat.py (binds bot instance; handles responses)
 
 The aggregation mechanism:
 - Messages are collected into a "response block" per group
@@ -18,27 +18,29 @@ The aggregation mechanism:
 """
 
 import asyncio
-import logging
 
 from nonebot import on_message
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 
 from qqbot.core.database import AsyncSessionLocal
+from qqbot.core.logging import get_logger, log_event
 from qqbot.services.context import ContextManager
 from qqbot.services.conversation import ConversationService
 from qqbot.services.group_message import GroupMessageService
 from qqbot.services.group_member import GroupMemberService
 from qqbot.services.user import UserService
+from qqbot.services.message_converter import MessageConverter
 from qqbot.services.message_aggregator import ResponseBlock, message_aggregator
 from qqbot.services.block_judge import block_judger, JudgeResult
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Handler with priority 50 (after message saving at priority 10)
 group_chat_handler = on_message(priority=50, block=False)
 
 # Store bot instance for callback use
 _bot_instance: Bot | None = None
+message_converter = MessageConverter()
 
 
 async def _process_response_block(group_id: int, block: ResponseBlock) -> None:
@@ -78,17 +80,17 @@ async def _process_response_block(group_id: int, block: ResponseBlock) -> None:
         async with AsyncSessionLocal() as session:
             # 1. Get user names for the block
             user_names: dict[int, str] = {}
+            member_service = GroupMemberService(session)
+            user_service = UserService(session)
             for user_id in block.get_unique_users():
                 try:
                     # Try group card first
-                    member = await GroupMemberService.get_member(
-                        session, group_id, user_id
-                    )
+                    member = await member_service.get_member(group_id, user_id)
                     if member and member.get("card"):
                         user_names[user_id] = member["card"]
                     else:
                         # Fallback to user nickname
-                        user = await UserService.get_user(session, user_id)
+                        user = await user_service.get_user(user_id)
                         if user and user.get("nickname"):
                             user_names[user_id] = user["nickname"]
                         else:
@@ -97,10 +99,10 @@ async def _process_response_block(group_id: int, block: ResponseBlock) -> None:
                     user_names[user_id] = f"用户{user_id}"
 
             # 2. Get historical context from database
-            context = await ContextManager.get_recent_context(
-                session=session,
+            context_manager = ContextManager(session)
+            context = await context_manager.get_recent_context(
                 group_id=group_id,
-                limit=30,
+                limit=50,  # Layer 1: 使用50条历史消息提供深层话题背景
                 bot_id=block.messages[0].event.self_id if block.messages else None,
             )
 
@@ -131,11 +133,10 @@ async def _process_response_block(group_id: int, block: ResponseBlock) -> None:
             print(msg)
 
             for i, reply_plan in enumerate(judge_result.replies):
-                msg = f"[group_chat] 🔷 正在生成第 {i + 1}/{len(judge_result.replies)} 条回复 | 类型={reply_plan.reply_type}, 态度={reply_plan.emotion}, @用户={reply_plan.target_user_id}"
+                msg = f"[group_chat] 🔷 正在生成第 {i + 1}/{len(judge_result.replies)} 条回复 | 态度={reply_plan.emotion}, @用户={reply_plan.target_user_id}"
                 logger.info(msg, extra={
                     "group_id": group_id,
                     "reply_index": i + 1,
-                    "reply_type": reply_plan.reply_type,
                     "emotion": reply_plan.emotion,
                     "target_user_id": reply_plan.target_user_id,
                 })
@@ -145,7 +146,7 @@ async def _process_response_block(group_id: int, block: ResponseBlock) -> None:
                 # This maintains compatibility with existing conversation service
                 legacy_judge_result = JudgeResult(
                     should_reply=True,
-                    reply_type=reply_plan.reply_type,
+                    reply_type="general",  # Default to general as types are removed
                     target_user_id=reply_plan.target_user_id,
                     emotion=reply_plan.emotion,
                     instruction=reply_plan.instruction,
@@ -164,14 +165,16 @@ async def _process_response_block(group_id: int, block: ResponseBlock) -> None:
                 )
 
                 # Send response
-                await bot.send_group_msg(group_id=group_id, message=response)
+                send_result = await bot.send_group_msg(
+                    group_id=group_id,
+                    message=response,
+                )
 
                 msg = f"[group_chat] 📤 第 {i + 1} 条回复已发送 | 群={group_id}, 长度={len(response)}, 内容={response[:50]}"
                 logger.info(msg, extra={
                     "group_id": group_id,
                     "reply_index": i + 1,
                     "response_length": len(response),
-                    "reply_type": reply_plan.reply_type,
                 })
                 print(msg)
 
@@ -182,12 +185,17 @@ async def _process_response_block(group_id: int, block: ResponseBlock) -> None:
                         block.messages[0].event.self_id if block.messages else None
                     )
                     if bot_self_id:
-                        await GroupMessageService.save_message(
-                            session=session,
+                        message_service = GroupMessageService(session)
+                        formatted = message_converter.wrap_plain_text(
+                            response,
+                            user_id=bot_self_id,
+                            display_name="小奏",
+                        )
+                        await message_service.save_message(
                             group_id=group_id,
                             user_id=bot_self_id,
-                            message_content=response,
-                            message_type="text",
+                            raw_message=response,
+                            formatted_message=formatted,
                         )
                         await session.commit()
                 except Exception as e:
@@ -223,99 +231,7 @@ message_aggregator.set_reply_callback(_process_response_block)
 
 @group_chat_handler.handle()
 async def handle_group_chat(bot: Bot, event: GroupMessageEvent) -> None:
-    """Handle group message by adding to aggregation block.
-
-    Instead of processing each message immediately, we add it to an
-    aggregation block. The block will be processed after a short delay,
-    allowing multiple messages to be analyzed together.
-
-    Args:
-        bot: NoneBot bot instance
-        event: Group message event
-    """
+    """Bind bot instance for later reply callback."""
     global _bot_instance
     _bot_instance = bot  # Store for callback use
-
-    # Skip if not a group message
-    if not hasattr(event, "group_id"):
-        return
-
-    group_id = event.group_id
-    user_id = event.user_id
-
-    # Skip bot's own messages to avoid self-loops
-    if user_id == event.self_id:
-        logger.debug(f"Skipping bot's own message in group {group_id}")
-        return
-
-    # Extract message content from event
-    message_content = ""
-    is_bot_mentioned = False
-
-    # Use raw_message first (contains original complete text)
-    if hasattr(event, "raw_message") and event.raw_message:
-        message_content = event.raw_message
-        if "小奏" in event.raw_message:
-            is_bot_mentioned = True
-    else:
-        # Fallback to segment parsing
-        for segment in event.message:
-            seg_type = segment.type
-            seg_data = segment.data
-
-            if seg_type == "text":
-                message_content += seg_data.get("text", "")
-            elif seg_type == "at":
-                at_qq = seg_data.get("qq", "")
-                at_name = seg_data.get("name", "")
-                is_at_bot = str(at_qq) == str(event.self_id)
-
-                if is_at_bot:
-                    is_bot_mentioned = True
-                    bot_name = at_name or "小奏"
-                    message_content += bot_name
-                else:
-                    message_content += f"@{at_name or at_qq}"
-            elif seg_type == "image":
-                message_content += "【图片】"
-            elif seg_type == "record":
-                message_content += "【语音】"
-            elif seg_type == "video":
-                message_content += "【视频】"
-            elif seg_type == "file":
-                message_content += "【文件】"
-            elif seg_type in ["face", "emoji", "shake", "poke"]:
-                pass  # Skip these
-
-    # Only skip if message is truly empty AND bot is not mentioned
-    if not message_content.strip() and not is_bot_mentioned:
-        logger.debug(f"Skipping empty message in group {group_id}")
-        return
-
-    # Add message to aggregation block (等待时间由聚合器判断)
-    try:
-        logger.debug(
-            f"[group_chat] 💬 处理消息 | 群={group_id}, 用户={user_id}, "
-            f"@机器人={is_bot_mentioned}, 内容={message_content[:40]}...",
-            extra={
-                "group_id": group_id,
-                "user_id": user_id,
-                "is_bot_mentioned": is_bot_mentioned,
-                "message_preview": message_content[:40],
-            },
-        )
-
-        await message_aggregator.add_message(
-            group_id=group_id,
-            user_id=user_id,
-            message_content=message_content,
-            event=event,
-            is_bot_mentioned=is_bot_mentioned,
-        )
-
-    except Exception as e:
-        logger.error(
-            f"[group_chat] Failed to add message to aggregator: {e}",
-            extra={"group_id": group_id, "user_id": user_id},
-            exc_info=True,
-        )
+    return
