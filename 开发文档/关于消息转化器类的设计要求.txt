@@ -1,0 +1,83 @@
+可以将消息处理成以下格式的内容
+
+标记定义：
+①<System-Message user_id="" display_name="" timestamp="">content</System-Message>
+用于格式化一条消息最外侧的标签
+user_id:发送者的QQ号
+display_name:发送者称呼（优先群昵称，其次QQ昵称）
+timestamp:消息时间（YYYY-MM-DD HH:MM:SS）
+content: 整条消息被xml化后的内容
+
+②<System-Reply>content</System-Reply> 
+用于格式化那些回复别人消息的消息中，所回复的消息的内容的标签
+content:这条消息所回复的消息的xml内容 （是否要去掉所回复消息的<System-Message>标签？ ）
+#目前无法从数据库回填时，content 统一用“引用消息”占位
+对应CQ
+[CQ:reply]
+格式：[CQ:reply,id=121687849][CQ:at,qq=1005089717] 嗯 
+
+③<System-At user_id="3167291813">content</System-At>
+user_id:被at人的qq号
+content:被at人的称呼 #下面会设计称呼返回器去返回称呼
+对应CQ
+[CQ:at]
+格式：[CQ:at,qq=2945900561]
+
+④<System-PureText>content</System-PureText>
+用于处理文本like类内容的标签
+content:文本like类的内容比如说"你好😊😊"
+没有对应CQ
+#只有这个内容容易发生转义错误 所以可不可以设置这个标签内的内容都不转义
+
+⑤<System-QQFace qq_face_id="86">content</System-QQFace>
+用于处理qq内置表情内容的标签
+qq_face_id:值qq内置表情的id
+content:该表情id对应的内容
+对应CQ
+[CQ:face]
+格式：[CQ:face,id=86,raw=&#91;object Object&#93;]
+
+⑥<System-AudioPlaceholder record_size="文" record_duration="3.2">content</System-AudioPlaceholder>
+用于处理语音消息的标签
+record_size:语音文件的大小 byte单位
+record_duration:语音的长度 s单位
+content:语音转化为文字之后的内容
+对应CQ
+[CQ:record]
+格式：[CQ:record,file=79fc43ef5386ea31f2d6d9e6d819f3d1.amr,path=/app/.config/QQ/nt_qq_5929970a0178d4b5b0a58d58b47405c1/nt_data/Ptt/2026-01/Ori/79fc43ef5386ea31f2d6d9e6d819f3d1.amr,url=https://multimedia.nt.qq.com.cn/download?appid=1403&amp;fileid=EhSYxrbCf1QG_zxcE4WTbhdWqxV0ZxitECD7Ciimu7PF9qOSAzIEcHJvZFCA9SRaEI-mIGphiO_c5-rDBFgbQr16Avi7ggECbmo&amp;format=amr&amp;rkey=CAESqAEZHK6PzBro6ApsL4ezWM3JGAajeXl0DjWfztKahFfbyGbRwuETD0I5Bd-SLsu_YfznIBu7C7hP8sOxshk2TTEdvRSl9xsBLB0blyOf5lfw0VYhhtJseXvEPJerIiSByPXwLHc8IdRTkyhAkAMleRm5PDneISAhpaTNYyQBqy0qN5_mGjHpJXZXVHXHCjdJQHrAH7cTf5x_CkztGVUuqdsTb9omXDbAW5k,file_size=2093]
+
+⑦<System-FilePlaceholder file_size="" file_name="xxx" file_format="pdf">content</System-FilePlaceholder>
+用于处理文件内容的标签
+file_size:文件的大小 byte单位
+file_name:文件前缀
+file_format:文件的后缀
+content:文件的内容分两种情况若是图片后缀的文件输出为图片识别后的文本内容 如是其他文件输出文件的全称即file_name+file_format
+对应CQ
+[CQ:image]
+格式1：[CQ:image,file=C01EF60EC982B7A28A85E24BAA80BDF7.png,sub_type=0,url=https://multimedia.nt.qq.com.cn/download?appid=1407&amp;fileid=EhQIgGdD0UUaDnS7nb4PCjgE7AD3Rhj6nccJIP8KKKr2lcKhpJIDMgRwcm9kUIC9owFaEB99jurbVAAVGElwtz8Obix6Aq7hggECbmo&amp;rkey=CAMSMNTM_4t6WZG3Dr_d9knLsWzDzdka_fNZaa_JJ5wb89K-GaIjHDRCY1PBufGlGi9-yg,file_size=20041466]
+格式2：[CQ:image,summary=&#91;动画表情&#93;,file=880218144BA369455A8C9D14A7B93612.jpg,sub_type=1,url=https://multimedia.nt.qq.com.cn/download?appid=1407&amp;fileid=EhRRWfoEzoUzYUVT64SFuRjaVbvp7Biexhog_wooxu6NlKGkkgMyBHByb2RQgL2jAVoQhztWWgpaMxABUZR0yBZCwnoCM4uCAQJuag&amp;rkey=CAMSMNTM_4t6WZG3Dr_d9knLsWzDzdka_fNZaa_JJ5wb89K-GaIjHDRCY1PBufGlGi9-yg,file_size=434974]
+#有两种格式是因为格式1是发送普通图片的格式 格式2是将普通图片保存到qq自己的表情包界面之后在发出来就会变成这种格式 
+[CQ:file]
+格式： [CQ:file,file=soulbelow.m4a,file_id=/f074db02-3830-4775-8f0f-312659fb4ae3,file_size=2383652,url=https://tjc-download.ftn.qq.com/ftn_handler/bb85e9f388ce36486ede474a359af3234f01becca0252c35f3e3b3d7e5fb0dc3c85f497efb5708a7ab34fc49e340f833db8a6f55b1d5f114aeb81700b40fffee/?fname=]
+
+⑧<System-Other type="">content</System-Other>#用于处理其他不常见的[CQ]事件
+用于处理上面没涉及到的内容的但是又属于CQ内容的标签，包括以下CQ但不限于
+type:指的是CQ的类型如forward
+content:这个CQ所代表的含义对于forward来说是"合并转发的消息"
+[CQ:forward]
+格式：[CQ:forward,id=7598822614393131897] 
+
+⑨<System-Unknown unknown_type="xml">content</System-Unknown>
+处理异常解析不了的内容
+content:直接存原始raw的数据
+#这个content容易转义错误 可不可以设置这个标签内的的内容都不转义
+
+
+消息处理器负责将一段消息处理成上面的格式：
+一些重要的点
+在③中的需要设计的这个称呼返回器，这样设计，传入群号以及qq号搜索该群成员表中的信息有限返回群昵称 其次返回qq昵称
+下面的内容因为一些部分暂时无力实现 所以采用占位的方式凑合用着
+在⑤中的qq_face_id和content暂时还没有对应上 你可以获取qq_face_id 返回的content就返回 "QQ表情" 就行了
+在⑥中因为还没有接入asr模型以及落盘机制所以你自己先设计一些内容先占位，标签的属性先都返回空值 content就返回"语音消息"
+在⑦中针对[CQ:file]内容都可以正常返回 但是针对[CQ:iamge]因为还有没接入多模态模型所以标签属性先返回空值 content就返回"图片"
+在⑧中除了我说的这个forward之后碰到其他type不知道content的话你就直接返回他的内容 比如[CQ:forward,id=7598822614393131897] 

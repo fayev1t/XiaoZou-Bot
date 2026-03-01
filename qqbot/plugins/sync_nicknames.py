@@ -8,16 +8,16 @@ Scheduling:
 - Periodic sync every 30 minutes thereafter
 """
 
-import logging
 import asyncio
 from nonebot.adapters.onebot.v11 import Bot
 
 from qqbot.core.database import AsyncSessionLocal
+from qqbot.core.logging import get_logger
 from qqbot.services.group import GroupService
 from qqbot.services.user import UserService
 from qqbot.services.group_member import GroupMemberService
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 async def sync_all_group_nicknames(bot: Bot) -> None:
@@ -26,7 +26,10 @@ async def sync_all_group_nicknames(bot: Bot) -> None:
     try:
         async with AsyncSessionLocal() as session:
             # Get all groups from database
-            all_groups = await GroupService.get_all_groups(session)
+            group_service = GroupService(session)
+            user_service = UserService(session)
+            member_service = GroupMemberService(session)
+            all_groups = await group_service.get_all_groups()
             print(f"[sync_nicknames] 📊 Found {len(all_groups) if all_groups else 0} groups in database")
 
             if not all_groups:
@@ -48,7 +51,10 @@ async def sync_all_group_nicknames(bot: Bot) -> None:
                         )
                         new_group_name = group_info.get("group_name")
                         if new_group_name and new_group_name != group.group_name:
-                            await GroupService.update_group_name(session, group_id, new_group_name)
+                            await group_service.update_group_name(
+                                group_id,
+                                new_group_name,
+                            )
                             logger.info(
                                 f"[sync_nicknames] 📝 Group name updated: {group.group_name} → {new_group_name}",
                                 extra={"group_id": group_id},
@@ -99,7 +105,7 @@ async def sync_all_group_nicknames(bot: Bot) -> None:
 
                     # Batch update all QQ nicknames
                     if nickname_updates:
-                        await UserService.batch_update_nicknames(session, nickname_updates)
+                        await user_service.batch_update_nicknames(nickname_updates)
                         print(f"[sync_nicknames] 👤 Updated {len(nickname_updates)} user QQ nicknames")
                     else:
                         print("[sync_nicknames] 👤 No nickname updates")
@@ -107,8 +113,7 @@ async def sync_all_group_nicknames(bot: Bot) -> None:
                     # Batch update all group member cards (group nicknames)
                     print(f"[sync_nicknames] 🏷️ card_updates 数据: {card_updates}")
                     if card_updates:
-                        await GroupMemberService.batch_update_cards(
-                            session,
+                        await member_service.batch_update_cards(
                             group_id=group_id,
                             card_updates=card_updates,
                         )

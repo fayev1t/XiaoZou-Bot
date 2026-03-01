@@ -14,7 +14,6 @@ Usage:
 Check console/logs for event information.
 """
 
-import logging
 from nonebot import on_notice, on_message
 from nonebot.adapters.onebot.v11 import (
     Bot,
@@ -24,7 +23,9 @@ from nonebot.adapters.onebot.v11 import (
     MessageEvent,
 )
 
-logger = logging.getLogger(__name__)
+from qqbot.core.logging import get_logger
+
+logger = get_logger(__name__)
 
 # Handler for group member join (increase)
 group_increase_handler = on_notice(priority=1, block=False)

@@ -3,12 +3,13 @@
 This plugin is loaded by NoneBot and handles all startup initialization.
 """
 
-import logging
 import asyncio
 import datetime
 from nonebot import get_driver, get_bot
 
-logger = logging.getLogger(__name__)
+from qqbot.core.logging import get_logger
+
+logger = get_logger(__name__)
 
 driver = get_driver()
 
