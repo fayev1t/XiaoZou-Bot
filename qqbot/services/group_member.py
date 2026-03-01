@@ -13,6 +13,9 @@ from qqbot.models import Group
 class GroupMemberService:
     """Service for managing per-group members tables."""
 
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
     @staticmethod
     def get_members_table_name(group_id: int) -> str:
         """Get the table name for a group's members.
@@ -25,9 +28,8 @@ class GroupMemberService:
         """
         return f"group_members_{group_id}"
 
-    @staticmethod
     async def add_or_update_member(
-        session: AsyncSession,
+        self,
         group_id: int,
         user_id: int,
         card: str | None = None,
@@ -36,14 +38,13 @@ class GroupMemberService:
         """Add or update a group member (idempotent using ON CONFLICT).
 
         Args:
-            session: Database session
             group_id: QQ group ID
             user_id: QQ user ID
             card: Group nickname
             join_time: Member join time
         """
         # Get the Group record to find members table name
-        result = await session.execute(
+        result = await self.session.execute(
             select(Group).where(Group.group_id == group_id)
         )
         group = result.scalar_one_or_none()
@@ -65,7 +66,7 @@ class GroupMemberService:
                 updated_at = :updated_at
         """)
 
-        await session.execute(
+        await self.session.execute(
             sql,
             {
                 "user_id": user_id,
@@ -77,9 +78,8 @@ class GroupMemberService:
             },
         )
 
-    @staticmethod
     async def add_member_from_join_event(
-        session: AsyncSession,
+        self,
         group_id: int,
         user_id: int,
     ) -> None:
@@ -89,12 +89,11 @@ class GroupMemberService:
         Uses ON CONFLICT to ensure idempotency in case of event duplication.
 
         Args:
-            session: Database session
             group_id: QQ group ID
             user_id: QQ user ID being added
         """
         # Get the Group record to find members table name
-        result = await session.execute(
+        result = await self.session.execute(
             select(Group).where(Group.group_id == group_id)
         )
         group = result.scalar_one_or_none()
@@ -114,7 +113,7 @@ class GroupMemberService:
                 updated_at = :updated_at
         """)
 
-        await session.execute(
+        await self.session.execute(
             sql,
             {
                 "user_id": user_id,
@@ -125,20 +124,18 @@ class GroupMemberService:
             },
         )
 
-    @staticmethod
     async def batch_update_cards(
-        session: AsyncSession,
+        self,
         group_id: int,
         card_updates: dict[int, str],
     ) -> None:
         """Batch update group member cards (for background sync task).
 
         Args:
-            session: Database session
             group_id: QQ group ID
             card_updates: Dict of {user_id: new_card}
         """
-        result = await session.execute(
+        result = await self.session.execute(
             select(Group).where(Group.group_id == group_id)
         )
         group = result.scalar_one_or_none()
@@ -159,7 +156,7 @@ class GroupMemberService:
                         card = :card,
                         updated_at = :updated_at
                 """)
-                await session.execute(
+                await self.session.execute(
                     sql,
                     {
                         "user_id": user_id,
@@ -170,16 +167,14 @@ class GroupMemberService:
                     },
                 )
 
-    @staticmethod
     async def get_member(
-        session: AsyncSession,
+        self,
         group_id: int,
         user_id: int,
     ) -> dict | None:
         """Get a specific group member.
 
         Args:
-            session: Database session
             group_id: QQ group ID
             user_id: QQ user ID
 
@@ -187,7 +182,7 @@ class GroupMemberService:
             Member data dict or None if not found
         """
         # Get the Group record to find members table name
-        result = await session.execute(
+        result = await self.session.execute(
             select(Group).where(Group.group_id == group_id)
         )
         group = result.scalar_one_or_none()
@@ -202,7 +197,7 @@ class GroupMemberService:
             SELECT * FROM {table_name} WHERE user_id = :user_id
         """)
 
-        result = await session.execute(sql, {"user_id": user_id})
+        result = await self.session.execute(sql, {"user_id": user_id})
         row = result.first()
 
         if row:
@@ -210,16 +205,14 @@ class GroupMemberService:
 
         return None
 
-    @staticmethod
     async def get_group_members(
-        session: AsyncSession,
+        self,
         group_id: int,
         active_only: bool = True,
     ) -> list[dict]:
         """Get all members of a group.
 
         Args:
-            session: Database session
             group_id: QQ group ID
             active_only: Only return active members
 
@@ -227,7 +220,7 @@ class GroupMemberService:
             List of member dicts
         """
         # Get the Group record to find members table name
-        result = await session.execute(
+        result = await self.session.execute(
             select(Group).where(Group.group_id == group_id)
         )
         group = result.scalar_one_or_none()
@@ -248,26 +241,24 @@ class GroupMemberService:
             ORDER BY user_id
         """)
 
-        result = await session.execute(sql)
+        result = await self.session.execute(sql)
         rows = result.fetchall()
 
         return [dict(row._mapping) for row in rows]  # type: ignore
 
-    @staticmethod
     async def mark_member_inactive(
-        session: AsyncSession,
+        self,
         group_id: int,
         user_id: int,
     ) -> None:
         """Mark a member as inactive (left the group).
 
         Args:
-            session: Database session
             group_id: QQ group ID
             user_id: QQ user ID
         """
         # Get the Group record to find members table name
-        result = await session.execute(
+        result = await self.session.execute(
             select(Group).where(Group.group_id == group_id)
         )
         group = result.scalar_one_or_none()
@@ -284,7 +275,7 @@ class GroupMemberService:
             WHERE user_id = :user_id
         """)
 
-        await session.execute(
+        await self.session.execute(
             sql,
             {
                 "user_id": user_id,

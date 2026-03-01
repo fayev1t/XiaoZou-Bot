@@ -5,21 +5,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from qqbot.models import Group
 from qqbot.core.database import create_group_tables, table_exists
+from qqbot.core.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class GroupService:
     """Service for managing groups."""
 
-    @staticmethod
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
     async def get_or_create_group(
-        session: AsyncSession,
+        self,
         group_id: int,
         group_name: str | None = None,
     ) -> Group:
         """Get an existing group or create a new one.
 
         Args:
-            session: Database session
             group_id: QQ group ID
             group_name: Group name (optional)
 
@@ -27,7 +31,7 @@ class GroupService:
             Group object
         """
         # Try to get existing group
-        result = await session.execute(
+        result = await self.session.execute(
             select(Group).where(Group.group_id == group_id)
         )
         group = result.scalar_one_or_none()
@@ -35,21 +39,30 @@ class GroupService:
         if group:
             # Verify tables exist for existing group
             # (in case table creation failed previously)
-            import logging
-            logger = logging.getLogger(__name__)
             members_exists = await table_exists(group.members_table_name)
             messages_exists = await table_exists(group.table_name)
 
             if not members_exists or not messages_exists:
                 logger.warning(
-                    f"[GroupService] Tables missing for existing group {group_id}, recreating..."
+                    (
+                        "[GroupService] Tables missing for existing group %s, "
+                        "recreating..."
+                    ),
+                    group_id,
                 )
                 try:
                     await create_group_tables(group_id)
-                    logger.info(f"[GroupService] ✅ Tables recreated for group {group_id}")
+                    logger.info(
+                        "[GroupService] ✅ Tables recreated for group %s",
+                        group_id,
+                    )
                 except Exception as e:
                     logger.error(
-                        f"[GroupService] ❌ Failed to recreate tables for {group_id}: {e}",
+                        (
+                            "[GroupService] ❌ Failed to recreate tables for %s: %s"
+                        ),
+                        group_id,
+                        e,
                         exc_info=True,
                     )
                     raise
@@ -57,12 +70,12 @@ class GroupService:
             # Update name if provided and different
             if group_name and group.group_name != group_name:
                 group.group_name = group_name
-                await session.commit()
-                await session.refresh(group)
+                await self.session.commit()
+                await self.session.refresh(group)
             return group
 
         # Create new group
-        table_name = f"group_messages_{group_id}"
+        table_name = f"group_messages_v2_{group_id}"
         members_table_name = f"group_members_{group_id}"
 
         group = Group(
@@ -74,75 +87,70 @@ class GroupService:
 
         # Create the per-group tables FIRST (before committing Group record)
         # Tables must exist before any data can be inserted
-        import logging
-        logger = logging.getLogger(__name__)
         logger.info(f"[GroupService] Creating tables for group {group_id}...")
         try:
             await create_group_tables(group_id)
             logger.info(f"[GroupService] ✅ Tables created for group {group_id}")
         except Exception as e:
-            logger.error(f"[GroupService] ❌ Failed to create tables for group {group_id}: {e}", exc_info=True)
+            logger.error(
+                "[GroupService] ❌ Failed to create tables for group %s: %s",
+                group_id,
+                e,
+                exc_info=True,
+            )
             raise
 
         # Only commit Group record after tables are successfully created
-        session.add(group)
-        await session.commit()
-        await session.refresh(group)
+        self.session.add(group)
+        await self.session.commit()
+        await self.session.refresh(group)
         logger.info(f"[GroupService] ✅ Group record saved for {group_id}")
 
         return group
 
-    @staticmethod
     async def get_group(
-        session: AsyncSession,
+        self,
         group_id: int,
     ) -> Group | None:
         """Get a group by ID.
 
         Args:
-            session: Database session
             group_id: QQ group ID
 
         Returns:
             Group object or None if not found
         """
-        result = await session.execute(
+        result = await self.session.execute(
             select(Group).where(Group.group_id == group_id)
         )
         return result.scalar_one_or_none()
 
-    @staticmethod
     async def get_all_groups(
-        session: AsyncSession,
+        self,
     ) -> list[Group]:
         """Get all groups from database.
-
-        Args:
-            session: Database session
 
         Returns:
             List of Group objects
         """
-        result = await session.execute(select(Group))
+        result = await self.session.execute(select(Group))
         return result.scalars().all()
 
-    @staticmethod
     async def update_group_name(
-        session: AsyncSession,
+        self,
         group_id: int,
         group_name: str,
     ) -> Group:
         """Update group name.
 
         Args:
-            session: Database session
             group_id: QQ group ID
             group_name: New group name
 
         Returns:
             Updated Group object
         """
-        result = await session.execute(
+        result = await self.session.execute(
             select(Group).where(Group.group_id == group_id)
         )
         group = result.scalar_one_or_none()
@@ -151,7 +159,7 @@ class GroupService:
             raise ValueError(f"Group {group_id} not found")
 
         group.group_name = group_name
-        await session.commit()
-        await session.refresh(group)
+        await self.session.commit()
+        await self.session.refresh(group)
 
         return group

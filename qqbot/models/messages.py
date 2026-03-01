@@ -4,7 +4,7 @@
 - users: 用户表 (静态)
 - groups: 群组表 (静态) - 记录群的基本信息和分表名
 - group_members_{group_id}: 群成员表 (动态，按群ID分表)
-- group_messages_{group_id}: 群消息表 (动态，按群ID分表)
+- group_messages_v2_{group_id}: 群消息表 (动态，按群ID分表)
 """
 
 from sqlalchemy import BigInteger, Boolean, Column, DateTime, Integer, String, Text, func
@@ -75,20 +75,20 @@ class GroupMemberTemplate(Base):
 
 
 class GroupMessage(Base):
-    """群消息表模板 (group_messages_template)
+    """群消息表模板 (group_messages_v2_template)
 
-    实际表名: group_messages_{group_id}
+    实际表名: group_messages_v2_{group_id}
     每个群有一个对应的消息表，存储该群的所有消息
     """
 
-    __tablename__ = "group_messages_template"
+    __tablename__ = "group_messages_v2_template"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(BigInteger, nullable=False, index=True)
-    message_content = Column(Text, nullable=True)
-    message_type = Column(String(20), default="text")  # text, img, vid, aud, others
+    raw_message = Column(Text, nullable=True)  # 原始消息
+    formatted_message = Column(Text, nullable=True)  # System-XML 格式
     is_recalled = Column(Boolean, default=False, index=True)  # 是否被撤回
     timestamp = Column(DateTime, nullable=False, default=func.now(), index=True)  # 消息时间
 
     def __repr__(self) -> str:
-        return f"<GroupMessage(id={self.id}, user_id={self.user_id}, message_type={self.message_type})>"
+        return f"<GroupMessage(id={self.id}, user_id={self.user_id})>"
