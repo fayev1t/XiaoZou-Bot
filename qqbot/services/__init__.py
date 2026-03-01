@@ -6,6 +6,7 @@ from qqbot.services.group_member import GroupMemberService
 from qqbot.services.group_message import GroupMessageService
 from qqbot.services.message_aggregator import MessageAggregator, message_aggregator
 from qqbot.services.block_judge import BlockJudger, block_judger
+from qqbot.services.message_pipeline import MessagePipeline
 
 __all__ = [
     "UserService",
@@ -16,4 +17,5 @@ __all__ = [
     "message_aggregator",
     "BlockJudger",
     "block_judger",
+    "MessagePipeline",
 ]
