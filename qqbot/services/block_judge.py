@@ -174,15 +174,8 @@ class BlockJudger:
             LLM实例
         """
         if self._llm is None:
-            from langchain_openai import ChatOpenAI
-
-            # 使用较低的temperature保证判断的稳定性
-            self._llm = ChatOpenAI(
-                model_name=self.config.llm_model,
-                api_key=self.config.llm_api_key,
-                base_url="https://api.deepseek.com/v1",
-                temperature=0.5,
-            )
+            from qqbot.core.llm import create_llm
+            self._llm = await create_llm(temperature=0.5)
         return self._llm
 
     def _format_block_messages(
@@ -323,11 +316,9 @@ class BlockJudger:
             # 记录判断结果
             msg = f"[block_judge] ======== 对话块判断完成 ========"
             logger.info(msg, extra={"group_id": group_id, "should_reply": result.should_reply, "reply_count": result.reply_count})
-            print(msg)
 
             msg = f"[block_judge] 块摘要: {result.block_summary}"
             logger.info(msg, extra={"group_id": group_id})
-            print(msg)
 
             msg = f"[block_judge] 判断结果: 需要回复={result.should_reply}, 回复次数={result.reply_count}, 原因={result.explanation}"
             logger.info(msg, extra={
@@ -335,13 +326,11 @@ class BlockJudger:
                 "should_reply": result.should_reply,
                 "reply_count": result.reply_count,
             })
-            print(msg)
 
             # 详细输出每个回复计划
             if result.should_reply and result.replies:
                 msg = f"[block_judge] 回复计划详情 (共{len(result.replies)}条回复):"
                 logger.info(msg, extra={"group_id": group_id})
-                print(msg)
                 for idx, reply_plan in enumerate(result.replies, 1):
                     msg = f"[block_judge] 【回复 {idx}】态度={reply_plan.emotion}, @用户={reply_plan.target_user_id}, 需要@={reply_plan.should_mention}"
                     logger.info(msg, extra={
@@ -351,13 +340,10 @@ class BlockJudger:
                         "target_user_id": reply_plan.target_user_id,
                         "should_mention": reply_plan.should_mention,
                     })
-                    print(msg)
                     msg = f"[block_judge]   指导词: {reply_plan.instruction}"
                     logger.info(msg, extra={"group_id": group_id})
-                    print(msg)
                     msg = f"[block_judge]   针对内容: {reply_plan.related_messages}"
                     logger.info(msg, extra={"group_id": group_id})
-                    print(msg)
 
             return result
 

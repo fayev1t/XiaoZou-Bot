@@ -162,17 +162,10 @@ class MessageAggregator:
 {silence_hint}
 {self.prompt_manager.wait_time_judge_prompt}"""
 
-            from langchain_openai import ChatOpenAI
+            from qqbot.core.llm import create_llm
             from langchain_core.messages import HumanMessage
-            from qqbot.core.llm import LLMConfig
 
-            config = LLMConfig()
-            llm = ChatOpenAI(
-                model_name=config.llm_model,
-                api_key=config.llm_api_key,
-                base_url="https://api.deepseek.com/v1",
-                temperature=0.5,
-            )
+            llm = await create_llm(temperature=0.5)
 
             # 记录 AI 输入（只记录消息块内容，不记录历史上下文和提示词）
             log_input = f"【消息块】共{len(block.messages)}条\n{block_content}"
@@ -211,7 +204,6 @@ class MessageAggregator:
 
                     msg = f"[aggregator] 🤖 AI判断：等待 {wait_time}秒 (原因: {result.get('reason', '无')})"
                     logger.info(msg, extra={"group_id": group_id, "wait_seconds": wait_time, "should_wait": True})
-                    print(msg)
 
                     # 启动实际的等待任务
                     block.wait_task = asyncio.create_task(
@@ -221,7 +213,6 @@ class MessageAggregator:
                     # 不需要等待，立即处理
                     msg = f"[aggregator] 🤖 AI判断：不等待，立即处理 (原因: {result.get('reason', '无')})"
                     logger.info(msg, extra={"group_id": group_id, "should_wait": False})
-                    print(msg)
 
                     # 立即启动处理（0秒等待）
                     block.wait_task = asyncio.create_task(
@@ -231,7 +222,6 @@ class MessageAggregator:
                 # 解析失败，使用默认等待5秒
                 msg = f"[aggregator] ⚠️ JSON解析失败，使用默认等待5秒"
                 logger.warning(msg, extra={"group_id": group_id})
-                print(msg)
                 block.wait_task = asyncio.create_task(
                     self._wait_and_process(group_id, 5.0)
                 )
@@ -240,10 +230,8 @@ class MessageAggregator:
             # 任务被取消（新消息到达），直接返回，会由add_message重新启动
             msg = f"[aggregator] ↩️ 等待时间判断被取消（检测到新消息） | 群={group_id}"
             logger.debug(msg)
-            print(msg)
         except Exception as e:
             logger.warning(f"[aggregator] 判断等待时间失败: {e}, 使用默认2秒", extra={"group_id": group_id})
-            print(f"[aggregator] ⚠️ 判断等待时间失败: {e}, 使用默认2秒")
             block.wait_task = asyncio.create_task(
                 self._wait_and_process(group_id, 2.0)
             )
@@ -280,7 +268,6 @@ class MessageAggregator:
             if block.is_processing:
                 msg = f"[aggregator] ⏹️ 旧块正在处理中，新消息创建新块 | 群={group_id}"
                 logger.debug(msg, extra={"group_id": group_id})
-                print(msg)
                 # 创建全新的块
                 self._blocks[group_id] = ResponseBlock(group_id=group_id)
                 block = self._blocks[group_id]
@@ -305,7 +292,6 @@ class MessageAggregator:
                 log_event("block_created", group_id=group_id)
                 msg = f"[aggregator] 📦 创建新对话块: 群{group_id}"
                 logger.info(msg, extra={"group_id": group_id})
-                print(msg)
 
             msg = (
                 f"[aggregator] ➕ 消息已加入块 | 群={group_id}, "
@@ -322,13 +308,11 @@ class MessageAggregator:
                 "is_bot_mentioned": is_bot_mentioned,
                 "user_id": user_id,
             })
-            print(msg)
 
             # 如果已有等待任务，取消它（因为有新消息，需要重新评估）
             if block.wait_task and not block.wait_task.done():
                 msg = f"[aggregator] ⏸️ 取消旧等待任务 | 群={group_id}"
                 logger.debug(msg, extra={"group_id": group_id})
-                print(msg)
                 block.wait_task.cancel()
                 try:
                     await block.wait_task
@@ -339,7 +323,6 @@ class MessageAggregator:
             if block.judge_wait_task and not block.judge_wait_task.done():
                 msg = f"[aggregator] 🔄 取消旧的等待时间判断API，重新发送 | 群={group_id}"
                 logger.debug(msg, extra={"group_id": group_id})
-                print(msg)
                 block.judge_wait_task.cancel()
                 try:
                     await block.judge_wait_task
@@ -352,7 +335,6 @@ class MessageAggregator:
 
             msg = f"[aggregator] 📡 发送等待时间判断API | 群={group_id}"
             logger.debug(msg, extra={"group_id": group_id})
-            print(msg)
 
     async def _wait_and_process(self, group_id: int, wait_seconds: float) -> None:
         """等待一段时间后处理块
@@ -385,14 +367,12 @@ class MessageAggregator:
                     "unique_users": len(block.get_unique_users()),
                     "has_bot_mention": block.has_bot_mention(),
                 })
-                print(msg)
 
             # 触发回复处理（在锁外执行，避免阻塞新消息）
             if self._reply_callback:
                 try:
                     msg = f"[aggregator] 🔷 触发回复处理回调 | 群={group_id}"
                     logger.debug(msg, extra={"group_id": group_id})
-                    print(msg)
                     await self._reply_callback(group_id, processing_block)
                 except Exception as e:
                     logger.error(
@@ -406,7 +386,6 @@ class MessageAggregator:
                 if current_block is processing_block:
                     msg = f"[aggregator] 🧹 对话块已处理完毕，清空块 | 群={group_id}"
                     logger.info(msg, extra={"group_id": group_id})
-                    print(msg)
                 else:
                     logger.debug(
                         "[aggregator] New block exists; cleaning processed block only",
@@ -418,7 +397,6 @@ class MessageAggregator:
             # 任务被取消（因为有新消息），这是正常的
             msg = f"[aggregator] ↩️ 等待任务被取消（检测到新消息） | 群={group_id}"
             logger.debug(msg)
-            print(msg)
 
     def get_block_info(self, group_id: int) -> dict[str, Any]:
         """获取块的状态信息（用于调试）

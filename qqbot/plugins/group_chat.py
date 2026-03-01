@@ -74,7 +74,6 @@ async def _process_response_block(group_id: int, block: ResponseBlock) -> None:
             "unique_users": len(block.get_unique_users()),
         },
     )
-    print(f"[group_chat] ══════ 开始处理对话块 ══════ 群={group_id}, 消息数={block.get_message_count()}, 用户数={len(block.get_unique_users())}")
 
     try:
         async with AsyncSessionLocal() as session:
@@ -109,7 +108,6 @@ async def _process_response_block(group_id: int, block: ResponseBlock) -> None:
             # 3. Judge the block (first-tier AI)
             msg = f"[group_chat] 🧠 第一层AI判断块内容..."
             logger.info(msg, extra={"group_id": group_id})
-            print(msg)
 
             judge_result = await block_judger.judge_block(
                 block=block,
@@ -122,7 +120,6 @@ async def _process_response_block(group_id: int, block: ResponseBlock) -> None:
             if not judge_result.should_reply or judge_result.reply_count == 0:
                 msg = f"[group_chat] ❌ 不需要回复 | 群={group_id}, 原因={judge_result.explanation}"
                 logger.info(msg, extra={"group_id": group_id})
-                print(msg)
                 return
 
             # 4. Generate and send responses for each reply plan
@@ -130,7 +127,6 @@ async def _process_response_block(group_id: int, block: ResponseBlock) -> None:
 
             msg = f"[group_chat] ✅ 准备生成回复 | 群={group_id}, 需要{len(judge_result.replies)}条回复"
             logger.info(msg, extra={"group_id": group_id, "reply_count": len(judge_result.replies)})
-            print(msg)
 
             for i, reply_plan in enumerate(judge_result.replies):
                 msg = f"[group_chat] 🔷 正在生成第 {i + 1}/{len(judge_result.replies)} 条回复 | 态度={reply_plan.emotion}, @用户={reply_plan.target_user_id}"
@@ -140,7 +136,6 @@ async def _process_response_block(group_id: int, block: ResponseBlock) -> None:
                     "emotion": reply_plan.emotion,
                     "target_user_id": reply_plan.target_user_id,
                 })
-                print(msg)
 
                 # Convert ReplyPlan to JudgeResult for ConversationService
                 # This maintains compatibility with existing conversation service
@@ -176,7 +171,6 @@ async def _process_response_block(group_id: int, block: ResponseBlock) -> None:
                     "reply_index": i + 1,
                     "response_length": len(response),
                 })
-                print(msg)
 
                 # Save bot's response to database
                 try:
@@ -208,7 +202,6 @@ async def _process_response_block(group_id: int, block: ResponseBlock) -> None:
                 if i < len(judge_result.replies) - 1:
                     msg = f"[group_chat] ⏳ 等待1秒后发送下一条回复 | 群={group_id}"
                     logger.debug(msg, extra={"group_id": group_id})
-                    print(msg)
                     await asyncio.sleep(1.0)  # 1 second between multiple replies
 
             msg = f"[group_chat] 🎉 对话块处理完成 | 群={group_id}, 共发送{len(judge_result.replies)}条回复"
@@ -216,7 +209,6 @@ async def _process_response_block(group_id: int, block: ResponseBlock) -> None:
                 "group_id": group_id,
                 "total_replies": len(judge_result.replies),
             })
-            print(msg)
 
     except Exception as e:
         logger.error(

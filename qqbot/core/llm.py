@@ -4,6 +4,10 @@ from typing import TYPE_CHECKING
 
 from pydantic_settings import BaseSettings
 
+from qqbot.core.logging import get_logger
+
+logger = get_logger(__name__)
+
 if TYPE_CHECKING:
     from langchain_core.language_model.llm import LLM
 
@@ -23,16 +27,22 @@ class LLMConfig(BaseSettings):
         extra = "ignore"
 
 
-async def create_llm() -> "LLM | None":
+async def create_llm(temperature: float | None = None) -> "LLM | None":
     """Create and return LLM instance based on config.
+
+    Args:
+        temperature: Override the default temperature from config
 
     Returns:
         LLM instance or None if configuration is incomplete
     """
     config = LLMConfig()
+    
+    # Use provided temperature or fallback to config default
+    temp = temperature if temperature is not None else config.llm_temperature
 
     if not config.llm_api_key:
-        print("Warning: LLM_API_KEY not configured")
+        logger.warning("LLM_API_KEY not configured")
         return None
 
     if config.llm_provider == "deepseek":
@@ -44,11 +54,11 @@ async def create_llm() -> "LLM | None":
                 model_name=config.llm_model,
                 api_key=config.llm_api_key,
                 base_url="https://api.deepseek.com/v1",
-                temperature=config.llm_temperature,
+                temperature=temp,
             )
             return llm
         except ImportError as e:
-            print(f"Error: Failed to import ChatOpenAI: {e}")
+            logger.error(f"Failed to import ChatOpenAI: {e}")
             return None
 
     elif config.llm_provider == "openai":
@@ -58,13 +68,13 @@ async def create_llm() -> "LLM | None":
             llm = ChatOpenAI(
                 model_name=config.llm_model,
                 api_key=config.llm_api_key,
-                temperature=config.llm_temperature,
+                temperature=temp,
             )
             return llm
         except ImportError as e:
-            print(f"Error: Failed to import ChatOpenAI: {e}")
+            logger.error(f"Failed to import ChatOpenAI: {e}")
             return None
 
     else:
-        print(f"Unknown LLM provider: {config.llm_provider}")
+        logger.error(f"Unknown LLM provider: {config.llm_provider}")
         return None

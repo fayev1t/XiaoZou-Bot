@@ -35,16 +35,6 @@ class ConversationService:
         if self._llm is None:
             self._llm = await create_llm(temperature=0.9)
         return self._llm
-            from langchain_openai import ChatOpenAI
-
-            # Use higher temperature (0.9) for creative response generation
-            self._llm = ChatOpenAI(
-                model_name=self.config.llm_model,
-                api_key=self.config.llm_api_key,
-                base_url="https://api.deepseek.com/v1",
-                temperature=0.9,
-            )
-        return self._llm
 
     async def generate_response(
         self,

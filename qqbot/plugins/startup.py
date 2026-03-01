@@ -54,16 +54,11 @@ async def _schedule_sync_tasks_delayed() -> None:
 
     try:
         # Wait 40 seconds for bot to be fully connected
-        # Wait 40 seconds for bot to be fully connected
         logger.info("⏳ Starting 40 second wait...")
         await asyncio.sleep(40)
         logger.info("⏳ 40 second wait completed!")
 
         logger.info("📝 Registering sync tasks now...")
-        await asyncio.sleep(40)
-        print("[startup] ⏳ 40 second wait completed!")
-
-        print("[startup] 📝 Registering sync tasks now...")
 
         from qqbot.core.scheduler import get_scheduler
 
@@ -110,56 +105,6 @@ async def _schedule_sync_tasks_delayed() -> None:
 
     except Exception as e:
         logger.error(f"❌ Failed to schedule sync tasks: {e}", exc_info=True)
-        except ValueError as e:
-            print(f"[startup] ❌ No bot connected yet: {e}")
-            return
-
-        scheduler = get_scheduler()
-        print(f"[startup] scheduler.running = {scheduler.running}")
-
-        if not scheduler.running:
-            print("[startup] ❌ Scheduler not running")
-            return
-
-        from qqbot.plugins.sync_nicknames import sync_all_group_nicknames
-        print("[startup] ✅ Imported sync_all_group_nicknames")
-
-        # 直接执行一次同步（不通过scheduler）
-        print("[startup] 🔄 Running sync_all_group_nicknames DIRECTLY (not via scheduler)...")
-        try:
-            await sync_all_group_nicknames(bot)
-            print("[startup] ✅ Direct sync completed!")
-        except Exception as e:
-            print(f"[startup] ❌ Direct sync failed: {e}")
-            import traceback
-            traceback.print_exc()
-
-        # Register initial sync (run immediately)
-        scheduler.add_job(
-            sync_all_group_nicknames,
-            "date",
-            run_date=datetime.datetime.now() + datetime.timedelta(seconds=1),
-            args=[bot],
-            id="sync_nicknames_initial",
-            misfire_grace_time=60,
-        )
-        print("[startup] ✅ Registered initial sync (will run in 1 second)")
-
-        # Register periodic sync (every 30 minutes)
-        scheduler.add_job(
-            sync_all_group_nicknames,
-            "interval",
-            minutes=30,
-            args=[bot],
-            id="sync_nicknames_periodic",
-            replace_existing=True,
-        )
-        print("[startup] ✅ Registered periodic sync (every 30 minutes)")
-
-    except Exception as e:
-        print(f"[startup] ❌ Failed to schedule sync tasks: {e}")
-        import traceback
-        traceback.print_exc()
 
 
 @driver.on_shutdown
