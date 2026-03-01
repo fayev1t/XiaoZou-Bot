@@ -60,7 +60,7 @@ logger.add(
 )
 
 
-def get_logger(name: str) -> "logger":
+def get_logger(name: str):
     """Get a logger instance with the given name.
     
     Args:

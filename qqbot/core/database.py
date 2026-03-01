@@ -55,7 +55,6 @@ logger.info(f"[database]   DB_HOST: {config.db_host}")
 logger.info(f"[database]   DB_PORT: {config.db_port}")
 logger.info(f"[database]   DB_USER: {config.db_user}")
 logger.info(f"[database]   DB_NAME: {config.db_name}")
-logger.info(f"[database]   DATABASE_URL: {config.database_url}")
 
 # 创建异步引擎
 engine: AsyncEngine = create_async_engine(

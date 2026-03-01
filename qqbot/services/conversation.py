@@ -33,6 +33,8 @@ class ConversationService:
             LLM instance for making API calls
         """
         if self._llm is None:
+            self._llm = await create_llm(temperature=0.9)
+        return self._llm
             from langchain_openai import ChatOpenAI
 
             # Use higher temperature (0.9) for creative response generation
@@ -143,7 +145,7 @@ class ConversationService:
                     logger.debug(f"[conversation] Failed to add mention: {e}")
                     # Continue without mention if lookup fails
 
-            print(f"[conversation] Response generated ({len(generated_text)} chars): {generated_text[:50]}...")
+            logger.debug(f"[conversation] Response generated ({len(generated_text)} chars): {generated_text[:50]}...")
 
             return generated_text
 
@@ -156,3 +158,7 @@ class ConversationService:
         cleaned = _SYSTEM_XML_TAG_RE.sub("", text)
         cleaned = cleaned.strip()
         return cleaned or "..."
+
+
+# 全局单例
+conversation_service = ConversationService()

@@ -1,6 +1,6 @@
 """Group member management service."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import (
     select,
     text,
@@ -71,10 +71,10 @@ class GroupMemberService:
             {
                 "user_id": user_id,
                 "card": card,
-                "join_time": join_time or datetime.utcnow(),
+                "join_time": join_time or datetime.now(timezone.utc),
                 "is_active": True,
-                "created_at": datetime.utcnow(),
-                "updated_at": datetime.utcnow(),
+                "created_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(timezone.utc),
             },
         )
 
@@ -117,10 +117,10 @@ class GroupMemberService:
             sql,
             {
                 "user_id": user_id,
-                "join_time": datetime.utcnow(),
+                "join_time": datetime.now(timezone.utc),
                 "is_active": True,
-                "created_at": datetime.utcnow(),
-                "updated_at": datetime.utcnow(),
+                "created_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(timezone.utc),
             },
         )
 
@@ -162,8 +162,8 @@ class GroupMemberService:
                         "user_id": user_id,
                         "card": card,
                         "is_active": True,
-                        "created_at": datetime.utcnow(),
-                        "updated_at": datetime.utcnow(),
+                        "created_at": datetime.now(timezone.utc),
+                        "updated_at": datetime.now(timezone.utc),
                     },
                 )
 
@@ -279,6 +279,6 @@ class GroupMemberService:
             sql,
             {
                 "user_id": user_id,
-                "updated_at": datetime.utcnow(),
+                "updated_at": datetime.now(timezone.utc),
             },
         )

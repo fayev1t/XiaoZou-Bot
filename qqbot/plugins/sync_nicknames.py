@@ -22,7 +22,7 @@ logger = get_logger(__name__)
 
 async def sync_all_group_nicknames(bot: Bot) -> None:
     """Batch update all group member nicknames and group names using get_group_member_list and get_group_info."""
-    print("[sync_nicknames] 🔄 *** sync_all_group_nicknames STARTED ***")
+    logger.info("🔄 *** sync_all_group_nicknames STARTED ***")
     try:
         async with AsyncSessionLocal() as session:
             # Get all groups from database
@@ -30,7 +30,17 @@ async def sync_all_group_nicknames(bot: Bot) -> None:
             user_service = UserService(session)
             member_service = GroupMemberService(session)
             all_groups = await group_service.get_all_groups()
-            print(f"[sync_nicknames] 📊 Found {len(all_groups) if all_groups else 0} groups in database")
+            group_service = GroupService(session)
+            user_service = UserService(session)
+            member_service = GroupMemberService(session)
+            all_groups = await group_service.get_all_groups()
+            logger.info(f"📊 Found {len(all_groups) if all_groups else 0} groups in database")
+
+            if not all_groups:
+                logger.warning("⚠️ No groups found in database - skipping sync")
+                return
+
+            logger.info(f"🔄 Starting sync for {len(all_groups)} groups...")
 
             if not all_groups:
                 print("[sync_nicknames] ⚠️ No groups found in database - skipping sync")
@@ -41,7 +51,10 @@ async def sync_all_group_nicknames(bot: Bot) -> None:
             for group in all_groups:
                 group_id = group.group_id
                 try:
-                    import asyncio
+                try:
+                    # 1. Fetch and update group name
+                    try:
+                        group_info = await asyncio.wait_for(
 
                     # 1. Fetch and update group name
                     try:
@@ -108,7 +121,22 @@ async def sync_all_group_nicknames(bot: Bot) -> None:
                         await user_service.batch_update_nicknames(nickname_updates)
                         print(f"[sync_nicknames] 👤 Updated {len(nickname_updates)} user QQ nicknames")
                     else:
-                        print("[sync_nicknames] 👤 No nickname updates")
+                    if nickname_updates:
+                        await user_service.batch_update_nicknames(nickname_updates)
+                        logger.info(f"👤 Updated {len(nickname_updates)} user QQ nicknames")
+                    else:
+                        logger.debug("👤 No nickname updates")
+
+                    # Batch update all group member cards (group nicknames)
+                    logger.debug(f"🏷️ card_updates 数据: {card_updates}")
+                    if card_updates:
+                        await member_service.batch_update_cards(
+                            group_id=group_id,
+                            card_updates=card_updates,
+                        )
+                        logger.info(f"🏷️ Updated {len(card_updates)} group member cards")
+                    else:
+                        logger.debug("🏷️ No card updates")
 
                     # Batch update all group member cards (group nicknames)
                     print(f"[sync_nicknames] 🏷️ card_updates 数据: {card_updates}")
@@ -137,6 +165,9 @@ async def sync_all_group_nicknames(bot: Bot) -> None:
             print(f"[sync_nicknames] ✨ All groups synced successfully!")
 
     except Exception as e:
-        print(f"[sync_nicknames] ❌ Fatal error: {e}")
+            logger.info("✨ All groups synced successfully!")
+
+    except Exception as e:
+        logger.error(f"❌ Fatal error: {e}", exc_info=True)
         import traceback
         traceback.print_exc()

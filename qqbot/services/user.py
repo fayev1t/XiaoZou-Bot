@@ -1,7 +1,7 @@
 """User service for user data management."""
 
-from datetime import datetime
-from sqlalchemy import select, insert, update
+from datetime import datetime, timezone
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from qqbot.models import User
@@ -40,8 +40,8 @@ class UserService:
         new_user = User(
             user_id=user_id,
             nickname=nickname,
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
         )
         self.session.add(new_user)
         await self.session.flush()  # Flush to get the id
@@ -80,7 +80,7 @@ class UserService:
             .where(User.user_id == user_id)
             .values(
                 nickname=nickname,
-                updated_at=datetime.utcnow(),
+                updated_at=datetime.now(timezone.utc),
             )
         )
         await self.session.execute(stmt)
@@ -104,13 +104,13 @@ class UserService:
                 stmt = pg_insert(User).values(
                     user_id=user_id,
                     nickname=nickname,
-                    created_at=datetime.utcnow(),
-                    updated_at=datetime.utcnow(),
+                    created_at=datetime.now(timezone.utc),
+                    updated_at=datetime.now(timezone.utc),
                 ).on_conflict_do_update(
                     index_elements=["user_id"],
                     set_={
                         "nickname": nickname,
-                        "updated_at": datetime.utcnow(),
+                        "updated_at": datetime.now(timezone.utc),
                     }
                 )
                 await self.session.execute(stmt)

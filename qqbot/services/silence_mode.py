@@ -1,10 +1,10 @@
 """Silence mode management for group conversations."""
 
-from typing import Dict
+from typing import Dict  # unused
 
 # Store silence mode state for each group
 # Key: group_id, Value: True (silent mode on) or False (silent mode off)
-_silence_states: Dict[int, bool] = {}
+_silence_states: dict[int, bool] = {}
 
 
 def is_silent(group_id: int) -> bool:

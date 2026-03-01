@@ -157,7 +157,7 @@ async def _process_response_block(group_id: int, block: ResponseBlock) -> None:
                 block_context = f"{context}\n\n【当前对话块摘要】\n{judge_result.block_summary}\n\n【相关消息】\n{reply_plan.related_messages}"
 
                 # Generate response (second-tier AI)
-                response = await conversation.generate_response(
+                response = await conversation_service.generate_response(
                     session=session,
                     context=block_context,
                     judge_result=legacy_judge_result,

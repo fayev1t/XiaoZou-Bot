@@ -51,7 +51,7 @@ async def handle_group_increase(bot: Bot, event: GroupIncreaseNoticeEvent) -> No
             f"新成员QQ: {event.user_id}\n"
             f"操作者QQ: {event.operator_id}"
         )
-        await group_increase_handler.send(message)
+        # removed for production safety
 
 
 # Handler for group member leave (decrease)
@@ -78,7 +78,7 @@ async def handle_group_decrease(bot: Bot, event: GroupDecreaseNoticeEvent) -> No
             f"离开成员QQ: {event.user_id}\n"
             f"操作者QQ: {event.operator_id}"
         )
-        await group_decrease_handler.send(message)
+        # removed for production safety
 
 
 # Handler for message recall
@@ -107,7 +107,7 @@ async def handle_group_recall(bot: Bot, event: GroupRecallNoticeEvent) -> None:
             f"消息发送者QQ: {event.user_id}\n"
             f"撤回操作者QQ: {event.operator_id}"
         )
-        await group_recall_handler.send(message)
+        # removed for production safety
 
 
 # Handler for baseline message (sanity check)
