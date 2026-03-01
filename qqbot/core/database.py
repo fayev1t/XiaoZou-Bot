@@ -3,10 +3,9 @@
 提供异步数据库连接、会话工厂、分表操作等功能。
 分表策略：
 - 群成员表按 group_id 分表: group_members_{group_id}
-- 群消息表按 group_id 分表: group_messages_{group_id}
+- 群消息表按 group_id 分表: group_messages_v2_{group_id}
 """
 
-import logging
 from typing import AsyncGenerator
 
 from sqlalchemy import text
@@ -18,7 +17,9 @@ from sqlalchemy.ext.asyncio import (
 )
 from pydantic_settings import BaseSettings
 
-logger = logging.getLogger(__name__)
+from qqbot.core.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class DatabaseConfig(BaseSettings):
@@ -144,7 +145,7 @@ async def create_group_tables(group_id: int) -> tuple[str, str]:
 
     创建以下两个表：
     - group_members_{group_id}: 群成员表
-    - group_messages_{group_id}: 群消息表
+    - group_messages_v2_{group_id}: 群消息表
 
     Args:
         group_id: 群组ID
@@ -156,7 +157,7 @@ async def create_group_tables(group_id: int) -> tuple[str, str]:
         Exception: 表创建失败
     """
     members_table = f"group_members_{group_id}"
-    messages_table = f"group_messages_{group_id}"
+    messages_table = f"group_messages_v2_{group_id}"
 
     try:
         async with engine.begin() as conn:
@@ -186,9 +187,8 @@ async def create_group_tables(group_id: int) -> tuple[str, str]:
                 CREATE TABLE IF NOT EXISTS {messages_table} (
                     id SERIAL PRIMARY KEY,
                     user_id BIGINT NOT NULL,
-                    message_content TEXT,
-                    message_type VARCHAR(20) DEFAULT 'text'
-                        CHECK(message_type IN ('text', 'img', 'vid', 'aud', 'others')),
+                    raw_message TEXT,
+                    formatted_message TEXT,
                     is_recalled BOOLEAN DEFAULT FALSE,
                     "timestamp" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )

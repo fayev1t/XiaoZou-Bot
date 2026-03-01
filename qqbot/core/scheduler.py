@@ -1,10 +1,11 @@
 """Task scheduler for background jobs."""
 
-import logging
 import asyncio
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-logger = logging.getLogger(__name__)
+from qqbot.core.logging import get_logger
+
+logger = get_logger(__name__)
 
 # Global scheduler instance
 scheduler = AsyncIOScheduler()

@@ -1,7 +1,9 @@
 import nonebot
-import logging
 
-logging.basicConfig(level=logging.INFO)
+# Initialize loguru logging system
+from qqbot.core.logging import logger
+
+logger.info("🚀 Starting QQ Bot with loguru logging...")
 
 nonebot.init()
 
@@ -10,10 +12,8 @@ nonebot.load_plugins("qqbot.plugins")
 
 # Print loaded plugins
 import nonebot.plugin
-print(f"[startup] Loaded plugins: {nonebot.plugin.get_loaded_plugins()}")
+logger.info(f"[startup] Loaded plugins: {nonebot.plugin.get_loaded_plugins()}")
 
 
 if __name__ == "__main__":
     nonebot.run()
-
-
