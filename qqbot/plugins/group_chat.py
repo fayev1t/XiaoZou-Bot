@@ -25,7 +25,7 @@ from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 from qqbot.core.database import AsyncSessionLocal
 from qqbot.core.logging import get_logger, log_event
 from qqbot.services.context import ContextManager
-from qqbot.services.conversation import ConversationService
+from qqbot.services.conversation import conversation_service
 from qqbot.services.group_message import GroupMessageService
 from qqbot.services.group_member import GroupMemberService
 from qqbot.services.user import UserService
@@ -123,7 +123,6 @@ async def _process_response_block(group_id: int, block: ResponseBlock) -> None:
                 return
 
             # 4. Generate and send responses for each reply plan
-            conversation = ConversationService()
 
             msg = f"[group_chat] ✅ 准备生成回复 | 群={group_id}, 需要{len(judge_result.replies)}条回复"
             logger.info(msg, extra={"group_id": group_id, "reply_count": len(judge_result.replies)})
