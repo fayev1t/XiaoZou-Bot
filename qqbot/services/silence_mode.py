@@ -1,30 +1,17 @@
-"""Silence mode management for group conversations."""
-
-from typing import Dict  # unused
-
-# Store silence mode state for each group
-# Key: group_id, Value: True (silent mode on) or False (silent mode off)
 _silence_states: dict[int, bool] = {}
 
 
 def is_silent(group_id: int) -> bool:
-    """Check if a group is in silence mode.
-
-    Args:
-        group_id: QQ group ID
-
-    Returns:
-        True if in silence mode, False otherwise
-    """
     return _silence_states.get(group_id, False)
 
 
 def set_silent(group_id: int, silent: bool) -> None:
-    """Set silence mode for a group.
+    if silent:
+        _silence_states[group_id] = True
+        return
 
-    Args:
-        group_id: QQ group ID
-        silent: True to enable, False to disable
-    """
-    _silence_states[group_id] = silent
+    _silence_states.pop(group_id, None)
 
+
+def reset_silence_states() -> None:
+    _silence_states.clear()

@@ -8,10 +8,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from qqbot.core.llm import LLMConfig
-from qqbot.core.logging import get_logger, log_ai_input, log_ai_output, log_event
+from qqbot.core.logging import get_logger, log_ai_input, log_ai_output
 from qqbot.services.message_aggregator import ResponseBlock
 from qqbot.services.prompt import PromptManager
 from qqbot.services.silence_mode import is_silent, set_silent
@@ -93,6 +92,7 @@ class ReplyPlan:
     instruction: str = ""
     should_mention: bool = False
     related_messages: str = ""
+    need_image_parsing: bool = False
 
 
 @dataclass
@@ -126,12 +126,15 @@ class BlockJudgeResult:
                     instruction=r.get("instruction", ""),
                     should_mention=r.get("should_mention", False),
                     related_messages=r.get("related_messages", ""),
+                    need_image_parsing=r.get("need_image_parsing", False),
                 )
             )
 
+        reply_count = len(replies)
+
         return cls(
-            should_reply=data.get("should_reply", False),
-            reply_count=data.get("reply_count", 0),
+            should_reply=reply_count > 0,
+            reply_count=reply_count,
             block_summary=data.get("block_summary", ""),
             replies=replies,
             explanation=data.get("explanation", ""),
@@ -224,6 +227,12 @@ class BlockJudger:
                 return BlockJudgeResult.no_reply("对话块为空")
 
             llm = await self._get_llm()
+            if llm is None:
+                logger.warning(
+                    "[block_judge] LLM unavailable, skip reply judgment",
+                    extra={"group_id": group_id},
+                )
+                return BlockJudgeResult.no_reply("LLM不可用")
 
             # 检查沉默模式
             silence_mode = is_silent(group_id) if group_id else False
@@ -332,13 +341,14 @@ class BlockJudger:
                 msg = f"[block_judge] 回复计划详情 (共{len(result.replies)}条回复):"
                 logger.info(msg, extra={"group_id": group_id})
                 for idx, reply_plan in enumerate(result.replies, 1):
-                    msg = f"[block_judge] 【回复 {idx}】态度={reply_plan.emotion}, @用户={reply_plan.target_user_id}, 需要@={reply_plan.should_mention}"
+                    msg = f"[block_judge] 【回复 {idx}】态度={reply_plan.emotion}, @用户={reply_plan.target_user_id}, 需要@={reply_plan.should_mention}, 需要重识图={reply_plan.need_image_parsing}"
                     logger.info(msg, extra={
                         "group_id": group_id,
                         "reply_index": idx,
                         "emotion": reply_plan.emotion,
                         "target_user_id": reply_plan.target_user_id,
                         "should_mention": reply_plan.should_mention,
+                        "need_image_parsing": reply_plan.need_image_parsing,
                     })
                     msg = f"[block_judge]   指导词: {reply_plan.instruction}"
                     logger.info(msg, extra={"group_id": group_id})

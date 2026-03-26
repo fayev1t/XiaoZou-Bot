@@ -14,7 +14,10 @@ Usage:
 Check console/logs for event information.
 """
 
+import os
+
 from nonebot import on_notice, on_message
+from nonebot.adapters import Event
 from nonebot.adapters.onebot.v11 import (
     Bot,
     GroupIncreaseNoticeEvent,
@@ -22,19 +25,44 @@ from nonebot.adapters.onebot.v11 import (
     GroupRecallNoticeEvent,
     MessageEvent,
 )
+from nonebot.rule import Rule
 
 from qqbot.core.logging import get_logger
 
 logger = get_logger(__name__)
+TEST_EVENTS_ENABLED = os.getenv("QQBOT_ENABLE_TEST_EVENTS", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
-# Handler for group member join (increase)
-group_increase_handler = on_notice(priority=1, block=False)
+
+def _is_group_increase_notice(event: Event) -> bool:
+    return isinstance(event, GroupIncreaseNoticeEvent)
 
 
-@group_increase_handler.handle()
-async def handle_group_increase(bot: Bot, event: GroupIncreaseNoticeEvent) -> None:
-    """Handle group member join event."""
-    if isinstance(event, GroupIncreaseNoticeEvent):
+def _is_group_decrease_notice(event: Event) -> bool:
+    return isinstance(event, GroupDecreaseNoticeEvent)
+
+
+def _is_group_recall_notice(event: Event) -> bool:
+    return isinstance(event, GroupRecallNoticeEvent)
+
+if TEST_EVENTS_ENABLED:
+    group_increase_handler = on_notice(
+        rule=Rule(_is_group_increase_notice),
+        priority=1,
+        block=False,
+    )
+
+
+    @group_increase_handler.handle()
+    async def handle_group_increase(
+        bot: Bot,
+        event: GroupIncreaseNoticeEvent,
+    ) -> None:
+        _ = bot
         logger.info(
             "✅ GROUP INCREASE EVENT RECEIVED",
             extra={
@@ -45,23 +73,21 @@ async def handle_group_increase(bot: Bot, event: GroupIncreaseNoticeEvent) -> No
                 "timestamp": event.time,
             },
         )
-        message = (
-            f"✅ 检测到成员加入事件！\n"
-            f"群号: {event.group_id}\n"
-            f"新成员QQ: {event.user_id}\n"
-            f"操作者QQ: {event.operator_id}"
-        )
-        # removed for production safety
 
 
-# Handler for group member leave (decrease)
-group_decrease_handler = on_notice(priority=1, block=False)
+    group_decrease_handler = on_notice(
+        rule=Rule(_is_group_decrease_notice),
+        priority=1,
+        block=False,
+    )
 
 
-@group_decrease_handler.handle()
-async def handle_group_decrease(bot: Bot, event: GroupDecreaseNoticeEvent) -> None:
-    """Handle group member leave event."""
-    if isinstance(event, GroupDecreaseNoticeEvent):
+    @group_decrease_handler.handle()
+    async def handle_group_decrease(
+        bot: Bot,
+        event: GroupDecreaseNoticeEvent,
+    ) -> None:
+        _ = bot
         logger.info(
             "✅ GROUP DECREASE EVENT RECEIVED",
             extra={
@@ -72,23 +98,18 @@ async def handle_group_decrease(bot: Bot, event: GroupDecreaseNoticeEvent) -> No
                 "timestamp": event.time,
             },
         )
-        message = (
-            f"✅ 检测到成员离开事件！\n"
-            f"群号: {event.group_id}\n"
-            f"离开成员QQ: {event.user_id}\n"
-            f"操作者QQ: {event.operator_id}"
-        )
-        # removed for production safety
 
 
-# Handler for message recall
-group_recall_handler = on_notice(priority=1, block=False)
+    group_recall_handler = on_notice(
+        rule=Rule(_is_group_recall_notice),
+        priority=1,
+        block=False,
+    )
 
 
-@group_recall_handler.handle()
-async def handle_group_recall(bot: Bot, event: GroupRecallNoticeEvent) -> None:
-    """Handle group message recall event."""
-    if isinstance(event, GroupRecallNoticeEvent):
+    @group_recall_handler.handle()
+    async def handle_group_recall(bot: Bot, event: GroupRecallNoticeEvent) -> None:
+        _ = bot
         logger.info(
             "✅ GROUP RECALL EVENT RECEIVED",
             extra={
@@ -100,30 +121,22 @@ async def handle_group_recall(bot: Bot, event: GroupRecallNoticeEvent) -> None:
                 "timestamp": event.time,
             },
         )
-        message = (
-            f"✅ 检测到消息撤回事件！\n"
-            f"群号: {event.group_id}\n"
-            f"消息ID: {event.message_id}\n"
-            f"消息发送者QQ: {event.user_id}\n"
-            f"撤回操作者QQ: {event.operator_id}"
-        )
-        # removed for production safety
 
 
-# Handler for baseline message (sanity check)
-message_handler = on_message(priority=100, block=False)
+    message_handler = on_message(priority=100, block=False)
 
 
-@message_handler.handle()
-async def handle_message(event: MessageEvent) -> None:
-    """Handle regular message (sanity check)."""
-    if str(event.message).strip():  # Only log non-empty messages
-        logger.info(
-            "✅ MESSAGE RECEIVED (sanity check)",
-            extra={
-                "event_type": "MessageEvent",
-                "group_id": getattr(event, "group_id", None),
-                "user_id": event.user_id,
-                "message": str(event.message)[:100],  # First 100 chars
-            },
-        )
+    @message_handler.handle()
+    async def handle_message(event: MessageEvent) -> None:
+        if str(event.message).strip():
+            logger.info(
+                "✅ MESSAGE RECEIVED (sanity check)",
+                extra={
+                    "event_type": "MessageEvent",
+                    "group_id": getattr(event, "group_id", None),
+                    "user_id": event.user_id,
+                    "message": str(event.message)[:100],
+                },
+            )
+else:
+    logger.info("[test_events] Plugin loaded in disabled mode")

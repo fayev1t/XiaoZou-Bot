@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Any
 
 from nonebot.adapters.onebot.v11 import Message
-from sqlalchemy import select, text
+from sqlalchemy import inspect, select, text
 
 from qqbot.core.database import AsyncSessionLocal
 from qqbot.models import Group
@@ -35,6 +35,7 @@ async def _create_v2_table(session: Any, table_name: str) -> None:
         CREATE TABLE IF NOT EXISTS {table_name} (
             id SERIAL PRIMARY KEY,
             user_id BIGINT NOT NULL,
+            onebot_message_id VARCHAR(255),
             raw_message TEXT,
             formatted_message TEXT,
             is_recalled BOOLEAN DEFAULT FALSE,
@@ -45,14 +46,48 @@ async def _create_v2_table(session: Any, table_name: str) -> None:
         CREATE INDEX IF NOT EXISTS idx_{table_name}_user_id
         ON {table_name}(user_id)
     """))
+    connection = await session.connection()
+    column_names = await connection.run_sync(
+        lambda sync_conn: {
+            column["name"]
+            for column in inspect(sync_conn).get_columns(table_name)
+        }
+    )
+    if "onebot_message_id" not in column_names:
+        await session.execute(text(f"""
+            ALTER TABLE {table_name}
+            ADD COLUMN onebot_message_id VARCHAR(255)
+        """))
+        column_names.add("onebot_message_id")
+    if "message_id" in column_names:
+        await session.execute(text(f"""
+            UPDATE {table_name}
+            SET onebot_message_id = message_id::text
+            WHERE onebot_message_id IS NULL
+              AND message_id IS NOT NULL
+        """))
     await session.execute(text(f"""
         CREATE INDEX IF NOT EXISTS idx_{table_name}_is_recalled
         ON {table_name}(is_recalled)
     """))
     await session.execute(text(f"""
+        CREATE INDEX IF NOT EXISTS idx_{table_name}_onebot_message_id
+        ON {table_name}(onebot_message_id)
+    """))
+    await session.execute(text(f"""
         CREATE INDEX IF NOT EXISTS idx_{table_name}_timestamp
         ON {table_name}("timestamp")
     """))
+
+
+async def _get_column_names(session: Any, table_name: str) -> set[str]:
+    connection = await session.connection()
+    return await connection.run_sync(
+        lambda sync_conn: {
+            column["name"]
+            for column in inspect(sync_conn).get_columns(table_name)
+        }
+    )
 
 
 async def _table_count(session: Any, table_name: str) -> int:
@@ -68,6 +103,8 @@ async def _migrate_group(
 ) -> None:
     old_table = group.table_name
     new_table = f"group_messages_v2_{group.group_id}"
+    old_columns = await _get_column_names(session, old_table)
+    old_has_message_id = "message_id" in old_columns
 
     await _create_v2_table(session, new_table)
     await session.commit()
@@ -86,8 +123,9 @@ async def _migrate_group(
     offset = 0
     total = 0
     while True:
+        message_id_expr = "message_id" if old_has_message_id else "NULL AS message_id"
         result = await session.execute(text(f"""
-            SELECT id, user_id, message_content, is_recalled, "timestamp"
+            SELECT id, user_id, {message_id_expr}, message_content, is_recalled, "timestamp"
             FROM {old_table}
             ORDER BY id
             LIMIT :limit OFFSET :offset
@@ -111,12 +149,14 @@ async def _migrate_group(
             await session.execute(text(f"""
                 INSERT INTO {new_table} (
                     user_id,
+                    onebot_message_id,
                     raw_message,
                     formatted_message,
                     is_recalled,
                     "timestamp"
                 ) VALUES (
                     :user_id,
+                    :onebot_message_id,
                     :raw_message,
                     :formatted_message,
                     :is_recalled,
@@ -124,6 +164,7 @@ async def _migrate_group(
                 )
             """), {
                 "user_id": row.user_id,
+                "onebot_message_id": str(row.message_id) if row.message_id is not None else None,
                 "raw_message": raw_message,
                 "formatted_message": converted.content,
                 "is_recalled": row.is_recalled,

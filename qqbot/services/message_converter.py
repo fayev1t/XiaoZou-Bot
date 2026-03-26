@@ -4,12 +4,16 @@ from __future__ import annotations
 
 from datetime import datetime
 from dataclasses import dataclass
+from html import escape
 
 from nonebot.adapters.onebot.v11 import GroupMessageEvent, MessageSegment
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from qqbot.core.logging import get_logger
+from qqbot.core.time import china_now, normalize_china_time
 from qqbot.services.display_name_resolver import DisplayNameResolver
+from qqbot.services.group_message import GroupMessageService
+from qqbot.services.image_parsing import ImageParsingService
 
 logger = get_logger(__name__)
 
@@ -106,7 +110,7 @@ class MessageConverter:
                 display_name = f"用户{user_id}"
 
         if timestamp is None:
-            timestamp = datetime.now()
+            timestamp = china_now()
 
         content = self._wrap("System-PureText", text)
         return self._wrap_message(
@@ -150,6 +154,7 @@ class MessageConverter:
             reply_id = seg_data.get("id")
             reply_content = await self._get_reply_content(
                 session=session,
+                event=event,
                 group_id=event.group_id,
                 reply_id=reply_id,
             )
@@ -198,11 +203,22 @@ class MessageConverter:
 
         if seg_type == "image":
             message_type = self._update_message_type(message_type, "img")
+            image_service = ImageParsingService(session)
+            parse_result = await image_service.parse_segment_sync(
+                group_id=event.group_id,
+                segment=segment,
+            )
             return (
                 self._wrap(
-                    "System-FilePlaceholder",
-                    "图片",
-                    {"file_size": "", "file_name": "", "file_format": ""},
+                    "System-Image",
+                    parse_result.description,
+                    {
+                        "file_hash": parse_result.file_hash,
+                        "url": parse_result.url,
+                        "local_path": parse_result.local_path,
+                        "desc": parse_result.description,
+                        "parse_status": "ok" if parse_result.success else "failed",
+                    },
                 ),
                 message_type,
             )
@@ -236,13 +252,45 @@ class MessageConverter:
     async def _get_reply_content(
         self,
         session: AsyncSession,
+        event: GroupMessageEvent,
         group_id: int,
         reply_id: str | int | None,
     ) -> str:
-        _ = session
-        _ = group_id
-        _ = reply_id
-        return "引用消息"
+        reply_event = getattr(event, "reply", None)
+        if reply_event is not None:
+            for attr_name in ("message", "raw_message", "message_text"):
+                reply_value = getattr(reply_event, attr_name, None)
+                if reply_value:
+                    return str(reply_value)
+
+        normalized_reply_id: str | None = None
+        if reply_id is not None:
+            normalized_reply_id = str(reply_id).strip() or None
+
+        if normalized_reply_id is not None:
+            try:
+                message_service = GroupMessageService(session)
+                reply_message = await message_service.get_message_by_onebot_message_id(
+                    group_id=group_id,
+                    onebot_message_id=normalized_reply_id,
+                )
+                if reply_message:
+                    return (
+                        reply_message.get("raw_message")
+                        or reply_message.get("formatted_message")
+                        or f"引用消息#{normalized_reply_id}"
+                    )
+            except Exception as exc:
+                logger.debug(
+                    "[message_converter] failed to resolve reply content",
+                    extra={
+                        "group_id": group_id,
+                        "reply_id": normalized_reply_id,
+                        "error": str(exc),
+                    },
+                )
+
+        return f"引用消息#{reply_id}" if reply_id else "引用消息"
 
     def _extract_file_meta(self, data: dict) -> dict[str, str]:
         file_name = data.get("file") or data.get("name") or ""
@@ -288,13 +336,14 @@ class MessageConverter:
             "display_name": display_name,
             "timestamp": timestamp,
         }
-        return self._wrap("System-Message", content, attrs)
+        return self._wrap("System-Message", content, attrs, escape_content=False)
 
     def _wrap(
         self,
         tag: str,
         content: str,
         attrs: dict[str, str | int | None] | None = None,
+        escape_content: bool = True,
     ) -> str:
         attr_text = ""
         if attrs:
@@ -303,7 +352,8 @@ class MessageConverter:
                 pairs.append(f'{key}="{self._attr_value(value)}"')
             attr_text = " " + " ".join(pairs)
 
-        return f"<{tag}{attr_text}>{content}</{tag}>"
+        safe_content = self._escape_text(content) if escape_content else content
+        return f"<{tag}{attr_text}>{safe_content}</{tag}>"
 
     def _wrap_unknown(self, unknown_type: str, raw: str) -> str:
         content = raw or "无"
@@ -312,7 +362,10 @@ class MessageConverter:
     def _attr_value(self, value: str | int | None) -> str:
         if value is None:
             return ""
-        return str(value)
+        return self._escape_text(str(value))
+
+    def _escape_text(self, value: str) -> str:
+        return escape(value, quote=True)
 
     async def _resolve_sender_name(
         self,
@@ -347,8 +400,8 @@ class MessageConverter:
         if value is None:
             return ""
         if isinstance(value, datetime):
-            return value.strftime("%Y-%m-%d %H:%M:%S")
+            return normalize_china_time(value).strftime("%Y-%m-%d %H:%M:%S")
         try:
-            return datetime.fromtimestamp(float(value)).strftime("%Y-%m-%d %H:%M:%S")
+            return normalize_china_time(float(value)).strftime("%Y-%m-%d %H:%M:%S")
         except (TypeError, ValueError, OSError):
             return str(value)

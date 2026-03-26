@@ -1,11 +1,15 @@
 """Group message management service."""
 
+from datetime import datetime
+
 from sqlalchemy import (
     select,
     text,
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from qqbot.core.database import is_sqlite_backend
+from qqbot.core.time import normalize_china_time
 from qqbot.models import Group
 
 
@@ -35,57 +39,126 @@ class GroupMessageService:
         self,
         group_id: int,
         user_id: int,
+        onebot_message_id: str | None,
         raw_message: str | None,
         formatted_message: str | None,
+        timestamp: datetime | int | float | None = None,
         is_recalled: bool = False,
     ) -> int:
         """Save a message to group message table."""
         table_name = await self._get_table_name(group_id)
 
+        params = {
+            "user_id": user_id,
+            "onebot_message_id": onebot_message_id,
+            "raw_message": raw_message,
+            "formatted_message": formatted_message,
+            "timestamp": normalize_china_time(timestamp),
+            "is_recalled": is_recalled,
+        }
+
+        if is_sqlite_backend():
+            sql = text(f"""
+                INSERT INTO {table_name}
+                (user_id, onebot_message_id, raw_message, formatted_message, "timestamp", is_recalled)
+                VALUES (
+                    :user_id,
+                    :onebot_message_id,
+                    :raw_message,
+                    :formatted_message,
+                    :timestamp,
+                    :is_recalled
+                )
+            """)
+            result = await self.session.execute(sql, params)
+            if result.lastrowid is not None:
+                return int(result.lastrowid)
+
+            fallback = await self.session.execute(
+                text("SELECT last_insert_rowid()")
+            )
+            saved_id = fallback.scalar()
+            return int(saved_id) if saved_id is not None else 0
+
         sql = text(f"""
             INSERT INTO {table_name}
-            (user_id, raw_message, formatted_message, is_recalled)
+            (user_id, onebot_message_id, raw_message, formatted_message, "timestamp", is_recalled)
             VALUES (
                 :user_id,
+                :onebot_message_id,
                 :raw_message,
                 :formatted_message,
+                :timestamp,
                 :is_recalled
             )
             RETURNING id
         """)
-
-        result = await self.session.execute(
-            sql,
-            {
-                "user_id": user_id,
-                "raw_message": raw_message,
-                "formatted_message": formatted_message,
-                "is_recalled": is_recalled,
-            },
-        )
-
+        result = await self.session.execute(sql, params)
         saved_id = result.scalar()
         return int(saved_id) if saved_id is not None else 0
 
     async def get_message(
         self,
         group_id: int,
-        message_id: int,
+        local_message_id: int,
     ) -> dict | None:
-        """Get a specific message by auto id."""
         table_name = await self._get_table_name(group_id)
 
         sql = text(f"""
-            SELECT * FROM {table_name} WHERE id = :message_id
+            SELECT * FROM {table_name} WHERE id = :local_message_id
         """)
 
-        result = await self.session.execute(sql, {"message_id": message_id})
+        result = await self.session.execute(sql, {"local_message_id": local_message_id})
         row = result.first()
 
         if row:
             return dict(row._mapping)  # type: ignore
 
         return None
+
+    async def get_message_by_onebot_message_id(
+        self,
+        group_id: int,
+        onebot_message_id: str,
+    ) -> dict | None:
+        table_name = await self._get_table_name(group_id)
+
+        sql = text(f"""
+            SELECT * FROM {table_name}
+            WHERE onebot_message_id = :onebot_message_id
+            ORDER BY id DESC
+            LIMIT 1
+        """)
+
+        result = await self.session.execute(
+            sql,
+            {"onebot_message_id": onebot_message_id},
+        )
+        row = result.first()
+        if row:
+            return dict(row._mapping)  # type: ignore
+
+        return None
+
+    async def mark_message_recalled_by_onebot_message_id(
+        self,
+        group_id: int,
+        onebot_message_id: str,
+    ) -> int:
+        table_name = await self._get_table_name(group_id)
+
+        sql = text(f"""
+            UPDATE {table_name}
+            SET is_recalled = true
+            WHERE onebot_message_id = :onebot_message_id
+              AND is_recalled = false
+        """)
+
+        result = await self.session.execute(
+            sql,
+            {"onebot_message_id": onebot_message_id},
+        )
+        return int(result.rowcount or 0)
 
     async def get_group_messages(
         self,
@@ -134,6 +207,35 @@ class GroupMessageService:
         messages = [dict(row._mapping) for row in rows]  # type: ignore
         messages.reverse()
 
+        return messages
+
+    async def get_messages_before_timestamp(
+        self,
+        group_id: int,
+        before_timestamp: datetime | int | float | None,
+        limit: int = 10,
+    ) -> list[dict]:
+        table_name = await self._get_table_name(group_id)
+
+        sql = text(f"""
+            SELECT * FROM {table_name}
+            WHERE is_recalled = false
+              AND "timestamp" < :before_timestamp
+            ORDER BY "timestamp" DESC
+            LIMIT :limit
+        """)
+
+        result = await self.session.execute(
+            sql,
+            {
+                "before_timestamp": normalize_china_time(before_timestamp),
+                "limit": limit,
+            },
+        )
+        rows = result.fetchall()
+
+        messages = [dict(row._mapping) for row in rows]  # type: ignore
+        messages.reverse()
         return messages
 
     async def get_user_messages_in_group(

@@ -9,6 +9,7 @@ This plugin listens to QQ Bot events and performs database operations:
 """
 
 from nonebot import on_notice, on_message
+from nonebot.adapters import Event
 from nonebot.adapters.onebot.v11 import (
     Bot,
     GroupMessageEvent,
@@ -16,37 +17,55 @@ from nonebot.adapters.onebot.v11 import (
     GroupDecreaseNoticeEvent,
     GroupRecallNoticeEvent,
 )
+from nonebot.rule import Rule
 
 from qqbot.core.database import AsyncSessionLocal
-from qqbot.core.logging import get_logger, log_event
+from qqbot.core.logging import get_logger
+from qqbot.core.settings import get_bot_nicknames
 from qqbot.services.user import UserService
 from qqbot.services.group import GroupService
+from qqbot.services.group_message import GroupMessageService
 from qqbot.services.group_member import GroupMemberService
 from qqbot.services.message_aggregator import message_aggregator
 from qqbot.services.message_pipeline import MessagePipeline
 
 logger = get_logger(__name__)
+BOT_NICKNAMES = get_bot_nicknames()
+
+
+def _is_group_message(event: Event) -> bool:
+    return isinstance(event, GroupMessageEvent)
+
+
+def _is_group_increase_notice(event: Event) -> bool:
+    return isinstance(event, GroupIncreaseNoticeEvent)
+
+
+def _is_group_decrease_notice(event: Event) -> bool:
+    return isinstance(event, GroupDecreaseNoticeEvent)
+
+
+def _is_group_recall_notice(event: Event) -> bool:
+    return isinstance(event, GroupRecallNoticeEvent)
 
 # ============================================================================
 # 1. GroupMessageEvent - 保存群消息到数据库
 # ============================================================================
 
-message_handler = on_message(priority=10, block=False)
+message_handler = on_message(rule=Rule(_is_group_message), priority=10, block=False)
 message_pipeline = MessagePipeline()
 
 
 @message_handler.handle()
 async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
-    """Handle group message event - save to database.
-
-    Priority: P0 - 高频操作，同步执行
-    """
-    # Only handle group messages, not private messages
-    if not hasattr(event, "group_id"):
-        return
+    _ = bot
 
     group_id = event.group_id
     user_id = event.user_id
+    track_persist = user_id != event.self_id
+
+    if track_persist:
+        await message_aggregator.begin_message_persist(group_id)
 
     async with AsyncSessionLocal() as session:
         try:
@@ -69,6 +88,7 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
 
             try:
                 if user_id == event.self_id:
+                    await message_aggregator.complete_message_persist(group_id)
                     return
 
                 message_source = getattr(event, "original_message", None) or event.message
@@ -79,21 +99,26 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
                         and str(segment.data.get("qq")) == str(event.self_id)
                         for segment in message_source
                     )
-                if not is_bot_mentioned and "小奏" in record.raw_message:
-                    is_bot_mentioned = True
+                if not is_bot_mentioned:
+                    is_bot_mentioned = any(
+                        nickname in record.raw_message
+                        for nickname in BOT_NICKNAMES
+                    )
 
                 if not record.raw_message.strip() and not is_bot_mentioned:
+                    await message_aggregator.complete_message_persist(group_id)
                     return
 
-                await message_aggregator.add_message(
+                await message_aggregator.finish_message_persist_and_add_message(
                     group_id=group_id,
                     user_id=user_id,
-                    raw_message=record.raw_message,
                     formatted_message=record.formatted_message,
                     event=event,
                     is_bot_mentioned=is_bot_mentioned,
                 )
             except Exception as exc:
+                if track_persist:
+                    await message_aggregator.fail_message_persist(group_id)
                 logger.error(
                     "Failed to add message to aggregator: %s",
                     exc,
@@ -101,8 +126,14 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
                 )
 
         except ValueError as e:
+            await session.rollback()
+            if track_persist:
+                await message_aggregator.fail_message_persist(group_id)
             logger.warning(f"Message event error: {e}", extra={"group_id": group_id})
         except Exception as e:
+            await session.rollback()
+            if track_persist:
+                await message_aggregator.fail_message_persist(group_id)
             logger.error(
                 f"Failed to save message: {e}",
                 extra={"group_id": group_id, "user_id": user_id},
@@ -113,16 +144,16 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
 # 2. GroupIncreaseNoticeEvent - 成员进群
 # ============================================================================
 
-increase_handler = on_notice(priority=5, block=False)
+increase_handler = on_notice(
+    rule=Rule(_is_group_increase_notice),
+    priority=5,
+    block=False,
+)
 
 
 @increase_handler.handle()
 async def handle_group_increase(bot: Bot, event: GroupIncreaseNoticeEvent) -> None:
-    """Handle group member join event.
-
-    Priority: P0 - 必需操作，同步执行
-    Idempotency: ✅ ON CONFLICT处理重复事件
-    """
+    _ = bot
     group_id = event.group_id
     user_id = event.user_id
 
@@ -131,22 +162,13 @@ async def handle_group_increase(bot: Bot, event: GroupIncreaseNoticeEvent) -> No
             user_service = UserService(session)
             group_service = GroupService(session)
             member_service = GroupMemberService(session)
-            # 1. 确保用户存在
             await user_service.get_or_create_user(user_id=user_id)
-            await session.commit()
-
-            # 2. 确保群存在
             await group_service.get_or_create_group(group_id=group_id)
-            await session.commit()
-
-            # 3. 添加成员（幂等操作）
             await member_service.add_member_from_join_event(
                 group_id=group_id,
                 user_id=user_id,
             )
             await session.commit()
-
-            # Note: 昵称更新现在由后台任务定期处理，避免频繁调用 QQ API
 
             logger.info(
                 "Member added to group",
@@ -158,8 +180,10 @@ async def handle_group_increase(bot: Bot, event: GroupIncreaseNoticeEvent) -> No
             )
 
         except ValueError as e:
+            await session.rollback()
             logger.warning(f"Join event error: {e}", extra={"group_id": group_id})
         except Exception as e:
+            await session.rollback()
             logger.error(
                 f"Failed to add member: {e}",
                 extra={"group_id": group_id, "user_id": user_id},
@@ -170,16 +194,16 @@ async def handle_group_increase(bot: Bot, event: GroupIncreaseNoticeEvent) -> No
 # 3. GroupDecreaseNoticeEvent - 成员离群
 # ============================================================================
 
-decrease_handler = on_notice(priority=5, block=False)
+decrease_handler = on_notice(
+    rule=Rule(_is_group_decrease_notice),
+    priority=5,
+    block=False,
+)
 
 
 @decrease_handler.handle()
 async def handle_group_decrease(bot: Bot, event: GroupDecreaseNoticeEvent) -> None:
-    """Handle group member leave event.
-
-    Priority: P0 - 必需操作，同步执行
-    Idempotency: ✅ UPDATE无唯一性约束，多次执行安全
-    """
+    _ = bot
     group_id = event.group_id
     user_id = event.user_id
 
@@ -203,8 +227,10 @@ async def handle_group_decrease(bot: Bot, event: GroupDecreaseNoticeEvent) -> No
             )
 
         except ValueError as e:
+            await session.rollback()
             logger.warning(f"Leave event error: {e}", extra={"group_id": group_id})
         except Exception as e:
+            await session.rollback()
             logger.error(
                 f"Failed to mark member inactive: {e}",
                 extra={"group_id": group_id, "user_id": user_id},
@@ -215,22 +241,51 @@ async def handle_group_decrease(bot: Bot, event: GroupDecreaseNoticeEvent) -> No
 # 4. GroupRecallNoticeEvent - 消息撤回
 # ============================================================================
 
-recall_handler = on_notice(priority=10, block=False)
+recall_handler = on_notice(
+    rule=Rule(_is_group_recall_notice),
+    priority=10,
+    block=False,
+)
 
 
 @recall_handler.handle()
 async def handle_group_recall(bot: Bot, event: GroupRecallNoticeEvent) -> None:
-    """Handle group message recall event.
-
-    Priority: P1 - 异步优先级，非关键操作
-    Idempotency: ✅ no-op
-    """
+    _ = bot
     group_id = event.group_id
-    logger.info(
-        "Recall event received (message_id column removed, skipping persist)",
-        extra={
-            "group_id": group_id,
-            "message_id": getattr(event, "message_id", None),
-            "operator_id": event.operator_id,
-        },
-    )
+    raw_message_id = getattr(event, "message_id", None)
+    onebot_message_id = str(raw_message_id).strip() if raw_message_id is not None else ""
+
+    if not onebot_message_id:
+        logger.warning(
+            "Recall event missing message id",
+            extra={"group_id": group_id, "operator_id": event.operator_id},
+        )
+        return
+
+    async with AsyncSessionLocal() as session:
+        try:
+            group_service = GroupService(session)
+            await group_service.get_or_create_group(group_id=group_id)
+
+            message_service = GroupMessageService(session)
+            updated_rows = await message_service.mark_message_recalled_by_onebot_message_id(
+                group_id=group_id,
+                onebot_message_id=onebot_message_id,
+            )
+            await session.commit()
+
+            logger.info(
+                "Recall event processed",
+                extra={
+                    "group_id": group_id,
+                    "message_id": onebot_message_id,
+                    "operator_id": event.operator_id,
+                    "updated_rows": updated_rows,
+                },
+            )
+        except Exception as e:
+            await session.rollback()
+            logger.error(
+                f"Failed to mark recalled message: {e}",
+                extra={"group_id": group_id, "message_id": onebot_message_id},
+            )

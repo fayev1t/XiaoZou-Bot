@@ -38,7 +38,7 @@ class ConversationService:
 
     async def generate_response(
         self,
-        session: AsyncSession,
+        session: AsyncSession | None,
         context: str,
         judge_result: JudgeResult,
         group_id: int | None = None,
@@ -56,6 +56,12 @@ class ConversationService:
         """
         try:
             llm = await self._get_llm()
+            if llm is None:
+                logger.warning(
+                    "[conversation] LLM unavailable, returning fallback response",
+                    extra={"group_id": group_id},
+                )
+                return "喵~让我想想..."
 
             # Build response prompt with guidance from judge layer
             response_prompt = f"""【对话背景】
@@ -97,28 +103,23 @@ class ConversationService:
                 and group_id
             ):
                 try:
-                    # Get target user info for @ mention
-                    user_service = UserService(session)
-                    member_service = GroupMemberService(session)
-                    target_user = await user_service.get_user(
-                        judge_result.target_user_id
-                    )
-                    target_member = await member_service.get_member(
-                        group_id, judge_result.target_user_id
-                    )
+                    target_session = session
+                    if target_session is None:
+                        from qqbot.core.database import AsyncSessionLocal
 
-                    target_card = (
-                        target_member.get("card")
-                        if target_member
-                        else target_user.get("nickname") if target_user else None
-                    )
-                    target_name = (
-                        target_card or
-                        (target_user.get("nickname") if target_user else None) or
-                        f"用户{judge_result.target_user_id}"
-                    )
+                        async with AsyncSessionLocal() as mention_session:
+                            target_name = await self._resolve_target_name(
+                                session=mention_session,
+                                group_id=group_id,
+                                target_user_id=judge_result.target_user_id,
+                            )
+                    else:
+                        target_name = await self._resolve_target_name(
+                            session=target_session,
+                            group_id=group_id,
+                            target_user_id=judge_result.target_user_id,
+                        )
 
-                    # Format as CQ code mention
                     prefix = f"[CQ:at,qq={judge_result.target_user_id}] "
                     generated_text = prefix + generated_text
 
@@ -143,6 +144,19 @@ class ConversationService:
             logger.error(f"[ConversationService] 【第二层AI】调用出错: {e}", exc_info=True)
             # Return fallback response on error
             return "喵~让我想想..."
+
+    async def _resolve_target_name(
+        self,
+        session: AsyncSession,
+        group_id: int,
+        target_user_id: int,
+    ) -> str:
+        user_service = UserService(session)
+        member_service = GroupMemberService(session)
+        target_user = await user_service.get_user(target_user_id)
+        target_member = await member_service.get_member(group_id, target_user_id)
+        target_card = target_member.get("card") if target_member else None
+        return target_card or (target_user.nickname if target_user else None) or f"用户{target_user_id}"
 
     def _strip_system_xml_tags(self, text: str) -> str:
         cleaned = _SYSTEM_XML_TAG_RE.sub("", text)

@@ -3,7 +3,7 @@ name = "qqbot"
 version = "0.1.0"
 description = "qqbot"
 readme = "README.md"
-requires-python = ">=3.9, <4.0"
+requires-python = ">=3.10, <4.0"
 dependencies = [
     "nonebot2[fastapi]>=2.4.4",
     "nonebot-adapter-onebot>=2.4.6",
@@ -12,6 +12,7 @@ dependencies = [
     "sqlalchemy>=2.0.0",
     "sqlalchemy[asyncio]",
     "asyncpg>=0.29.0",
+    "aiosqlite>=0.20.0",
     "apscheduler>=3.10.0",
     "langchain>=0.1.0",
     "langchain-openai>=0.0.5",
@@ -36,7 +37,7 @@ nonebot-adapter-onebot = [{name = "OneBot V11", module_name = "nonebot.adapters.
 "@local" = []
 [tool.ruff]
 line-length = 88
-target-version = "py39"
+target-version = "py310"
 
 [tool.ruff.format]
 line-ending = "lf"
@@ -104,6 +105,6 @@ keep-runtime-typing = true
 
 [tool.pyright]
 # For Pylance/Pyright configurations, see https://microsoft.github.io/pyright/#/configuration.
-pythonVersion = "3.9"
+pythonVersion = "3.10"
 pythonPlatform = "All"
 typeCheckingMode = "standard"

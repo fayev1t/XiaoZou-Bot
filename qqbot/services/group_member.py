@@ -1,12 +1,13 @@
 """Group member management service."""
 
-from datetime import datetime, timezone
+from datetime import datetime
 from sqlalchemy import (
     select,
     text,
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from qqbot.core.time import china_now, normalize_china_time
 from qqbot.models import Group
 
 
@@ -61,9 +62,9 @@ class GroupMemberService:
             (user_id, card, join_time, is_active, created_at, updated_at)
             VALUES (:user_id, :card, :join_time, :is_active, :created_at, :updated_at)
             ON CONFLICT(user_id) DO UPDATE SET
-                card = COALESCE(:card, {table_name}.card),
-                is_active = :is_active,
-                updated_at = :updated_at
+                card = COALESCE(excluded.card, card),
+                is_active = excluded.is_active,
+                updated_at = excluded.updated_at
         """)
 
         await self.session.execute(
@@ -71,10 +72,10 @@ class GroupMemberService:
             {
                 "user_id": user_id,
                 "card": card,
-                "join_time": join_time or datetime.now(timezone.utc),
+                "join_time": normalize_china_time(join_time),
                 "is_active": True,
-                "created_at": datetime.now(timezone.utc),
-                "updated_at": datetime.now(timezone.utc),
+                "created_at": china_now(),
+                "updated_at": china_now(),
             },
         )
 
@@ -109,18 +110,18 @@ class GroupMemberService:
             (user_id, join_time, is_active, created_at, updated_at)
             VALUES (:user_id, :join_time, :is_active, :created_at, :updated_at)
             ON CONFLICT(user_id) DO UPDATE SET
-                is_active = true,
-                updated_at = :updated_at
+                is_active = excluded.is_active,
+                updated_at = excluded.updated_at
         """)
 
         await self.session.execute(
             sql,
             {
                 "user_id": user_id,
-                "join_time": datetime.now(timezone.utc),
+                "join_time": china_now(),
                 "is_active": True,
-                "created_at": datetime.now(timezone.utc),
-                "updated_at": datetime.now(timezone.utc),
+                "created_at": china_now(),
+                "updated_at": china_now(),
             },
         )
 
@@ -147,14 +148,15 @@ class GroupMemberService:
 
         for user_id, card in card_updates.items():
             if card:  # Only update if card is not empty
+                current_time = china_now()
                 # Use UPSERT (INSERT ... ON CONFLICT DO UPDATE) to create or update
                 sql = text(f"""
                     INSERT INTO {table_name}
                     (user_id, card, is_active, created_at, updated_at)
                     VALUES (:user_id, :card, :is_active, :created_at, :updated_at)
                     ON CONFLICT(user_id) DO UPDATE SET
-                        card = :card,
-                        updated_at = :updated_at
+                        card = excluded.card,
+                        updated_at = excluded.updated_at
                 """)
                 await self.session.execute(
                     sql,
@@ -162,8 +164,8 @@ class GroupMemberService:
                         "user_id": user_id,
                         "card": card,
                         "is_active": True,
-                        "created_at": datetime.now(timezone.utc),
-                        "updated_at": datetime.now(timezone.utc),
+                        "created_at": current_time,
+                        "updated_at": current_time,
                     },
                 )
 
@@ -279,6 +281,6 @@ class GroupMemberService:
             sql,
             {
                 "user_id": user_id,
-                "updated_at": datetime.now(timezone.utc),
+                "updated_at": china_now(),
             },
         )

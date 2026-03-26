@@ -7,7 +7,9 @@
 - group_messages_v2_{group_id}: 群消息表 (动态，按群ID分表)
 """
 
-from sqlalchemy import BigInteger, Boolean, Column, DateTime, Integer, String, Text, func
+from sqlalchemy import BigInteger, Boolean, Column, DateTime, Integer, String, Text
+
+from qqbot.core.time import china_now
 from qqbot.models.base import Base
 
 
@@ -22,8 +24,8 @@ class User(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(BigInteger, unique=True, nullable=False, index=True)
     nickname = Column(String(255), nullable=True)
-    created_at = Column(DateTime(timezone=True), nullable=False, default=func.now())
-    updated_at = Column(DateTime(timezone=True), nullable=False, default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime, nullable=False, default=china_now)
+    updated_at = Column(DateTime, nullable=False, default=china_now, onupdate=china_now)
 
     def __repr__(self) -> str:
         return f"<User(user_id={self.user_id}, nickname={self.nickname})>"
@@ -42,8 +44,8 @@ class Group(Base):
     group_name = Column(String(255), nullable=True)
     table_name = Column(String(255), nullable=False)  # 消息表名: group_messages_{group_id}
     members_table_name = Column(String(255), nullable=False)  # 群成员表名: group_members_{group_id}
-    created_at = Column(DateTime(timezone=True), nullable=False, default=func.now())
-    updated_at = Column(DateTime(timezone=True), nullable=False, default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime, nullable=False, default=china_now)
+    updated_at = Column(DateTime, nullable=False, default=china_now, onupdate=china_now)
 
     def __repr__(self) -> str:
         return f"<Group(group_id={self.group_id}, group_name={self.group_name})>"
@@ -67,8 +69,8 @@ class GroupMemberTemplate(Base):
     card = Column(String(255), nullable=True)  # 群昵称
     join_time = Column(DateTime, nullable=True)  # 入群时间
     is_active = Column(Boolean, default=True)  # 是否在群中
-    created_at = Column(DateTime, nullable=False, default=func.now())
-    updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime, nullable=False, default=china_now)
+    updated_at = Column(DateTime, nullable=False, default=china_now, onupdate=china_now)
 
     def __repr__(self) -> str:
         return f"<GroupMember(user_id={self.user_id}, card={self.card}, is_active={self.is_active})>"
@@ -85,10 +87,11 @@ class GroupMessage(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(BigInteger, nullable=False, index=True)
+    onebot_message_id = Column(String(255), nullable=True, index=True)
     raw_message = Column(Text, nullable=True)  # 原始消息
     formatted_message = Column(Text, nullable=True)  # System-XML 格式
     is_recalled = Column(Boolean, default=False, index=True)  # 是否被撤回
-    timestamp = Column(DateTime, nullable=False, default=func.now(), index=True)  # 消息时间
+    timestamp = Column(DateTime, nullable=False, default=china_now, index=True)  # 消息时间
 
     def __repr__(self) -> str:
         return f"<GroupMessage(id={self.id}, user_id={self.user_id})>"

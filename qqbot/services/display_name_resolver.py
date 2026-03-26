@@ -45,8 +45,8 @@ class DisplayNameResolver:
                 display_name = member["card"]
             else:
                 user = await user_service.get_user(user_id_int)
-                if user and user.get("nickname"):
-                    display_name = user["nickname"]
+                if user and user.nickname:
+                    display_name = user.nickname
         except Exception as exc:
             logger.debug(
                 "[display_name_resolver] resolve failed",

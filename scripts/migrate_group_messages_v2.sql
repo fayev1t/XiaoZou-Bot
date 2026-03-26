@@ -8,6 +8,7 @@ DECLARE
     old_table TEXT;
     new_table TEXT;
     row_count BIGINT;
+    has_message_id BOOLEAN;
 BEGIN
     FOR r IN SELECT group_id, table_name FROM groups LOOP
         old_table := r.table_name;
@@ -18,6 +19,7 @@ BEGIN
                 'CREATE TABLE %I (
                     id SERIAL PRIMARY KEY,
                     user_id BIGINT NOT NULL,
+                    onebot_message_id VARCHAR(255),
                     raw_message TEXT,
                     formatted_message TEXT,
                     is_recalled BOOLEAN DEFAULT FALSE,
@@ -29,6 +31,11 @@ BEGIN
 
         EXECUTE format(
             'CREATE INDEX IF NOT EXISTS idx_%I_user_id ON %I(user_id)',
+            new_table,
+            new_table
+        );
+        EXECUTE format(
+            'CREATE INDEX IF NOT EXISTS idx_%I_onebot_message_id ON %I(onebot_message_id)',
             new_table,
             new_table
         );
@@ -45,24 +52,57 @@ BEGIN
 
         EXECUTE format('SELECT COUNT(*) FROM %I', new_table) INTO row_count;
         IF row_count = 0 AND to_regclass(old_table) IS NOT NULL THEN
-            EXECUTE format(
-                'INSERT INTO %I (
-                    user_id,
-                    raw_message,
-                    formatted_message,
-                    is_recalled,
-                    "timestamp"
-                )
-                SELECT
-                    user_id,
-                    message_content,
-                    NULL,
-                    is_recalled,
-                    "timestamp"
-                FROM %I',
-                new_table,
-                old_table
-            );
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = old_table
+                  AND column_name = 'message_id'
+            ) INTO has_message_id;
+
+            IF has_message_id THEN
+                EXECUTE format(
+                    'INSERT INTO %I (
+                        user_id,
+                        onebot_message_id,
+                        raw_message,
+                        formatted_message,
+                        is_recalled,
+                        "timestamp"
+                    )
+                    SELECT
+                        user_id,
+                        message_id::text,
+                        message_content,
+                        NULL,
+                        is_recalled,
+                        "timestamp"
+                    FROM %I',
+                    new_table,
+                    old_table
+                );
+            ELSE
+                EXECUTE format(
+                    'INSERT INTO %I (
+                        user_id,
+                        onebot_message_id,
+                        raw_message,
+                        formatted_message,
+                        is_recalled,
+                        "timestamp"
+                    )
+                    SELECT
+                        user_id,
+                        NULL,
+                        message_content,
+                        NULL,
+                        is_recalled,
+                        "timestamp"
+                    FROM %I',
+                    new_table,
+                    old_table
+                );
+            END IF;
         END IF;
     END LOOP;
 END $$;

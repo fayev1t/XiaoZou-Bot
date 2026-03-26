@@ -1,9 +1,9 @@
 """User service for user data management."""
-
-from datetime import datetime, timezone
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from qqbot.core.database import is_sqlite_backend
+from qqbot.core.time import china_now
 from qqbot.models import User
 
 
@@ -18,34 +18,43 @@ class UserService:
         user_id: int,
         nickname: str | None = None,
     ) -> User:
-        """Get existing user or create new one (idempotent).
-
-        Args:
-            user_id: QQ user ID
-            nickname: User nickname (optional)
-
-        Returns:
-            User object
-        """
-        # Try to get existing user
         result = await self.session.execute(
             select(User).where(User.user_id == user_id)
         )
         user = result.scalar_one_or_none()
 
         if user:
+            if nickname and user.nickname != nickname:
+                user.nickname = nickname
+                user.updated_at = china_now()
             return user
 
-        # Create new user
-        new_user = User(
+        if is_sqlite_backend():
+            from sqlalchemy.dialects.sqlite import insert as dialect_insert
+        else:
+            from sqlalchemy.dialects.postgresql import insert as dialect_insert
+
+        current_time = china_now()
+        stmt = dialect_insert(User).values(
             user_id=user_id,
             nickname=nickname,
-            created_at=datetime.now(timezone.utc),
-            updated_at=datetime.now(timezone.utc),
+            created_at=current_time,
+            updated_at=current_time,
+        ).on_conflict_do_nothing(index_elements=["user_id"])
+        await self.session.execute(stmt)
+
+        result = await self.session.execute(
+            select(User).where(User.user_id == user_id)
         )
-        self.session.add(new_user)
-        await self.session.flush()  # Flush to get the id
-        return new_user
+        user = result.scalar_one_or_none()
+        if user is None:
+            raise ValueError(f"User {user_id} was not created")
+
+        if nickname and user.nickname != nickname:
+            user.nickname = nickname
+            user.updated_at = china_now()
+
+        return user
 
     async def get_user(
         self,
@@ -80,7 +89,7 @@ class UserService:
             .where(User.user_id == user_id)
             .values(
                 nickname=nickname,
-                updated_at=datetime.now(timezone.utc),
+                updated_at=china_now(),
             )
         )
         await self.session.execute(stmt)
@@ -96,21 +105,24 @@ class UserService:
         Args:
             user_updates: Dict of {user_id: new_nickname}
         """
-        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        if is_sqlite_backend():
+            from sqlalchemy.dialects.sqlite import insert as dialect_insert
+        else:
+            from sqlalchemy.dialects.postgresql import insert as dialect_insert
 
         for user_id, nickname in user_updates.items():
             if nickname:  # Only update if nickname is not empty
-                # Use PostgreSQL UPSERT (INSERT ... ON CONFLICT DO UPDATE)
-                stmt = pg_insert(User).values(
+                current_time = china_now()
+                stmt = dialect_insert(User).values(
                     user_id=user_id,
                     nickname=nickname,
-                    created_at=datetime.now(timezone.utc),
-                    updated_at=datetime.now(timezone.utc),
+                    created_at=current_time,
+                    updated_at=current_time,
                 ).on_conflict_do_update(
                     index_elements=["user_id"],
                     set_={
                         "nickname": nickname,
-                        "updated_at": datetime.now(timezone.utc),
+                        "updated_at": current_time,
                     }
                 )
                 await self.session.execute(stmt)
@@ -118,7 +130,7 @@ class UserService:
     async def get_user_by_id(
         self,
         user_id: int,
-    ) -> dict | None:
+    ) -> dict[str, object] | None:
         """Get user data as dict.
 
         Args:

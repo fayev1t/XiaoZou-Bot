@@ -3,11 +3,13 @@
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from qqbot.models import Group
-from qqbot.core.database import create_group_tables, table_exists
+from qqbot.core.database import create_group_tables, is_sqlite_backend
 from qqbot.core.logging import get_logger
+from qqbot.core.time import china_now
+from qqbot.models import Group
 
 logger = get_logger(__name__)
+_verified_group_tables: set[int] = set()
 
 
 class GroupService:
@@ -21,75 +23,26 @@ class GroupService:
         group_id: int,
         group_name: str | None = None,
     ) -> Group:
-        """Get an existing group or create a new one.
-
-        Args:
-            group_id: QQ group ID
-            group_name: Group name (optional)
-
-        Returns:
-            Group object
-        """
-        # Try to get existing group
         result = await self.session.execute(
             select(Group).where(Group.group_id == group_id)
         )
         group = result.scalar_one_or_none()
 
         if group:
-            # Verify tables exist for existing group
-            # (in case table creation failed previously)
-            members_exists = await table_exists(group.members_table_name)
-            messages_exists = await table_exists(group.table_name)
-
-            if not members_exists or not messages_exists:
-                logger.warning(
-                    (
-                        "[GroupService] Tables missing for existing group %s, "
-                        "recreating..."
-                    ),
-                    group_id,
-                )
-                try:
-                    await create_group_tables(group_id)
-                    logger.info(
-                        "[GroupService] ✅ Tables recreated for group %s",
-                        group_id,
-                    )
-                except Exception as e:
-                    logger.error(
-                        (
-                            "[GroupService] ❌ Failed to recreate tables for %s: %s"
-                        ),
-                        group_id,
-                        e,
-                        exc_info=True,
-                    )
-                    raise
-
-            # Update name if provided and different
+            if group_id not in _verified_group_tables:
+                await create_group_tables(group_id)
+                _verified_group_tables.add(group_id)
             if group_name and group.group_name != group_name:
                 group.group_name = group_name
-                await self.session.commit()
-                await self.session.refresh(group)
+                group.updated_at = china_now()
             return group
 
-        # Create new group
         table_name = f"group_messages_v2_{group_id}"
         members_table_name = f"group_members_{group_id}"
-
-        group = Group(
-            group_id=group_id,
-            group_name=group_name,
-            table_name=table_name,
-            members_table_name=members_table_name,
-        )
-
-        # Create the per-group tables FIRST (before committing Group record)
-        # Tables must exist before any data can be inserted
         logger.info(f"[GroupService] Creating tables for group {group_id}...")
         try:
             await create_group_tables(group_id)
+            _verified_group_tables.add(group_id)
             logger.info(f"[GroupService] ✅ Tables created for group {group_id}")
         except Exception as e:
             logger.error(
@@ -100,11 +53,32 @@ class GroupService:
             )
             raise
 
-        # Only commit Group record after tables are successfully created
-        self.session.add(group)
-        await self.session.commit()
-        await self.session.refresh(group)
-        logger.info(f"[GroupService] ✅ Group record saved for {group_id}")
+        if is_sqlite_backend():
+            from sqlalchemy.dialects.sqlite import insert as dialect_insert
+        else:
+            from sqlalchemy.dialects.postgresql import insert as dialect_insert
+
+        current_time = china_now()
+        stmt = dialect_insert(Group).values(
+            group_id=group_id,
+            group_name=group_name,
+            table_name=table_name,
+            members_table_name=members_table_name,
+            created_at=current_time,
+            updated_at=current_time,
+        ).on_conflict_do_nothing(index_elements=["group_id"])
+        await self.session.execute(stmt)
+
+        result = await self.session.execute(
+            select(Group).where(Group.group_id == group_id)
+        )
+        group = result.scalar_one_or_none()
+        if group is None:
+            raise ValueError(f"Group {group_id} was not created")
+
+        if group_name and group.group_name != group_name:
+            group.group_name = group_name
+            group.updated_at = china_now()
 
         return group
 
@@ -141,15 +115,6 @@ class GroupService:
         group_id: int,
         group_name: str,
     ) -> Group:
-        """Update group name.
-
-        Args:
-            group_id: QQ group ID
-            group_name: New group name
-
-        Returns:
-            Updated Group object
-        """
         result = await self.session.execute(
             select(Group).where(Group.group_id == group_id)
         )
@@ -159,7 +124,6 @@ class GroupService:
             raise ValueError(f"Group {group_id} not found")
 
         group.group_name = group_name
-        await self.session.commit()
-        await self.session.refresh(group)
+        group.updated_at = china_now()
 
         return group

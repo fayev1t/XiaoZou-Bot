@@ -7,10 +7,14 @@ import re
 from nonebot.adapters.onebot.v11 import Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from qqbot.core.settings import get_primary_bot_name
 from qqbot.services.group_member import GroupMemberService
 from qqbot.services.group_message import GroupMessageService
+from qqbot.services.image_parsing import ImageParsingService
 from qqbot.services.message_converter import MessageConverter
 from qqbot.services.user import UserService
+
+BOT_DISPLAY_NAME = get_primary_bot_name()
 
 
 @dataclass
@@ -59,7 +63,7 @@ class ContextManager:
             try:
                 user_service = UserService(self.session)
                 user = await user_service.get_user(at_qq)
-                user_nickname = user.get("nickname") if user else f"用户{at_qq}"
+                user_nickname = user.nickname if user and user.nickname else f"用户{at_qq}"
             except Exception:
                 user_nickname = f"用户{at_qq}"
 
@@ -106,6 +110,7 @@ class ContextManager:
             return "（暂无上下文消息）"
 
         converter = MessageConverter()
+        image_service = ImageParsingService(self.session)
         context_lines: list[str] = []
 
         for msg in messages:
@@ -116,6 +121,9 @@ class ContextManager:
 
             formatted_message = msg.get("formatted_message")
             if formatted_message:
+                formatted_message = await image_service.refresh_image_descriptions_in_text(
+                    formatted_message
+                )
                 context_lines.append(formatted_message)
                 continue
 
@@ -132,7 +140,7 @@ class ContextManager:
                 fallback = converter.wrap_plain_text(
                     raw_message,
                     user_id=user_id,
-                    display_name="小奏",
+                    display_name=BOT_DISPLAY_NAME,
                     timestamp=timestamp,
                 )
                 context_lines.append(fallback)
