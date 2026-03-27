@@ -6,6 +6,7 @@ import hashlib
 import mimetypes
 import re
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from html import escape
 from pathlib import Path
@@ -17,7 +18,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from qqbot.core.llm import create_llm
 from qqbot.core.logging import get_logger
-from qqbot.core.time import normalize_china_time
 from qqbot.services.group_message import GroupMessageService
 from qqbot.services.image_record import ImageRecordService
 
@@ -42,7 +42,9 @@ class ImageParseResult:
 @dataclass
 class ImageReference:
     file_hash: str
-    timestamp: object | None = None
+
+
+OpenAIImageBlock = dict[str, object]
 
 
 class ImageParsingService:
@@ -82,7 +84,7 @@ class ImageParsingService:
                 local_path=local_path,
             )
 
-            context = await self._get_recent_context_before(group_id=group_id)
+            context = await self._get_recent_context(group_id=group_id)
             description = await self._describe_image(
                 image_bytes=image_bytes,
                 context=context,
@@ -120,71 +122,6 @@ class ImageParsingService:
             )
             return self._failure_result(file_hash=file_hash, url=url, local_path=None)
 
-    async def reparse_file_hashes(
-        self,
-        group_id: int,
-        refs: list[ImageReference],
-    ) -> dict[str, str]:
-        descriptions: dict[str, str] = {}
-        deduped: dict[str, ImageReference] = {}
-        for ref in refs:
-            deduped.setdefault(ref.file_hash, ref)
-
-        for file_hash, ref in deduped.items():
-            record = await self.record_service.get_by_hash(file_hash)
-            if record is None or not record.local_path:
-                logger.warning(
-                    "[image_parsing] stage3 reparse skipped",
-                    extra={
-                        "group_id": group_id,
-                        "file_hash": file_hash,
-                        "reason": "missing record or local_path",
-                    },
-                )
-                continue
-
-            image_path = Path(record.local_path)
-            if not image_path.exists():
-                logger.warning(
-                    "[image_parsing] stage3 reparse skipped",
-                    extra={
-                        "group_id": group_id,
-                        "file_hash": file_hash,
-                        "reason": "local file missing",
-                        "local_path": record.local_path,
-                    },
-                )
-                continue
-
-            try:
-                image_bytes = image_path.read_bytes()
-                context = await self._get_recent_context_before(
-                    group_id=group_id,
-                    before_timestamp=ref.timestamp,
-                )
-                description = await self._describe_image(
-                    image_bytes=image_bytes,
-                    context=context,
-                )
-                if not description:
-                    continue
-
-                record.description = description
-                descriptions[file_hash] = description
-            except Exception as exc:
-                logger.warning(
-                    "[image_parsing] stage3 reparse failed",
-                    extra={
-                        "group_id": group_id,
-                        "file_hash": file_hash,
-                        "error": str(exc),
-                    },
-                )
-
-        if descriptions:
-            await self.session.flush()
-        return descriptions
-
     async def refresh_image_descriptions_in_text(self, text: str) -> str:
         file_hashes = self.extract_image_hashes(text)
         if not file_hashes:
@@ -193,25 +130,10 @@ class ImageParsingService:
         records = await self.record_service.get_by_hashes(file_hashes)
         return self._refresh_text_with_records(text, records)
 
-    async def refresh_multiple_texts(self, texts: list[str]) -> list[str]:
-        if not texts:
-            return []
-
-        merged_hashes: list[str] = []
-        for text in texts:
-            merged_hashes.extend(self.extract_image_hashes(text))
-
-        if not merged_hashes:
-            return texts
-
-        records = await self.record_service.get_by_hashes(list(dict.fromkeys(merged_hashes)))
-
-        return [self._refresh_text_with_records(text, records) for text in texts]
-
     @staticmethod
     def _refresh_text_with_records(
         text: str,
-        records: dict[str, object],
+        records: Mapping[str, object],
     ) -> str:
         def _replace(match: re.Match[str]) -> str:
             attrs_text = match.group(1)
@@ -245,12 +167,61 @@ class ImageParsingService:
     @staticmethod
     def extract_refs_from_formatted_message(
         formatted_message: str,
-        timestamp: object | None = None,
     ) -> list[ImageReference]:
         return [
-            ImageReference(file_hash=file_hash, timestamp=timestamp)
+            ImageReference(file_hash=file_hash)
             for file_hash in ImageParsingService.extract_image_hashes(formatted_message)
         ]
+
+    async def build_openai_image_blocks(
+        self,
+        refs: list[ImageReference],
+    ) -> list[OpenAIImageBlock]:
+        if not refs:
+            return []
+
+        file_hashes = list(dict.fromkeys(ref.file_hash for ref in refs if ref.file_hash))
+        records = await self.record_service.get_by_hashes(file_hashes)
+        image_blocks: list[OpenAIImageBlock] = []
+
+        for file_hash in file_hashes:
+            record = records.get(file_hash)
+            if record is None or not record.local_path:
+                logger.warning(
+                    "[image_parsing] skip image block, missing cached record",
+                    extra={"file_hash": file_hash},
+                )
+                continue
+
+            image_path = Path(record.local_path)
+            if not image_path.exists():
+                logger.warning(
+                    "[image_parsing] skip image block, cached file missing",
+                    extra={"file_hash": file_hash, "local_path": record.local_path},
+                )
+                continue
+
+            try:
+                image_bytes = await asyncio.to_thread(image_path.read_bytes)
+            except OSError as exc:
+                logger.warning(
+                    "[image_parsing] skip image block, cached file unreadable",
+                    extra={
+                        "file_hash": file_hash,
+                        "local_path": record.local_path,
+                        "error": str(exc),
+                    },
+                )
+                continue
+
+            image_blocks.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": self._build_image_data_url(image_bytes)},
+                }
+            )
+
+        return image_blocks
 
     def _failure_result(
         self,
@@ -266,21 +237,9 @@ class ImageParsingService:
             success=False,
         )
 
-    async def _get_recent_context_before(
-        self,
-        group_id: int,
-        before_timestamp: object | None = None,
-        limit: int = 10,
-    ) -> str:
+    async def _get_recent_context(self, group_id: int, limit: int = 10) -> str:
         message_service = GroupMessageService(self.session)
-        if before_timestamp is None:
-            messages = await message_service.get_recent_messages(group_id=group_id, limit=limit)
-        else:
-            messages = await message_service.get_messages_before_timestamp(
-                group_id=group_id,
-                before_timestamp=before_timestamp,
-                limit=limit,
-            )
+        messages = await message_service.get_recent_messages(group_id=group_id, limit=limit)
         if not messages:
             return "（暂无历史上下文）"
 

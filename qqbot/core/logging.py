@@ -76,7 +76,7 @@ def log_ai_input(layer: str, group_id: int, prompt: str) -> None:
     """Log AI model input.
     
     Args:
-        layer: Which layer is calling (Layer0/Layer1/Layer2)
+        layer: Which layer is calling (Layer1/Layer2/Layer3)
         group_id: Group ID
         prompt: The prompt sent to AI
     """
@@ -90,7 +90,7 @@ def log_ai_output(layer: str, group_id: int, response: str) -> None:
     """Log AI model output.
     
     Args:
-        layer: Which layer is calling (Layer0/Layer1/Layer2)
+        layer: Which layer is calling (Layer1/Layer2/Layer3)
         group_id: Group ID
         response: The response from AI
     """

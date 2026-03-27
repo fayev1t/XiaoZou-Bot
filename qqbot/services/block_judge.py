@@ -3,96 +3,125 @@
 替代原来的单消息判断（message_judge.py），改为对整个对话块进行判断。
 """
 
+from __future__ import annotations
+
+import importlib
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from langchain_core.messages import HumanMessage, SystemMessage
-
-from qqbot.core.llm import LLMConfig
 from qqbot.core.logging import get_logger, log_ai_input, log_ai_output
-from qqbot.services.message_aggregator import ResponseBlock
 from qqbot.services.prompt import PromptManager
 from qqbot.services.silence_mode import is_silent, set_silent
 
+if TYPE_CHECKING:
+    from qqbot.services.message_aggregator import ResponseBlock
+
 logger = get_logger(__name__)
+_TRUE_STRINGS = {"1", "true", "yes", "y", "on"}
+_FALSE_STRINGS = {"0", "false", "no", "n", "off", ""}
 
 
-class JudgeResult:
-    """Result of message judgment analysis (legacy compatibility class).
+def _normalize_str(value: object, default: str = "") -> str:
+    if value is None:
+        return default
+    normalized = str(value).strip()
+    return normalized or default
 
-    Used to maintain compatibility with ConversationService which expects
-    this format. New code should use BlockJudgeResult instead.
-    """
 
-    def __init__(
-        self,
-        should_reply: bool,
-        reply_type: str,
-        target_user_id: int | None = None,
-        emotion: str = "happy",
-        explanation: str = "",
-        instruction: str = "",
-        should_mention: bool = False,
-        user_complaining_too_much: bool = False,
-        user_asking_to_speak: bool = False,
-    ) -> None:
-        """Initialize judgment result.
+def _normalize_bool(value: object, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _TRUE_STRINGS:
+            return True
+        if normalized in _FALSE_STRINGS:
+            return False
+    return default
 
-        Args:
-            should_reply: Whether bot should reply to this message
-            reply_type: Type of reply - "person", "topic", "knowledge", or "none"
-            target_user_id: If replying to a person, their QQ ID
-            emotion: Emotion for the response - happy/serious/sarcastic/confused/gentle
-            explanation: Explanation of the judgment decision
-            instruction: Instructions for the response generation layer
-            should_mention: Whether to @ mention the target user (only in special cases)
-            user_complaining_too_much: User is complaining bot talks too much
-            user_asking_to_speak: User is asking bot to speak more
-        """
-        self.should_reply = should_reply
-        self.reply_type = reply_type
-        self.target_user_id = target_user_id
-        self.emotion = emotion
-        self.explanation = explanation
-        self.instruction = instruction
-        self.should_mention = should_mention
-        self.user_complaining_too_much = user_complaining_too_much
-        self.user_asking_to_speak = user_asking_to_speak
 
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "JudgeResult":
-        """Create JudgeResult from dictionary.
+def _normalize_optional_int(value: object) -> int | None:
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str):
+        normalized = value.strip()
+        if not normalized:
+            return None
+        try:
+            return int(normalized)
+        except ValueError:
+            try:
+                numeric_value = float(normalized)
+            except ValueError:
+                return None
+            return int(numeric_value) if numeric_value.is_integer() else None
+    return None
 
-        Args:
-            data: Dictionary with judgment result fields
 
-        Returns:
-            JudgeResult instance
-        """
-        return cls(
-            should_reply=data.get("should_reply", False),
-            reply_type=data.get("reply_type", "none"),
-            target_user_id=data.get("target_user_id"),
-            emotion=data.get("emotion", "happy"),
-            explanation=data.get("explanation", ""),
-            instruction=data.get("instruction", ""),
-            should_mention=data.get("should_mention", False),
-            user_complaining_too_much=data.get("user_complaining_too_much", False),
-            user_asking_to_speak=data.get("user_asking_to_speak", False),
-        )
+def _normalize_related_image_hashes(value: object) -> list[str]:
+    if isinstance(value, str):
+        raw_items: list[object] = [value]
+    elif isinstance(value, list):
+        raw_items = value
+    else:
+        return []
+
+    related_image_hashes: list[str] = []
+    seen_hashes: set[str] = set()
+    for raw_item in raw_items:
+        if not isinstance(raw_item, str):
+            continue
+
+        normalized = raw_item.strip()
+        if not normalized or normalized in seen_hashes:
+            continue
+
+        related_image_hashes.append(normalized)
+        seen_hashes.add(normalized)
+
+    return related_image_hashes
+
+
+def _normalize_non_negative_int(value: object, default: int = 0) -> int:
+    normalized = _normalize_optional_int(value)
+    if normalized is None or normalized < 0:
+        return default
+    return normalized
 
 
 @dataclass
 class ReplyPlan:
     """单次回复的计划"""
 
-    target_user_id: int | None = None
-    emotion: str = "happy"
+    should_reply: bool = False
     instruction: str = ""
+    target_user_id: int | None = None
     should_mention: bool = False
-    related_messages: str = ""
-    need_image_parsing: bool = False
+    related_image_hashes: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: object) -> ReplyPlan | None:
+        if not isinstance(data, dict):
+            return None
+
+        return cls(
+            should_reply=_normalize_bool(data.get("should_reply"), default=False),
+            instruction=_normalize_str(data.get("instruction")),
+            target_user_id=_normalize_optional_int(data.get("target_user_id")),
+            should_mention=_normalize_bool(data.get("should_mention"), default=False),
+            related_image_hashes=_normalize_related_image_hashes(
+                data.get("related_image_hashes")
+            ),
+        )
 
 
 @dataclass
@@ -101,7 +130,7 @@ class BlockJudgeResult:
 
     should_reply: bool
     reply_count: int
-    block_summary: str
+    topic_count: int
     replies: list[ReplyPlan] = field(default_factory=list)
     explanation: str = ""
     should_enter_silence_mode: bool = False
@@ -117,29 +146,40 @@ class BlockJudgeResult:
         Returns:
             BlockJudgeResult实例
         """
-        replies = []
-        for r in data.get("replies", []):
-            replies.append(
-                ReplyPlan(
-                    target_user_id=r.get("target_user_id"),
-                    emotion=r.get("emotion", "happy"),
-                    instruction=r.get("instruction", ""),
-                    should_mention=r.get("should_mention", False),
-                    related_messages=r.get("related_messages", ""),
-                    need_image_parsing=r.get("need_image_parsing", False),
-                )
-            )
+        raw_replies = data.get("replies", []) if isinstance(data, dict) else []
+        if isinstance(raw_replies, dict):
+            raw_replies = [raw_replies]
+        if not isinstance(raw_replies, list):
+            raw_replies = []
 
-        reply_count = len(replies)
+        replies: list[ReplyPlan] = []
+        for raw_reply in raw_replies:
+            reply_plan = ReplyPlan.from_dict(raw_reply)
+            if reply_plan is not None:
+                replies.append(reply_plan)
+
+        reply_count = sum(1 for reply in replies if reply.should_reply)
+        topic_count = _normalize_non_negative_int(
+            data.get("topic_count"),
+            default=len(replies),
+        )
+        if topic_count != len(replies):
+            topic_count = len(replies)
 
         return cls(
             should_reply=reply_count > 0,
             reply_count=reply_count,
-            block_summary=data.get("block_summary", ""),
+            topic_count=topic_count,
             replies=replies,
-            explanation=data.get("explanation", ""),
-            should_enter_silence_mode=data.get("should_enter_silence_mode", False),
-            should_exit_silence_mode=data.get("should_exit_silence_mode", False),
+            explanation=_normalize_str(data.get("explanation", "")),
+            should_enter_silence_mode=_normalize_bool(
+                data.get("should_enter_silence_mode", False),
+                default=False,
+            ),
+            should_exit_silence_mode=_normalize_bool(
+                data.get("should_exit_silence_mode", False),
+                default=False,
+            ),
         )
 
     @classmethod
@@ -155,10 +195,36 @@ class BlockJudgeResult:
         return cls(
             should_reply=False,
             reply_count=0,
-            block_summary="",
+            topic_count=0,
             replies=[],
             explanation=reason,
         )
+
+
+def format_block_messages(block: ResponseBlock) -> str:
+    return "\n".join(
+        msg.formatted_message for msg in block.messages if msg.formatted_message
+    )
+
+
+def build_layer3_context(
+    *,
+    context: str,
+    current_block_text: str,
+) -> str:
+    sections: list[str] = []
+
+    base_context = context.strip()
+    if base_context:
+        sections.append(f"【历史上下文】\n{base_context}")
+
+    normalized_block_text = current_block_text.strip()
+    if normalized_block_text:
+        sections.append(f"【当前对话块】\n{normalized_block_text}")
+
+    if not sections:
+        return "（暂无对话上下文）"
+    return "\n\n".join(section for section in sections if section.strip())
 
 
 class BlockJudger:
@@ -166,6 +232,8 @@ class BlockJudger:
 
     def __init__(self) -> None:
         """初始化判断服务"""
+        from qqbot.core.llm import LLMConfig
+
         self.config = LLMConfig()
         self.prompt_manager = PromptManager()
         self._llm = None
@@ -178,37 +246,15 @@ class BlockJudger:
         """
         if self._llm is None:
             from qqbot.core.llm import create_llm
+
             self._llm = await create_llm(temperature=0.5)
         return self._llm
-
-    def _format_block_messages(
-        self,
-        block: ResponseBlock,
-        user_names: dict[int, str] | None = None,
-    ) -> str:
-        """格式化对话块中的消息
-
-        Args:
-            block: 对话响应块
-            user_names: 用户ID到昵称的映射
-
-        Returns:
-            格式化的消息文本
-        """
-        _ = user_names
-        lines = []
-
-        for msg in block.messages:
-            lines.append(msg.formatted_message)
-
-        return "\n".join(lines)
 
     async def judge_block(
         self,
         block: ResponseBlock,
         context: str,
         group_id: int | None = None,
-        user_names: dict[int, str] | None = None,
     ) -> BlockJudgeResult:
         """判断对话块是否需要回复，以及如何回复
 
@@ -216,8 +262,6 @@ class BlockJudger:
             block: 对话响应块
             context: 历史上下文（从数据库获取的最近消息）
             group_id: 群ID（用于沉默模式管理）
-            user_names: 用户ID到昵称的映射
-
         Returns:
             BlockJudgeResult包含回复策略
         """
@@ -238,7 +282,7 @@ class BlockJudger:
             silence_mode = is_silent(group_id) if group_id else False
 
             # 格式化对话块消息
-            block_content = self._format_block_messages(block, user_names)
+            block_content = format_block_messages(block)
 
             # 构建用户提示
             user_prompt = f"""【历史上下文】
@@ -249,10 +293,11 @@ class BlockJudger:
 
 请分析这个对话块并判断：
 1. 是否需要回复？
-2. 如果需要回复，需要回复几次？（通常1次就够）
-3. 每次回复针对什么内容，用什么情绪？
-4. 用户是否在抱怨AI说话太多？
-5. 用户是否在催促AI说话？
+2. 当前块里有几个彼此独立、可区分的话题？
+3. 每个主题是否应该实际发送回复、主要在回谁、要不要@、要给 Layer 3 看哪些当前块图片 file_hash？
+4. 必须先分清谁在对谁说话、谁是主要回复对象、谁只是补充或背景。
+5. 用户是否在抱怨AI说话太多？
+6. 用户是否在催促AI说话？
 
 输出JSON格式的判断结果。"""
 
@@ -274,22 +319,26 @@ class BlockJudger:
             )
 
             # 调用LLM
+            messages_module = importlib.import_module("langchain_core.messages")
+            human_message_class = messages_module.HumanMessage
+            system_message_class = messages_module.SystemMessage
+
             messages = [
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=user_prompt),
+                system_message_class(content=system_prompt),
+                human_message_class(content=user_prompt),
             ]
 
             # 记录 AI 输入（只记录消息块内容，不记录历史上下文和提示词）
             log_input = f"【消息块】{block.get_message_count()}条消息，{len(block.get_unique_users())}个用户\n{block_content}"
             if silence_mode:
                 log_input += "\n【沉默模式】已激活"
-            log_ai_input("Layer1", group_id or 0, log_input)
+            log_ai_input("Layer2", group_id or 0, log_input)
 
             response = await llm.ainvoke(messages)
             response_text = response.content.strip()
 
             # 记录 AI 输出
-            log_ai_output("Layer1", group_id or 0, response_text)
+            log_ai_output("Layer2", group_id or 0, response_text)
 
             # 解析JSON响应
             try:
@@ -324,36 +373,66 @@ class BlockJudger:
 
             # 记录判断结果
             msg = f"[block_judge] ======== 对话块判断完成 ========"
-            logger.info(msg, extra={"group_id": group_id, "should_reply": result.should_reply, "reply_count": result.reply_count})
+            logger.info(
+                msg,
+                extra={
+                    "group_id": group_id,
+                    "should_reply": result.should_reply,
+                    "reply_count": result.reply_count,
+                    "topic_count": result.topic_count,
+                },
+            )
 
-            msg = f"[block_judge] 块摘要: {result.block_summary}"
-            logger.info(msg, extra={"group_id": group_id})
-
-            msg = f"[block_judge] 判断结果: 需要回复={result.should_reply}, 回复次数={result.reply_count}, 原因={result.explanation}"
-            logger.info(msg, extra={
-                "group_id": group_id,
-                "should_reply": result.should_reply,
-                "reply_count": result.reply_count,
-            })
+            msg = (
+                "[block_judge] 判断结果: "
+                f"需要回复={result.should_reply}, "
+                f"主题数={result.topic_count}, "
+                f"实际回复数={result.reply_count}, "
+                f"原因={result.explanation}"
+            )
+            logger.info(
+                msg,
+                extra={
+                    "group_id": group_id,
+                    "should_reply": result.should_reply,
+                    "reply_count": result.reply_count,
+                    "topic_count": result.topic_count,
+                },
+            )
 
             # 详细输出每个回复计划
-            if result.should_reply and result.replies:
-                msg = f"[block_judge] 回复计划详情 (共{len(result.replies)}条回复):"
+            if result.replies:
+                msg = f"[block_judge] 回复计划详情 (共{len(result.replies)}个主题):"
                 logger.info(msg, extra={"group_id": group_id})
                 for idx, reply_plan in enumerate(result.replies, 1):
-                    msg = f"[block_judge] 【回复 {idx}】态度={reply_plan.emotion}, @用户={reply_plan.target_user_id}, 需要@={reply_plan.should_mention}, 需要重识图={reply_plan.need_image_parsing}"
-                    logger.info(msg, extra={
-                        "group_id": group_id,
-                        "reply_index": idx,
-                        "emotion": reply_plan.emotion,
-                        "target_user_id": reply_plan.target_user_id,
-                        "should_mention": reply_plan.should_mention,
-                        "need_image_parsing": reply_plan.need_image_parsing,
-                    })
+                    msg = (
+                        f"[block_judge] 【主题 {idx}】"
+                        f"should_reply={reply_plan.should_reply}, "
+                        f"@用户={reply_plan.target_user_id}, "
+                        f"需要@={reply_plan.should_mention}, "
+                        f"关联图片数={len(reply_plan.related_image_hashes)}"
+                    )
+                    logger.info(
+                        msg,
+                        extra={
+                            "group_id": group_id,
+                            "reply_index": idx,
+                            "topic_should_reply": reply_plan.should_reply,
+                            "target_user_id": reply_plan.target_user_id,
+                            "should_mention": reply_plan.should_mention,
+                            "related_image_count": len(
+                                reply_plan.related_image_hashes
+                            ),
+                        },
+                    )
                     msg = f"[block_judge]   指导词: {reply_plan.instruction}"
                     logger.info(msg, extra={"group_id": group_id})
-                    msg = f"[block_judge]   针对内容: {reply_plan.related_messages}"
-                    logger.info(msg, extra={"group_id": group_id})
+                    if reply_plan.related_image_hashes:
+                        msg = (
+                            "[block_judge]   关联图片哈希: "
+                            f"{', '.join(reply_plan.related_image_hashes)}"
+                        )
+                        logger.info(msg, extra={"group_id": group_id})
 
             return result
 

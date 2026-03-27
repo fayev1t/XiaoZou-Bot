@@ -209,35 +209,6 @@ class GroupMessageService:
 
         return messages
 
-    async def get_messages_before_timestamp(
-        self,
-        group_id: int,
-        before_timestamp: datetime | int | float | None,
-        limit: int = 10,
-    ) -> list[dict]:
-        table_name = await self._get_table_name(group_id)
-
-        sql = text(f"""
-            SELECT * FROM {table_name}
-            WHERE is_recalled = false
-              AND "timestamp" < :before_timestamp
-            ORDER BY "timestamp" DESC
-            LIMIT :limit
-        """)
-
-        result = await self.session.execute(
-            sql,
-            {
-                "before_timestamp": normalize_china_time(before_timestamp),
-                "limit": limit,
-            },
-        )
-        rows = result.fetchall()
-
-        messages = [dict(row._mapping) for row in rows]  # type: ignore
-        messages.reverse()
-        return messages
-
     async def get_user_messages_in_group(
         self,
         group_id: int,

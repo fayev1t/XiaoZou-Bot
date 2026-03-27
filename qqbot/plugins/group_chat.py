@@ -1,11 +1,18 @@
 """Group chat AI conversation plugin with message aggregation."""
 
 import asyncio
+import importlib
 
-from nonebot import on_message
-from nonebot.adapters import Event
-from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
-from nonebot.rule import Rule
+nonebot_module = importlib.import_module("nonebot")
+adapters_module = importlib.import_module("nonebot.adapters")
+onebot_v11_module = importlib.import_module("nonebot.adapters.onebot.v11")
+rule_module = importlib.import_module("nonebot.rule")
+
+on_message = nonebot_module.on_message
+Event = adapters_module.Event
+Bot = onebot_v11_module.Bot
+GroupMessageEvent = onebot_v11_module.GroupMessageEvent
+Rule = rule_module.Rule
 
 from qqbot.core.database import AsyncSessionLocal
 from qqbot.core.logging import get_logger
@@ -13,13 +20,16 @@ from qqbot.core.settings import get_primary_bot_name
 from qqbot.core.time import china_now
 from qqbot.services.context import ContextManager
 from qqbot.services.conversation import conversation_service
-from qqbot.services.image_parsing import ImageParsingService
+from qqbot.services.image_parsing import ImageParsingService, ImageReference
 from qqbot.services.group_message import GroupMessageService
-from qqbot.services.group_member import GroupMemberService
-from qqbot.services.user import UserService
 from qqbot.services.message_converter import MessageConverter
 from qqbot.services.message_aggregator import ResponseBlock, message_aggregator
-from qqbot.services.block_judge import block_judger, JudgeResult
+from qqbot.services.block_judge import (
+    block_judger,
+    build_layer3_context,
+    format_block_messages,
+)
+from qqbot.services.reply_plan_images import resolve_reply_plan_image_refs
 
 logger = get_logger(__name__)
 
@@ -67,6 +77,17 @@ def _get_bot_for_block(block: ResponseBlock) -> Bot | None:
     return next(iter(_bot_instances.values()), None)
 
 
+def _collect_block_image_refs(block: ResponseBlock) -> list[ImageReference]:
+    refs: list[ImageReference] = []
+    for pending_message in block.messages:
+        refs.extend(
+            ImageParsingService.extract_refs_from_formatted_message(
+                pending_message.formatted_message,
+            )
+        )
+    return refs
+
+
 async def _process_response_block(group_id: int, block: ResponseBlock) -> None:
     bot = _get_bot_for_block(block)
     if bot is None:
@@ -89,127 +110,112 @@ async def _process_response_block(group_id: int, block: ResponseBlock) -> None:
 
     try:
         async with AsyncSessionLocal() as session:
-            user_names: dict[int, str] = {}
-            member_service = GroupMemberService(session)
-            user_service = UserService(session)
-            for user_id in block.get_unique_users():
-                try:
-                    # Try group card first
-                    member = await member_service.get_member(group_id, user_id)
-                    if member and member.get("card"):
-                        user_names[user_id] = member["card"]
-                    else:
-                        user = await user_service.get_user(user_id)
-                        if user and user.nickname:
-                            user_names[user_id] = user.nickname
-                        else:
-                            user_names[user_id] = f"用户{user_id}"
-                except Exception:
-                    user_names[user_id] = f"用户{user_id}"
-
             context_manager = ContextManager(session)
             context = await context_manager.get_recent_context(
                 group_id=group_id,
-                limit=50,  # Layer 1: 使用50条历史消息提供深层话题背景
+                limit=50,  # Layer 2: 使用50条历史消息提供深层话题背景
                 bot_id=block.messages[0].event.self_id if block.messages else None,
             )
 
-        msg = f"[group_chat] 🧠 第一层AI判断块内容..."
+        msg = f"[group_chat] 🧠 第二层AI判断块内容..."
         logger.info(msg, extra={"group_id": group_id})
 
         judge_result = await block_judger.judge_block(
             block=block,
             context=context,
             group_id=group_id,
-            user_names=user_names,
         )
 
-        if not judge_result.replies:
-            msg = f"[group_chat] ❌ 不需要回复 | 群={group_id}, 原因={judge_result.explanation}"
+        planned_replies = [
+            reply_plan for reply_plan in judge_result.replies if reply_plan.should_reply
+        ]
+        if not planned_replies:
+            msg = (
+                f"[group_chat] ❌ 不需要实际回复 | 群={group_id}, "
+                f"主题数={judge_result.topic_count}, 原因={judge_result.explanation}"
+            )
             logger.info(msg, extra={"group_id": group_id})
             return
 
-        msg = f"[group_chat] ✅ 准备生成回复 | 群={group_id}, 需要{len(judge_result.replies)}条回复"
-        logger.info(msg, extra={"group_id": group_id, "reply_count": len(judge_result.replies)})
-
-        can_send = await message_aggregator.wait_for_reply_quiet_window(
-            group_id=group_id,
-            block=block,
-            quiet_seconds=2.0,
+        msg = (
+            f"[group_chat] ✅ 准备生成回复 | 群={group_id}, "
+            f"主题数={judge_result.topic_count}, 需要发送{len(planned_replies)}条回复"
         )
-        if not can_send:
-            logger.info(
-                f"[group_chat] ⏸️ 发送前2秒静默窗口内出现新消息，取消本次发送 | 群={group_id}",
-                extra={"group_id": group_id},
-            )
-            return
-
-        for i, reply_plan in enumerate(judge_result.replies):
-            msg = f"[group_chat] 🔷 正在生成第 {i + 1}/{len(judge_result.replies)} 条回复 | 态度={reply_plan.emotion}, @用户={reply_plan.target_user_id}"
-            logger.info(msg, extra={
+        logger.info(
+            msg,
+            extra={
                 "group_id": group_id,
-                "reply_index": i + 1,
-                "emotion": reply_plan.emotion,
-                "target_user_id": reply_plan.target_user_id,
-            })
+                "reply_count": len(planned_replies),
+                "topic_count": judge_result.topic_count,
+            },
+        )
 
-            legacy_judge_result = JudgeResult(
-                should_reply=True,
-                reply_type="general",
-                target_user_id=reply_plan.target_user_id,
-                emotion=reply_plan.emotion,
-                instruction=reply_plan.instruction,
-                should_mention=reply_plan.should_mention,
+        block_refs = _collect_block_image_refs(block)
+        current_block_text = format_block_messages(block)
+
+        for i, reply_plan in enumerate(planned_replies):
+            msg = (
+                f"[group_chat] 🔷 正在生成第 {i + 1}/{len(planned_replies)} 条回复 "
+                f"| @用户={reply_plan.target_user_id}, 需要@={reply_plan.should_mention}"
+            )
+            logger.info(
+                msg,
+                extra={
+                    "group_id": group_id,
+                    "reply_index": i + 1,
+                    "target_user_id": reply_plan.target_user_id,
+                    "should_mention": reply_plan.should_mention,
+                },
             )
 
-            block_context = f"{context}\n\n【当前对话块摘要】\n{judge_result.block_summary}\n\n【相关消息】\n{reply_plan.related_messages}"
+            reply_refs = resolve_reply_plan_image_refs(
+                block_refs,
+                reply_plan.related_image_hashes,
+            )
+            reply_image_inputs: list[dict[str, object]] | None = None
 
-            if reply_plan.need_image_parsing:
+            if reply_plan.related_image_hashes and not reply_refs:
+                logger.info(
+                    "[group_chat] related_image_hashes 未命中当前对话块图片，按纯文本继续",
+                    extra={
+                        "group_id": group_id,
+                        "reply_index": i + 1,
+                        "requested_hashes": reply_plan.related_image_hashes,
+                    },
+                )
+
+            if reply_refs:
                 async with AsyncSessionLocal() as session:
                     image_service = ImageParsingService(session)
-                    refs = []
-                    for pending_message in block.messages:
-                        refs.extend(
-                            image_service.extract_refs_from_formatted_message(
-                                pending_message.formatted_message,
-                                timestamp=getattr(pending_message.event, "time", None),
-                            )
+                    try:
+                        reply_image_inputs = await image_service.build_openai_image_blocks(
+                            reply_refs
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[group_chat] failed to build reply image payload, fallback to text-only",
+                            extra={
+                                "group_id": group_id,
+                                "reply_index": i + 1,
+                                "image_count": len(reply_refs),
+                                "error": str(exc),
+                            },
                         )
 
-                    if refs:
-                        await image_service.reparse_file_hashes(
-                            group_id=group_id,
-                            refs=refs,
-                        )
-                        await session.commit()
-                        refresh_targets = [
-                            context,
-                            judge_result.block_summary,
-                            reply_plan.related_messages,
-                            *[
-                                pending_message.formatted_message
-                                for pending_message in block.messages
-                            ],
-                        ]
-                        refreshed_texts = await image_service.refresh_multiple_texts(
-                            refresh_targets
-                        )
-                        refreshed_context = refreshed_texts[0]
-                        refreshed_summary = refreshed_texts[1]
-                        refreshed_related = refreshed_texts[2]
-                        refreshed_block_parts = refreshed_texts[3:]
-                        refreshed_block = "\n".join(refreshed_block_parts)
-                        block_context = (
-                            f"{refreshed_context}\n\n【当前对话块摘要】\n{refreshed_summary}"
-                            f"\n\n【当前对话块（最新图片描述）】\n{refreshed_block}"
-                            f"\n\n【相关消息】\n{refreshed_related}"
-                        )
+                if not reply_image_inputs:
+                    reply_image_inputs = None
 
             response = await conversation_service.generate_response(
                 session=None,
-                context=block_context,
-                judge_result=legacy_judge_result,
+                context=build_layer3_context(
+                    context=context,
+                    current_block_text=current_block_text,
+                ),
+                instruction=reply_plan.instruction,
+                target_user_id=reply_plan.target_user_id,
+                should_mention=reply_plan.should_mention,
                 group_id=group_id,
+                image_inputs=reply_image_inputs,
             )
 
             send_result = await bot.send_group_msg(
@@ -252,16 +258,19 @@ async def _process_response_block(group_id: int, block: ResponseBlock) -> None:
                     extra={"group_id": group_id},
                 )
 
-            if i < len(judge_result.replies) - 1:
+            if i < len(planned_replies) - 1:
                 msg = f"[group_chat] ⏳ 等待1秒后发送下一条回复 | 群={group_id}"
                 logger.debug(msg, extra={"group_id": group_id})
                 await asyncio.sleep(1.0)
 
-        msg = f"[group_chat] 🎉 对话块处理完成 | 群={group_id}, 共发送{len(judge_result.replies)}条回复"
-        logger.info(msg, extra={
-            "group_id": group_id,
-            "total_replies": len(judge_result.replies),
-        })
+        msg = f"[group_chat] 🎉 对话块处理完成 | 群={group_id}, 共发送{len(planned_replies)}条回复"
+        logger.info(
+            msg,
+            extra={
+                "group_id": group_id,
+                "total_replies": len(planned_replies),
+            },
+        )
 
     except Exception as e:
         logger.error(

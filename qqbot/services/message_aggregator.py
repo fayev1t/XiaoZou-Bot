@@ -13,6 +13,7 @@
 """
 
 import asyncio
+import importlib
 import json
 import time
 from dataclasses import dataclass, field
@@ -22,6 +23,8 @@ from qqbot.core.logging import get_logger, log_ai_input, log_ai_output, log_even
 from qqbot.services.prompt import PromptManager
 
 logger = get_logger(__name__)
+
+PRE_CLOSE_QUIET_SECONDS = 2.0
 
 
 @dataclass
@@ -46,6 +49,7 @@ class ResponseBlock:
     is_processing: bool = False
     wait_task: asyncio.Task | None = None
     judge_wait_task: asyncio.Task | None = None
+    judge_request_version: int = 0
 
     def add_message(self, msg: PendingMessage) -> None:
         self.messages.append(msg)
@@ -71,6 +75,7 @@ class ResponseBlock:
         if self.judge_wait_task and not self.judge_wait_task.done():
             self.judge_wait_task.cancel()
         self.judge_wait_task = None
+        self.judge_request_version = 0
 
 
 class MessageAggregator:
@@ -81,6 +86,7 @@ class MessageAggregator:
         self._locks: dict[int, asyncio.Lock] = {}
         self._group_versions: dict[int, int] = {}
         self._pending_persist_counts: dict[int, int] = {}
+        self._pre_close_quiet_seconds = PRE_CLOSE_QUIET_SECONDS
         self._reply_callback: Callable[
             [int, ResponseBlock], Coroutine[Any, Any, None]
         ] | None = None
@@ -127,11 +133,17 @@ class MessageAggregator:
         expected_version: int,
         *,
         require_no_pending: bool,
+        expected_judge_request_version: int | None = None,
     ) -> bool:
         current_block = self._blocks.get(group_id)
         if current_block is not block:
             return False
         if self._get_group_version(group_id) != expected_version:
+            return False
+        if (
+            expected_judge_request_version is not None
+            and block.judge_request_version != expected_judge_request_version
+        ):
             return False
         if require_no_pending and self._get_pending_persist_count(group_id) > 0:
             return False
@@ -143,8 +155,15 @@ class MessageAggregator:
         if self._get_pending_persist_count(group_id) > 0:
             return
         expected_version = self._get_group_version(group_id)
+        block.judge_request_version += 1
+        expected_judge_request_version = block.judge_request_version
         block.judge_wait_task = asyncio.create_task(
-            self._judge_wait_time(group_id, block, expected_version)
+            self._judge_wait_time(
+                group_id,
+                block,
+                expected_version,
+                expected_judge_request_version,
+            )
         )
 
     def _schedule_wait_task(
@@ -153,12 +172,14 @@ class MessageAggregator:
         block: ResponseBlock,
         expected_version: int,
         wait_seconds: float,
+        expected_judge_request_version: int | None = None,
     ) -> None:
         if not self._is_snapshot_current(
             group_id,
             block,
             expected_version,
             require_no_pending=True,
+            expected_judge_request_version=expected_judge_request_version,
         ):
             return
         block.wait_task = asyncio.create_task(
@@ -259,13 +280,15 @@ class MessageAggregator:
         group_id: int,
         block: ResponseBlock,
         expected_version: int,
+        expected_judge_request_version: int,
     ) -> None:
         try:
             from qqbot.core.database import AsyncSessionLocal
             from qqbot.services.context import ContextManager
             from qqbot.services.silence_mode import is_silent
             from qqbot.core.llm import create_llm
-            from langchain_core.messages import HumanMessage
+            messages_module = importlib.import_module("langchain_core.messages")
+            human_message_class = messages_module.HumanMessage
 
             history_context = ""
             silence_mode = is_silent(group_id)
@@ -292,6 +315,7 @@ class MessageAggregator:
                     block,
                     expected_version,
                     require_no_pending=True,
+                    expected_judge_request_version=expected_judge_request_version,
                 ):
                     return
 
@@ -312,15 +336,21 @@ class MessageAggregator:
                     extra={"group_id": group_id},
                 )
                 async with lock:
-                    self._schedule_wait_task(group_id, block, expected_version, 5.0)
+                    self._schedule_wait_task(
+                        group_id,
+                        block,
+                        expected_version,
+                        5.0,
+                        expected_judge_request_version,
+                    )
                 return
 
             log_input = f"【消息块】共{len(block.messages)}条\n{block_content}"
             if silence_mode:
                 log_input += "\n【沉默模式】已激活"
-            log_ai_input("Layer0", group_id, log_input)
+            log_ai_input("Layer1", group_id, log_input)
 
-            response = await llm.ainvoke([HumanMessage(content=prompt)])
+            response = await llm.ainvoke([human_message_class(content=prompt)])
 
             async with lock:
                 if not self._is_snapshot_current(
@@ -328,11 +358,12 @@ class MessageAggregator:
                     block,
                     expected_version,
                     require_no_pending=True,
+                    expected_judge_request_version=expected_judge_request_version,
                 ):
                     return
 
             response_text = response.content.strip()
-            log_ai_output("Layer0", group_id, response_text)
+            log_ai_output("Layer1", group_id, response_text)
             json_start = response_text.find("{")
             json_end = response_text.rfind("}") + 1
 
@@ -342,7 +373,13 @@ class MessageAggregator:
                     extra={"group_id": group_id},
                 )
                 async with lock:
-                    self._schedule_wait_task(group_id, block, expected_version, 5.0)
+                    self._schedule_wait_task(
+                        group_id,
+                        block,
+                        expected_version,
+                        5.0,
+                        expected_judge_request_version,
+                    )
                 return
 
             result = json.loads(response_text[json_start:json_end])
@@ -373,6 +410,7 @@ class MessageAggregator:
                         block,
                         expected_version,
                         wait_time,
+                        expected_judge_request_version,
                     )
                 return
 
@@ -381,7 +419,13 @@ class MessageAggregator:
                 extra={"group_id": group_id, "should_wait": False},
             )
             async with lock:
-                self._schedule_wait_task(group_id, block, expected_version, 0.0)
+                self._schedule_wait_task(
+                    group_id,
+                    block,
+                    expected_version,
+                    0.0,
+                    expected_judge_request_version,
+                )
 
         except asyncio.CancelledError:
             logger.debug(
@@ -394,7 +438,13 @@ class MessageAggregator:
                 extra={"group_id": group_id},
             )
             async with self._get_lock(group_id):
-                self._schedule_wait_task(group_id, block, expected_version, 2.0)
+                self._schedule_wait_task(
+                    group_id,
+                    block,
+                    expected_version,
+                    2.0,
+                    expected_judge_request_version,
+                )
 
     async def _wait_and_process(
         self,
@@ -421,18 +471,49 @@ class MessageAggregator:
                     )
                     return
 
-                block.is_processing = True
-                block.wait_task = None
-                processing_block = block
-
                 logger.info(
-                    f"[aggregator] ⏰ 等待时间已到，对话块已关闭 | 群={group_id}, 块内消息数={block.get_message_count()}, 用户数={len(block.get_unique_users())}, @机器人={block.has_bot_mention()}",
+                    f"[aggregator] ⏳ 第一层关闭条件已满足，进入冻结前静默窗口 | 群={group_id}, quiet={self._pre_close_quiet_seconds}秒, 块内消息数={block.get_message_count()}, 用户数={len(block.get_unique_users())}, @机器人={block.has_bot_mention()}",
                     extra={
                         "group_id": group_id,
                         "message_count": block.get_message_count(),
                         "unique_users": len(block.get_unique_users()),
                         "has_bot_mention": block.has_bot_mention(),
                         "group_version": expected_version,
+                        "wait_seconds": wait_seconds,
+                        "pre_close_quiet_seconds": self._pre_close_quiet_seconds,
+                    },
+                )
+
+            await asyncio.sleep(self._pre_close_quiet_seconds)
+
+            async with lock:
+                if not self._is_snapshot_current(
+                    group_id,
+                    block,
+                    expected_version,
+                    require_no_pending=True,
+                ):
+                    return
+                if block.get_message_count() == 0:
+                    logger.debug(
+                        f"[aggregator] Block for group {group_id} is empty, skipping"
+                    )
+                    return
+
+                block.is_processing = True
+                block.wait_task = None
+                processing_block = block
+
+                logger.info(
+                    f"[aggregator] ⏰ 冻结前静默窗口结束，对话块已关闭 | 群={group_id}, 块内消息数={block.get_message_count()}, 用户数={len(block.get_unique_users())}, @机器人={block.has_bot_mention()}",
+                    extra={
+                        "group_id": group_id,
+                        "message_count": block.get_message_count(),
+                        "unique_users": len(block.get_unique_users()),
+                        "has_bot_mention": block.has_bot_mention(),
+                        "group_version": expected_version,
+                        "wait_seconds": wait_seconds,
+                        "pre_close_quiet_seconds": self._pre_close_quiet_seconds,
                     },
                 )
 
@@ -468,24 +549,6 @@ class MessageAggregator:
         except asyncio.CancelledError:
             logger.debug(
                 f"[aggregator] ↩️ 等待任务被取消（检测到新消息） | 群={group_id}"
-            )
-
-    async def wait_for_reply_quiet_window(
-        self,
-        group_id: int,
-        block: ResponseBlock,
-        quiet_seconds: float = 2.0,
-    ) -> bool:
-        expected_version = self._get_group_version(group_id)
-        await asyncio.sleep(quiet_seconds)
-
-        lock = self._get_lock(group_id)
-        async with lock:
-            return self._is_snapshot_current(
-                group_id,
-                block,
-                expected_version,
-                require_no_pending=True,
             )
 
     def get_block_info(self, group_id: int) -> dict[str, Any]:

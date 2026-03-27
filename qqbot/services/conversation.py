@@ -1,4 +1,4 @@
-"""Conversation service for generating AI responses (second-tier AI)."""
+"""Conversation service for generating AI responses (Layer 3 AI)."""
 
 import re
 from typing import Any
@@ -11,14 +11,14 @@ from qqbot.core.logging import get_logger, log_ai_input, log_ai_output
 from qqbot.services.group_member import GroupMemberService
 from qqbot.services.prompt import PromptManager
 from qqbot.services.user import UserService
-from qqbot.services.block_judge import JudgeResult
 
 logger = get_logger(__name__)
 _SYSTEM_XML_TAG_RE = re.compile(r"</?System-[^>]*>")
+OpenAIImageBlock = dict[str, object]
 
 
 class ConversationService:
-    """Service for generating AI responses based on judgment and context."""
+    """Service for generating Layer 3 responses from context and instruction."""
 
     def __init__(self) -> None:
         """Initialize the conversation service."""
@@ -40,15 +40,20 @@ class ConversationService:
         self,
         session: AsyncSession | None,
         context: str,
-        judge_result: JudgeResult,
+        instruction: str,
+        target_user_id: int | None = None,
+        should_mention: bool = False,
         group_id: int | None = None,
+        image_inputs: list[OpenAIImageBlock] | None = None,
     ) -> str:
-        """Generate a response based on judgment and context.
+        """Generate a response from Layer 2 instruction and context.
 
         Args:
             session: Database session
             context: Formatted message context
-            judge_result: Result from first-tier judgment
+            instruction: Direct instruction from Layer 2
+            target_user_id: Target user id for optional @ mention
+            should_mention: Whether to prepend a CQ @ mention
             group_id: Group ID for looking up member info (optional)
 
         Returns:
@@ -63,45 +68,64 @@ class ConversationService:
                 )
                 return "喵~让我想想..."
 
-            # Build response prompt with guidance from judge layer
+            normalized_context = context.strip() or "（暂无对话上下文）"
+            normalized_instruction = instruction.strip() or "请自然承接当前话题。"
+
             response_prompt = f"""【对话背景】
-{context}
+{normalized_context}
 
 【当前指导】
-{judge_result.instruction}
-
-【回复要求】
-- 情绪: {judge_result.emotion}"""
+{normalized_instruction}"""
 
             response_prompt += "\n\n请根据以上信息生成一条自然的群聊回复。注意保持小奏的人格特征。"
 
-            logger.info(f"[Layer2] 生成回复 | 情绪={judge_result.emotion}")
-
-            # Get messages for LLM call
-            messages = [
-                SystemMessage(content=self.prompt_manager.response_prompt),
-                HumanMessage(content=response_prompt),
-            ]
+            logger.info(
+                "[Layer3] 生成回复",
+                extra={
+                    "group_id": group_id,
+                    "target_user_id": target_user_id,
+                    "should_mention": should_mention,
+                    "image_count": len(image_inputs) if image_inputs else 0,
+                },
+            )
 
             # 记录 AI 输入（只记录指导信息，不记录历史上下文和提示词）
-            log_input = f"【指导】{judge_result.instruction}\n【情绪】{judge_result.emotion}"
-            log_ai_input("Layer2", group_id or 0, log_input)
+            log_input = f"【指导】{normalized_instruction}"
+            log_ai_input("Layer3", group_id or 0, log_input)
 
-            # Call LLM to generate response
-            response = await llm.ainvoke(messages)
-            generated_text = response.content.strip()
+            if image_inputs:
+                try:
+                    generated_text = await self._invoke_response_llm(
+                        llm,
+                        response_prompt,
+                        image_inputs=image_inputs,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[conversation] multimodal response failed, retry text-only",
+                        extra={
+                            "group_id": group_id,
+                            "image_count": len(image_inputs),
+                            "error": str(exc),
+                        },
+                    )
+                    generated_text = await self._invoke_response_llm(
+                        llm,
+                        response_prompt,
+                    )
+            else:
+                generated_text = await self._invoke_response_llm(
+                    llm,
+                    response_prompt,
+                )
 
             # 记录 AI 输出
-            log_ai_output("Layer2", group_id or 0, generated_text)
+            log_ai_output("Layer3", group_id or 0, generated_text)
 
             generated_text = self._strip_system_xml_tags(generated_text)
 
             # Add @mention prefix if replying to a specific person AND should_mention=true
-            if (
-                judge_result.target_user_id
-                and judge_result.should_mention
-                and group_id
-            ):
+            if target_user_id and should_mention and group_id:
                 try:
                     target_session = session
                     if target_session is None:
@@ -111,23 +135,23 @@ class ConversationService:
                             target_name = await self._resolve_target_name(
                                 session=mention_session,
                                 group_id=group_id,
-                                target_user_id=judge_result.target_user_id,
+                                target_user_id=target_user_id,
                             )
                     else:
                         target_name = await self._resolve_target_name(
                             session=target_session,
                             group_id=group_id,
-                            target_user_id=judge_result.target_user_id,
+                            target_user_id=target_user_id,
                         )
 
-                    prefix = f"[CQ:at,qq={judge_result.target_user_id}] "
+                    prefix = f"[CQ:at,qq={target_user_id}] "
                     generated_text = prefix + generated_text
 
                     logger.debug(
-                        "[ConversationService] 【第二层AI】添加@提及",
+                        "[ConversationService] 【第三层AI】添加@提及",
                         extra={
                             "layer": "response",
-                            "target_user_id": judge_result.target_user_id,
+                            "target_user_id": target_user_id,
                             "target_name": target_name,
                         },
                     )
@@ -141,7 +165,7 @@ class ConversationService:
             return generated_text
 
         except Exception as e:
-            logger.error(f"[ConversationService] 【第二层AI】调用出错: {e}", exc_info=True)
+            logger.error(f"[ConversationService] 【第三层AI】调用出错: {e}", exc_info=True)
             # Return fallback response on error
             return "喵~让我想想..."
 
@@ -162,6 +186,62 @@ class ConversationService:
         cleaned = _SYSTEM_XML_TAG_RE.sub("", text)
         cleaned = cleaned.strip()
         return cleaned or "..."
+
+    async def _invoke_response_llm(
+        self,
+        llm: Any,
+        response_prompt: str,
+        image_inputs: list[OpenAIImageBlock] | None = None,
+    ) -> str:
+        messages = self._build_messages(
+            response_prompt=response_prompt,
+            image_inputs=image_inputs,
+        )
+        response = await llm.ainvoke(messages)
+        return self._extract_text_response(response.content)
+
+    def _build_messages(
+        self,
+        response_prompt: str,
+        image_inputs: list[OpenAIImageBlock] | None = None,
+    ) -> list[SystemMessage | HumanMessage]:
+        human_content: str | list[dict[str, object]] = response_prompt
+        if image_inputs:
+            human_content = [
+                {"type": "text", "text": response_prompt},
+                *image_inputs,
+            ]
+
+        return [
+            SystemMessage(content=self.prompt_manager.response_prompt),
+            HumanMessage(content=human_content),
+        ]
+
+    def _extract_text_response(self, content: object) -> str:
+        if isinstance(content, str):
+            normalized = content.strip()
+            if normalized:
+                return normalized
+            raise ValueError("empty response content")
+
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str) and item.strip():
+                    parts.append(item.strip())
+                    continue
+
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        parts.append(text.strip())
+
+            merged = "\n".join(parts).strip()
+            if merged:
+                return merged
+            raise ValueError("empty structured response content")
+
+        raise TypeError(f"unsupported response content type: {type(content).__name__}")
 
 
 # 全局单例

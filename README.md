@@ -66,9 +66,54 @@
 
 ---
 
-## 🚀 快速开始
+## 🚀 Docker 部署
 
-docker?(❌) requstment?(❌) 直接把小奏（1005089717）拉到群里！！！
+仓库现在提供了 `Dockerfile`、`.dockerignore` 和 `docker-compose.yml`，可以直接用于单容器部署 QQ Bot 本体。
+
+### 1. 准备配置
+
+先基于模板生成容器实际使用的环境变量文件：
+
+```bash
+cp .env.example .env
+```
+
+然后至少补齐这些配置：
+
+- `ONEBOT_ACCESS_TOKEN`：和 NapCat / OneBot 侧保持一致
+- `LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`：模型调用配置
+- `DATABASE_URL`：默认是 SQLite，若改用 PostgreSQL 直接填完整连接串即可
+- `PORT`：容器内 NoneBot 监听端口，默认 `8080`
+
+### 2. 构建并启动
+
+```bash
+docker compose up -d --build
+```
+
+默认会做这些事情：
+
+- 通过 `Dockerfile` 构建 Python 3.10 运行镜像
+- 使用源码目录作为运行根目录，兼容当前项目按相对路径读取 `.env`、`logs/`、`sqlite_data/` 的实现
+- 将 `./logs` 挂载到容器 `/app/logs`
+- 将 `./sqlite_data` 挂载到容器 `/app/sqlite_data`
+- 暴露 `${PORT}` 端口，默认是 `8080`
+
+### 3. 查看运行状态
+
+```bash
+docker compose logs -f qqbot
+```
+
+### 4. NapCat / OneBot 侧对接说明
+
+当前项目默认跑的是 `fastapi` 驱动，也就是由机器人容器提供 HTTP 接收端。部署后需要在 NapCat / OneBot 侧把上报地址指向机器人服务，例如：
+
+```text
+http://你的宿主机IP:8080/onebot/v11/
+```
+
+并确保上报 token 与 `.env` 里的 `ONEBOT_ACCESS_TOKEN` 一致。
 
 ##  🐢慢速开始
 ### 前置条件
