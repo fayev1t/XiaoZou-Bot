@@ -214,14 +214,28 @@ class ImageParsingService:
                 )
                 continue
 
-            image_blocks.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": self._build_image_data_url(image_bytes)},
-                }
+            image_blocks.extend(
+                [
+                    self._build_image_reference_block(file_hash),
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": self._build_image_data_url(image_bytes)},
+                    },
+                ]
             )
 
         return image_blocks
+
+    @staticmethod
+    def _build_image_reference_block(file_hash: str) -> OpenAIImageBlock:
+        return {
+            "type": "text",
+            "text": (
+                "以下图片对应 file_hash="
+                f"{file_hash}。请将它与当前对话上下文中相同 file_hash 的 "
+                "System-Image 线索对应理解。"
+            ),
+        }
 
     def _failure_result(
         self,

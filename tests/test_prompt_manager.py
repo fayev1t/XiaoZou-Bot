@@ -74,6 +74,9 @@ class PromptManagerContractTests(unittest.TestCase):
         self.assertIn('"related_image_hashes": [string]', prompt)
         self.assertIn('"replies": [', prompt)
         self.assertIn('"should_exit_silence_mode": bool', prompt)
+        self.assertIn("当前消息块、显式 @、`System-Reply` 直接线程，优先于更早历史", prompt)
+        self.assertIn("不要替 Layer 3 写具体措辞", prompt)
+        self.assertIn("不应该像半成品文案或台词提纲", prompt)
         self.assertNotIn('"reply_count": number', prompt)
         self.assertNotIn('"block_summary": string', prompt)
         self.assertNotIn('"emotion": string', prompt)
@@ -97,6 +100,11 @@ class PromptManagerContractTests(unittest.TestCase):
         self.assertIn("输出的时候 **绝对不要** 带任何 XML 标签", prompt)
         self.assertIn("来自 Layer 2 对话块判断层的【当前指导】（instruction）", prompt)
         self.assertIn("与当前回复任务精确相关的图片", prompt)
+        self.assertIn("标明这张图对应的 `file_hash`", prompt)
+        self.assertIn("相同 `file_hash` 的 `<System-Image ...>` 标签对应理解", prompt)
+        self.assertIn("instruction 只是边界与目标，不是文案脚本", prompt)
+        self.assertIn("当前对话块 / 当前直接线程 > 显式 @ 与 Reply 关系 > 更早历史", prompt)
+        self.assertIn("不要把过去话题硬拉回当前回复", prompt)
         self.assertNotIn("【情绪】（emotion）", prompt)
         self.assertIn(
             "根据指导和相关图片，生成一条符合小奏人设的、像真人一样的群聊回复。",

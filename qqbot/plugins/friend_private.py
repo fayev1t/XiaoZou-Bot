@@ -6,6 +6,7 @@ from nonebot.rule import Rule
 from nonebot.adapters.onebot.v11 import (
     Bot,
     FriendRequestEvent,
+    GroupRequestEvent,
     PrivateMessageEvent,
 )
 
@@ -20,6 +21,10 @@ def _is_friend_request(event: Event) -> bool:
 
 def _is_private_message(event: Event) -> bool:
     return isinstance(event, PrivateMessageEvent)
+
+
+def _is_group_request(event: Event) -> bool:
+    return isinstance(event, GroupRequestEvent)
 
 
 friend_request_handler = on_request(
@@ -49,6 +54,45 @@ async def handle_friend_request(bot: Bot, event: FriendRequestEvent) -> None:
         )
 
 
+group_request_handler = on_request(
+    rule=Rule(_is_group_request),
+    priority=5,
+    block=True,
+)
+
+
+@group_request_handler.handle()
+async def handle_group_request(bot: Bot, event: GroupRequestEvent) -> None:
+    if event.sub_type != "invite":
+        return
+
+    try:
+        await bot.set_group_add_request(
+            flag=event.flag,
+            sub_type=event.sub_type,
+            approve=True,
+        )
+        logger.info(
+            "Group request approved",
+            extra={
+                "group_id": getattr(event, "group_id", None),
+                "user_id": getattr(event, "user_id", None),
+                "sub_type": getattr(event, "sub_type", None),
+                "comment": getattr(event, "comment", None),
+            },
+        )
+    except Exception as exc:
+        logger.error(
+            "Failed to approve group request: %s",
+            exc,
+            extra={
+                "group_id": getattr(event, "group_id", None),
+                "user_id": getattr(event, "user_id", None),
+                "sub_type": getattr(event, "sub_type", None),
+            },
+        )
+
+
 private_message_handler = on_message(
     rule=Rule(_is_private_message),
     priority=5,
@@ -62,7 +106,7 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
     if event.user_id == event.self_id:
         return
 
-    reply = "请把我拉入群聊，AI聊天只在群内启动。"
+    reply = "你好啊 我是AI聊天机器人小奏 将我拉进群之后我就会自动激活啦"
     try:
         await bot.send(event, message=reply)
         logger.info(
