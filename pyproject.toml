@@ -16,7 +16,6 @@ dependencies = [
     "sqlalchemy>=2.0.0",
     "sqlalchemy[asyncio]",
     "asyncpg>=0.29.0",
-    "aiosqlite>=0.20.0",
     "apscheduler>=3.10.0",
     "langchain>=0.1.0",
     "langchain-openai>=0.0.5",

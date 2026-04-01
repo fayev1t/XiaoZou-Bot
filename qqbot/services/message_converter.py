@@ -100,7 +100,7 @@ class MessageConverter:
         text: str,
         user_id: int | None = None,
         display_name: str | None = None,
-        timestamp: str | datetime | None = None,
+        timestamp: datetime | int | float | None = None,
     ) -> str:
         """Wrap plain text content into System-Message format."""
         if display_name is None:
@@ -396,12 +396,9 @@ class MessageConverter:
             )
             return f"用户{user_id}"
 
-    def _format_message_time(self, value: str | int | float | datetime | None) -> str:
+    def _format_message_time(self, value: datetime | int | float | None) -> str:
         if value is None:
             return ""
         if isinstance(value, datetime):
             return normalize_china_time(value).strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            return normalize_china_time(float(value)).strftime("%Y-%m-%d %H:%M:%S")
-        except (TypeError, ValueError, OSError):
-            return str(value)
+        return normalize_china_time(value).strftime("%Y-%m-%d %H:%M:%S")

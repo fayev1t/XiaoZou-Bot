@@ -19,8 +19,13 @@ class ImageRecord(Base):
     url = Column(Text, nullable=True)  # 最新的下载URL（可能过期，仅供临时使用）
     local_path = Column(Text, nullable=True)
     description = Column(Text, nullable=True)  # GPT 视觉解析出的群聊图片描述
-    created_at = Column(DateTime, nullable=False, default=china_now)
-    updated_at = Column(DateTime, nullable=False, default=china_now, onupdate=china_now)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=china_now)
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=china_now,
+        onupdate=china_now,
+    )
 
     def __repr__(self) -> str:
         return f"<ImageRecord(hash={self.file_hash}, has_desc={bool(self.description)})>"

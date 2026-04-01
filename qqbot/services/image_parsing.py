@@ -23,7 +23,7 @@ from qqbot.services.image_record import ImageRecordService
 
 logger = get_logger(__name__)
 
-IMAGE_CACHE_DIR = Path("./sqlite_data/images")
+IMAGE_CACHE_DIR = Path("./runtime_data/images")
 DEFAULT_FAILURE_DESC = "图片解析失败"
 IMAGE_PARSE_LLM_TIMEOUT_SECONDS = 45.0
 SYSTEM_IMAGE_TAG_RE = re.compile(r"<System-Image\s+([^>]*)>(.*?)</System-Image>")

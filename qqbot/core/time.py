@@ -5,7 +5,7 @@ CHINA_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 def china_now() -> datetime:
-    return datetime.now(CHINA_TIMEZONE).replace(tzinfo=None)
+    return datetime.now(CHINA_TIMEZONE)
 
 
 def normalize_china_time(value: datetime | int | float | None) -> datetime:
@@ -14,7 +14,7 @@ def normalize_china_time(value: datetime | int | float | None) -> datetime:
 
     if isinstance(value, datetime):
         if value.tzinfo is None:
-            return value
-        return value.astimezone(CHINA_TIMEZONE).replace(tzinfo=None)
+            raise ValueError("Expected timezone-aware datetime")
+        return value.astimezone(CHINA_TIMEZONE)
 
-    return datetime.fromtimestamp(value, CHINA_TIMEZONE).replace(tzinfo=None)
+    return datetime.fromtimestamp(value, CHINA_TIMEZONE)

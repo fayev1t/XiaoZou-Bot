@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  napcat:
+    image: mlikiowa/napcat-docker:latest
+    container_name: napcat_qqbot
+    restart: unless-stopped
+    network_mode: bridge
+    ports:
+      - "7501:6099" # WebUI 端口
+      - "7502:3000" # HTTP 接口端口（可选）
+      - "7503:3001" # WebSocket 端口（可选）
+    volumes:
+      - ./QQ:/app/.config/QQ        # QQ 数据持久化
+      - ./config:/app/napcat/config # NapCat 配置持久化
+      - ./plugins:/app/napcat/plugins # NapCat 插件目录
+    environment:
+      - NAPCAT_UID=${UID}
+      - NAPCAT_GID=${GID}

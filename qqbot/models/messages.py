@@ -24,8 +24,13 @@ class User(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(BigInteger, unique=True, nullable=False, index=True)
     nickname = Column(String(255), nullable=True)
-    created_at = Column(DateTime, nullable=False, default=china_now)
-    updated_at = Column(DateTime, nullable=False, default=china_now, onupdate=china_now)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=china_now)
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=china_now,
+        onupdate=china_now,
+    )
 
     def __repr__(self) -> str:
         return f"<User(user_id={self.user_id}, nickname={self.nickname})>"
@@ -42,10 +47,15 @@ class Group(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     group_id = Column(BigInteger, unique=True, nullable=False, index=True)
     group_name = Column(String(255), nullable=True)
-    table_name = Column(String(255), nullable=False)  # 消息表名: group_messages_{group_id}
-    members_table_name = Column(String(255), nullable=False)  # 群成员表名: group_members_{group_id}
-    created_at = Column(DateTime, nullable=False, default=china_now)
-    updated_at = Column(DateTime, nullable=False, default=china_now, onupdate=china_now)
+    table_name = Column(String(255), nullable=False)
+    members_table_name = Column(String(255), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=china_now)
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=china_now,
+        onupdate=china_now,
+    )
 
     def __repr__(self) -> str:
         return f"<Group(group_id={self.group_id}, group_name={self.group_name})>"
@@ -67,10 +77,15 @@ class GroupMemberTemplate(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(BigInteger, nullable=False, unique=True, index=True)
     card = Column(String(255), nullable=True)  # 群昵称
-    join_time = Column(DateTime, nullable=True)  # 入群时间
+    join_time = Column(DateTime(timezone=True), nullable=True)  # 入群时间
     is_active = Column(Boolean, default=True)  # 是否在群中
-    created_at = Column(DateTime, nullable=False, default=china_now)
-    updated_at = Column(DateTime, nullable=False, default=china_now, onupdate=china_now)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=china_now)
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=china_now,
+        onupdate=china_now,
+    )
 
     def __repr__(self) -> str:
         return f"<GroupMember(user_id={self.user_id}, card={self.card}, is_active={self.is_active})>"
@@ -91,7 +106,12 @@ class GroupMessage(Base):
     raw_message = Column(Text, nullable=True)  # 原始消息
     formatted_message = Column(Text, nullable=True)  # System-XML 格式
     is_recalled = Column(Boolean, default=False, index=True)  # 是否被撤回
-    timestamp = Column(DateTime, nullable=False, default=china_now, index=True)  # 消息时间
+    timestamp = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=china_now,
+        index=True,
+    )
 
     def __repr__(self) -> str:
         return f"<GroupMessage(id={self.id}, user_id={self.user_id})>"

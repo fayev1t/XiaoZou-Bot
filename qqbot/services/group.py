@@ -1,9 +1,10 @@
 """Group management service."""
 
+from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from qqbot.core.database import create_group_tables, is_sqlite_backend
+from qqbot.core.database import create_group_tables
 from qqbot.core.logging import get_logger
 from qqbot.core.time import china_now
 from qqbot.models import Group
@@ -30,7 +31,7 @@ class GroupService:
 
         if group:
             if group_id not in _verified_group_tables:
-                await create_group_tables(group_id)
+                await create_group_tables(group_id, await self.session.connection())
                 _verified_group_tables.add(group_id)
             if group_name and group.group_name != group_name:
                 group.group_name = group_name
@@ -41,7 +42,7 @@ class GroupService:
         members_table_name = f"group_members_{group_id}"
         logger.info(f"[GroupService] Creating tables for group {group_id}...")
         try:
-            await create_group_tables(group_id)
+            await create_group_tables(group_id, await self.session.connection())
             _verified_group_tables.add(group_id)
             logger.info(f"[GroupService] ✅ Tables created for group {group_id}")
         except Exception as e:
@@ -53,13 +54,8 @@ class GroupService:
             )
             raise
 
-        if is_sqlite_backend():
-            from sqlalchemy.dialects.sqlite import insert as dialect_insert
-        else:
-            from sqlalchemy.dialects.postgresql import insert as dialect_insert
-
         current_time = china_now()
-        stmt = dialect_insert(Group).values(
+        stmt = postgres_insert(Group).values(
             group_id=group_id,
             group_name=group_name,
             table_name=table_name,

@@ -8,7 +8,6 @@ from sqlalchemy import (
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from qqbot.core.database import is_sqlite_backend
 from qqbot.core.time import normalize_china_time
 from qqbot.models import Group
 
@@ -56,29 +55,6 @@ class GroupMessageService:
             "timestamp": normalize_china_time(timestamp),
             "is_recalled": is_recalled,
         }
-
-        if is_sqlite_backend():
-            sql = text(f"""
-                INSERT INTO {table_name}
-                (user_id, onebot_message_id, raw_message, formatted_message, "timestamp", is_recalled)
-                VALUES (
-                    :user_id,
-                    :onebot_message_id,
-                    :raw_message,
-                    :formatted_message,
-                    :timestamp,
-                    :is_recalled
-                )
-            """)
-            result = await self.session.execute(sql, params)
-            if result.lastrowid is not None:
-                return int(result.lastrowid)
-
-            fallback = await self.session.execute(
-                text("SELECT last_insert_rowid()")
-            )
-            saved_id = fallback.scalar()
-            return int(saved_id) if saved_id is not None else 0
 
         sql = text(f"""
             INSERT INTO {table_name}

@@ -12,7 +12,7 @@ class PromptManager:
 1. 顶层消息容器：`<System-Message user_id="..." display_name="..." timestamp="...">...</System-Message>`
    - `user_id`：发送者 QQ 号；拿它判断是谁说的话。
    - `display_name`：发送者在当前群里展示给机器人的称呼（群名片/昵称等）；拿它判断别人平时怎么叫这个人。
-   - `timestamp`：消息时间，通常是 `YYYY-MM-DD HH:MM:SS`；拿它判断先后顺序和最近一次发言。
+   - `timestamp`：消息时间，格式是 `YYYY-MM-DD HH:MM:SS`，表示 Asia/Shanghai 本地时间；拿它判断先后顺序和最近一次发言。
    - 一个 `System-Message` 里面会顺序串联若干子标签；这些子标签的顺序基本就是消息段原始顺序。
 
 2. 文本标签：`<System-PureText>...</System-PureText>`

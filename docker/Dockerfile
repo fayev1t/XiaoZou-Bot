@@ -19,13 +19,13 @@ RUN pip install --upgrade pip setuptools wheel \
     && pip install -e .
 
 RUN useradd --create-home --home-dir /home/qqbot --shell /usr/sbin/nologin qqbot \
-    && mkdir -p /app/logs /app/sqlite_data/images \
+    && mkdir -p /app/logs /app/runtime_data/images \
     && chown -R qqbot:qqbot /app
 
 USER qqbot
 
-VOLUME ["/app/logs", "/app/sqlite_data"]
+VOLUME ["/app/logs", "/app/runtime_data"]
 
-EXPOSE 8080
+EXPOSE 7500
 
 CMD ["python", "-m", "qqbot"]

@@ -1,24 +1,68 @@
 # Repository Guidelines
 说中文
-①这个目录是通过sftp挂载的服务器上的目录 这个终端并没有上面程序的运行环境
-②相关的代码修改都要记录到开发文档目录下的开发日志.md中
+
+①这个目录是通过 sftp 挂载的服务器目录，这个终端不等于真实运行环境。  
+②相关代码修改都要记录到 `开发文档/开发日志.md`。  
+
 ## Project Structure & Module Organization
-`qqbot/` contains the application. `qqbot/plugins/` hosts NoneBot event handlers (priority-driven), `qqbot/services/` holds singleton business services, `qqbot/core/` contains infra (DB, LLM, scheduler), and `qqbot/models/` defines SQLAlchemy ORM models and sharded table naming. Root-level `postgres/` contains `docker-compose.yml` and `init.sql` for local DB. Config and docs live at `pyproject.toml`, `.env*`, `.env.example`, `README.md`, and `CLAUDE.md`.
+
+- `qqbot/`：应用主体
+- `qqbot/plugins/`：NoneBot 插件入口
+- `qqbot/services/`：业务服务层
+- `qqbot/core/`：配置、数据库、日志、调度器等基础设施
+- `qqbot/models/`：SQLAlchemy 模型与动态分表约定
+- `docker/`：Docker 部署文件
+  - `docker/docker-compose.yml`：应用容器
+  - `docker/postgres/compose.yml`：PostgreSQL
+  - `docker/napcat/compose.yml`：NapCat
+- `runtime_data/`：运行时本地缓存目录
+- `logs/`：日志目录
+- `tests/`：`unittest` 契约测试
+- `开发文档/`：开发规范、数据库设计、开发日志等文档
 
 ## Build, Test, and Development Commands
-- `pip install -e ".[dev]"` installs runtime + dev tools (ruff, pyright).
-- `nb run --reload` starts the bot in development; `nb run` for production.
-- `ruff check .` (lint) and `ruff format .` (format); `pyright` for type checking.
-- `psql -U postgres -c "CREATE DATABASE qqbot;"` initializes DB; tables are auto-created by SQLAlchemy on startup.
+
+- `pip install -e ".[dev]"`：安装运行与开发依赖
+- `nb run --reload`：宿主机开发启动
+- `nb run`：宿主机普通启动
+- `docker compose -f docker/postgres/compose.yml up -d`：启动 PostgreSQL
+- `docker compose -f docker/docker-compose.yml up -d --build`：启动应用容器
+- `ruff check .`：Lint
+- `ruff format .`：格式化
+- `pyright`：类型检查
+- `python -m unittest discover -s tests`：运行全部契约测试
+
+## Database & Runtime Conventions
+
+- 当前数据库后端是 PostgreSQL-only
+- 宿主机默认数据库地址由根 `.env` 中的 `DATABASE_URL` 决定
+- `docker/docker-compose.yml` 会在容器内覆盖 `DATABASE_URL` 为 `postgresql+asyncpg://admin:mypassword@postgres:5432/mydb`
+- PostgreSQL 表结构由应用启动时自动创建
+- `docker/postgres/init/` 当前为空
+- 时间语义统一使用 `Asia/Shanghai` 的 timezone-aware `datetime`
 
 ## Coding Style & Naming Conventions
-Python 3.10+ with Ruff enforcing 88-char lines and LF endings. Public functions require type hints; async I/O only (no blocking calls). Naming: `snake_case` for functions/vars, `PascalCase` for classes, `UPPER_CASE` for constants, and `snake_case_plural` for DB tables. Use `logging.getLogger(__name__)` and include context in `extra`.
+
+- Python 3.10+
+- 公共函数必须带类型标注
+- 仅使用异步 I/O，不要引入阻塞调用
+- 命名规范：函数/变量 `snake_case`，类 `PascalCase`，常量 `UPPER_CASE`
+- 日志使用模块级 logger，并在 `extra` 中带上下文
 
 ## Testing Guidelines
-No formal test suite is configured; `qqbot/plugins/test_events.py` is available for manual event checks only when `QQBOT_ENABLE_TEST_EVENTS=1`. Validate behavior by running `nb run --reload` and watching logs. If you add a test framework, document the commands and file layout here and in `pyproject.toml`.
+
+- 仓库已存在 `tests/` 下的 `unittest` 契约测试
+- `qqbot/plugins/test_events.py` 只在 `QQBOT_ENABLE_TEST_EVENTS=1` 时加载
+- 改动数据库、配置、提示词、部署语义时，要同步更新对应测试
+- 当前终端没有完整运行环境，优先给出静态检查与契约测试结果
 
 ## Commit & Pull Request Guidelines
-Recent commits use short Chinese verb prefixes with a full-width colon, e.g. `修复：...`, `优化：...`, `更新：... - ...`. Keep summaries concise and mention key files or features. PRs should include a short description, testing/verification notes, and any config or DB-impacting changes. If dependencies change, record them in `CLAUDE.md`.
+
+- 提交信息使用中文短前缀，例如 `修复：...`、`优化：...`、`更新：...`
+- PR 说明要包含：改动摘要、验证方式、配置或数据库影响
 
 ## Configuration & Secrets
-Use `.env` for shared defaults, `.env.dev`/`.env.prod` for environment overrides, and `.env.example` as the checked-in template. Do not commit real tokens; keep example values and document required variables.
+
+- 根 `.env` 是默认配置入口，`.env.example` 是脱敏模板
+- 可选覆盖文件是 `.env.<ENVIRONMENT>`
+- 不要提交真实 token、密码或其他密钥

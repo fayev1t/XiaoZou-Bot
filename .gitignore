@@ -1,7 +1,7 @@
 # Environment files
 .env
-.env.dev
-.env.prod
+.env.*
+!.env.example
 
 # Virtual environments
 .venv/
@@ -16,6 +16,11 @@ build/
 dist/
 *.egg-info/
 .ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.pyright/
+.coverage
+htmlcov/
 
 
 
@@ -27,9 +32,16 @@ dist/
 
 # Runtime data
 logs/
-sqlite_data/
+runtime_data/
+docker/postgres/*
+!docker/postgres/compose.yml
+docker/napcat/*
+!docker/napcat/compose.yml
 
-#others
+# others
 开发文档/
-.vscode/
 
+
+# Local editor files
+.vscode/
+.idea/

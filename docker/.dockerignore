@@ -19,6 +19,6 @@ build
 dist
 
 logs
-sqlite_data
+runtime_data
 assets
 开发文档

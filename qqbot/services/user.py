@@ -1,8 +1,8 @@
 """User service for user data management."""
+from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from qqbot.core.database import is_sqlite_backend
 from qqbot.core.time import china_now
 from qqbot.models import User
 
@@ -29,13 +29,8 @@ class UserService:
                 user.updated_at = china_now()
             return user
 
-        if is_sqlite_backend():
-            from sqlalchemy.dialects.sqlite import insert as dialect_insert
-        else:
-            from sqlalchemy.dialects.postgresql import insert as dialect_insert
-
         current_time = china_now()
-        stmt = dialect_insert(User).values(
+        stmt = postgres_insert(User).values(
             user_id=user_id,
             nickname=nickname,
             created_at=current_time,
@@ -105,15 +100,10 @@ class UserService:
         Args:
             user_updates: Dict of {user_id: new_nickname}
         """
-        if is_sqlite_backend():
-            from sqlalchemy.dialects.sqlite import insert as dialect_insert
-        else:
-            from sqlalchemy.dialects.postgresql import insert as dialect_insert
-
         for user_id, nickname in user_updates.items():
             if nickname:  # Only update if nickname is not empty
                 current_time = china_now()
-                stmt = dialect_insert(User).values(
+                stmt = postgres_insert(User).values(
                     user_id=user_id,
                     nickname=nickname,
                     created_at=current_time,

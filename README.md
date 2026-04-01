@@ -1,86 +1,93 @@
-一个基于 NAPCAT + NONEBOT 的 QQ 机器人框架，核心设计目标是实现机器人在群聊中自然、灵活地参与对话。
-
-## 这个项目实际在做什么
-
-项目主要解决的是一件事：
-
-> **如何让 QQ 机器人在群聊里像群友一样参与对话，而不是像指令机一样机械响应。**
-
-围绕这个目标，仓库里已经落地的核心能力主要包括：
-
-- 群消息接收、转换、入库
-- 对话块聚合与等待时机判断
-- 整块消息的回复决策与多条回复规划
-- 最终回复文本生成与串行发送
-- 图片缓存、图片描述复用、按需重识图
-- 历史上下文读取、撤回过滤、@ 信息可读化
-- 群名、QQ 昵称、群名片的周期同步
-
-
-此外我也会添加更多的机器人功能、多模态效果以及爬虫功能，完善它的机器人属性。 同时特别感谢 NAPCAT 和 NONEBOT 两个优秀的开源项目，让我可以专注于对话逻辑、数据库以及其他功能的开发。
-
-
-## QQ 交流群
-
-欢迎进群交流：**610662657**
-
----
-
-## 功能特点
-
-- **群聊内容整理与理解**：收到的群消息会先统一转换成内部格式，再按聊天内容组织处理，不是把每句话都当成独立指令。
-- **上下文参与回复判断**：回复时会结合最近聊天记录一起理解语境，而不是只盯着当前这一条消息。
-- **图片内容解析与复用**：支持图片内容识别，识图结果会缓存并在后续对话处理中继续复用，需要时也能重新解析。
-- **更自然的回复节奏**：机器人不会一有判断就立刻发消息，而是会尽量避开打断正在进行的聊天。
-- **群资料与成员称呼同步**：会持续同步群名、QQ 昵称、群名片等信息，方便在上下文和回复中使用更接近真实群内环境的称呼。
-- **历史消息持久化**：群消息、图片描述、机器人自己的回复都会写入数据库，供后续上下文读取和对话判断使用。
-- **按群组织的数据管理**：消息和成员信息按群维度独立组织，方便长期积累上下文，也方便后续维护和扩展。
-
----
-
+一个基于 NapCat + NoneBot 的 QQ 机器人项目，目标是让机器人在群聊里更自然地理解上下文、参与对话并持续积累长期记忆。
 
 ## 项目结构
 
-代码主体在 `qqbot/` 目录下：
-
-- `qqbot/plugins/`：运行入口层，处理启动、群消息、群通知、群聊回复、私聊引导等
-- `qqbot/services/`：业务核心层，负责消息转换、聚合、上下文、回复判断、回复生成、图片解析等
-- `qqbot/core/`：基础设施层，负责数据库、配置、LLM、调度器、日志等
-- `qqbot/models/`：数据模型层，定义用户、群、群成员、群消息、图片记录等表结构
-- `scripts/`：迁移和维护脚本
-- `sqlite_data/`：本地 SQLite 数据和图片缓存目录
-- `logs/`：运行日志、错误日志、AI 输入输出日志
+- `qqbot/plugins/`：NoneBot 插件入口，处理启动、群消息、群通知、私聊等事件
+- `qqbot/services/`：业务服务层，负责消息转换、上下文、聚合、回复、图片解析等逻辑
+- `qqbot/core/`：基础设施层，负责配置、数据库、调度器、日志等能力
+- `qqbot/models/`：SQLAlchemy 模型与动态分表命名规则
+- `docker/`：应用、PostgreSQL、NapCat 的 Docker 部署文件
+- `runtime_data/`：运行时本地缓存目录，当前主要用于图片缓存
+- `logs/`：运行日志目录
+- `tests/`：`unittest` 契约测试
 - `开发文档/`：开发规范、数据库设计、开发日志等文档
 
+## 当前运行基线
 
----
-
-## 技术简述
-
-- **NoneBot2**：机器人框架
-- **OneBot V11**：协议适配
-- **NapCat**：QQ 侧接入
-- **SQLAlchemy + SQLite / PostgreSQL**：异步数据存储
-- **APScheduler**：周期任务调度
-- **LangChain / OpenAI 兼容接口**：LLM 调用封装
-
----
-
-##  🚀快速开始
-(requirement？)❌ | (docker？)❌ 直接把小奏（1005089717）拉到你自己的群里！！！
-
-##  🐢慢速开始
-### 前置条件
 - Python 3.10+
-- 已安装 `nb-cli`
-- 准备好 `.env` / `.env.dev` 等配置文件
-- 可用的 OneBot / NapCat 运行环境
-（缺什么依赖装什么）
+- 数据库后端：PostgreSQL-only
+- 时间语义：统一使用 `Asia/Shanghai` 的 timezone-aware `datetime`
+- `System-Message.timestamp`：渲染为 `YYYY-MM-DD HH:MM:SS` 的上海本地时间字符串
+- 配置加载顺序：`.env` → `.env.<ENVIRONMENT>`
 
-## QQ 交流群图片
+## 关键配置
 
-![QQ交流群图片1](assets/imgs/0AB65B95E57CAE189B4EF9EA29369F32.jpg)
+根目录 `.env` 是默认配置入口。
 
-![QQ交流群图片2](assets/imgs/屏幕截图%202025-12-18%20165501.png)
+当前最关键的运行项：
 
----
+- `PORT=7500`
+- `DATABASE_URL=postgresql+asyncpg://admin:mypassword@127.0.0.1:7504/mydb`
+- `QQBOT_ENABLE_TEST_EVENTS=0`
+
+说明：
+
+- 宿主机直接运行 bot 时，默认使用根 `.env` 里的 `DATABASE_URL`
+- 使用 `docker/docker-compose.yml` 启动 `qqbot` 容器时，compose 会覆盖容器内 `DATABASE_URL` 为 `postgresql+asyncpg://admin:mypassword@postgres:5432/mydb`
+- 根 `.env` 里的 `NAPCAT_*`、`POSTGRES_*` 当前用于和 `docker/napcat/compose.yml`、`docker/postgres/compose.yml` 对照，不是 Python 运行时直接读取的数据库键
+
+## Docker 文件位置
+
+- 应用：`docker/docker-compose.yml`
+- PostgreSQL：`docker/postgres/compose.yml`
+- NapCat：`docker/napcat/compose.yml`
+
+当前 checked-in 默认值：
+
+- `qqbot` 容器用户：`1001:1001`
+- `postgres` 容器用户：`1001:1001`
+- `napcat` 容器用户：跟随 `${UID}` / `${GID}`
+- `qqbot` 对外端口：`7500`
+- `postgres` 对外端口：`7504`
+- `napcat` 对外端口：`7501 / 7502 / 7503`
+
+`docker/docker-compose.yml` 与 `docker/postgres/compose.yml` 通过命名网络 `qqbot-postgres-network` 互通，应用容器通过 PostgreSQL 服务名 `postgres` 建库连接。
+
+## 启动方式
+
+### 宿主机直接运行
+
+1. 准备根目录 `.env`
+2. 启动 PostgreSQL：`docker compose -f docker/postgres/compose.yml up -d`
+3. 安装依赖：`pip install -e ".[dev]"`
+4. 启动 bot：`nb run --reload`
+
+### Docker 运行应用容器
+
+1. 先启动 PostgreSQL：`docker compose -f docker/postgres/compose.yml up -d`
+2. 再启动应用：`docker compose -f docker/docker-compose.yml up -d --build`
+
+## 测试与校验
+
+当前仓库已经有 `unittest` 契约测试。
+
+常用检查命令：
+
+- `python -m unittest discover -s tests`
+- `ruff check .`
+- `pyright`
+
+如果只想验证数据库/配置契约，可运行：
+
+- `python -m unittest tests.test_env_centralization_contract tests.test_postgres_only_contract tests.test_time_contract`
+
+## 数据与缓存
+
+- PostgreSQL 表结构由应用启动时通过 SQLAlchemy 建立
+- `docker/postgres/init/` 当前为空
+- 图片缓存保存在 `runtime_data/images`
+
+## 说明
+
+- 这个仓库目录是通过 SFTP 挂载的服务器目录；当前终端不等于真实运行环境
+- 因此本地修改后的验证以静态检查和契约测试为主，完整联调需要在真实运行环境完成

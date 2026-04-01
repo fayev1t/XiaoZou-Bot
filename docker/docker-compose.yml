@@ -1,0 +1,25 @@
+services:
+  qqbot:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: qqbot
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    user: "1001:1001"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://admin:mypassword@postgres:5432/mydb
+    ports:
+      - "7500:7500"
+    volumes:
+      - ../logs:/app/logs
+      - ../runtime_data:/app/runtime_data
+    command: ["python", "-m", "qqbot"]
+    networks:
+      - postgres-network
+
+networks:
+  postgres-network:
+    name: qqbot-postgres-network
+    driver: bridge

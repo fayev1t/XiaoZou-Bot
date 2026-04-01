@@ -4,6 +4,7 @@ import asyncio
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from qqbot.core.logging import get_logger
+from qqbot.core.time import CHINA_TIMEZONE
 
 logger = get_logger(__name__)
 
@@ -25,8 +26,7 @@ async def init_scheduler() -> None:
             loop = asyncio.get_running_loop()
             logger.debug(f"[scheduler] Current event loop: {loop}")
 
-            # Ensure scheduler uses the current event loop
-            scheduler.configure(timezone="UTC")
+            scheduler.configure(timezone=CHINA_TIMEZONE)
             scheduler.start()
 
             logger.info(f"[scheduler] ✅ Scheduler started. Running: {scheduler.running}")
@@ -46,5 +46,4 @@ async def shutdown_scheduler() -> None:
             logger.info("[scheduler] ✅ Scheduler shut down")
         except Exception as e:
             logger.error(f"[scheduler] ❌ Failed to shutdown scheduler: {e}", exc_info=True)
-
 

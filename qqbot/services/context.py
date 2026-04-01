@@ -25,7 +25,7 @@ class LegacyEvent:
     user_id: int | None
     message: Message
     raw_message: str
-    time: datetime | str | None = None
+    time: datetime | int | float | None = None
 
 
 class ContextManager:
@@ -127,11 +127,14 @@ class ContextManager:
                 context_lines.append(formatted_message)
                 continue
 
-            raw_message = (
-                msg.get("raw_message") or msg.get("message_content", "") or ""
-            )
+            raw_message = msg.get("raw_message") or ""
             user_id = msg.get("user_id")
-            timestamp = msg.get("timestamp")
+            raw_timestamp = msg.get("timestamp")
+            timestamp = (
+                raw_timestamp
+                if isinstance(raw_timestamp, (datetime, int, float))
+                else None
+            )
 
             if not raw_message:
                 raw_message = "【空消息】"
