@@ -1,93 +1,77 @@
-一个基于 NapCat + NoneBot 的 QQ 机器人项目，目标是让机器人在群聊里更自然地理解上下文、参与对话并持续积累长期记忆。
+<div align="center">
 
-## 项目结构
+# 🌟 XiaoZou-Bot (小奏)
 
-- `qqbot/plugins/`：NoneBot 插件入口，处理启动、群消息、群通知、私聊等事件
-- `qqbot/services/`：业务服务层，负责消息转换、上下文、聚合、回复、图片解析等逻辑
-- `qqbot/core/`：基础设施层，负责配置、数据库、调度器、日志等能力
-- `qqbot/models/`：SQLAlchemy 模型与动态分表命名规则
-- `docker/`：应用、PostgreSQL、NapCat 的 Docker 部署文件
-- `runtime_data/`：运行时本地缓存目录，当前主要用于图片缓存
-- `logs/`：运行日志目录
-- `tests/`：`unittest` 契约测试
-- `开发文档/`：开发规范、数据库设计、开发日志等文档
+<p align="center">
+  <em>「其实原型人设就是逢坂大河,但是立华奏已经在我心里留下了永远永远也无法磨灭的印记」</em>
+</p>
 
-## 当前运行基线
+![Python](https://img.shields.io/badge/Python-3.10+-blue?style=flat-square&logo=python)
+![NoneBot](https://img.shields.io/badge/NoneBot-2.0+-red?style=flat-square)
+![PostgreSQL](https://img.shields.io/badge/Database-PostgreSQL-336791?style=flat-square&logo=postgresql)
 
-- Python 3.10+
-- 数据库后端：PostgreSQL-only
-- 时间语义：统一使用 `Asia/Shanghai` 的 timezone-aware `datetime`
-- `System-Message.timestamp`：渲染为 `YYYY-MM-DD HH:MM:SS` 的上海本地时间字符串
-- 配置加载顺序：`.env` → `.env.<ENVIRONMENT>`
+</div>
 
-## 关键配置
+---
 
-根目录 `.env` 是默认配置入口。
+## 🎭 她是谁？
 
-当前最关键的运行项：
+小奏不仅是一个基于大语言模型的应答程序，她被赋予了拥有类似逢坂大河般傲娇性格的灵魂。她的核心设计理念是成为一个具有日常真实陪伴感的“赛博群友”。
 
-- `PORT=7500`
-- `DATABASE_URL=postgresql+asyncpg://admin:mypassword@127.0.0.1:7504/mydb`
-- `QQBOT_ENABLE_TEST_EVENTS=0`
+> **她最大的愿望，是像一个普通的群友一样，自然地看大家聊天，在合适的时机插科打诨。**
 
-说明：
+- 🧠 **上下文融入**：她会自动记忆近期的聊天记录，理解当前的讨论语境，拒绝缺乏逻辑的生硬回复。
+- ⏳ **拟人化审时度势**：当大家讨论激烈时，她会默默潜水围观；只有在话题告一段落或适合吐槽时，才会自然地下场发表看法。
+- 👁️ **跨模态视觉记忆**：发送图片给她，她不仅能精准识别图片内容，甚至可能在未来的某次闲聊中不经意地回想起这些画面。
+- 👤 **群体关系感知**：她能够识别所处的群组环境、理解成员昵称与群名片，用熟人的口吻与每一个人交流。
 
-- 宿主机直接运行 bot 时，默认使用根 `.env` 里的 `DATABASE_URL`
-- 使用 `docker/docker-compose.yml` 启动 `qqbot` 容器时，compose 会覆盖容器内 `DATABASE_URL` 为 `postgresql+asyncpg://admin:mypassword@postgres:5432/mydb`
-- 根 `.env` 里的 `NAPCAT_*`、`POSTGRES_*` 当前用于和 `docker/napcat/compose.yml`、`docker/postgres/compose.yml` 对照，不是 Python 运行时直接读取的数据库键
+## 📸 小奏的日常
 
-## Docker 文件位置
+在这里你可以看到小奏在群内潜水与活跃的真实表现：
 
-- 应用：`docker/docker-compose.yml`
-- PostgreSQL：`docker/postgres/compose.yml`
-- NapCat：`docker/napcat/compose.yml`
+<div align="center">
+  <img src="assets/imgs/屏幕截图%202025-12-18%20165501.png" width="400" />
+</div>
 
-当前 checked-in 默认值：
+---
 
-- `qqbot` 容器用户：`1001:1001`
-- `postgres` 容器用户：`1001:1001`
-- `napcat` 容器用户：跟随 `${UID}` / `${GID}`
-- `qqbot` 对外端口：`7500`
-- `postgres` 对外端口：`7504`
-- `napcat` 对外端口：`7501 / 7502 / 7503`
+## 🛠️ 进化路线 (TODO)
 
-`docker/docker-compose.yml` 与 `docker/postgres/compose.yml` 通过命名网络 `qqbot-postgres-network` 互通，应用容器通过 PostgreSQL 服务名 `postgres` 建库连接。
+为了让小奏在群聊中拥有更真实的陪伴感，项目计划进行以下核心功能的演进：
 
-## 启动方式
+- [ ] **全知感知管线重构 (当前进行中)**
+  重构底层的意图识别管线，使机器人在查天气、解析图片、网络搜索和日常聊天之间能够无缝切换，彻底消除传统机器人的“机械指令感”。
+  
+- [ ] **群聊心流与旁观机制**
+  赋予机器人判断“发言时机”的能力。在群友热烈交流时适时潜水围观，避免“抢话”；并增加独立的非文本情绪机制，支持在适当的语境下单独发送表情包回应，建立属于她自己的表情图库。
 
-### 宿主机直接运行
+- [ ] **闲时记忆提炼系统**
+  摒弃死板的长期对话完整记录。系统将在无消息的闲时，自动提炼聊天记录中的高价值内容（如群友的个人偏好、群内近期发生的核心话题），并清理无意义的闲聊，建立轻量的“群体画像”。
 
-1. 准备根目录 `.env`
-2. 启动 PostgreSQL：`docker compose -f docker/postgres/compose.yml up -d`
-3. 安装依赖：`pip install -e ".[dev]"`
-4. 启动 bot：`nb run --reload`
+- [ ] **群体语境自适应（黑话学习）**
+  具备按群隔离的上下文理解能力，让小奏自动挖掘并学习各个群内特有的缩写、梗和专属“黑话”。使其逐渐适应不同群的聊天氛围，做到真正的入乡随俗。
 
-### Docker 运行应用容器
+---
 
-1. 先启动 PostgreSQL：`docker compose -f docker/postgres/compose.yml up -d`
-2. 再启动应用：`docker compose -f docker/docker-compose.yml up -d --build`
+## 🚀 快速部署
 
-## 测试与校验
+开箱即用的体验，无需配置环境或 Docker！
+直接将小奏的 QQ (\`1005089717\`) 拉入你的群组，即可开始互动。
 
-当前仓库已经有 `unittest` 契约测试。
+## 🐢 本地开发与定制部署
 
-常用检查命令：
+对于有意向进行二次开发或深入部署的核心开发者：
+- **基线环境**：推荐使用 Python 3.10，配合 NB-cli。容器化依赖（NapCat 与 PostgreSQL）请参考 `docker/` 目录下的 Compose 文件。
+- **配置起点**：从项目根目录的 `.env` 入口开始，正确配置 `DATABASE_URL`。
+- **开发与调试**：基于 NoneBot 框架，本地日常开发可通过执行 `nb run --reload` 边跑边改，实现热重载调试。
+- **运行时目录**：图片缓存和其他运行时产物默认写入 `runtime_data/`，日志写入 `logs/`。
 
-- `python -m unittest discover -s tests`
-- `ruff check .`
-- `pyright`
+---
 
-如果只想验证数据库/配置契约，可运行：
+## 💬 交流社区
 
-- `python -m unittest tests.test_env_centralization_contract tests.test_postgres_only_contract tests.test_time_contract`
-
-## 数据与缓存
-
-- PostgreSQL 表结构由应用启动时通过 SQLAlchemy 建立
-- `docker/postgres/init/` 当前为空
-- 图片缓存保存在 `runtime_data/images`
-
-## 说明
-
-- 这个仓库目录是通过 SFTP 挂载的服务器目录；当前终端不等于真实运行环境
-- 因此本地修改后的验证以静态检查和契约测试为主，完整联调需要在真实运行环境完成
+任何问题，欢迎加入。
+**技术与交流群：610662657**
+<div align="center">
+  <img src="assets/imgs/0AB65B95E57CAE189B4EF9EA29369F32.jpg" width="400" />
+</div>

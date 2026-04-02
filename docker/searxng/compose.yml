@@ -1,0 +1,26 @@
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng_qqbot
+    restart: unless-stopped
+    environment:
+      SEARXNG_BASE_URL: http://127.0.0.1:7505
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-change-this-searxng-secret}
+      SEARXNG_LIMITER: "false"
+      SEARXNG_PUBLIC_INSTANCE: "false"
+    ports:
+      - "7505:8080"
+    volumes:
+      - searxng-config:/etc/searxng
+      - searxng-cache:/var/cache/searxng
+    networks:
+      - searxng-network
+
+volumes:
+  searxng-config:
+  searxng-cache:
+
+networks:
+  searxng-network:
+    name: qqbot-searxng-network
+    driver: bridge

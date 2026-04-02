@@ -24,6 +24,14 @@ from qqbot.services.prompt import PromptManager
 
 logger = get_logger(__name__)
 
+
+def _build_parse_failed_placeholder(reason: str = "消息未完成格式化") -> str:
+    normalized_reason = reason.strip() if reason else "消息不可用"
+    return f"【解析失败：{normalized_reason}】"
+
+
+PARSE_FAILED_PLACEHOLDER = _build_parse_failed_placeholder()
+
 PRE_CLOSE_QUIET_SECONDS = 2.0
 
 
@@ -32,10 +40,14 @@ class PendingMessage:
     """待处理的消息"""
 
     user_id: int
-    formatted_message: str
-    timestamp: float
-    event: Any
+    msg_hash: str
+    raw_message: str
+    formatted_message: str | None = None
+    timestamp: float = field(default_factory=time.time)
+    event: Any = None
     is_bot_mentioned: bool = False
+    format_task: asyncio.Task | None = None
+    persisted_message_id: int | None = None
 
 
 @dataclass
@@ -63,6 +75,16 @@ class ResponseBlock:
 
     def get_unique_users(self) -> set[int]:
         return {msg.user_id for msg in self.messages}
+
+    def get_earliest_persisted_message_id(self) -> int | None:
+        message_ids = [
+            msg.persisted_message_id
+            for msg in self.messages
+            if msg.persisted_message_id is not None
+        ]
+        if not message_ids:
+            return None
+        return min(message_ids)
 
     def clear(self) -> None:
         self.messages.clear()
@@ -214,8 +236,12 @@ class MessageAggregator:
         self,
         group_id: int,
         user_id: int,
-        formatted_message: str,
+        msg_hash: str,
+        raw_message: str,
+        formatted_message: str | None,
+        format_task: asyncio.Task | None,
         event: Any,
+        persisted_message_id: int | None = None,
         is_bot_mentioned: bool = False,
     ) -> None:
         lock = self._get_lock(group_id)
@@ -237,10 +263,13 @@ class MessageAggregator:
 
             pending_msg = PendingMessage(
                 user_id=user_id,
+                msg_hash=msg_hash,
+                raw_message=raw_message,
                 formatted_message=formatted_message,
-                timestamp=time.time(),
                 event=event,
                 is_bot_mentioned=is_bot_mentioned,
+                format_task=format_task,
+                persisted_message_id=persisted_message_id,
             )
 
             is_new_block = block.get_message_count() == 0
@@ -255,8 +284,9 @@ class MessageAggregator:
                     extra={"group_id": group_id},
                 )
 
+            preview_text = raw_message or formatted_message or PARSE_FAILED_PLACEHOLDER
             logger.info(
-                f"[aggregator] ➕ 消息已加入块 | 群={group_id}, 消息数={block.get_message_count()}, 用户数={len(block.get_unique_users())}, @机器人={block.has_bot_mention()}, 内容={formatted_message[:30]}",
+                f"[aggregator] ➕ 消息已加入块 | 群={group_id}, 消息数={block.get_message_count()}, 用户数={len(block.get_unique_users())}, @机器人={block.has_bot_mention()}, 内容={preview_text[:30]}",
                 extra={
                     "group_id": group_id,
                     "message_count": block.get_message_count(),
@@ -283,30 +313,12 @@ class MessageAggregator:
         expected_judge_request_version: int,
     ) -> None:
         try:
-            from qqbot.core.database import AsyncSessionLocal
-            from qqbot.services.context import ContextManager
             from qqbot.services.silence_mode import is_silent
             from qqbot.core.llm import create_llm
             messages_module = importlib.import_module("langchain_core.messages")
             human_message_class = messages_module.HumanMessage
 
-            history_context = ""
             silence_mode = is_silent(group_id)
-            try:
-                async with AsyncSessionLocal() as session:
-                    context_manager = ContextManager(session)
-                    history_context = await context_manager.get_recent_context(
-                        group_id=group_id,
-                        limit=20,
-                        bot_id=block.messages[0].event.self_id if block.messages else None,
-                    )
-            except Exception as e:
-                logger.warning(
-                    "[aggregator] 获取历史上下文失败: {!r}",
-                    e,
-                    extra={"group_id": group_id},
-                )
-                history_context = ""
 
             lock = self._get_lock(group_id)
             async with lock:
@@ -319,12 +331,9 @@ class MessageAggregator:
                 ):
                     return
 
-            block_content = "\n".join(msg.formatted_message for msg in block.messages)
+            block_content = "\n".join(msg.raw_message for msg in block.messages)
             silence_hint = "\n【特殊状态：沉默模式激活】当前群处于沉默模式，只有在被@或有明确问题时才应判断为需要回复。其他闲聊一律判断为需要等待（should_wait=true）。" if silence_mode else ""
-            prompt = f"""【历史上下文】（最近消息）
-{history_context if history_context else "暂无历史上下文"}
-
-【当前消息块】（刚接收到的消息，共{len(block.messages)}条）
+            prompt = f"""【当前消息块】（刚接收到的原始消息，共{len(block.messages)}条）
 {block_content}
 {silence_hint}
 {self.prompt_manager.wait_time_judge_prompt}"""

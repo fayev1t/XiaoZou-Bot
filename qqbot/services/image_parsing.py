@@ -6,9 +6,7 @@ import hashlib
 import mimetypes
 import re
 import time
-from collections.abc import Mapping
 from dataclasses import dataclass
-from html import escape
 from pathlib import Path
 
 import httpx
@@ -19,43 +17,34 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from qqbot.core.llm import create_llm
 from qqbot.core.logging import get_logger
 from qqbot.services.group_message import GroupMessageService
-from qqbot.services.image_record import ImageRecordService
+from qqbot.services.message_format_fallback import build_parse_failure_text
+from qqbot.services.tool_manager import ToolManager
 
 logger = get_logger(__name__)
 
 IMAGE_CACHE_DIR = Path("./runtime_data/images")
 DEFAULT_FAILURE_DESC = "图片解析失败"
 IMAGE_PARSE_LLM_TIMEOUT_SECONDS = 45.0
-SYSTEM_IMAGE_TAG_RE = re.compile(r"<System-Image\s+([^>]*)>(.*?)</System-Image>")
+SYSTEM_IMAGE_TAG_RE = re.compile(r"<System-Image\s+([^>]*)>.*?</System-Image>")
 ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
 
 
 @dataclass
 class ImageParseResult:
     file_hash: str
-    url: str | None
-    local_path: str | None
-    description: str
-    success: bool
-
-
-@dataclass
-class ImageReference:
-    file_hash: str
-
-
-OpenAIImageBlock = dict[str, object]
+    call_hash: str
 
 
 class ImageParsingService:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
-        self.record_service = ImageRecordService(session)
+        self.tool_manager = ToolManager(session)
 
     async def parse_segment_sync(
         self,
         group_id: int,
         segment: MessageSegment,
+        msg_hash: str,
     ) -> ImageParseResult:
         url = self._extract_image_url(segment)
         fallback_hash = self._build_fallback_hash(segment)
@@ -77,34 +66,17 @@ class ImageParsingService:
                 },
             )
             file_hash = hashlib.md5(image_bytes).hexdigest()
-            local_path = self._persist_image(file_hash, image_bytes, url)
-            record = await self.record_service.upsert_record(
-                file_hash=file_hash,
-                url=url,
-                local_path=local_path,
-            )
-
+            self._persist_image(file_hash, image_bytes, url)
             context = await self._get_recent_context(group_id=group_id)
-            description = await self._describe_image(
-                image_bytes=image_bytes,
-                context=context,
-            )
-            if description:
-                record.description = description
-                await self.session.flush()
-                return ImageParseResult(
-                    file_hash=file_hash,
-                    url=url,
-                    local_path=local_path,
-                    description=description,
-                    success=True,
-                )
-
-            return self._failure_result(
+            tool_result = await self.tool_manager.execute_image_parse(
+                msg_hash=msg_hash,
                 file_hash=file_hash,
-                url=url,
-                local_path=local_path,
+                generator=lambda: self._generate_image_summary(
+                    image_bytes=image_bytes,
+                    context=context,
+                ),
             )
+            return ImageParseResult(file_hash=file_hash, call_hash=tool_result.call_hash)
         except Exception as exc:
             logger.warning(
                 "[image_parsing] stage0 parse failed",
@@ -114,142 +86,25 @@ class ImageParsingService:
                     "image_url": url,
                 },
             )
-            file_hash = fallback_hash
-            await self.record_service.upsert_record(
-                file_hash=file_hash,
-                url=url,
-                local_path=None,
+            tool_result = await self.tool_manager.execute_image_parse(
+                msg_hash=msg_hash,
+                file_hash=fallback_hash,
+                generator=self._build_failure_summary,
             )
-            return self._failure_result(file_hash=file_hash, url=url, local_path=None)
-
-    async def refresh_image_descriptions_in_text(self, text: str) -> str:
-        file_hashes = self.extract_image_hashes(text)
-        if not file_hashes:
-            return text
-
-        records = await self.record_service.get_by_hashes(file_hashes)
-        return self._refresh_text_with_records(text, records)
-
-    @staticmethod
-    def _refresh_text_with_records(
-        text: str,
-        records: Mapping[str, object],
-    ) -> str:
-        def _replace(match: re.Match[str]) -> str:
-            attrs_text = match.group(1)
-            attrs = dict(ATTR_RE.findall(attrs_text))
-            file_hash = attrs.get("file_hash", "")
-            record = records.get(file_hash)
-            if record is None or not getattr(record, "description", None):
-                return match.group(0)
-
-            description = getattr(record, "description")
-            attrs["desc"] = description
-            attrs_str = " ".join(
-                f'{key}="{escape(str(value), quote=True)}"'
-                for key, value in attrs.items()
+            return ImageParseResult(
+                file_hash=fallback_hash,
+                call_hash=tool_result.call_hash,
             )
-            safe_desc = escape(description, quote=True)
-            return f"<System-Image {attrs_str}>{safe_desc}</System-Image>"
-
-        return SYSTEM_IMAGE_TAG_RE.sub(_replace, text)
 
     @staticmethod
     def extract_image_hashes(text: str) -> list[str]:
         hashes: list[str] = []
-        for attrs_text, _ in SYSTEM_IMAGE_TAG_RE.findall(text):
+        for attrs_text in SYSTEM_IMAGE_TAG_RE.findall(text):
             attrs = dict(ATTR_RE.findall(attrs_text))
             file_hash = attrs.get("file_hash")
             if file_hash:
                 hashes.append(file_hash)
         return hashes
-
-    @staticmethod
-    def extract_refs_from_formatted_message(
-        formatted_message: str,
-    ) -> list[ImageReference]:
-        return [
-            ImageReference(file_hash=file_hash)
-            for file_hash in ImageParsingService.extract_image_hashes(formatted_message)
-        ]
-
-    async def build_openai_image_blocks(
-        self,
-        refs: list[ImageReference],
-    ) -> list[OpenAIImageBlock]:
-        if not refs:
-            return []
-
-        file_hashes = list(dict.fromkeys(ref.file_hash for ref in refs if ref.file_hash))
-        records = await self.record_service.get_by_hashes(file_hashes)
-        image_blocks: list[OpenAIImageBlock] = []
-
-        for file_hash in file_hashes:
-            record = records.get(file_hash)
-            if record is None or not record.local_path:
-                logger.warning(
-                    "[image_parsing] skip image block, missing cached record",
-                    extra={"file_hash": file_hash},
-                )
-                continue
-
-            image_path = Path(record.local_path)
-            if not image_path.exists():
-                logger.warning(
-                    "[image_parsing] skip image block, cached file missing",
-                    extra={"file_hash": file_hash, "local_path": record.local_path},
-                )
-                continue
-
-            try:
-                image_bytes = await asyncio.to_thread(image_path.read_bytes)
-            except OSError as exc:
-                logger.warning(
-                    "[image_parsing] skip image block, cached file unreadable",
-                    extra={
-                        "file_hash": file_hash,
-                        "local_path": record.local_path,
-                        "error": str(exc),
-                    },
-                )
-                continue
-
-            image_blocks.extend(
-                [
-                    self._build_image_reference_block(file_hash),
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": self._build_image_data_url(image_bytes)},
-                    },
-                ]
-            )
-
-        return image_blocks
-
-    @staticmethod
-    def _build_image_reference_block(file_hash: str) -> OpenAIImageBlock:
-        return {
-            "type": "text",
-            "text": (
-                "以下图片对应 file_hash="
-                f"{file_hash}。请将它与当前对话上下文中相同 file_hash 的 "
-                "System-Image 线索对应理解。"
-            ),
-        }
-
-    def _failure_result(
-        self,
-        file_hash: str,
-        url: str | None,
-        local_path: str | None,
-    ) -> ImageParseResult:
-        return ImageParseResult(
-            file_hash=file_hash,
-            url=url,
-            local_path=local_path,
-            description=DEFAULT_FAILURE_DESC,
-            success=False,
-        )
 
     async def _get_recent_context(self, group_id: int, limit: int = 10) -> str:
         message_service = GroupMessageService(self.session)
@@ -258,10 +113,18 @@ class ImageParsingService:
             return "（暂无历史上下文）"
 
         parts = [
-            message.get("formatted_message") or message.get("raw_message") or ""
+            message.get("formatted_message")
+            or build_parse_failure_text("历史消息不可用")
             for message in messages
         ]
         return "\n".join(part for part in parts if part)
+
+    async def _generate_image_summary(self, image_bytes: bytes, context: str) -> str:
+        description = await self._describe_image(image_bytes=image_bytes, context=context)
+        return description or DEFAULT_FAILURE_DESC
+
+    async def _build_failure_summary(self) -> str:
+        return DEFAULT_FAILURE_DESC
 
     async def _describe_image(self, image_bytes: bytes, context: str) -> str | None:
         llm = await create_llm(temperature=0.2)
@@ -363,12 +226,11 @@ class ImageParsingService:
             response.raise_for_status()
             return response.content
 
-    def _persist_image(self, file_hash: str, image_bytes: bytes, url: str | None) -> str:
+    def _persist_image(self, file_hash: str, image_bytes: bytes, url: str | None) -> None:
         IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         suffix = self._guess_suffix(url, image_bytes)
         image_path = IMAGE_CACHE_DIR / f"{file_hash}{suffix}"
         image_path.write_bytes(image_bytes)
-        return image_path.as_posix()
 
     @staticmethod
     def _guess_suffix(url: str | None, image_bytes: bytes) -> str:

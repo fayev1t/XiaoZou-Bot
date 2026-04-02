@@ -2,18 +2,17 @@ version: '3.8'
 
 services:
   postgres:
-    image: postgres:16-alpine
-    container_name: postgres16
+    image: postgres:18-alpine
+    container_name: postgres18_qqbot
     restart: unless-stopped
     environment:
       POSTGRES_USER: admin
       POSTGRES_PASSWORD: mypassword
       POSTGRES_DB: mydb
-    user: "1001:1001"
     ports:
       - "7504:5432"
     volumes:
-      - ./postgres-data:/var/lib/postgresql/data
+      - ./postgres-data:/var/lib/postgresql
       - ./init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U admin -d mydb"]

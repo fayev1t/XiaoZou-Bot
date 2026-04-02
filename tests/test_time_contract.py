@@ -43,13 +43,14 @@ class TimeContractTests(unittest.TestCase):
 
     def test_models_and_scheduler_match_timezone_contract(self) -> None:
         messages_model = (ROOT / "qqbot" / "models" / "messages.py").read_text(encoding="utf-8")
-        image_model = (ROOT / "qqbot" / "models" / "image.py").read_text(encoding="utf-8")
+        tool_call_model = (ROOT / "qqbot" / "models" / "tool_call.py").read_text(encoding="utf-8")
         scheduler = (ROOT / "qqbot" / "core" / "scheduler.py").read_text(encoding="utf-8")
         database = (ROOT / "qqbot" / "core" / "database.py").read_text(encoding="utf-8")
         converter = (ROOT / "qqbot" / "services" / "message_converter.py").read_text(encoding="utf-8")
 
         self.assertIn("DateTime(timezone=True)", messages_model)
-        self.assertIn("DateTime(timezone=True)", image_model)
+        self.assertIn("DateTime(timezone=True)", tool_call_model)
+        self.assertIn('server_default=text("CURRENT_TIMESTAMP")', tool_call_model)
         self.assertIn("scheduler.configure(timezone=CHINA_TIMEZONE)", scheduler)
         self.assertIn('"timezone": "Asia/Shanghai"', database)
         self.assertIn(

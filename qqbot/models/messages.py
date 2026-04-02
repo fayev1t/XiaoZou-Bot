@@ -102,6 +102,7 @@ class GroupMessage(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(BigInteger, nullable=False, index=True)
+    msg_hash = Column(String(64), nullable=False, unique=True, index=True)
     onebot_message_id = Column(String(255), nullable=True, index=True)
     raw_message = Column(Text, nullable=True)  # 原始消息
     formatted_message = Column(Text, nullable=True)  # System-XML 格式

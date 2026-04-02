@@ -124,8 +124,8 @@ async def init_db() -> None:
     try:
         # 导入所有模型以注册到Base.metadata
         from qqbot.models import Base  # noqa: F401
-        importlib.import_module("qqbot.models.image")
         importlib.import_module("qqbot.models.messages")
+        importlib.import_module("qqbot.models.tool_call")
 
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
@@ -203,6 +203,10 @@ async def create_group_tables(
         """))
 
         await conn.execute(text(f"""
+            CREATE INDEX IF NOT EXISTS idx_{messages_table}_msg_hash ON {messages_table}(msg_hash)
+        """))
+
+        await conn.execute(text(f"""
             CREATE INDEX IF NOT EXISTS idx_{messages_table}_is_recalled ON {messages_table}(is_recalled)
         """))
 
@@ -246,6 +250,7 @@ def _build_messages_table_sql(table_name: str) -> str:
         CREATE TABLE IF NOT EXISTS {table_name} (
             id SERIAL PRIMARY KEY,
             user_id BIGINT NOT NULL,
+            msg_hash VARCHAR(64) UNIQUE NOT NULL,
             onebot_message_id VARCHAR(255),
             raw_message TEXT,
             formatted_message TEXT,

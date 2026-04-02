@@ -14,6 +14,7 @@ from qqbot.core.time import china_now, normalize_china_time
 from qqbot.services.display_name_resolver import DisplayNameResolver
 from qqbot.services.group_message import GroupMessageService
 from qqbot.services.image_parsing import ImageParsingService
+from qqbot.services.message_format_fallback import build_parse_failure_text
 
 logger = get_logger(__name__)
 
@@ -29,10 +30,15 @@ class MessageConversionResult:
 class MessageConverter:
     """Convert OneBot message segments to System-XML format."""
 
+    @staticmethod
+    def build_parse_failure_text(reason: str) -> str:
+        return build_parse_failure_text(reason)
+
     async def convert_event(
         self,
         session: AsyncSession,
         event: GroupMessageEvent,
+        msg_hash: str,
     ) -> MessageConversionResult:
         parts: list[str] = []
         message_type = "text"
@@ -53,6 +59,7 @@ class MessageConverter:
                     session=session,
                     event=event,
                     segment=segment,
+                    msg_hash=msg_hash,
                     message_type=message_type,
                     name_cache=name_cache,
                 )
@@ -65,30 +72,18 @@ class MessageConverter:
                         "error": str(exc),
                     },
                 )
-                part = self._wrap_unknown(
-                    "segment",
-                    getattr(event, "raw_message", "") or "",
-                )
+                part = self._wrap_unknown("segment_parse_failed")
 
             if part:
                 parts.append(part)
 
         if not parts:
-            raw_message = ""
-            if original_message is not None:
-                raw_message = str(original_message)
-            if not raw_message:
-                raw_message = getattr(event, "raw_message", "") or ""
-            if not raw_message:
-                raw_message = str(message_source)
-            if raw_message:
-                parts.append(self._wrap_unknown("raw", raw_message))
-            else:
-                parts.append(self._wrap("System-PureText", "【空消息】"))
+            parts.append(self._wrap_unknown("message_parse_failed"))
 
         user_id = getattr(event, "user_id", None)
         content = self._wrap_message(
             content="".join(parts),
+            msg_hash=msg_hash,
             user_id=user_id,
             display_name=sender_display_name,
             timestamp=message_time,
@@ -98,6 +93,7 @@ class MessageConverter:
     def wrap_plain_text(
         self,
         text: str,
+        msg_hash: str,
         user_id: int | None = None,
         display_name: str | None = None,
         timestamp: datetime | int | float | None = None,
@@ -115,6 +111,7 @@ class MessageConverter:
         content = self._wrap("System-PureText", text)
         return self._wrap_message(
             content=content,
+            msg_hash=msg_hash,
             user_id=user_id,
             display_name=display_name,
             timestamp=self._format_message_time(timestamp),
@@ -125,6 +122,7 @@ class MessageConverter:
         session: AsyncSession,
         event: GroupMessageEvent,
         segment: MessageSegment,
+        msg_hash: str,
         message_type: str,
         name_cache: dict[int, str],
     ) -> tuple[str, str]:
@@ -207,17 +205,14 @@ class MessageConverter:
             parse_result = await image_service.parse_segment_sync(
                 group_id=event.group_id,
                 segment=segment,
+                msg_hash=msg_hash,
             )
             return (
                 self._wrap(
                     "System-Image",
-                    parse_result.description,
+                    "图片",
                     {
                         "file_hash": parse_result.file_hash,
-                        "url": parse_result.url,
-                        "local_path": parse_result.local_path,
-                        "desc": parse_result.description,
-                        "parse_status": "ok" if parse_result.success else "failed",
                     },
                 ),
                 message_type,
@@ -226,7 +221,7 @@ class MessageConverter:
         if seg_type == "video":
             message_type = self._update_message_type(message_type, "vid")
             return (
-                self._wrap("System-Other", str(segment), {"type": "video"}),
+                self._wrap("System-Other", "视频消息", {"type": "video"}),
                 message_type,
             )
 
@@ -237,15 +232,13 @@ class MessageConverter:
             )
 
         if seg_type in {"xml", "json"}:
-            raw = seg_data.get("data") or getattr(event, "raw_message", "") or ""
-            raw = raw or str(segment)
             return (
-                self._wrap("System-Unknown", raw, {"unknown_type": seg_type}),
+                self._wrap_unknown(f"{seg_type}_parse_failed", "结构化消息不可解析"),
                 message_type,
             )
 
         return (
-            self._wrap("System-Other", str(segment), {"type": seg_type}),
+            self._wrap("System-Other", "未知消息段", {"type": seg_type}),
             message_type,
         )
 
@@ -258,10 +251,14 @@ class MessageConverter:
     ) -> str:
         reply_event = getattr(event, "reply", None)
         if reply_event is not None:
-            for attr_name in ("message", "raw_message", "message_text"):
+            for attr_name in ("formatted_message", "message"):
                 reply_value = getattr(reply_event, attr_name, None)
                 if reply_value:
-                    return str(reply_value)
+                    if isinstance(reply_value, str) and reply_value.strip().startswith(
+                        "<System-Message"
+                    ):
+                        return reply_value.strip()
+                    break
 
         normalized_reply_id: str | None = None
         if reply_id is not None:
@@ -276,9 +273,10 @@ class MessageConverter:
                 )
                 if reply_message:
                     return (
-                        reply_message.get("raw_message")
-                        or reply_message.get("formatted_message")
-                        or f"引用消息#{normalized_reply_id}"
+                        reply_message.get("formatted_message")
+                        or self.build_parse_failure_text(
+                            f"引用消息不可解析#{normalized_reply_id}"
+                        )
                     )
             except Exception as exc:
                 logger.debug(
@@ -290,7 +288,9 @@ class MessageConverter:
                     },
                 )
 
-        return f"引用消息#{reply_id}" if reply_id else "引用消息"
+        if reply_id:
+            return self.build_parse_failure_text(f"引用消息不可解析#{reply_id}")
+        return self.build_parse_failure_text("引用消息不可解析")
 
     def _extract_file_meta(self, data: dict) -> dict[str, str]:
         file_name = data.get("file") or data.get("name") or ""
@@ -327,11 +327,13 @@ class MessageConverter:
     def _wrap_message(
         self,
         content: str,
+        msg_hash: str,
         user_id: int | None = None,
         display_name: str | None = None,
         timestamp: str | None = None,
     ) -> str:
         attrs = {
+            "msg_hash": msg_hash,
             "user_id": user_id,
             "display_name": display_name,
             "timestamp": timestamp,
@@ -355,8 +357,8 @@ class MessageConverter:
         safe_content = self._escape_text(content) if escape_content else content
         return f"<{tag}{attr_text}>{safe_content}</{tag}>"
 
-    def _wrap_unknown(self, unknown_type: str, raw: str) -> str:
-        content = raw or "无"
+    def _wrap_unknown(self, unknown_type: str, reason: str | None = None) -> str:
+        content = self.build_parse_failure_text(reason or unknown_type)
         return self._wrap("System-Unknown", content, {"unknown_type": unknown_type})
 
     def _attr_value(self, value: str | int | None) -> str:

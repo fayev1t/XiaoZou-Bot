@@ -90,13 +90,11 @@ class BlockJudgeParsingTests(unittest.TestCase):
                     "instruction": " 先回小林追问的截图问题，再补一句吐槽 ",
                     "target_user_id": "1001",
                     "should_mention": "1",
-                    "related_image_hashes": [
-                        " hash-1 ",
-                        "",
-                        None,
-                        "hash-2",
-                        "hash-1",
-                        123,
+                    "tool_calls": [
+                        {"tool": "web_search", "input": " hash-1 ", "msg_hash": " msg-1 "},
+                        {"tool": "", "input": "xx", "msg_hash": "msg-1"},
+                        {"tool": "web_crawl", "input": "https://a", "msg_hash": "msg-2"},
+                        {"tool": "web_search", "input": "hash-1", "msg_hash": "msg-1"},
                     ],
                 },
                 {
@@ -104,7 +102,9 @@ class BlockJudgeParsingTests(unittest.TestCase):
                     "instruction": "这个闲聊话题群友已经接住了",
                     "target_user_id": "",
                     "should_mention": "false",
-                    "related_image_hashes": " hash-3 ",
+                    "tool_calls": [
+                        {"tool": "web_crawl", "input": " https://b ", "msg_hash": " msg-3 "},
+                    ],
                 },
             ],
             "explanation": None,
@@ -126,14 +126,23 @@ class BlockJudgeParsingTests(unittest.TestCase):
         self.assertEqual(first_reply.instruction, "先回小林追问的截图问题，再补一句吐槽")
         self.assertEqual(first_reply.target_user_id, 1001)
         self.assertTrue(first_reply.should_mention)
-        self.assertEqual(first_reply.related_image_hashes, ["hash-1", "hash-2"])
+        self.assertEqual(
+            [(item.tool, item.input, item.msg_hash) for item in first_reply.tool_calls],
+            [
+                ("web_search", "hash-1", "msg-1"),
+                ("web_crawl", "https://a", "msg-2"),
+            ],
+        )
 
         second_reply = result.replies[1]
         self.assertFalse(second_reply.should_reply)
         self.assertEqual(second_reply.instruction, "这个闲聊话题群友已经接住了")
         self.assertIsNone(second_reply.target_user_id)
         self.assertFalse(second_reply.should_mention)
-        self.assertEqual(second_reply.related_image_hashes, ["hash-3"])
+        self.assertEqual(
+            [(item.tool, item.input, item.msg_hash) for item in second_reply.tool_calls],
+            [("web_crawl", "https://b", "msg-3")],
+        )
 
     def test_replies_order_is_preserved_and_reply_count_comes_from_sendable_topics(self) -> None:
         payload = {
@@ -175,6 +184,9 @@ class BlockJudgeContextTests(unittest.TestCase):
         context_text = block_judge.build_layer3_context(
             context="历史上下文",
             current_block_text="<System-Message user_id=\"1\">当前对话块</System-Message>",
+            tool_call_xmls=[
+                '<System-ToolCall call_hash="call-1" tool="web_search" input="问题">结果</System-ToolCall>'
+            ],
         )
 
         self.assertIn("【历史上下文】\n历史上下文", context_text)
@@ -182,6 +194,8 @@ class BlockJudgeContextTests(unittest.TestCase):
             "【当前对话块】\n<System-Message user_id=\"1\">当前对话块</System-Message>",
             context_text,
         )
+        self.assertIn("【当前工具调用结果】", context_text)
+        self.assertIn("System-ToolCall", context_text)
         self.assertNotIn("【当前对话块摘要】", context_text)
         self.assertNotIn("【本轮回复任务】", context_text)
 

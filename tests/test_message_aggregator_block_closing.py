@@ -72,17 +72,24 @@ class MessageAggregatorBlockClosingTests(unittest.IsolatedAsyncioTestCase):
         self.aggregator = self.module.MessageAggregator()
         self.aggregator._pre_close_quiet_seconds = 0.05
         self.group_id = 10001
+        self._next_persisted_message_id = 1
 
     async def asyncTearDown(self) -> None:
         await self.aggregator.shutdown()
 
     async def _add_message(self, text: str, user_id: int = 1) -> None:
+        persisted_message_id = self._next_persisted_message_id
+        self._next_persisted_message_id += 1
         await self.aggregator.begin_message_persist(self.group_id)
         await self.aggregator.finish_message_persist_and_add_message(
             group_id=self.group_id,
             user_id=user_id,
+            msg_hash=f"msg-{persisted_message_id}",
+            raw_message=text,
             formatted_message=text,
+            format_task=None,
             event=FakeEvent(),
+            persisted_message_id=persisted_message_id,
         )
 
     async def _wait_for(self, predicate: Any, timeout: float = 0.5) -> None:
@@ -111,7 +118,7 @@ class MessageAggregatorBlockClosingTests(unittest.IsolatedAsyncioTestCase):
                     expected_version,
                     expected_judge_request_version,
                     id(block),
-                    [msg.formatted_message for msg in block.messages],
+                    [msg.raw_message for msg in block.messages],
                 )
             )
             await asyncio.sleep(0)
@@ -135,6 +142,69 @@ class MessageAggregatorBlockClosingTests(unittest.IsolatedAsyncioTestCase):
 
         self.aggregator._judge_wait_time = fake_judge
         return judge_calls
+
+    async def test_layer1_wait_judge_uses_raw_message_not_formatted_placeholder(self) -> None:
+        captured_prompts: list[str] = []
+        captured_logs: list[str] = []
+
+        llm_module = types.ModuleType("qqbot.core.llm")
+
+        class FakeLLM:
+            async def ainvoke(self, messages: list[object]) -> object:
+                captured_prompts.append(messages[0].content)
+                return types.SimpleNamespace(
+                    content='{"should_wait": false, "reason": "raw ok"}'
+                )
+
+        async def fake_create_llm(*args: object, **kwargs: object) -> FakeLLM:
+            _ = args, kwargs
+            return FakeLLM()
+
+        setattr(llm_module, "create_llm", fake_create_llm)
+        sys.modules["qqbot.core.llm"] = llm_module
+
+        silence_module = types.ModuleType("qqbot.services.silence_mode")
+        setattr(silence_module, "is_silent", lambda group_id: False)
+        sys.modules["qqbot.services.silence_mode"] = silence_module
+
+        messages_module = types.ModuleType("langchain_core.messages")
+
+        class FakeHumanMessage:
+            def __init__(self, content: str) -> None:
+                self.content = content
+
+        setattr(messages_module, "HumanMessage", FakeHumanMessage)
+        sys.modules["langchain_core.messages"] = messages_module
+
+        original_log_ai_input = self.module.log_ai_input
+        self.module.log_ai_input = lambda layer, group_id, prompt: captured_logs.append(prompt)
+        try:
+            block = self.module.ResponseBlock(group_id=self.group_id)
+            self.aggregator._blocks[self.group_id] = block
+            block.add_message(
+                self.module.PendingMessage(
+                    user_id=1,
+                    msg_hash="msg-1",
+                    raw_message="原始CQ文本",
+                    formatted_message="<System-Message>不该给Layer1</System-Message>",
+                    event=FakeEvent(),
+                )
+            )
+            await self.aggregator._judge_wait_time(
+                self.group_id,
+                block,
+                expected_version=0,
+                expected_judge_request_version=0,
+            )
+        finally:
+            self.module.log_ai_input = original_log_ai_input
+
+        self.assertEqual(len(captured_prompts), 1)
+        self.assertIn("原始CQ文本", captured_prompts[0])
+        self.assertNotIn("<System-Message>", captured_prompts[0])
+        self.assertEqual(len(captured_logs), 1)
+        self.assertIn("原始CQ文本", captured_logs[0])
+        self.assertNotIn("<System-Message>", captured_logs[0])
 
     async def test_new_message_during_pre_close_quiet_joins_same_block_and_reruns_layer1(self) -> None:
         judge_calls = self._install_fake_judge(wait_seconds=0.0)
@@ -313,6 +383,13 @@ class MessageAggregatorBlockClosingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(judge_calls[1][2], ["旧判断", "新判断"])
         self.assertEqual(callback_snapshots, [["旧判断", "新判断"]])
         self.assertIn(judge_calls[0][1], discarded_versions)
+
+    async def test_earliest_persisted_message_id_tracks_first_message_in_block(self) -> None:
+        await self._add_message("第一条", user_id=1)
+        await self._add_message("第二条", user_id=2)
+
+        block = self.aggregator._blocks[self.group_id]
+        self.assertEqual(block.get_earliest_persisted_message_id(), 1)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,12 @@ dist/
 .coverage
 htmlcov/
 
+# Browser automation artifacts
+.playwright/
+ms-playwright/
+playwright-report/
+test-results/
+
 
 
 # Editor and OS files
@@ -33,10 +39,14 @@ htmlcov/
 # Runtime data
 logs/
 runtime_data/
+docker/postgres/postgres-data/
 docker/postgres/*
 !docker/postgres/compose.yml
+docker/napcat/QQ/
 docker/napcat/*
 !docker/napcat/compose.yml
+docker/searxng/*
+!docker/searxng/compose.yml
 
 # others
 开发文档/

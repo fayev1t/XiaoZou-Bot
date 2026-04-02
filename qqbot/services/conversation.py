@@ -14,7 +14,6 @@ from qqbot.services.user import UserService
 
 logger = get_logger(__name__)
 _SYSTEM_XML_TAG_RE = re.compile(r"</?System-[^>]*>")
-OpenAIImageBlock = dict[str, object]
 
 
 class ConversationService:
@@ -44,7 +43,6 @@ class ConversationService:
         target_user_id: int | None = None,
         should_mention: bool = False,
         group_id: int | None = None,
-        image_inputs: list[OpenAIImageBlock] | None = None,
     ) -> str:
         """Generate a response from Layer 2 instruction and context.
 
@@ -70,6 +68,7 @@ class ConversationService:
 
             normalized_context = context.strip() or "（暂无对话上下文）"
             normalized_instruction = instruction.strip() or "请自然承接当前话题。"
+            tool_call_count = normalized_context.count("<System-ToolCall")
 
             response_prompt = f"""【对话背景】
 {normalized_context}
@@ -85,39 +84,20 @@ class ConversationService:
                     "group_id": group_id,
                     "target_user_id": target_user_id,
                     "should_mention": should_mention,
-                    "image_count": len(image_inputs) if image_inputs else 0,
+                    "tool_call_count": tool_call_count,
                 },
             )
 
-            # 记录 AI 输入（只记录指导信息，不记录历史上下文和提示词）
-            log_input = f"【指导】{normalized_instruction}"
+            log_input = (
+                f"【指导】{normalized_instruction}\n"
+                f"【上下文统计】长度={len(normalized_context)}，工具结果数={tool_call_count}"
+            )
             log_ai_input("Layer3", group_id or 0, log_input)
 
-            if image_inputs:
-                try:
-                    generated_text = await self._invoke_response_llm(
-                        llm,
-                        response_prompt,
-                        image_inputs=image_inputs,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "[conversation] multimodal response failed, retry text-only",
-                        extra={
-                            "group_id": group_id,
-                            "image_count": len(image_inputs),
-                            "error": str(exc),
-                        },
-                    )
-                    generated_text = await self._invoke_response_llm(
-                        llm,
-                        response_prompt,
-                    )
-            else:
-                generated_text = await self._invoke_response_llm(
-                    llm,
-                    response_prompt,
-                )
+            generated_text = await self._invoke_response_llm(
+                llm,
+                response_prompt,
+            )
 
             # 记录 AI 输出
             log_ai_output("Layer3", group_id or 0, generated_text)
@@ -191,30 +171,18 @@ class ConversationService:
         self,
         llm: Any,
         response_prompt: str,
-        image_inputs: list[OpenAIImageBlock] | None = None,
     ) -> str:
-        messages = self._build_messages(
-            response_prompt=response_prompt,
-            image_inputs=image_inputs,
-        )
+        messages = self._build_messages(response_prompt=response_prompt)
         response = await llm.ainvoke(messages)
         return self._extract_text_response(response.content)
 
     def _build_messages(
         self,
         response_prompt: str,
-        image_inputs: list[OpenAIImageBlock] | None = None,
     ) -> list[SystemMessage | HumanMessage]:
-        human_content: str | list[dict[str, object]] = response_prompt
-        if image_inputs:
-            human_content = [
-                {"type": "text", "text": response_prompt},
-                *image_inputs,
-            ]
-
         return [
             SystemMessage(content=self.prompt_manager.response_prompt),
-            HumanMessage(content=human_content),
+            HumanMessage(content=response_prompt),
         ]
 
     def _extract_text_response(self, content: object) -> str:

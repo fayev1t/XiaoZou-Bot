@@ -38,6 +38,7 @@ class GroupMessageService:
         self,
         group_id: int,
         user_id: int,
+        msg_hash: str,
         onebot_message_id: str | None,
         raw_message: str | None,
         formatted_message: str | None,
@@ -49,6 +50,7 @@ class GroupMessageService:
 
         params = {
             "user_id": user_id,
+            "msg_hash": msg_hash,
             "onebot_message_id": onebot_message_id,
             "raw_message": raw_message,
             "formatted_message": formatted_message,
@@ -58,9 +60,10 @@ class GroupMessageService:
 
         sql = text(f"""
             INSERT INTO {table_name}
-            (user_id, onebot_message_id, raw_message, formatted_message, "timestamp", is_recalled)
+            (user_id, msg_hash, onebot_message_id, raw_message, formatted_message, "timestamp", is_recalled)
             VALUES (
                 :user_id,
+                :msg_hash,
                 :onebot_message_id,
                 :raw_message,
                 :formatted_message,
@@ -91,6 +94,32 @@ class GroupMessageService:
             return dict(row._mapping)  # type: ignore
 
         return None
+
+    async def update_formatted_message(
+        self,
+        group_id: int,
+        local_message_id: int,
+        formatted_message: str,
+    ) -> None:
+        table_name = await self._get_table_name(group_id)
+
+        sql = text(f"""
+            UPDATE {table_name}
+            SET formatted_message = :formatted_message
+            WHERE id = :local_message_id
+        """)
+
+        result = await self.session.execute(
+            sql,
+            {
+                "local_message_id": local_message_id,
+                "formatted_message": formatted_message,
+            },
+        )
+        if not result.rowcount:
+            raise ValueError(
+                f"Message {local_message_id} not found in group {group_id}"
+            )
 
     async def get_message_by_onebot_message_id(
         self,
@@ -166,18 +195,27 @@ class GroupMessageService:
         self,
         group_id: int,
         limit: int = 10,
+        before_message_id: int | None = None,
     ) -> list[dict]:
         """Get recent messages in chronological order (for context)."""
         table_name = await self._get_table_name(group_id)
 
+        where_clauses = ["is_recalled = false"]
+        params: dict[str, int] = {"limit": limit}
+        if before_message_id is not None:
+            where_clauses.append("id < :before_message_id")
+            params["before_message_id"] = before_message_id
+
+        where_sql = " AND ".join(where_clauses)
+
         sql = text(f"""
             SELECT * FROM {table_name}
-            WHERE is_recalled = false
+            WHERE {where_sql}
             ORDER BY "timestamp" DESC
             LIMIT :limit
         """)
 
-        result = await self.session.execute(sql, {"limit": limit})
+        result = await self.session.execute(sql, params)
         rows = result.fetchall()
 
         messages = [dict(row._mapping) for row in rows]  # type: ignore

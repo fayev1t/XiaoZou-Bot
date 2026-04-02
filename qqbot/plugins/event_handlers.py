@@ -8,6 +8,8 @@ This plugin listens to QQ Bot events and performs database operations:
 - Group name & member nickname sync: Every 30 minutes (background task in sync_nicknames.py)
 """
 
+from __future__ import annotations
+
 from nonebot import on_notice, on_message
 from nonebot.adapters import Event
 from nonebot.adapters.onebot.v11 import (
@@ -70,8 +72,7 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     async with AsyncSessionLocal() as session:
         try:
             record, saved_id = await message_pipeline.process_event(session, event)
-
-            # Commit all operations together so group_chat handler sees the message.
+            raw_message = record.raw_message
             await session.commit()
 
             logger.info(
@@ -80,8 +81,9 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
                     "group_id": group_id,
                     "user_id": user_id,
                     "message_id": saved_id,
-                    "onebot_message_id": getattr(event, "message_id", None),
-                    "content_length": len(record.formatted_message),
+                    "onebot_message_id": record.onebot_message_id,
+                    "raw_length": len(raw_message),
+                    "formatted_length": len(record.formatted_message or ""),
                     "message_type": record.message_type,
                 },
             )
@@ -101,19 +103,23 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
                     )
                 if not is_bot_mentioned:
                     is_bot_mentioned = any(
-                        nickname in record.raw_message
+                        nickname in raw_message
                         for nickname in BOT_NICKNAMES
                     )
 
-                if not record.raw_message.strip() and not is_bot_mentioned:
+                if not raw_message.strip() and not is_bot_mentioned:
                     await message_aggregator.complete_message_persist(group_id)
                     return
 
                 await message_aggregator.finish_message_persist_and_add_message(
                     group_id=group_id,
                     user_id=user_id,
+                    raw_message=raw_message,
                     formatted_message=record.formatted_message,
+                    format_task=None,
                     event=event,
+                    msg_hash=record.msg_hash,
+                    persisted_message_id=saved_id,
                     is_bot_mentioned=is_bot_mentioned,
                 )
             except Exception as exc:

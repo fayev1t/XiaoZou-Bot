@@ -31,6 +31,8 @@ class EnvCentralizationContractTests(unittest.TestCase):
             "POSTGRES_PASSWORD=your_postgres_password",
             "POSTGRES_DB=mydb",
             "POSTGRES_HOST_PORT=7504",
+            "SEARXNG_BASE_URL=http://127.0.0.1:7505",
+            "SEARXNG_SECRET=change-this-searxng-secret",
         ):
             with self.subTest(key=key):
                 self.assertIn(key, env_example)
@@ -46,10 +48,13 @@ class EnvCentralizationContractTests(unittest.TestCase):
             "      DATABASE_URL: postgresql+asyncpg://admin:mypassword@postgres:5432/mydb",
             compose_text,
         )
+        self.assertIn("      SEARXNG_BASE_URL: http://searxng:8080", compose_text)
         self.assertIn('      - "7500:7500"', compose_text)
         self.assertIn("      - ../logs:/app/logs", compose_text)
         self.assertIn("      - ../runtime_data:/app/runtime_data", compose_text)
         self.assertIn("    name: qqbot-postgres-network", compose_text)
+        self.assertIn("      - searxng-network", compose_text)
+        self.assertIn("    name: qqbot-searxng-network", compose_text)
 
     def test_napcat_compose_keeps_current_hardcoded_ports_and_permissions(self) -> None:
         compose_text = self.read_text("docker/napcat/compose.yml")
@@ -69,11 +74,14 @@ class EnvCentralizationContractTests(unittest.TestCase):
         compose_text = self.read_text("docker/postgres/compose.yml")
 
         self.assertNotIn("env_file:", compose_text)
+        self.assertIn("image: postgres:18-alpine", compose_text)
+        self.assertIn("container_name: postgres18_qqbot", compose_text)
         self.assertIn("POSTGRES_USER: admin", compose_text)
         self.assertIn("POSTGRES_PASSWORD: mypassword", compose_text)
         self.assertIn("POSTGRES_DB: mydb", compose_text)
         self.assertIn('    user: "1001:1001"', compose_text)
         self.assertIn('"7504:5432"', compose_text)
+        self.assertIn("./postgres-data:/var/lib/postgresql", compose_text)
         self.assertIn(
             'test: ["CMD-SHELL", "pg_isready -U admin -d mydb"]',
             compose_text,
@@ -83,6 +91,23 @@ class EnvCentralizationContractTests(unittest.TestCase):
         self.assertNotIn("${POSTGRES_PASSWORD}", compose_text)
         self.assertNotIn("${POSTGRES_DB}", compose_text)
         self.assertNotIn("${POSTGRES_HOST_PORT}", compose_text)
+
+    def test_searxng_compose_keeps_current_hardcoded_contract(self) -> None:
+        compose_text = self.read_text("docker/searxng/compose.yml")
+
+        self.assertNotIn("env_file:", compose_text)
+        self.assertIn("image: searxng/searxng:latest", compose_text)
+        self.assertIn("container_name: searxng_qqbot", compose_text)
+        self.assertIn("restart: unless-stopped", compose_text)
+        self.assertIn("SEARXNG_BASE_URL: http://127.0.0.1:7505", compose_text)
+        self.assertIn("SEARXNG_SECRET: ${SEARXNG_SECRET:-change-this-searxng-secret}", compose_text)
+        self.assertIn('SEARXNG_LIMITER: "false"', compose_text)
+        self.assertIn('SEARXNG_PUBLIC_INSTANCE: "false"', compose_text)
+        self.assertIn('"7505:8080"', compose_text)
+        self.assertIn("searxng-config:/etc/searxng", compose_text)
+        self.assertIn("searxng-cache:/var/cache/searxng", compose_text)
+        self.assertIn("    name: qqbot-searxng-network", compose_text)
+        self.assertNotIn("${SEARXNG_BASE_URL}", compose_text)
 
 
 if __name__ == "__main__":
