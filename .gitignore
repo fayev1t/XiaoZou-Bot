@@ -45,6 +45,9 @@ docker/napcat/*
 !docker/napcat/compose.yml
 docker/searxng/*
 !docker/searxng/compose.yml
+!docker/searxng/config/
+docker/searxng/config/*
+!docker/searxng/config/settings.yml
 docker/crawl4ai/*
 !docker/crawl4ai/compose.yml
 

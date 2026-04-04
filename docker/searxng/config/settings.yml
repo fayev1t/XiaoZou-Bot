@@ -1,0 +1,13 @@
+use_default_settings:
+  engines:
+    keep_only:
+      - bing
+
+server:
+  secret_key: "change-this-searxng-secret"
+  limiter: false
+  public_instance: false
+
+engines:
+  - name: bing
+    disabled: false
