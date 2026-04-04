@@ -47,7 +47,7 @@ async def on_startup() -> None:
         asyncio.create_task(_run_initial_sync_when_ready())
 
     except Exception as e:
-        logger.error(f"[startup] ❌ Initialization failed: {e}", exc_info=True)
+        logger.exception("[startup] ❌ Initialization failed: {}", e)
         raise
 
 
@@ -101,9 +101,10 @@ async def _run_sync_nicknames_job() -> None:
         try:
             await sync_all_group_nicknames(bot)
         except Exception as e:
-            logger.error(
-                f"[startup] Failed nickname sync for bot {getattr(bot, 'self_id', None)}: {e}",
-                exc_info=True,
+            logger.exception(
+                "[startup] Failed nickname sync for bot {}: {}",
+                getattr(bot, "self_id", None),
+                e,
             )
 
     logger.info(
@@ -125,4 +126,4 @@ async def on_shutdown() -> None:
         await close_db()
         logger.info("[shutdown] ✅ Cleanup complete")
     except Exception as e:
-        logger.error(f"[shutdown] ❌ Error during cleanup: {e}", exc_info=True)
+        logger.exception("[shutdown] ❌ Error during cleanup: {}", e)

@@ -372,12 +372,13 @@ class BlockJudger:
 
             if result.replies:
                 logger.info(
-                    f"[block_judge] 回复计划详情 (共{len(result.replies)}个主题):",
+                    "[block_judge] 回复计划详情 (共{}个主题):",
+                    len(result.replies),
                     extra={"group_id": group_id},
                 )
                 for idx, reply_plan in enumerate(result.replies, 1):
                     logger.info(
-                        "[block_judge] 【主题 %s】should_reply=%s, @用户=%s, 需要@=%s, 工具调用数=%s",
+                        "[block_judge] 【主题 {}】should_reply={}, @用户={}, 需要@={}, 工具调用数={}",
                         idx,
                         reply_plan.should_reply,
                         reply_plan.target_user_id,
@@ -393,12 +394,13 @@ class BlockJudger:
                         },
                     )
                     logger.info(
-                        f"[block_judge]   指导词: {reply_plan.instruction}",
+                        "[block_judge]   指导词: {}",
+                        reply_plan.instruction,
                         extra={"group_id": group_id},
                     )
                     if reply_plan.tool_calls:
                         logger.info(
-                            "[block_judge]   工具调用: %s",
+                            "[block_judge]   工具调用: {}",
                             ", ".join(
                                 f"{tool_call.tool}:{tool_call.input}@{tool_call.msg_hash}"
                                 for tool_call in reply_plan.tool_calls
@@ -409,7 +411,7 @@ class BlockJudger:
             return result
 
         except Exception as exc:
-            logger.error(f"[block_judge] 判断出错: {exc}", exc_info=True)
+            logger.exception("[block_judge] 判断出错: {}", exc)
             return BlockJudgeResult.no_reply(f"判断出错: {exc}")
 
 

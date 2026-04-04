@@ -70,8 +70,8 @@ def _track_detached_format_task(task: asyncio.Task[MessageRecord]) -> None:
             completed_task.result()
         except asyncio.CancelledError:
             return
-        except Exception as exc:
-            logger.error("Detached format task failed: %s", exc)
+        except Exception:
+            logger.exception("Detached format task failed")
 
     task.add_done_callback(_cleanup)
 
@@ -191,13 +191,12 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
                     persisted_message_id=saved_id,
                     is_bot_mentioned=is_bot_mentioned,
                 )
-            except Exception as exc:
+            except Exception:
                 _track_detached_format_task(format_task)
                 if track_persist:
                     await message_aggregator.fail_message_persist(group_id)
-                logger.error(
-                    "Failed to add message to aggregator: %s",
-                    exc,
+                logger.exception(
+                    "Failed to add message to aggregator",
                     extra={"group_id": group_id, "user_id": user_id},
                 )
 
@@ -205,13 +204,14 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
             await session.rollback()
             if track_persist:
                 await message_aggregator.fail_message_persist(group_id)
-            logger.warning(f"Message event error: {e}", extra={"group_id": group_id})
+            logger.warning("Message event error: {}", e, extra={"group_id": group_id})
         except Exception as e:
             await session.rollback()
             if track_persist:
                 await message_aggregator.fail_message_persist(group_id)
             logger.error(
-                f"Failed to save message: {e}",
+                "Failed to save message: {}",
+                e,
                 extra={"group_id": group_id, "user_id": user_id},
             )
 
@@ -257,11 +257,12 @@ async def handle_group_increase(bot: Bot, event: GroupIncreaseNoticeEvent) -> No
 
         except ValueError as e:
             await session.rollback()
-            logger.warning(f"Join event error: {e}", extra={"group_id": group_id})
+            logger.warning("Join event error: {}", e, extra={"group_id": group_id})
         except Exception as e:
             await session.rollback()
             logger.error(
-                f"Failed to add member: {e}",
+                "Failed to add member: {}",
+                e,
                 extra={"group_id": group_id, "user_id": user_id},
             )
 
@@ -304,11 +305,12 @@ async def handle_group_decrease(bot: Bot, event: GroupDecreaseNoticeEvent) -> No
 
         except ValueError as e:
             await session.rollback()
-            logger.warning(f"Leave event error: {e}", extra={"group_id": group_id})
+            logger.warning("Leave event error: {}", e, extra={"group_id": group_id})
         except Exception as e:
             await session.rollback()
             logger.error(
-                f"Failed to mark member inactive: {e}",
+                "Failed to mark member inactive: {}",
+                e,
                 extra={"group_id": group_id, "user_id": user_id},
             )
 
@@ -362,6 +364,7 @@ async def handle_group_recall(bot: Bot, event: GroupRecallNoticeEvent) -> None:
         except Exception as e:
             await session.rollback()
             logger.error(
-                f"Failed to mark recalled message: {e}",
+                "Failed to mark recalled message: {}",
+                e,
                 extra={"group_id": group_id, "message_id": onebot_message_id},
             )

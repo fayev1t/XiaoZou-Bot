@@ -88,7 +88,9 @@ async def sync_all_group_nicknames(bot: Bot) -> None:
                                 new_group_name,
                             )
                             logger.info(
-                                f"[sync_nicknames] 📝 Group name updated: {group_name} → {new_group_name}",
+                                "[sync_nicknames] 📝 Group name updated: {} → {}",
+                                group_name,
+                                new_group_name,
                                 extra={"group_id": group_id},
                             )
 
@@ -124,4 +126,4 @@ async def sync_all_group_nicknames(bot: Bot) -> None:
             logger.info("✨ All groups synced successfully!")
 
     except Exception as e:
-        logger.error(f"❌ Fatal error: {e}", exc_info=True)
+        logger.exception("❌ Fatal error: {}", e)

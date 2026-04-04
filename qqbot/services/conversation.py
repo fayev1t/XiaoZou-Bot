@@ -149,7 +149,7 @@ class ConversationService:
             return generated_text
 
         except Exception as e:
-            logger.error(f"[ConversationService] 【第三层AI】调用出错: {e}", exc_info=True)
+            logger.exception("[ConversationService] 【第三层AI】调用出错: {}", e)
             # Return fallback response on error
             return "喵~让我想想..."
 

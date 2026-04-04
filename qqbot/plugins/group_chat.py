@@ -333,7 +333,10 @@ async def _process_response_block(group_id: int, block: ResponseBlock) -> None:
         ]
         if not planned_replies:
             logger.info(
-                f"[group_chat] ❌ 不需要实际回复 | 群={group_id}, 主题数={judge_result.topic_count}, 原因={judge_result.explanation}",
+                "[group_chat] ❌ 不需要实际回复 | 群={}, 主题数={}, 原因={}",
+                group_id,
+                judge_result.topic_count,
+                judge_result.explanation,
                 extra={"group_id": group_id},
             )
             return
@@ -389,7 +392,11 @@ async def _process_response_block(group_id: int, block: ResponseBlock) -> None:
 
             send_result = await bot.send_group_msg(group_id=group_id, message=response)
             logger.info(
-                f"[group_chat] 📤 第 {index} 条回复已发送 | 群={group_id}, 长度={len(response)}, 内容={response[:50]}",
+                "[group_chat] 📤 第 {} 条回复已发送 | 群={}, 长度={}, 内容={}",
+                index,
+                group_id,
+                len(response),
+                response[:50],
                 extra={
                     "group_id": group_id,
                     "reply_index": index,
@@ -408,7 +415,8 @@ async def _process_response_block(group_id: int, block: ResponseBlock) -> None:
                     )
             except Exception as exc:
                 logger.warning(
-                    f"[group_chat] Failed to save bot response: {exc}",
+                    "[group_chat] Failed to save bot response: {}",
+                    exc,
                     extra={"group_id": group_id},
                 )
 

@@ -31,7 +31,7 @@ async def init_scheduler() -> None:
 
             logger.info(f"[scheduler] ✅ Scheduler started. Running: {scheduler.running}")
         except Exception as e:
-            logger.error(f"[scheduler] ❌ Failed to start scheduler: {e}", exc_info=True)
+            logger.exception("[scheduler] ❌ Failed to start scheduler: {}", e)
             raise
     else:
         logger.debug("[scheduler] Scheduler already running")
@@ -45,5 +45,4 @@ async def shutdown_scheduler() -> None:
             scheduler.shutdown()
             logger.info("[scheduler] ✅ Scheduler shut down")
         except Exception as e:
-            logger.error(f"[scheduler] ❌ Failed to shutdown scheduler: {e}", exc_info=True)
-
+            logger.exception("[scheduler] ❌ Failed to shutdown scheduler: {}", e)

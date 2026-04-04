@@ -28,6 +28,10 @@ class _Crawl4AIServiceUnavailableError(RuntimeError):
     pass
 
 
+class _Crawl4AIPayloadUnusableError(RuntimeError):
+    pass
+
+
 class WebSearchService:
     async def search(self, query: str) -> str:
         logger.info(
@@ -156,7 +160,10 @@ class WebSearchService:
         fallback_urls: list[str] = []
         crawl_endpoint = f"{base_url.rstrip('/')}/crawl"
 
-        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            timeout=60.0,
+            follow_redirects=True,
+        ) as client:
             for index, url in enumerate(urls):
                 try:
                     document = await self._fetch_single_url_via_crawl4ai_http(
@@ -166,16 +173,17 @@ class WebSearchService:
                     )
                 except _Crawl4AIServiceUnavailableError as exc:
                     logger.warning(
-                        "[web_search] crawl4ai service unavailable, fallback to httpx",
-                        extra={"url": url, "error": str(exc)},
+                        "[web_search] crawl4ai service unavailable, fallback to httpx | url={} | error={}",
+                        url,
+                        str(exc),
                     )
                     fallback_urls.extend(urls[index:])
                     break
-
-                if document is None:
+                except _Crawl4AIPayloadUnusableError as exc:
                     logger.warning(
-                        "[web_search] crawl4ai payload unusable, fallback to httpx",
-                        extra={"url": url},
+                        "[web_search] crawl4ai payload unusable, fallback to httpx | url={} | detail={}",
+                        url,
+                        str(exc),
                     )
                     fallback_urls.append(url)
                     continue
@@ -184,12 +192,10 @@ class WebSearchService:
 
         documents = [documents_by_url[url] for url in urls if url in documents_by_url]
         logger.info(
-            "[web_search] fetch via crawl4ai http finished",
-            extra={
-                "url_count": len(urls),
-                "document_count": len(documents),
-                "fallback_count": len(fallback_urls),
-            },
+            "[web_search] fetch via crawl4ai http finished | url_count={} | document_count={} | fallback_count={}",
+            len(urls),
+            len(documents),
+            len(fallback_urls),
         )
         return documents, fallback_urls
 
@@ -199,37 +205,78 @@ class WebSearchService:
         client: httpx.AsyncClient,
         crawl_endpoint: str,
         url: str,
-    ) -> dict[str, str] | None:
-        request_payloads: tuple[dict[str, object], ...] = (
-            {"urls": [url]},
-            {"url": url},
-        )
+    ) -> dict[str, str]:
+        request_payload: dict[str, object] = {
+            "urls": [url],
+            "browser_config": {"type": "BrowserConfig", "params": {"headless": True}},
+            "crawler_config": {"type": "CrawlerRunConfig", "params": {"stream": False}},
+        }
 
-        for request_payload in request_payloads:
-            try:
-                response = await client.post(crawl_endpoint, json=request_payload)
-            except httpx.RequestError as exc:
-                raise _Crawl4AIServiceUnavailableError(str(exc)) from exc
+        try:
+            response = await client.post(crawl_endpoint, json=request_payload)
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            raise _Crawl4AIServiceUnavailableError(str(exc)) from exc
+        except httpx.RequestError as exc:
+            raise _Crawl4AIPayloadUnusableError(
+                f"request_error={type(exc).__name__}: {exc}",
+            ) from exc
 
-            if response.status_code >= 500:
-                raise _Crawl4AIServiceUnavailableError(
-                    f"status_code={response.status_code}",
-                )
-
-            if response.is_error:
-                continue
-
-            try:
-                payload = response.json()
-            except ValueError:
-                return None
-
-            return self._build_document_from_crawl4ai_payload(
-                payload=payload,
-                requested_url=url,
+        if response.status_code >= 500:
+            raise _Crawl4AIServiceUnavailableError(
+                self._describe_crawl4ai_http_response(response),
             )
 
-        return None
+        if response.is_error:
+            raise _Crawl4AIPayloadUnusableError(
+                self._describe_crawl4ai_http_response(response),
+            )
+
+        try:
+            payload = response.json()
+        except ValueError:
+            raise _Crawl4AIPayloadUnusableError(
+                self._describe_crawl4ai_http_response(response),
+            )
+
+        document = self._build_document_from_crawl4ai_payload(
+            payload=payload,
+            requested_url=url,
+        )
+        if document is None:
+            raise _Crawl4AIPayloadUnusableError(
+                self._describe_crawl4ai_payload(payload),
+            )
+
+        return document
+
+    @staticmethod
+    def _describe_crawl4ai_http_response(response: httpx.Response) -> str:
+        headers = getattr(response, "headers", {})
+        if isinstance(headers, dict):
+            content_type = str(headers.get("content-type", ""))
+        else:
+            content_type = str(getattr(headers, "get", lambda *_args, **_kwargs: "")("content-type", ""))
+
+        body_preview = _WHITESPACE_RE.sub(" ", getattr(response, "text", "")).strip()
+        if len(body_preview) > 240:
+            body_preview = f"{body_preview[:240]}..."
+
+        return (
+            f"status_code={response.status_code}, "
+            f"content_type={content_type or 'unknown'}, "
+            f"body_preview={body_preview or '<empty>'}"
+        )
+
+    @staticmethod
+    def _describe_crawl4ai_payload(payload: object) -> str:
+        if isinstance(payload, dict):
+            top_level_keys = ", ".join(sorted(str(key) for key in payload.keys())[:12])
+            return f"payload_type=dict, top_level_keys={top_level_keys or '<none>'}"
+
+        if isinstance(payload, list):
+            return f"payload_type=list, item_count={len(payload)}"
+
+        return f"payload_type={type(payload).__name__}"
 
     def _build_document_from_crawl4ai_payload(
         self,
@@ -356,8 +403,9 @@ class WebSearchService:
                     response.raise_for_status()
                 except Exception as exc:
                     logger.warning(
-                        "[web_search] httpx fetch failed",
-                        extra={"url": url, "error": str(exc)},
+                        "[web_search] httpx fetch failed | url={} | error={}",
+                        url,
+                        str(exc),
                     )
                     continue
                 documents.append(
@@ -368,8 +416,9 @@ class WebSearchService:
                     }
                 )
         logger.info(
-            "[web_search] fetch via httpx finished",
-            extra={"url_count": len(urls), "document_count": len(documents)},
+            "[web_search] fetch via httpx finished | url_count={} | document_count={}",
+            len(urls),
+            len(documents),
         )
         return documents
 

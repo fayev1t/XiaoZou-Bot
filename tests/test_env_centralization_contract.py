@@ -118,11 +118,11 @@ class EnvCentralizationContractTests(unittest.TestCase):
     def test_crawl4ai_compose_exposes_http_service_contract(self) -> None:
         compose_text = self.read_text("docker/crawl4ai/compose.yml")
 
-        self.assertIn("image: unclecode/crawl4ai:basic", compose_text)
+        self.assertIn("image: unclecode/crawl4ai:0.8.6", compose_text)
         self.assertIn("container_name: crawl4ai_qqbot", compose_text)
         self.assertIn("restart: unless-stopped", compose_text)
         self.assertIn('"7506:11235"', compose_text)
-        self.assertIn('shm_size: "1g"', compose_text)
+        self.assertIn('shm_size: "2g"', compose_text)
         self.assertIn("TZ: Asia/Shanghai", compose_text)
         self.assertIn("network_mode: bridge", compose_text)
         self.assertNotIn("version:", compose_text)

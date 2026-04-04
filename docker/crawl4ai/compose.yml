@@ -1,6 +1,6 @@
 services:
   crawl4ai:
-    image: unclecode/crawl4ai:latest
+    image: unclecode/crawl4ai:0.8.6
     container_name: crawl4ai_qqbot
     restart: unless-stopped
     environment:
@@ -8,4 +8,4 @@ services:
     ports:
       - "7506:11235"
     network_mode: bridge
-    shm_size: "1g"
+    shm_size: "2g"

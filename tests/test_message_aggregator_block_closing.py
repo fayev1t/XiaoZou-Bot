@@ -352,6 +352,50 @@ class MessageAggregatorBlockClosingTests(unittest.IsolatedAsyncioTestCase):
         allow_format_to_finish.set()
         await asyncio.wait_for(callback_done.wait(), timeout=0.5)
 
+    async def test_add_message_allows_unmatched_braces_in_preview_text(self) -> None:
+        class _LoguruStyleLogger:
+            def __init__(self) -> None:
+                self.messages: list[str] = []
+
+            def _render(
+                self,
+                message: str,
+                *args: object,
+                **kwargs: object,
+            ) -> None:
+                rendered = message.format(*args, **kwargs) if (args or kwargs) else message
+                self.messages.append(rendered)
+
+            def debug(self, message: str, *args: object, **kwargs: object) -> None:
+                self._render(message, *args, **kwargs)
+
+            def info(self, message: str, *args: object, **kwargs: object) -> None:
+                self._render(message, *args, **kwargs)
+
+            def warning(self, message: str, *args: object, **kwargs: object) -> None:
+                self._render(message, *args, **kwargs)
+
+            def error(self, message: str, *args: object, **kwargs: object) -> None:
+                self._render(message, *args, **kwargs)
+
+        formatting_logger = _LoguruStyleLogger()
+        original_logger = self.module.logger
+        original_schedule_judge_task = self.aggregator._schedule_judge_task
+        self.module.logger = formatting_logger
+        self.aggregator._schedule_judge_task = lambda group_id, block: None
+
+        try:
+            await self._add_message("这里有未配对花括号{")
+        finally:
+            self.module.logger = original_logger
+            self.aggregator._schedule_judge_task = original_schedule_judge_task
+
+        block = self.aggregator._blocks[self.group_id]
+        self.assertEqual(block.get_message_count(), 1)
+        self.assertTrue(
+            any("这里有未配对花括号{" in message for message in formatting_logger.messages)
+        )
+
     async def test_older_layer1_result_is_discarded_after_newer_same_block_judge_starts(self) -> None:
         judge_calls: list[tuple[int, int, list[str]]] = []
         discarded_versions: list[int] = []

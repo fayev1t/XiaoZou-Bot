@@ -93,6 +93,7 @@ def _install_web_search_test_stubs() -> None:
     setattr(httpx_module, "Request", FakeRequest)
     setattr(httpx_module, "RequestError", FakeRequestError)
     setattr(httpx_module, "ConnectError", FakeConnectError)
+    setattr(httpx_module, "ConnectTimeout", FakeConnectError)
     setattr(httpx_module, "HTTPStatusError", FakeHTTPStatusError)
     setattr(httpx_module, "Response", FakeResponse)
     sys.modules["httpx"] = httpx_module
@@ -156,7 +157,7 @@ class FakeAsyncClient:
     post_calls: list[tuple[str, dict[str, object]]] = []
     get_calls: list[str] = []
 
-    def __init__(self, *, timeout: float, follow_redirects: bool) -> None:
+    def __init__(self, *, timeout: object, follow_redirects: bool) -> None:
         _ = timeout, follow_redirects
 
     async def __aenter__(self) -> FakeAsyncClient:
@@ -202,6 +203,22 @@ class WebSearchServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.service = self.module.WebSearchService()
 
+    def assert_typed_crawl4ai_post_calls(self, urls: list[str]) -> None:
+        self.assertEqual(
+            FakeAsyncClient.post_calls,
+            [
+                (
+                    "http://crawl4ai.test/crawl",
+                    {
+                        "urls": [url],
+                        "browser_config": {"type": "BrowserConfig", "params": {"headless": True}},
+                        "crawler_config": {"type": "CrawlerRunConfig", "params": {"stream": False}},
+                    },
+                )
+                for url in urls
+            ],
+        )
+
     async def test_fetch_urls_uses_crawl4ai_http_and_parses_multiple_envelopes(self) -> None:
         FakeAsyncClient.post_responses = [
             _json_response(
@@ -225,13 +242,7 @@ class WebSearchServiceTests(unittest.IsolatedAsyncioTestCase):
 
         documents = await self.service._fetch_urls(["https://a.example", "https://b.example"])
 
-        self.assertEqual(
-            FakeAsyncClient.post_calls,
-            [
-                ("http://crawl4ai.test/crawl", {"urls": ["https://a.example"]}),
-                ("http://crawl4ai.test/crawl", {"urls": ["https://b.example"]}),
-            ],
-        )
+        self.assert_typed_crawl4ai_post_calls(["https://a.example", "https://b.example"])
         self.assertEqual(FakeAsyncClient.get_calls, [])
         self.assertEqual(
             documents,
@@ -263,10 +274,7 @@ class WebSearchServiceTests(unittest.IsolatedAsyncioTestCase):
 
         documents = await self.service._fetch_urls(["https://a.example", "https://b.example"])
 
-        self.assertEqual(
-            FakeAsyncClient.post_calls,
-            [("http://crawl4ai.test/crawl", {"urls": ["https://a.example"]})],
-        )
+        self.assert_typed_crawl4ai_post_calls(["https://a.example"])
         self.assertEqual(FakeAsyncClient.get_calls, ["https://a.example", "https://b.example"])
         self.assertEqual(
             documents,
@@ -288,13 +296,7 @@ class WebSearchServiceTests(unittest.IsolatedAsyncioTestCase):
 
         documents = await self.service._fetch_urls(["https://a.example", "https://b.example"])
 
-        self.assertEqual(
-            FakeAsyncClient.post_calls,
-            [
-                ("http://crawl4ai.test/crawl", {"urls": ["https://a.example"]}),
-                ("http://crawl4ai.test/crawl", {"urls": ["https://b.example"]}),
-            ],
-        )
+        self.assert_typed_crawl4ai_post_calls(["https://a.example", "https://b.example"])
         self.assertEqual(FakeAsyncClient.get_calls, ["https://a.example"])
         self.assertEqual(
             documents,
@@ -333,10 +335,7 @@ class WebSearchServiceTests(unittest.IsolatedAsyncioTestCase):
 
         documents = await self.service._fetch_urls(["https://a.example"])
 
-        self.assertEqual(
-            FakeAsyncClient.post_calls,
-            [("http://crawl4ai.test/crawl", {"urls": ["https://a.example"]})],
-        )
+        self.assert_typed_crawl4ai_post_calls(["https://a.example"])
         self.assertEqual(FakeAsyncClient.get_calls, ["https://a.example"])
         self.assertEqual(
             documents,
@@ -355,19 +354,15 @@ class WebSearchServiceTests(unittest.IsolatedAsyncioTestCase):
 
         documents = await self.service._fetch_urls(["https://a.example"])
 
-        self.assertEqual(
-            FakeAsyncClient.post_calls,
-            [("http://crawl4ai.test/crawl", {"urls": ["https://a.example"]})],
-        )
+        self.assert_typed_crawl4ai_post_calls(["https://a.example"])
         self.assertEqual(FakeAsyncClient.get_calls, ["https://a.example"])
         self.assertEqual(
             documents,
             [{"url": "https://a.example", "title": "", "content": "后备 A"}],
         )
 
-    async def test_fetch_single_url_retries_with_legacy_single_url_payload(self) -> None:
+    async def test_fetch_single_url_uses_official_typed_payload(self) -> None:
         FakeAsyncClient.post_responses = [
-            _json_response("http://crawl4ai.test/crawl", {"error": "bad request"}, status_code=400),
             _json_response(
                 "http://crawl4ai.test/crawl",
                 {"result": {"title": "标题A", "markdown": "<p>服务 A</p>"}},
@@ -380,13 +375,7 @@ class WebSearchServiceTests(unittest.IsolatedAsyncioTestCase):
             url="https://a.example",
         )
 
-        self.assertEqual(
-            FakeAsyncClient.post_calls,
-            [
-                ("http://crawl4ai.test/crawl", {"urls": ["https://a.example"]}),
-                ("http://crawl4ai.test/crawl", {"url": "https://a.example"}),
-            ],
-        )
+        self.assert_typed_crawl4ai_post_calls(["https://a.example"])
         self.assertEqual(
             document,
             {

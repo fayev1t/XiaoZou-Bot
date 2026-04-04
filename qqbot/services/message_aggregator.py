@@ -286,7 +286,12 @@ class MessageAggregator:
 
             preview_text = raw_message or formatted_message or PARSE_FAILED_PLACEHOLDER
             logger.info(
-                f"[aggregator] ➕ 消息已加入块 | 群={group_id}, 消息数={block.get_message_count()}, 用户数={len(block.get_unique_users())}, @机器人={block.has_bot_mention()}, 内容={preview_text[:30]}",
+                "[aggregator] ➕ 消息已加入块 | 群={}, 消息数={}, 用户数={}, @机器人={}, 内容={}",
+                group_id,
+                block.get_message_count(),
+                len(block.get_unique_users()),
+                block.has_bot_mention(),
+                preview_text[:30],
                 extra={
                     "group_id": group_id,
                     "message_count": block.get_message_count(),
@@ -406,7 +411,9 @@ class MessageAggregator:
                     wait_time = max(3.0, min(10.0, float(wait_time)))
 
                 logger.info(
-                    f"[aggregator] 🤖 AI判断：等待 {wait_time}秒 (原因: {result.get('reason', '无')})",
+                    "[aggregator] 🤖 AI判断：等待 {}秒 (原因: {})",
+                    wait_time,
+                    result.get("reason", "无"),
                     extra={
                         "group_id": group_id,
                         "wait_seconds": wait_time,
@@ -424,7 +431,8 @@ class MessageAggregator:
                 return
 
             logger.info(
-                f"[aggregator] 🤖 AI判断：不等待，立即处理 (原因: {result.get('reason', '无')})",
+                "[aggregator] 🤖 AI判断：不等待，立即处理 (原因: {})",
+                result.get("reason", "无"),
                 extra={"group_id": group_id, "should_wait": False},
             )
             async with lock:
