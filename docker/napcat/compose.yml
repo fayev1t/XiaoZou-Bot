@@ -7,9 +7,6 @@ services:
       - "7501:6099"
       - "7502:3000"
       - "7503:3001"
-    environment:
-      NAPCAT_UID: ${UID}
-      NAPCAT_GID: ${GID}
     network_mode: bridge
     volumes:
       - "./QQ:/app/.config/QQ"

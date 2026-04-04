@@ -5,7 +5,7 @@ services:
     restart: unless-stopped
     environment:
       SEARXNG_BASE_URL: http://127.0.0.1:7505
-      SEARXNG_SECRET: ${SEARXNG_SECRET:-change-this-searxng-secret}
+      SEARXNG_SECRET: change-this-searxng-secret
       SEARXNG_LIMITER: "false"
       SEARXNG_PUBLIC_INSTANCE: "false"
     ports:
