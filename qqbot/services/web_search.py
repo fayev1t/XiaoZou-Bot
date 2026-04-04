@@ -11,7 +11,21 @@ from qqbot.core.settings import get_env_value
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _WHITESPACE_RE = re.compile(r"\s+")
+_CRAWL4AI_CONTENT_KEYS = (
+    "markdown",
+    "cleaned_html",
+    "html",
+    "content",
+    "text",
+    "fit_markdown",
+    "fit_html",
+    "extracted_content",
+)
 logger = get_logger(__name__)
+
+
+class _Crawl4AIServiceUnavailableError(RuntimeError):
+    pass
 
 
 class WebSearchService:
@@ -112,35 +126,226 @@ class WebSearchService:
             logger.info("[web_search] no urls to fetch", extra={"url_count": 0})
             return []
 
-        try:
-            from crawl4ai import AsyncWebCrawler  # type: ignore
-        except ImportError:
+        crawl4ai_base_url = get_env_value("CRAWL4AI_BASE_URL")
+        if not crawl4ai_base_url:
             logger.warning(
-                "[web_search] crawl4ai unavailable, fallback to httpx",
+                "[web_search] CRAWL4AI_BASE_URL missing, fallback to httpx",
                 extra={"url_count": len(normalized_urls)},
             )
             return await self._fetch_urls_via_httpx(normalized_urls)
 
-        documents: list[dict[str, str]] = []
-        async with AsyncWebCrawler() as crawler:
-            results = await crawler.arun_many(normalized_urls)
-        for result in results:
-            url = getattr(result, "url", "") or ""
-            content = (
-                getattr(result, "markdown", "")
-                or getattr(result, "cleaned_html", "")
-                or getattr(result, "html", "")
-                or ""
-            )
-            title = getattr(result, "title", "") or ""
-            normalized = self._normalize_content(content)
-            if normalized:
-                documents.append({"url": url, "title": title, "content": normalized})
-        logger.info(
-            "[web_search] fetch via crawl4ai finished",
-            extra={"url_count": len(normalized_urls), "document_count": len(documents)},
+        crawl4ai_documents, fallback_urls = await self._fetch_urls_via_crawl4ai_http(
+            normalized_urls,
+            base_url=crawl4ai_base_url,
         )
-        return documents
+        documents_by_url = {doc["url"]: doc for doc in crawl4ai_documents}
+
+        if fallback_urls:
+            fallback_documents = await self._fetch_urls_via_httpx(fallback_urls)
+            documents_by_url.update({doc["url"]: doc for doc in fallback_documents})
+
+        return [documents_by_url[url] for url in normalized_urls if url in documents_by_url]
+
+    async def _fetch_urls_via_crawl4ai_http(
+        self,
+        urls: list[str],
+        *,
+        base_url: str,
+    ) -> tuple[list[dict[str, str]], list[str]]:
+        documents_by_url: dict[str, dict[str, str]] = {}
+        fallback_urls: list[str] = []
+        crawl_endpoint = f"{base_url.rstrip('/')}/crawl"
+
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            for index, url in enumerate(urls):
+                try:
+                    document = await self._fetch_single_url_via_crawl4ai_http(
+                        client=client,
+                        crawl_endpoint=crawl_endpoint,
+                        url=url,
+                    )
+                except _Crawl4AIServiceUnavailableError as exc:
+                    logger.warning(
+                        "[web_search] crawl4ai service unavailable, fallback to httpx",
+                        extra={"url": url, "error": str(exc)},
+                    )
+                    fallback_urls.extend(urls[index:])
+                    break
+
+                if document is None:
+                    logger.warning(
+                        "[web_search] crawl4ai payload unusable, fallback to httpx",
+                        extra={"url": url},
+                    )
+                    fallback_urls.append(url)
+                    continue
+
+                documents_by_url[url] = document
+
+        documents = [documents_by_url[url] for url in urls if url in documents_by_url]
+        logger.info(
+            "[web_search] fetch via crawl4ai http finished",
+            extra={
+                "url_count": len(urls),
+                "document_count": len(documents),
+                "fallback_count": len(fallback_urls),
+            },
+        )
+        return documents, fallback_urls
+
+    async def _fetch_single_url_via_crawl4ai_http(
+        self,
+        *,
+        client: httpx.AsyncClient,
+        crawl_endpoint: str,
+        url: str,
+    ) -> dict[str, str] | None:
+        request_payloads: tuple[dict[str, object], ...] = (
+            {"urls": [url]},
+            {"url": url},
+        )
+
+        for request_payload in request_payloads:
+            try:
+                response = await client.post(crawl_endpoint, json=request_payload)
+            except httpx.RequestError as exc:
+                raise _Crawl4AIServiceUnavailableError(str(exc)) from exc
+
+            if response.status_code >= 500:
+                raise _Crawl4AIServiceUnavailableError(
+                    f"status_code={response.status_code}",
+                )
+
+            if response.is_error:
+                continue
+
+            try:
+                payload = response.json()
+            except ValueError:
+                return None
+
+            return self._build_document_from_crawl4ai_payload(
+                payload=payload,
+                requested_url=url,
+            )
+
+        return None
+
+    def _build_document_from_crawl4ai_payload(
+        self,
+        *,
+        payload: object,
+        requested_url: str,
+    ) -> dict[str, str] | None:
+        for candidate in self._iter_preferred_crawl4ai_candidates(payload):
+            content = self._extract_crawl4ai_content(candidate)
+            if content is None:
+                continue
+
+            normalized = self._normalize_content(content)
+            if not normalized:
+                continue
+
+            return {
+                "url": self._extract_crawl4ai_url(candidate, requested_url),
+                "title": self._extract_crawl4ai_title(candidate),
+                "content": normalized,
+            }
+
+        return None
+
+    def _iter_preferred_crawl4ai_candidates(self, payload: object) -> list[dict[str, object]]:
+        candidates: list[dict[str, object]] = []
+        seen_ids: set[int] = set()
+
+        def add_candidate(candidate: object) -> None:
+            if isinstance(candidate, dict):
+                candidate_id = id(candidate)
+                if candidate_id not in seen_ids:
+                    seen_ids.add(candidate_id)
+                    candidates.append(candidate)
+
+        if isinstance(payload, dict):
+            add_candidate(payload.get("result"))
+
+            results = payload.get("results")
+            if isinstance(results, list):
+                for item in results:
+                    add_candidate(item)
+
+            data = payload.get("data")
+            if isinstance(data, dict):
+                add_candidate(data.get("result"))
+
+                data_results = data.get("results")
+                if isinstance(data_results, list):
+                    for item in data_results:
+                        add_candidate(item)
+
+        for candidate in self._iter_crawl4ai_candidates(payload):
+            add_candidate(candidate)
+
+        return candidates
+
+    def _iter_crawl4ai_candidates(self, payload: object) -> list[dict[str, object]]:
+        pending = [payload]
+        candidates: list[dict[str, object]] = []
+        seen_ids: set[int] = set()
+
+        while pending:
+            current = pending.pop(0)
+            current_id = id(current)
+            if current_id in seen_ids:
+                continue
+            seen_ids.add(current_id)
+
+            if isinstance(current, dict):
+                candidates.append(current)
+                pending.extend(
+                    value for value in current.values() if isinstance(value, (dict, list))
+                )
+                continue
+
+            if isinstance(current, list):
+                pending.extend(item for item in current if isinstance(item, (dict, list)))
+
+        return candidates
+
+    @staticmethod
+    def _extract_crawl4ai_content(candidate: dict[str, object]) -> str | None:
+        for key in _CRAWL4AI_CONTENT_KEYS:
+            value = candidate.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        return None
+
+    @staticmethod
+    def _extract_crawl4ai_url(candidate: dict[str, object], requested_url: str) -> str:
+        url = candidate.get("url")
+        if isinstance(url, str) and url.strip():
+            return url
+
+        metadata = candidate.get("metadata")
+        if isinstance(metadata, dict):
+            metadata_url = metadata.get("url")
+            if isinstance(metadata_url, str) and metadata_url.strip():
+                return metadata_url
+
+        return requested_url
+
+    @staticmethod
+    def _extract_crawl4ai_title(candidate: dict[str, object]) -> str:
+        title = candidate.get("title") or candidate.get("page_title")
+        if isinstance(title, str):
+            return title
+
+        metadata = candidate.get("metadata")
+        if isinstance(metadata, dict):
+            metadata_title = metadata.get("title")
+            if isinstance(metadata_title, str):
+                return metadata_title
+
+        return ""
 
     async def _fetch_urls_via_httpx(self, urls: list[str]) -> list[dict[str, str]]:
         documents: list[dict[str, str]] = []

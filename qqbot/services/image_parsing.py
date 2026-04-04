@@ -8,6 +8,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import httpx
 from langchain_core.messages import HumanMessage
@@ -16,9 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from qqbot.core.llm import create_llm
 from qqbot.core.logging import get_logger
-from qqbot.services.group_message import GroupMessageService
-from qqbot.services.message_format_fallback import build_parse_failure_text
-from qqbot.services.tool_manager import ToolManager
+from qqbot.services.tool_manager import ToolCallResult, ToolManager
 
 logger = get_logger(__name__)
 
@@ -32,13 +31,13 @@ ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
 @dataclass
 class ImageParseResult:
     file_hash: str
-    call_hash: str
+    description: str
 
 
 class ImageParsingService:
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession | None = None) -> None:
         self.session = session
-        self.tool_manager = ToolManager(session)
+        self.tool_manager = ToolManager(session) if session is not None else None
 
     async def parse_segment_sync(
         self,
@@ -46,6 +45,7 @@ class ImageParsingService:
         segment: MessageSegment,
         msg_hash: str,
     ) -> ImageParseResult:
+        _ = msg_hash
         url = self._extract_image_url(segment)
         fallback_hash = self._build_fallback_hash(segment)
 
@@ -57,7 +57,7 @@ class ImageParsingService:
             )
             image_bytes = await self._download_image(url)
             logger.info(
-                "[image_parsing] stage0 download done",
+                "[image_parsing] stage0 image cached",
                 extra={
                     "group_id": group_id,
                     "image_url": url,
@@ -67,34 +67,86 @@ class ImageParsingService:
             )
             file_hash = hashlib.md5(image_bytes).hexdigest()
             self._persist_image(file_hash, image_bytes, url)
-            context = await self._get_recent_context(group_id=group_id)
-            tool_result = await self.tool_manager.execute_image_parse(
-                msg_hash=msg_hash,
-                file_hash=file_hash,
-                generator=lambda: self._generate_image_summary(
-                    image_bytes=image_bytes,
-                    context=context,
-                ),
-            )
-            return ImageParseResult(file_hash=file_hash, call_hash=tool_result.call_hash)
+            try:
+                description = await self._generate_initial_image_summary(image_bytes)
+            except Exception as exc:
+                logger.warning(
+                    "[image_parsing] stage0 initial description failed",
+                    extra={
+                        "group_id": group_id,
+                        "file_hash": file_hash,
+                        "error": str(exc),
+                    },
+                )
+                description = DEFAULT_FAILURE_DESC
+            return ImageParseResult(file_hash=file_hash, description=description)
         except Exception as exc:
             logger.warning(
-                "[image_parsing] stage0 parse failed",
+                "[image_parsing] stage0 image cache failed",
                 extra={
                     "group_id": group_id,
                     "error": str(exc),
                     "image_url": url,
                 },
             )
-            tool_result = await self.tool_manager.execute_image_parse(
-                msg_hash=msg_hash,
-                file_hash=fallback_hash,
-                generator=self._build_failure_summary,
-            )
             return ImageParseResult(
                 file_hash=fallback_hash,
-                call_hash=tool_result.call_hash,
+                description=DEFAULT_FAILURE_DESC,
             )
+
+    async def execute_image_parse_by_hash(
+        self,
+        *,
+        msg_hash: str,
+        file_hash: str,
+        context: str,
+        reuse_existing: bool = False,
+    ) -> ToolCallResult:
+        if self.tool_manager is None:
+            raise RuntimeError("ImageParsingService requires a session for tool execution")
+
+        return await self.tool_manager.execute_image_parse(
+            msg_hash=msg_hash,
+            file_hash=file_hash,
+            generator=lambda: self._generate_image_summary_from_hash(
+                file_hash=file_hash,
+                context=context,
+            ),
+            reuse_existing=reuse_existing,
+        )
+
+    def build_layer3_image_inputs(self, file_hashes: list[str]) -> list[dict[str, Any]]:
+        image_inputs: list[dict[str, Any]] = []
+        seen_hashes: set[str] = set()
+
+        for file_hash in file_hashes:
+            normalized_hash = file_hash.strip()
+            if not normalized_hash or normalized_hash in seen_hashes:
+                continue
+            seen_hashes.add(normalized_hash)
+
+            image_data_url = self.get_image_data_url(normalized_hash)
+            if image_data_url is None:
+                logger.warning(
+                    "[image_parsing] cached image missing for layer3",
+                    extra={"file_hash": normalized_hash},
+                )
+                continue
+
+            image_inputs.extend(
+                [
+                    {
+                        "type": "text",
+                        "text": f"以下图片对应的 file_hash 是 {normalized_hash}。",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": image_data_url},
+                    },
+                ]
+            )
+
+        return image_inputs
 
     @staticmethod
     def extract_image_hashes(text: str) -> list[str]:
@@ -106,25 +158,36 @@ class ImageParsingService:
                 hashes.append(file_hash)
         return hashes
 
-    async def _get_recent_context(self, group_id: int, limit: int = 10) -> str:
-        message_service = GroupMessageService(self.session)
-        messages = await message_service.get_recent_messages(group_id=group_id, limit=limit)
-        if not messages:
-            return "（暂无历史上下文）"
-
-        parts = [
-            message.get("formatted_message")
-            or build_parse_failure_text("历史消息不可用")
-            for message in messages
-        ]
-        return "\n".join(part for part in parts if part)
-
     async def _generate_image_summary(self, image_bytes: bytes, context: str) -> str:
         description = await self._describe_image(image_bytes=image_bytes, context=context)
         return description or DEFAULT_FAILURE_DESC
 
+    async def _generate_initial_image_summary(self, image_bytes: bytes) -> str:
+        description = await self._describe_image(image_bytes=image_bytes, context="")
+        return description or DEFAULT_FAILURE_DESC
+
     async def _build_failure_summary(self) -> str:
         return DEFAULT_FAILURE_DESC
+
+    async def _generate_image_summary_from_hash(self, *, file_hash: str, context: str) -> str:
+        image_path = self._find_cached_image_path(file_hash)
+        if image_path is None:
+            logger.warning(
+                "[image_parsing] cached image not found",
+                extra={"file_hash": file_hash},
+            )
+            return await self._build_failure_summary()
+
+        try:
+            image_bytes = image_path.read_bytes()
+        except Exception as exc:
+            logger.warning(
+                "[image_parsing] failed to read cached image",
+                extra={"file_hash": file_hash, "error": str(exc)},
+            )
+            return await self._build_failure_summary()
+
+        return await self._generate_image_summary(image_bytes=image_bytes, context=context)
 
     async def _describe_image(self, image_bytes: bytes, context: str) -> str | None:
         llm = await create_llm(temperature=0.2)
@@ -133,12 +196,20 @@ class ImageParsingService:
             return None
 
         image_data_url = self._build_image_data_url(image_bytes)
-        prompt = (
-            "你是群聊图片理解工具。请结合这张图片之前的聊天上下文，"
-            "输出一段简洁、适合放入群聊上下文的中文图片描述。"
-            "只描述图片中对群聊理解有帮助的内容，不要输出多余前缀。\n\n"
-            f"【图片前的最近聊天记录】\n{context}"
-        )
+        normalized_context = context.strip()
+        if normalized_context:
+            prompt = (
+                "你是群聊图片理解工具。请结合这张图片所在的当前群聊上下文和当前回复任务，"
+                "输出一段简洁、适合放入群聊上下文的中文图片描述。"
+                "只描述图片中对群聊理解有帮助的内容，不要输出多余前缀。\n\n"
+                f"【当前上下文】\n{normalized_context}"
+            )
+        else:
+            prompt = (
+                "你是群聊图片理解工具。当前没有额外上下文，请只根据图片本身输出一段简洁中文描述，"
+                "供后续群聊理解使用。"
+                "优先概括主体、动作、场景、明显文字或梗图关键信息，不要输出多余前缀。"
+            )
         message = HumanMessage(
             content=[
                 {"type": "text", "text": prompt},
@@ -231,6 +302,28 @@ class ImageParsingService:
         suffix = self._guess_suffix(url, image_bytes)
         image_path = IMAGE_CACHE_DIR / f"{file_hash}{suffix}"
         image_path.write_bytes(image_bytes)
+
+    def get_image_data_url(self, file_hash: str) -> str | None:
+        image_path = self._find_cached_image_path(file_hash)
+        if image_path is None:
+            return None
+        try:
+            image_bytes = image_path.read_bytes()
+        except Exception as exc:
+            logger.warning(
+                "[image_parsing] failed to load cached image for layer3",
+                extra={"file_hash": file_hash, "error": str(exc)},
+            )
+            return None
+        return self._build_image_data_url(image_bytes)
+
+    @staticmethod
+    def _find_cached_image_path(file_hash: str) -> Path | None:
+        if not IMAGE_CACHE_DIR.exists():
+            return None
+
+        candidates = sorted(IMAGE_CACHE_DIR.glob(f"{file_hash}.*"))
+        return candidates[0] if candidates else None
 
     @staticmethod
     def _guess_suffix(url: str | None, image_bytes: bytes) -> str:

@@ -210,7 +210,7 @@ class MessageConverter:
             return (
                 self._wrap(
                     "System-Image",
-                    "图片",
+                    parse_result.description,
                     {
                         "file_hash": parse_result.file_hash,
                     },

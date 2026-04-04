@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+from typing import Any
 
 nonebot_module = importlib.import_module("nonebot")
 adapters_module = importlib.import_module("nonebot.adapters")
@@ -21,6 +22,7 @@ from qqbot.services.block_judge import block_judger, build_layer3_context
 from qqbot.services.context import ContextManager
 from qqbot.services.conversation import conversation_service
 from qqbot.services.group_message import GroupMessageService
+from qqbot.services.image_parsing import ImageParsingService
 from qqbot.services.message_aggregator import ResponseBlock, message_aggregator
 from qqbot.services.message_format_fallback import build_parse_failure_text
 from qqbot.services.message_converter import MessageConverter
@@ -143,10 +145,39 @@ async def _render_current_block_text(
         )
 
 
-async def _execute_reply_tool_calls(reply_plan) -> list[str]:
+def _build_image_parse_context(
+    *,
+    context: str,
+    current_block_text: str,
+    instruction: str,
+) -> str:
+    sections: list[str] = []
+
+    normalized_context = context.strip()
+    if normalized_context:
+        sections.append(f"【历史上下文】\n{normalized_context}")
+
+    normalized_block = current_block_text.strip()
+    if normalized_block:
+        sections.append(f"【当前对话块】\n{normalized_block}")
+
+    normalized_instruction = instruction.strip()
+    if normalized_instruction:
+        sections.append(f"【当前回复任务】\n{normalized_instruction}")
+
+    return "\n\n".join(sections) if sections else "（暂无图片解析上下文）"
+
+
+async def _execute_reply_tool_calls(
+    reply_plan,
+    *,
+    context: str,
+    current_block_text: str,
+) -> tuple[list[str], list[dict[str, Any]]]:
     tool_call_xmls: list[str] = []
+    image_inputs: list[dict[str, Any]] = []
     if not reply_plan.tool_calls:
-        return tool_call_xmls
+        return tool_call_xmls, image_inputs
 
     logger.info(
         "[group_chat] executing reply tool calls",
@@ -158,6 +189,13 @@ async def _execute_reply_tool_calls(reply_plan) -> list[str]:
 
     async with AsyncSessionLocal() as session:
         tool_manager = ToolManager(session)
+        image_service = ImageParsingService(session)
+        image_parse_context = _build_image_parse_context(
+            context=context,
+            current_block_text=current_block_text,
+            instruction=reply_plan.instruction,
+        )
+        image_file_hashes: list[str] = []
         for tool_call in reply_plan.tool_calls:
             logger.info(
                 "[group_chat] tool call started",
@@ -177,6 +215,14 @@ async def _execute_reply_tool_calls(reply_plan) -> list[str]:
                     msg_hash=tool_call.msg_hash,
                     url=tool_call.input,
                 )
+            elif tool_call.tool == "image_parse":
+                result = await image_service.execute_image_parse_by_hash(
+                    msg_hash=tool_call.msg_hash,
+                    file_hash=tool_call.input,
+                    context=image_parse_context,
+                    reuse_existing=False,
+                )
+                image_file_hashes.append(tool_call.input)
             else:
                 logger.warning(
                     "[group_chat] unsupported tool call skipped",
@@ -198,13 +244,17 @@ async def _execute_reply_tool_calls(reply_plan) -> list[str]:
                 },
             )
         await session.commit()
+        image_inputs = image_service.build_layer3_image_inputs(image_file_hashes)
 
     logger.info(
         "[group_chat] reply tool calls committed",
-        extra={"tool_result_count": len(tool_call_xmls)},
+        extra={
+            "tool_result_count": len(tool_call_xmls),
+            "image_input_count": len(image_inputs),
+        },
     )
 
-    return tool_call_xmls
+    return tool_call_xmls, image_inputs
 
 
 async def _persist_bot_response(
@@ -308,12 +358,17 @@ async def _process_response_block(group_id: int, block: ResponseBlock) -> None:
                 },
             )
 
-            tool_call_xmls = await _execute_reply_tool_calls(reply_plan)
+            tool_call_xmls, image_inputs = await _execute_reply_tool_calls(
+                reply_plan,
+                context=context,
+                current_block_text=current_block_text,
+            )
             logger.info(
                 "[group_chat] Layer3 context ready",
                 extra={
                     "group_id": group_id,
                     "tool_result_count": len(tool_call_xmls),
+                    "image_input_count": len(image_inputs),
                     "context_length": len(context),
                     "current_block_length": len(current_block_text),
                 },
@@ -329,6 +384,7 @@ async def _process_response_block(group_id: int, block: ResponseBlock) -> None:
                 target_user_id=reply_plan.target_user_id,
                 should_mention=reply_plan.should_mention,
                 group_id=group_id,
+                image_inputs=image_inputs,
             )
 
             send_result = await bot.send_group_msg(group_id=group_id, message=response)

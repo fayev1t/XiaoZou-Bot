@@ -32,7 +32,7 @@ def _build_parse_failed_placeholder(reason: str = "消息未完成格式化") ->
 
 PARSE_FAILED_PLACEHOLDER = _build_parse_failed_placeholder()
 
-PRE_CLOSE_QUIET_SECONDS = 2.0
+PRE_CLOSE_QUIET_SECONDS = 3.5
 
 
 @dataclass
@@ -466,6 +466,7 @@ class MessageAggregator:
             await asyncio.sleep(wait_seconds)
 
             lock = self._get_lock(group_id)
+            format_tasks: list[asyncio.Task] = []
             async with lock:
                 if not self._is_snapshot_current(
                     group_id,
@@ -480,6 +481,12 @@ class MessageAggregator:
                     )
                     return
 
+                format_tasks = [
+                    pending_message.format_task
+                    for pending_message in block.messages
+                    if pending_message.format_task is not None
+                ]
+
                 logger.info(
                     f"[aggregator] ⏳ 第一层关闭条件已满足，进入冻结前静默窗口 | 群={group_id}, quiet={self._pre_close_quiet_seconds}秒, 块内消息数={block.get_message_count()}, 用户数={len(block.get_unique_users())}, @机器人={block.has_bot_mention()}",
                     extra={
@@ -490,8 +497,27 @@ class MessageAggregator:
                         "group_version": expected_version,
                         "wait_seconds": wait_seconds,
                         "pre_close_quiet_seconds": self._pre_close_quiet_seconds,
+                        "format_task_count": len(format_tasks),
                     },
                 )
+
+            if format_tasks:
+                results = await asyncio.gather(
+                    *[asyncio.shield(task) for task in format_tasks],
+                    return_exceptions=True,
+                )
+                failed_task_count = sum(
+                    1 for result in results if isinstance(result, Exception)
+                )
+                if failed_task_count > 0:
+                    logger.warning(
+                        "[aggregator] format tasks finished with failures before quiet window",
+                        extra={
+                            "group_id": group_id,
+                            "failed_task_count": failed_task_count,
+                            "format_task_count": len(format_tasks),
+                        },
+                    )
 
             await asyncio.sleep(self._pre_close_quiet_seconds)
 

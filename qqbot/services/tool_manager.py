@@ -42,13 +42,14 @@ class ToolManager:
         msg_hash: str,
         file_hash: str,
         generator: Callable[[], Awaitable[str]],
+        reuse_existing: bool = True,
     ) -> ToolCallResult:
         return await self._execute_tool(
             msg_hash=msg_hash,
             tool_name="image_parse",
             input_data=file_hash,
             generator=generator,
-            reuse_existing=True,
+            reuse_existing=reuse_existing,
         )
 
     async def execute_web_search(

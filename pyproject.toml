@@ -12,7 +12,6 @@ dependencies = [
     "nonebot2[fastapi]>=2.4.4",
     "nonebot-adapter-onebot>=2.4.6",
     "httpx>=0.24.0",
-    "crawl4ai>=0.8,<0.9",
     "pydantic-settings>=2.0.0",
     "sqlalchemy>=2.0.0",
     "sqlalchemy[asyncio]",

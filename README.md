@@ -16,21 +16,28 @@
 
 ## 🎭 她是谁？
 
+<!-- Mascot on the Right (Float) -->
+<img src="assets/imgs/xiaozou.png" align="right" width="30%" alt="XiaoZou Character" style="margin-left: 20px; margin-bottom: 20px;">
+
 小奏不仅是一个基于大语言模型的应答程序，她被赋予了拥有类似逢坂大河般傲娇性格的灵魂。她的核心设计理念是成为一个具有日常真实陪伴感的“赛博群友”。
 
-> **她最大的愿望，是像一个普通的群友一样，自然地看大家聊天，在合适的时机插科打诨。**
+**「她最大的愿望，是像一个普通的群友一样，自然地看大家聊天，在合适的时机插科打诨。」**
 
 - 🧠 **上下文融入**：她会自动记忆近期的聊天记录，理解当前的讨论语境，拒绝缺乏逻辑的生硬回复。
 - ⏳ **拟人化审时度势**：当大家讨论激烈时，她会默默潜水围观；只有在话题告一段落或适合吐槽时，才会自然地下场发表看法。
 - 👁️ **跨模态视觉记忆**：发送图片给她，她不仅能精准识别图片内容，甚至可能在未来的某次闲聊中不经意地回想起这些画面。
 - 👤 **群体关系感知**：她能够识别所处的群组环境、理解成员昵称与群名片，用熟人的口吻与每一个人交流。
 
+<!-- Clear float to ensure subsequent content starts below the image area if text is short -->
+<br clear="both">
+
 ## 📸 小奏的日常
 
-在这里你可以看到小奏在群内潜水与活跃的真实表现：
+😘😘😘
 
 <div align="center">
-  <img src="assets/imgs/屏幕截图%202025-12-18%20165501.png" width="400" />
+  <img src="assets/imgs/qqgroup_message.png" width="45%" />
+  <img src="assets/imgs/qqgroup_message2.png" width="45%" />
 </div>
 
 ---
@@ -53,25 +60,20 @@
 
 ---
 
-## 🚀 快速部署
+## 🚀 快速开始
 
-开箱即用的体验，无需配置环境或 Docker！
-直接将小奏的 QQ (\`1005089717\`) 拉入你的群组，即可开始互动。
+docker?(❌) requstment?(❌) 直接把小奏（1005089717）拉到群里！！！
 
-## 🐢 本地开发与定制部署
-
-对于有意向进行二次开发或深入部署的核心开发者：
-- **基线环境**：推荐使用 Python 3.10，配合 NB-cli。容器化依赖（NapCat 与 PostgreSQL）请参考 `docker/` 目录下的 Compose 文件。
-- **配置起点**：从项目根目录的 `.env` 入口开始，正确配置 `DATABASE_URL`。
+## 🐢 龟速部署
+- **基线环境**： Python 3.10，配合 NB-cli。容器化依赖（NapCat、PostgreSQL、SearXNG 与网页抓取侧车 Crawl4AI）请参考 `docker/` 目录下的 Compose 文件，其中 Crawl4AI 服务定义位于 `docker/crawl4ai/compose.yml`，应用侧通过 HTTP 调用该服务，不再依赖进程内 Python `crawl4ai`。
+- **配置起点**：从项目根目录的 `.env` 入口开始，正确配置 `DATABASE_URL`、`SEARXNG_BASE_URL`、`CRAWL4AI_BASE_URL`。如果采用“应用服务器 + Docker 服务服务器”双机部署，这几个地址应指向 Docker 服务所在机器的可达地址，而不是固定写死 `127.0.0.1`；`docker/` 下各个 compose 继续保持各自独立的固定部署基线，不依赖根 `.env` 做变量插值。
 - **开发与调试**：基于 NoneBot 框架，本地日常开发可通过执行 `nb run --reload` 边跑边改，实现热重载调试。
 - **运行时目录**：图片缓存和其他运行时产物默认写入 `runtime_data/`，日志写入 `logs/`。
-
----
 
 ## 💬 交流社区
 
 任何问题，欢迎加入。
-**技术与交流群：610662657**
+**610662657**
 <div align="center">
-  <img src="assets/imgs/0AB65B95E57CAE189B4EF9EA29369F32.jpg" width="400" />
+  <img src="assets/imgs/qqgroup_info.png" width="400" />
 </div>

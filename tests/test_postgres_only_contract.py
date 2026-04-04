@@ -42,27 +42,17 @@ class PostgresOnlyContractTests(unittest.TestCase):
 
     def test_runtime_cache_path_no_longer_uses_sqlite_name(self) -> None:
         image_parsing = self.read_text("qqbot/services/image_parsing.py")
-        dockerfile = self.read_text("docker/Dockerfile")
-        docker_compose = self.read_text("docker/docker-compose.yml")
         postgres_compose = self.read_text("docker/postgres/compose.yml")
         gitignore = self.read_text(".gitignore")
-        dockerignore = self.read_text("docker/.dockerignore")
         readme = self.read_text("README.md")
 
         self.assertIn('Path("./runtime_data/images")', image_parsing)
         self.assertNotIn("sqlite_data", image_parsing)
-        self.assertIn("/app/runtime_data/images", dockerfile)
-        self.assertIn('VOLUME ["/app/logs", "/app/runtime_data"]', dockerfile)
-        self.assertIn('EXPOSE 7500', dockerfile)
-        self.assertIn("../runtime_data:/app/runtime_data", docker_compose)
-        self.assertIn("../logs:/app/logs", docker_compose)
-        self.assertIn("context: ..", docker_compose)
-        self.assertIn("dockerfile: docker/Dockerfile", docker_compose)
-        self.assertIn("postgres:5432", docker_compose)
-        self.assertIn("name: qqbot-postgres-network", docker_compose)
-        self.assertIn("name: qqbot-postgres-network", postgres_compose)
+        self.assertFalse((ROOT / "docker" / "Dockerfile").exists())
+        self.assertFalse((ROOT / "docker" / "docker-compose.yml").exists())
+        self.assertIn("network_mode: bridge", postgres_compose)
+        self.assertNotIn("qqbot-postgres-network", postgres_compose)
         self.assertIn("runtime_data/", gitignore)
-        self.assertIn("runtime_data", dockerignore)
         self.assertIn("runtime_data/", readme)
 
     def test_sqlite_dependency_and_script_are_removed(self) -> None:

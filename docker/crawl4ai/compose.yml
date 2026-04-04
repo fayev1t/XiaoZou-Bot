@@ -1,0 +1,11 @@
+services:
+  crawl4ai:
+    image: unclecode/crawl4ai:latest
+    container_name: crawl4ai_qqbot
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+    ports:
+      - "7506:11235"
+    network_mode: bridge
+    shm_size: "1g"

@@ -10,6 +10,8 @@ This plugin listens to QQ Bot events and performs database operations:
 
 from __future__ import annotations
 
+import asyncio
+
 from nonebot import on_notice, on_message
 from nonebot.adapters import Event
 from nonebot.adapters.onebot.v11 import (
@@ -29,10 +31,11 @@ from qqbot.services.group import GroupService
 from qqbot.services.group_message import GroupMessageService
 from qqbot.services.group_member import GroupMemberService
 from qqbot.services.message_aggregator import message_aggregator
-from qqbot.services.message_pipeline import MessagePipeline
+from qqbot.services.message_pipeline import MessagePipeline, MessageRecord
 
 logger = get_logger(__name__)
 BOT_NICKNAMES = get_bot_nicknames()
+_detached_format_tasks: set[asyncio.Task[MessageRecord]] = set()
 
 
 def _is_group_message(event: Event) -> bool:
@@ -58,6 +61,74 @@ message_handler = on_message(rule=Rule(_is_group_message), priority=10, block=Fa
 message_pipeline = MessagePipeline()
 
 
+def _track_detached_format_task(task: asyncio.Task[MessageRecord]) -> None:
+    _detached_format_tasks.add(task)
+
+    def _cleanup(completed_task: asyncio.Task[MessageRecord]) -> None:
+        _detached_format_tasks.discard(completed_task)
+        try:
+            completed_task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.error("Detached format task failed: %s", exc)
+
+    task.add_done_callback(_cleanup)
+
+
+def _is_bot_mentioned(event: GroupMessageEvent, raw_message: str) -> bool:
+    is_bot_mentioned = getattr(event, "to_me", False)
+    if is_bot_mentioned:
+        return True
+
+    message_source = getattr(event, "original_message", None) or event.message
+    try:
+        if any(
+            getattr(segment, "type", None) == "at"
+            and str(getattr(segment, "data", {}).get("qq")) == str(event.self_id)
+            for segment in message_source
+        ):
+            return True
+    except TypeError:
+        pass
+
+    return any(nickname in raw_message for nickname in BOT_NICKNAMES)
+
+
+async def _format_message_record(
+    event: GroupMessageEvent,
+    saved_id: int,
+    msg_hash: str,
+    raw_message: str,
+) -> MessageRecord:
+    async with AsyncSessionLocal() as session:
+        try:
+            record = await message_pipeline.format_and_update(
+                session,
+                event,
+                saved_id,
+                msg_hash=msg_hash,
+                raw_message=raw_message,
+            )
+            await session.commit()
+            logger.info(
+                "Message formatted successfully",
+                extra={
+                    "group_id": record.group_id,
+                    "user_id": record.user_id,
+                    "message_id": saved_id,
+                    "onebot_message_id": record.onebot_message_id,
+                    "raw_length": len(raw_message),
+                    "formatted_length": len(record.formatted_message or ""),
+                    "message_type": record.message_type,
+                },
+            )
+            return record
+        except Exception:
+            await session.rollback()
+            raise
+
+
 @message_handler.handle()
 async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     _ = bot
@@ -71,58 +142,57 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
 
     async with AsyncSessionLocal() as session:
         try:
-            record, saved_id = await message_pipeline.process_event(session, event)
-            raw_message = record.raw_message
+            raw_message = message_pipeline.extract_raw(event)
+            record = message_pipeline.create_raw_record(event, raw_message)
+            saved_id = await message_pipeline.persist_raw(session, record)
             await session.commit()
 
             logger.info(
-                "Message saved successfully",
+                "Raw message saved successfully",
                 extra={
                     "group_id": group_id,
                     "user_id": user_id,
                     "message_id": saved_id,
                     "onebot_message_id": record.onebot_message_id,
                     "raw_length": len(raw_message),
-                    "formatted_length": len(record.formatted_message or ""),
-                    "message_type": record.message_type,
+                    "msg_hash": record.msg_hash,
                 },
+            )
+
+            format_task = asyncio.create_task(
+                _format_message_record(
+                    event,
+                    saved_id,
+                    record.msg_hash,
+                    raw_message,
+                )
             )
 
             try:
                 if user_id == event.self_id:
-                    await message_aggregator.complete_message_persist(group_id)
+                    _track_detached_format_task(format_task)
                     return
 
-                message_source = getattr(event, "original_message", None) or event.message
-                is_bot_mentioned = getattr(event, "to_me", False)
-                if not is_bot_mentioned:
-                    is_bot_mentioned = any(
-                        segment.type == "at"
-                        and str(segment.data.get("qq")) == str(event.self_id)
-                        for segment in message_source
-                    )
-                if not is_bot_mentioned:
-                    is_bot_mentioned = any(
-                        nickname in raw_message
-                        for nickname in BOT_NICKNAMES
-                    )
+                is_bot_mentioned = _is_bot_mentioned(event, raw_message)
 
                 if not raw_message.strip() and not is_bot_mentioned:
                     await message_aggregator.complete_message_persist(group_id)
+                    _track_detached_format_task(format_task)
                     return
 
                 await message_aggregator.finish_message_persist_and_add_message(
                     group_id=group_id,
                     user_id=user_id,
                     raw_message=raw_message,
-                    formatted_message=record.formatted_message,
-                    format_task=None,
+                    formatted_message=None,
+                    format_task=format_task,
                     event=event,
                     msg_hash=record.msg_hash,
                     persisted_message_id=saved_id,
                     is_bot_mentioned=is_bot_mentioned,
                 )
             except Exception as exc:
+                _track_detached_format_task(format_task)
                 if track_persist:
                     await message_aggregator.fail_message_persist(group_id)
                 logger.error(

@@ -74,6 +74,8 @@ class PromptManagerContractTests(unittest.TestCase):
         self.assertIn('"tool_calls": [', prompt)
         self.assertIn('"tool": string', prompt)
         self.assertIn('"msg_hash": string', prompt)
+        self.assertIn("image_parse", prompt)
+        self.assertIn("file_hash", prompt)
         self.assertIn('"replies": [', prompt)
         self.assertIn('"should_exit_silence_mode": bool', prompt)
         self.assertIn("当前消息块、显式 @、`System-Reply` 直接线程，优先于更早历史", prompt)
@@ -101,9 +103,11 @@ class PromptManagerContractTests(unittest.TestCase):
         self.assertIn("输出的时候 **绝对不要** 带任何 XML 标签", prompt)
         self.assertIn("当前对话块", prompt)
         self.assertIn("System-ToolCall", prompt)
+        self.assertIn("图片本身一并作为多模态输入", prompt)
         self.assertIn("instruction", prompt)
         self.assertIn("当前对话块 / 当前直接线程 > 显式 @ 与 Reply 关系 > 更早历史", prompt)
         self.assertIn("不要把它误当聊天记录中的自然发言", prompt)
+        self.assertIn("不要忽略图片本体", prompt)
         self.assertNotIn("【情绪】（emotion）", prompt)
         self.assertIn(
             "根据指导和相关工具结果，生成一条符合小奏人设、像真人一样的群聊回复。",

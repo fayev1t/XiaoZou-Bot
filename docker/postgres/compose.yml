@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   postgres:
     image: postgres:18-alpine
@@ -11,18 +9,12 @@ services:
       POSTGRES_DB: mydb
     ports:
       - "7504:5432"
+    network_mode: bridge
     volumes:
-      - ./postgres-data:/var/lib/postgresql
-      - ./init:/docker-entrypoint-initdb.d:ro
+      - "./postgres-data:/var/lib/postgresql"
+      - "./init:/docker-entrypoint-initdb.d:ro"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U admin -d mydb"]
       interval: 10s
       timeout: 5s
       retries: 5
-    networks:
-      - postgres-network
-
-networks:
-  postgres-network:
-    name: qqbot-postgres-network
-    driver: bridge

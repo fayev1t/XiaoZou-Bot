@@ -28,8 +28,10 @@ class PromptManager:
    - 表示 QQ 内建表情。
 
 6. 图片标签：`<System-Image file_hash="...">图片</System-Image>`
-   - 只表示这条消息里有一张图片，以及它对应的 `file_hash`。
-   - 图片内容本身不再内联在消息标签里；如果系统真的执行了图片解析，你会在同一条消息后面看到独立的 `System-ToolCall`。
+   - 表示这条消息里有一张图片，以及它对应的 `file_hash`。
+   - 标签正文通常是入库阶段生成的首轮基础图片描述；它只负责提供轻量的首眼理解，不等于完整图片分析。
+   - 如果系统后续又显式执行了图片解析，你还会在同一条消息后面看到独立的 `System-ToolCall`，那代表更贴近当前任务的补充结果。
+   - 如果你要请求图片理解工具，`input` 必须直接填写这里的 `file_hash`。
 
 7. 语音占位标签：`<System-AudioPlaceholder record_size="..." record_duration="...">语音消息</System-AudioPlaceholder>`
    - 表示原始消息里有语音，但当前没有转写文本。
@@ -100,9 +102,11 @@ class PromptManager:
 - 主要是在回谁；如果是公共话题，就保持 `target_user_id = null`。
 - 是否需要 @ 对方。
 - 如果需要额外工具结果，必须在 `tool_calls` 里写清楚：
-  - `tool`：工具名，只能是当前系统支持的工具，如 `web_search`、`web_crawl`。
+  - `tool`：工具名，只能是当前系统支持的工具，如 `image_parse`、`web_search`、`web_crawl`。
   - `input`：这次工具调用的直接输入。
   - `msg_hash`：触发这次工具调用的那条消息的 `msg_hash`，必须照抄，不要编造。
+- 只有在当前回复真的需要理解图片内容、且现有 `System-Image` / 既有工具结果仍不够时，才调用 `image_parse`。
+- `image_parse.input` 必须直接填写对应图片的 `file_hash`，不要写“这张图”“第一张图”这类自然语言。
 - `instruction` 只写回复边界：当前主要回应点、回复目标、必须覆盖的事实、暂不展开的话题、不能跑偏的限制。
 - 不要替 Layer 3 写具体措辞、详细展开顺序、语气设计、情绪标签，或“顺带补一句什么”的话术。
 
@@ -197,10 +201,12 @@ class PromptManager:
 2. 当前对话块
 3. 来自 Layer 2 的 instruction
 4. 如有需要，还会附带 `System-ToolCall`，它表示系统为当前回复额外调用到的工具结果
+5. 如果当前回复明确触发了图片解析，系统还可能把对应图片本身一并作为多模态输入交给你
 
 【理解优先级】
 - 当前对话块 / 当前直接线程 > 显式 @ 与 Reply 关系 > 更早历史。
 - `System-ToolCall` 只是补充资料，不是用户说的话；不要把它误当聊天记录中的自然发言。
+- 如果本轮还额外附带了图片输入，系统通常会先给一段带 `file_hash` 的文本提示，再给图片本体；要把这两者和 `System-ToolCall(image_parse)` 一起理解，不要忽略图片本体。
 
 【你与 Layer 2 的分工】
 - Layer 2 已经负责判断：要不要回、主要回谁、当前主话题是什么、哪些边界不能越过。

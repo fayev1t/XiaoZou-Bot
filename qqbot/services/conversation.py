@@ -43,6 +43,7 @@ class ConversationService:
         target_user_id: int | None = None,
         should_mention: bool = False,
         group_id: int | None = None,
+        image_inputs: list[dict[str, Any]] | None = None,
     ) -> str:
         """Generate a response from Layer 2 instruction and context.
 
@@ -69,6 +70,7 @@ class ConversationService:
             normalized_context = context.strip() or "（暂无对话上下文）"
             normalized_instruction = instruction.strip() or "请自然承接当前话题。"
             tool_call_count = normalized_context.count("<System-ToolCall")
+            normalized_image_inputs = image_inputs or []
 
             response_prompt = f"""【对话背景】
 {normalized_context}
@@ -85,18 +87,20 @@ class ConversationService:
                     "target_user_id": target_user_id,
                     "should_mention": should_mention,
                     "tool_call_count": tool_call_count,
+                    "image_input_count": len(normalized_image_inputs),
                 },
             )
 
             log_input = (
                 f"【指导】{normalized_instruction}\n"
-                f"【上下文统计】长度={len(normalized_context)}，工具结果数={tool_call_count}"
+                f"【上下文统计】长度={len(normalized_context)}，工具结果数={tool_call_count}，图片数={len(normalized_image_inputs)}"
             )
             log_ai_input("Layer3", group_id or 0, log_input)
 
             generated_text = await self._invoke_response_llm(
                 llm,
                 response_prompt,
+                image_inputs=normalized_image_inputs,
             )
 
             # 记录 AI 输出
@@ -171,18 +175,37 @@ class ConversationService:
         self,
         llm: Any,
         response_prompt: str,
+        image_inputs: list[dict[str, Any]] | None = None,
     ) -> str:
-        messages = self._build_messages(response_prompt=response_prompt)
-        response = await llm.ainvoke(messages)
+        messages = self._build_messages(
+            response_prompt=response_prompt,
+            image_inputs=image_inputs,
+        )
+        try:
+            response = await llm.ainvoke(messages)
+        except Exception:
+            if image_inputs:
+                logger.warning(
+                    "[conversation] multimodal response failed, fallback to text-only"
+                )
+                response = await llm.ainvoke(
+                    self._build_messages(response_prompt=response_prompt)
+                )
+            else:
+                raise
         return self._extract_text_response(response.content)
 
     def _build_messages(
         self,
         response_prompt: str,
+        image_inputs: list[dict[str, Any]] | None = None,
     ) -> list[SystemMessage | HumanMessage]:
+        human_content: str | list[dict[str, Any]] = response_prompt
+        if image_inputs:
+            human_content = [{"type": "text", "text": response_prompt}, *image_inputs]
         return [
             SystemMessage(content=self.prompt_manager.response_prompt),
-            HumanMessage(content=response_prompt),
+            HumanMessage(content=human_content),
         ]
 
     def _extract_text_response(self, content: object) -> str:

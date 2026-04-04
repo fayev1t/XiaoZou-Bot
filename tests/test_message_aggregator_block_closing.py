@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
+_UNSET = object()
 
 
 def _install_message_aggregator_test_stubs() -> None:
@@ -77,7 +78,14 @@ class MessageAggregatorBlockClosingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         await self.aggregator.shutdown()
 
-    async def _add_message(self, text: str, user_id: int = 1) -> None:
+    async def _add_message(
+        self,
+        text: str,
+        user_id: int = 1,
+        *,
+        formatted_message: str | None | object = _UNSET,
+        format_task: asyncio.Task | None = None,
+    ) -> None:
         persisted_message_id = self._next_persisted_message_id
         self._next_persisted_message_id += 1
         await self.aggregator.begin_message_persist(self.group_id)
@@ -86,8 +94,8 @@ class MessageAggregatorBlockClosingTests(unittest.IsolatedAsyncioTestCase):
             user_id=user_id,
             msg_hash=f"msg-{persisted_message_id}",
             raw_message=text,
-            formatted_message=text,
-            format_task=None,
+            formatted_message=text if formatted_message is _UNSET else formatted_message,
+            format_task=format_task,
             event=FakeEvent(),
             persisted_message_id=persisted_message_id,
         )
@@ -312,6 +320,36 @@ class MessageAggregatorBlockClosingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(block.get_message_count(), 1)
         self.assertFalse(callback_done.is_set())
 
+        await asyncio.wait_for(callback_done.wait(), timeout=0.5)
+
+    async def test_wait_timer_blocks_on_format_tasks_before_quiet_window(self) -> None:
+        self._install_fake_judge(wait_seconds=0.0)
+        callback_done = asyncio.Event()
+        allow_format_to_finish = asyncio.Event()
+
+        async def fake_reply(group_id: int, block: Any) -> None:
+            _ = group_id, block
+            callback_done.set()
+
+        async def slow_format_task() -> Any:
+            await allow_format_to_finish.wait()
+            return types.SimpleNamespace(
+                formatted_message="<System-Message>格式化完成</System-Message>"
+            )
+
+        self.aggregator.set_reply_callback(fake_reply)
+
+        await self._add_message(
+            "慢格式化消息",
+            formatted_message=None,
+            format_task=asyncio.create_task(slow_format_task()),
+        )
+
+        await asyncio.sleep(0.08)
+        self.assertFalse(callback_done.is_set())
+        self.assertFalse(self.aggregator._blocks[self.group_id].is_processing)
+
+        allow_format_to_finish.set()
         await asyncio.wait_for(callback_done.wait(), timeout=0.5)
 
     async def test_older_layer1_result_is_discarded_after_newer_same_block_judge_starts(self) -> None:

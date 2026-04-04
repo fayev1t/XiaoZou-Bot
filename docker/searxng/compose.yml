@@ -10,17 +10,7 @@ services:
       SEARXNG_PUBLIC_INSTANCE: "false"
     ports:
       - "7505:8080"
+    network_mode: bridge
     volumes:
-      - searxng-config:/etc/searxng
-      - searxng-cache:/var/cache/searxng
-    networks:
-      - searxng-network
-
-volumes:
-  searxng-config:
-  searxng-cache:
-
-networks:
-  searxng-network:
-    name: qqbot-searxng-network
-    driver: bridge
+      - "./config:/etc/searxng"
+      - "./cache:/var/cache/searxng"
