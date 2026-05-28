@@ -7,9 +7,7 @@ from qqbot.core.settings import get_runtime_environment
 
 PLUGIN_MODULES = [
     "qqbot.plugins.startup",
-    "qqbot.plugins.event_handlers",
-    "qqbot.plugins.group_chat",
-    "qqbot.plugins.friend_private",
+    "qqbot.plugins.v2_main",
 ]
 
 

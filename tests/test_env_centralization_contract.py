@@ -65,8 +65,11 @@ class EnvCentralizationContractTests(unittest.TestCase):
         self.assertNotIn("NAPCAT_WEBUI_HOST_PORT", compose_text)
         self.assertNotIn("NAPCAT_HTTP_HOST_PORT", compose_text)
         self.assertNotIn("NAPCAT_WS_HOST_PORT", compose_text)
-        self.assertIn("NAPCAT_UID: ${UID}", compose_text)
-        self.assertIn("NAPCAT_GID: ${GID}", compose_text)
+        # NAPCAT_UID/GID 的 env-var 注入曾经是设想，但当前 compose 不再依赖
+        # 宿主机 UID/GID（也不再硬编码 user: "1001:1001"）。这里仅约束这两种
+        # 旧形态都不应回潮。
+        self.assertNotIn("NAPCAT_UID:", compose_text)
+        self.assertNotIn("NAPCAT_GID:", compose_text)
         self.assertNotIn('user: "1001:1001"', compose_text)
         self.assertIn("network_mode: bridge", compose_text)
         self.assertIn('      - "./QQ:/app/.config/QQ"', compose_text)
@@ -103,7 +106,9 @@ class EnvCentralizationContractTests(unittest.TestCase):
         self.assertIn("container_name: searxng_qqbot", compose_text)
         self.assertIn("restart: unless-stopped", compose_text)
         self.assertIn("SEARXNG_BASE_URL: http://127.0.0.1:7505", compose_text)
-        self.assertIn("SEARXNG_SECRET: ${SEARXNG_SECRET:-change-this-searxng-secret}", compose_text)
+        # secret 当前以硬编码 placeholder 形式写入 compose（部署侧自行替换）；
+        # ${SEARXNG_SECRET:-...} 形式的 env-var 注入是历史设想。
+        self.assertIn("SEARXNG_SECRET: change-this-searxng-secret", compose_text)
         self.assertIn('SEARXNG_LIMITER: "false"', compose_text)
         self.assertIn('SEARXNG_PUBLIC_INSTANCE: "false"', compose_text)
         self.assertIn('"7505:8080"', compose_text)

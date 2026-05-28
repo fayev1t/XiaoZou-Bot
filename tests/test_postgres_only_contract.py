@@ -1,3 +1,10 @@
+"""Contract: 仓库已彻底切到 PostgreSQL-only，不留任何 SQLite 残余。
+
+v1 service / image_parsing / context 等模块已删除，相关 sqlite 分支断言
+跟着删；保留 database.py 自身的清洁性 + pyproject 无 aiosqlite + 旧迁移
+脚本不存在等仍然有意义的项。
+"""
+
 from __future__ import annotations
 
 import unittest
@@ -24,48 +31,38 @@ class PostgresOnlyContractTests(unittest.TestCase):
         self.assertNotIn("db_password: str | None", database_text)
         self.assertNotIn("db_name: str | None", database_text)
         self.assertNotIn("complete DB_* settings", database_text)
-        self.assertNotIn("ALTER TABLE {messages_table}", database_text)
         self.assertNotIn("message_id::text", database_text)
-        self.assertNotIn("_ensure_image_records_columns", database_text)
+        # v1 group dynamic sharding helpers 已随 v1 删除
+        self.assertNotIn("def create_group_tables", database_text)
+        self.assertNotIn("_build_members_table_sql", database_text)
+        self.assertNotIn("_build_messages_table_sql", database_text)
 
-    def test_services_no_longer_branch_on_sqlite(self) -> None:
-        for relative_path in (
-            "qqbot/services/user.py",
-            "qqbot/services/group.py",
-            "qqbot/services/group_message.py",
-        ):
-            text = self.read_text(relative_path)
-            with self.subTest(file=relative_path):
-                self.assertNotIn("is_sqlite_backend", text)
-                self.assertNotIn("dialects.sqlite", text)
-                self.assertNotIn("last_insert_rowid", text)
-
-    def test_runtime_cache_path_no_longer_uses_sqlite_name(self) -> None:
-        image_parsing = self.read_text("qqbot/services/image_parsing.py")
+    def test_docker_layout_baseline(self) -> None:
         postgres_compose = self.read_text("docker/postgres/compose.yml")
         gitignore = self.read_text(".gitignore")
-        readme = self.read_text("README.md")
 
-        self.assertIn('Path("./runtime_data/images")', image_parsing)
-        self.assertNotIn("sqlite_data", image_parsing)
         self.assertFalse((ROOT / "docker" / "Dockerfile").exists())
         self.assertFalse((ROOT / "docker" / "docker-compose.yml").exists())
         self.assertIn("network_mode: bridge", postgres_compose)
         self.assertNotIn("qqbot-postgres-network", postgres_compose)
+        # runtime_data/ 必须被 .gitignore 屏蔽（heartbeat 等本地状态落在那里）。
+        # 此前还要求 README 提及 runtime_data/，但 README 现在是用户面文档不再
+        # 暴露这类内部细节；.gitignore 才是事实标准，足以表达契约。
         self.assertIn("runtime_data/", gitignore)
-        self.assertIn("runtime_data/", readme)
 
-    def test_sqlite_dependency_and_script_are_removed(self) -> None:
+    def test_sqlite_dependency_and_migrations_removed(self) -> None:
         pyproject = self.read_text("pyproject.toml")
-        context = self.read_text("qqbot/services/context.py")
 
         self.assertNotIn("aiosqlite", pyproject)
-        self.assertNotIn('msg.get("message_content"', context)
+        # v1 数据库迁移脚本与 v1 service 数据库模块均不应再存在
         self.assertFalse((ROOT / "qqbot" / "services" / "database.py").exists())
         self.assertFalse((ROOT / "scripts" / "migrate_postgres_to_sqlite.py").exists())
         self.assertFalse((ROOT / "scripts" / "migrate_group_messages_v2.py").exists())
         self.assertFalse((ROOT / "scripts" / "migrate_group_messages_v2.sql").exists())
         self.assertFalse((ROOT / "scripts" / "remove_message_id_column.sql").exists())
+        self.assertFalse(
+            (ROOT / "scripts" / "migrate_unified_tool_calls.py").exists()
+        )
 
 
 if __name__ == "__main__":

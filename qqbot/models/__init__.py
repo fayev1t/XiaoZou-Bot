@@ -1,14 +1,9 @@
-"""ORM Models for QQ Bot."""
+"""ORM Models for QQ Bot (v2)."""
 
+from qqbot.models.agent_event import AgentEvent
 from qqbot.models.base import Base
-from qqbot.models.messages import User, Group, GroupMemberTemplate, GroupMessage
-from qqbot.models.tool_call import ToolCallRecord
 
 __all__ = [
+    "AgentEvent",
     "Base",
-    "User",
-    "Group",
-    "GroupMemberTemplate",
-    "GroupMessage",
-    "ToolCallRecord",
 ]

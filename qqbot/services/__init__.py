@@ -1,21 +1,8 @@
-"""Services for QQ Bot."""
+"""Services for QQ Bot (v2).
 
-from qqbot.services.user import UserService
-from qqbot.services.group import GroupService
-from qqbot.services.group_member import GroupMemberService
-from qqbot.services.group_message import GroupMessageService
-from qqbot.services.message_aggregator import MessageAggregator, message_aggregator
-from qqbot.services.block_judge import BlockJudger, block_judger
-from qqbot.services.message_pipeline import MessagePipeline
+v2 子包：
+- qqbot.services.event_ingest  napcat 事件入口流水线
+- qqbot.services.agent_loop    决策循环 + workers + 工具
 
-__all__ = [
-    "UserService",
-    "GroupService",
-    "GroupMemberService",
-    "GroupMessageService",
-    "MessageAggregator",
-    "message_aggregator",
-    "BlockJudger",
-    "block_judger",
-    "MessagePipeline",
-]
+显式 import 通过子包路径完成；本 __init__ 不再 re-export。
+"""

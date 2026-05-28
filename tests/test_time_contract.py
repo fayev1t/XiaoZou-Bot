@@ -42,19 +42,28 @@ class TimeContractTests(unittest.TestCase):
             time_module.normalize_china_time(datetime(2026, 4, 1, 8, 0))
 
     def test_models_and_scheduler_match_timezone_contract(self) -> None:
-        messages_model = (ROOT / "qqbot" / "models" / "messages.py").read_text(encoding="utf-8")
-        tool_call_model = (ROOT / "qqbot" / "models" / "tool_call.py").read_text(encoding="utf-8")
-        scheduler = (ROOT / "qqbot" / "core" / "scheduler.py").read_text(encoding="utf-8")
-        database = (ROOT / "qqbot" / "core" / "database.py").read_text(encoding="utf-8")
-        converter = (ROOT / "qqbot" / "services" / "message_converter.py").read_text(encoding="utf-8")
-
-        self.assertIn("DateTime(timezone=True)", messages_model)
-        self.assertIn("DateTime(timezone=True)", tool_call_model)
-        self.assertIn('server_default=text("CURRENT_TIMESTAMP")', tool_call_model)
-        self.assertIn("scheduler.configure(timezone=CHINA_TIMEZONE)", scheduler)
-        self.assertIn('"timezone": "Asia/Shanghai"', database)
-        self.assertIn(
-            "def _format_message_time(self, value: datetime | int | float | None) -> str:",
-            converter,
+        # v2 把 messages.py / tool_call.py / message_converter.py 全部删了
+        # （[[v1-fully-discarded]]）；时区契约现在落在唯一的 agent_event 模型 +
+        # scheduler + database 三处。
+        agent_event_model = (
+            ROOT / "qqbot" / "models" / "agent_event.py"
+        ).read_text(encoding="utf-8")
+        scheduler = (ROOT / "qqbot" / "core" / "scheduler.py").read_text(
+            encoding="utf-8"
         )
-        self.assertNotIn("replace(tzinfo=None)", TIME_FILE.read_text(encoding="utf-8"))
+        database = (ROOT / "qqbot" / "core" / "database.py").read_text(
+            encoding="utf-8"
+        )
+
+        # 所有持久化时间戳必须 tz-aware
+        self.assertIn("DateTime(timezone=True)", agent_event_model)
+        # APScheduler 必须用 CHINA_TIMEZONE
+        self.assertIn(
+            "scheduler.configure(timezone=CHINA_TIMEZONE)", scheduler
+        )
+        # asyncpg connect_args 必须设 timezone=Asia/Shanghai
+        self.assertIn('"timezone": "Asia/Shanghai"', database)
+        # time.py 不应再剥离 tzinfo（防止 naive datetime 回流）
+        self.assertNotIn(
+            "replace(tzinfo=None)", TIME_FILE.read_text(encoding="utf-8")
+        )

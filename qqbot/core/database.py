@@ -1,10 +1,8 @@
-import importlib
 from typing import Any, AsyncGenerator
 
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
-    AsyncConnection,
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
@@ -119,15 +117,34 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
 async def init_db() -> None:
     """初始化数据库表
 
-    创建所有静态表（users, groups, 模板表）
+    v2 唯一表：agent_events（append-only event stream）。
+
+    pg_trgm 扩展先建好，AgentEvent.search_text 上的 GIN trgm 索引才能创建
+    （供 search_history 关键字检索使用）。
+
+    幂等 ALTER：`Base.metadata.create_all` 不会给已存在的表加新列。线上若
+    在加入 search_text 列**之前**就建过 agent_events，重启后 SELECT 会
+    `UndefinedColumnError`——这里用 `ALTER TABLE IF EXISTS ADD COLUMN
+    IF NOT EXISTS` 补上。第一次部署（表还没建）时这条 ALTER 是 no-op，
+    随后 create_all 直接建带 search_text 的全新表。
     """
     try:
-        # 导入所有模型以注册到Base.metadata
+        # 触发 agent_event 模块加载以注册到 Base.metadata
         from qqbot.models import Base  # noqa: F401
-        importlib.import_module("qqbot.models.messages")
-        importlib.import_module("qqbot.models.tool_call")
+        from qqbot.models import agent_event  # noqa: F401
 
         async with engine.begin() as conn:
+            # 必须在 create_all 之前，否则 GIN trgm 索引创建会失败
+            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+            # 已存在表的迁移补丁——column 必须先于 index 创建，否则 create_all
+            # 里的 agent_events_search_trgm_idx 会引用不存在的列。
+            await conn.execute(
+                text(
+                    "ALTER TABLE IF EXISTS agent_events "
+                    "ADD COLUMN IF NOT EXISTS search_text TEXT "
+                    "GENERATED ALWAYS AS (payload->>'raw_message') STORED"
+                )
+            )
             await conn.run_sync(Base.metadata.create_all)
             logger.info("Database tables initialized successfully")
     except Exception as e:
@@ -145,116 +162,8 @@ async def close_db() -> None:
 
 
 async def table_exists(table_name: str) -> bool:
-    """检查表是否存在
-
-    Args:
-        table_name: 表名
-
-    Returns:
-        bool: 表是否存在
-    """
+    """检查表是否存在"""
     async with engine.begin() as conn:
         return await conn.run_sync(
             lambda sync_conn: inspect(sync_conn).has_table(table_name)
         )
-
-
-async def create_group_tables(
-    group_id: int,
-    conn: AsyncConnection | None = None,
-) -> tuple[str, str]:
-    """为指定群组创建分表
-
-    创建以下两个表：
-    - group_members_{group_id}: 群成员表
-    - group_messages_v2_{group_id}: 群消息表
-
-    Args:
-        group_id: 群组ID
-
-    Returns:
-        tuple[str, str]: (members_table_name, messages_table_name)
-
-    Raises:
-        Exception: 表创建失败
-    """
-    members_table = f"group_members_{group_id}"
-    messages_table = f"group_messages_v2_{group_id}"
-
-    try:
-        if conn is None:
-            async with engine.begin() as managed_conn:
-                return await create_group_tables(group_id, managed_conn)
-
-        logger.debug(f"[create_group_tables] Creating tables for group {group_id}")
-
-        await conn.execute(text(_build_members_table_sql(members_table)))
-        logger.debug(f"[create_group_tables] Created/verified members table: {members_table}")
-
-        await conn.execute(text(f"""
-            CREATE INDEX IF NOT EXISTS idx_{members_table}_user_id ON {members_table}(user_id)
-        """))
-
-        await conn.execute(text(_build_messages_table_sql(messages_table)))
-        logger.debug(f"[create_group_tables] Created/verified messages table: {messages_table}")
-
-        await conn.execute(text(f"""
-            CREATE INDEX IF NOT EXISTS idx_{messages_table}_user_id ON {messages_table}(user_id)
-        """))
-
-        await conn.execute(text(f"""
-            CREATE INDEX IF NOT EXISTS idx_{messages_table}_msg_hash ON {messages_table}(msg_hash)
-        """))
-
-        await conn.execute(text(f"""
-            CREATE INDEX IF NOT EXISTS idx_{messages_table}_is_recalled ON {messages_table}(is_recalled)
-        """))
-
-        await conn.execute(text(f"""
-            CREATE INDEX IF NOT EXISTS idx_{messages_table}_onebot_message_id ON {messages_table}(onebot_message_id)
-        """))
-
-        await conn.execute(text(f"""
-            CREATE INDEX IF NOT EXISTS idx_{messages_table}_timestamp ON {messages_table}("timestamp")
-        """))
-
-        logger.info(
-            f"[create_group_tables] ✅ Group tables ready: {members_table}, {messages_table}"
-        )
-        return members_table, messages_table
-
-    except Exception as e:
-        logger.error(
-            f"[create_group_tables] ❌ Failed to create/verify group tables for {group_id}: {e}",
-            exc_info=True,
-        )
-        raise
-
-
-def _build_members_table_sql(table_name: str) -> str:
-    return f"""
-        CREATE TABLE IF NOT EXISTS {table_name} (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL UNIQUE,
-            card VARCHAR(255),
-            join_time TIMESTAMP WITH TIME ZONE,
-            is_active BOOLEAN DEFAULT TRUE,
-            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-    """
-
-
-def _build_messages_table_sql(table_name: str) -> str:
-    return f"""
-        CREATE TABLE IF NOT EXISTS {table_name} (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL,
-            msg_hash VARCHAR(64) UNIQUE NOT NULL,
-            onebot_message_id VARCHAR(255),
-            raw_message TEXT,
-            formatted_message TEXT,
-            is_recalled BOOLEAN DEFAULT FALSE,
-            "timestamp" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-    """
