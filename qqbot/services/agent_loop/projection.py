@@ -37,6 +37,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from qqbot.core.logging import get_logger
+from qqbot.core.time import CHINA_TIMEZONE
 from qqbot.models.agent_event import AgentEvent
 from qqbot.services.agent_loop.decision import (
     DecisionContext,
@@ -72,9 +73,17 @@ class _EventSnapshot:
 
 
 def _snapshot_from_row(row: AgentEvent) -> _EventSnapshot:
+    # asyncpg 把 TIMESTAMPTZ 列硬编码返回 UTC tzinfo（与 PG session
+    # timezone 设置无关）。但人类可读输出必须用北京时间——这是项目契约：
+    # 写入侧 china_now() 已是 +08:00，读出侧必须 normalize 回去，否则
+    # timeline 渲染给 LLM 时会出现 "+00:00" 这种和数据库语义不一致的尾巴，
+    # LLM 容易被它带歪（"现在凌晨1点，用户应该睡了" 实际是早上 9 点）。
+    occurred_at = row.occurred_at
+    if occurred_at is not None and occurred_at.tzinfo is not None:
+        occurred_at = occurred_at.astimezone(CHINA_TIMEZONE)
     return _EventSnapshot(
         event_id=row.event_id,
-        occurred_at=row.occurred_at,
+        occurred_at=occurred_at,
         origin=row.origin,
         type=row.type,
         scope=row.scope,
@@ -118,6 +127,7 @@ class Projector:
         correlation_id: str,
         tick_seq: int,
         now: datetime,
+        bot_user_id: str | None = None,
     ) -> DecisionContext:
         scope, group_id, _ = parse_scope_key(scope_key)
         cutoff = now - self._lookback
@@ -130,6 +140,7 @@ class Projector:
             tick_seq=tick_seq,
             now=now,
             max_timeline_items=self._max_timeline_items,
+            bot_user_id=bot_user_id,
         )
 
     async def _fetch(
@@ -165,6 +176,7 @@ class Projector:
         tick_seq: int,
         now: datetime,
         max_timeline_items: int | None = None,
+        bot_user_id: str | None = None,
     ) -> DecisionContext:
         active_tasks = Projector.fold_tasks(events, scope_key=scope_key)
         tool_views = Projector.fold_tool_results(events)
@@ -184,6 +196,7 @@ class Projector:
             timeline=timeline,
             active_tasks=active_tasks,
             pending_tool_results=pending_tool_results,
+            bot_user_id=bot_user_id,
         )
 
     # ─── Folding helpers ───

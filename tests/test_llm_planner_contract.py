@@ -31,7 +31,6 @@ from qqbot.services.agent_loop import (
     ImageRef,
     LLMPlanner,
     NoteTaskProgressAction,
-    ReplyAction,
     TimelineItem,
 )
 
@@ -73,24 +72,42 @@ class LLMPlannerContractTest(unittest.TestCase):
         self.assertIsInstance(out.actions[0], IdleAction)
         self.assertEqual(out.actions[0].reason, "nothing happening")
 
-    def test_reply_action_parsed(self) -> None:
+    def test_reply_now_parsed_as_call_tool(self) -> None:
+        """Reply 不再是独立 action：LLM 必须用 call_tool tool_name=reply 发言。
+        裸 {"type":"reply"} 会走入 _parse_action 的"未知 type"分支 → IdleAction(bad_action)。
+        这条断言把"reply 是普通工具"的契约钉死。"""
         body = (
-            '{"reasoning":"hi user","actions":['
-            '{"type":"reply",'
-            '"content":[{"type":"text","data":{"text":"hello"}}],'
-            '"target":{"kind":"group","group_id":100},'
-            '"related_msg_hashes":["h1"]}'
-            "]}"
+            '{"reasoning":"hi","actions":[{"type":"call_tool",'
+            '"tool_name":"reply",'
+            '"arguments":{"content":[{"type":"text","data":{"text":"hi"}}],'
+            '"target":{"kind":"group","group_id":100}}}]}'
         )
         llm = _StubLLM(response_content=body)
         planner = LLMPlanner(llm_client=llm)
         out = asyncio.run(planner.decide(_ctx()))
-        self.assertEqual(out.reasoning, "hi user")
         self.assertEqual(len(out.actions), 1)
-        reply = out.actions[0]
-        self.assertIsInstance(reply, ReplyAction)
-        self.assertEqual(reply.target, {"kind": "group", "group_id": 100})
-        self.assertEqual(reply.related_msg_hashes, ["h1"])
+        self.assertIsInstance(out.actions[0], CallToolAction)
+        self.assertEqual(out.actions[0].tool_name, "reply")
+        self.assertEqual(
+            out.actions[0].arguments["target"],
+            {"kind": "group", "group_id": 100},
+        )
+
+    def test_bare_reply_type_falls_back_to_idle(self) -> None:
+        """旧 {"type":"reply"} 已弃用；planner 把它当作未知 action 处理。"""
+        body = (
+            '{"actions":[{"type":"reply",'
+            '"content":[{"type":"text","data":{"text":"hi"}}],'
+            '"target":{"kind":"group","group_id":100}}]}'
+        )
+        llm = _StubLLM(response_content=body)
+        planner = LLMPlanner(llm_client=llm)
+        out = asyncio.run(planner.decide(_ctx()))
+        self.assertEqual(len(out.actions), 1)
+        self.assertIsInstance(out.actions[0], IdleAction)
+        self.assertEqual(
+            out.actions[0].reason, "llm_schema_error:bad_action"
+        )
 
     def test_code_fence_tolerated(self) -> None:
         body = '```json\n{"actions":[{"type":"idle","reason":"x"}]}\n```'
@@ -236,10 +253,9 @@ class LLMPlannerContractTest(unittest.TestCase):
         self.assertIsInstance(ct, CreateTaskAction)
         self.assertEqual(ct.triggered_by_event_id, "MSG_42")
 
-    def test_system_prompt_includes_reply_usage_doc(self) -> None:
-        """reply.md 内容必须出现在 SystemMessage 里 —— LLM 才能用 at /
-        reply / face 这些 OneBot V11 段。锚两个特征关键词即可，文案细节
-        不绑死。"""
+    def test_system_prompt_includes_xml_format_doc(self) -> None:
+        """xml_format.md 必须注入 system prompt —— LLM 据此读懂 <agent-input>
+        信封的标签语义。锚定文档头和几个关键概念即可，避免绑死文案。"""
         llm = _StubLLM(
             response_content='{"actions":[{"type":"idle","reason":"x"}]}'
         )
@@ -247,12 +263,102 @@ class LLMPlannerContractTest(unittest.TestCase):
         asyncio.run(planner.decide(_ctx()))
         content = llm.invocations[0][0].content
 
-        # reply.md 文档头
-        self.assertIn("Reply usage", content)
-        # at 段示例的关键字面
+        # xml_format.md 文档头
+        self.assertIn("reading the `<agent-input>` envelope", content)
+        # 关键标签必须解释过
+        self.assertIn("<tool-catalog>", content)
+        self.assertIn("<active-tasks>", content)
+        self.assertIn("<pending-tool-results>", content)
+        self.assertIn("<timeline>", content)
+        # 特殊标记
+        self.assertIn("<truncated/>", content)
+        self.assertIn("<pending/>", content)
+
+    def test_system_prompt_includes_group_chat_rules_doc(self) -> None:
+        """group_chat_rules.md 必须注入 system prompt —— LLM 据此决定什么时候
+        reply / 什么时候 idle / 怎么称呼对方。"""
+        llm = _StubLLM(
+            response_content='{"actions":[{"type":"idle","reason":"x"}]}'
+        )
+        planner = LLMPlanner(llm_client=llm)
+        asyncio.run(planner.decide(_ctx()))
+        content = llm.invocations[0][0].content
+
+        # 文档头
+        self.assertIn("Group chat etiquette", content)
+        # 关键规则锚点（addressee 解析 + reply 默认沉默 + 强制社交推理链）
+        self.assertIn("Addressee Resolution", content)
+        self.assertIn("most messages are not for you", content)
+        self.assertIn("3-Step Social Reasoning Chain", content)
+        # 行为约束里仍要涉及备选决策
+        self.assertIn("note_task_progress", content)
+
+    def test_default_prompt_section_order(self) -> None:
+        """xml_format 与 group_chat_rules 必须按 order 升序拼接：
+        persona < xml_format < protocol < group_chat_rules < tools_usage。
+        LLM 按"身份→输入语言→决策→社交→工具"递进读。reply.md 段已废除
+        （reply 现在是工具，文档归入 tools_usage）。"""
+        from qqbot.services.agent_loop.tool_registry import ToolRegistry
+
+        class _StubTool:
+            name = "stub_tool_for_order"
+            description = "..."
+            arguments_schema = {"type": "object"}
+            usage_prompt = "STUB-TOOL-ORDER-MARKER content"
+
+            async def run(self, arguments: dict, **_: object) -> dict:
+                return {}
+
+        reg = ToolRegistry()
+        reg.register(_StubTool())
+
+        llm = _StubLLM(
+            response_content='{"actions":[{"type":"idle","reason":"x"}]}'
+        )
+        planner = LLMPlanner(
+            llm_client=llm,
+            persona_text="测试人设标记 PERSONA_MARKER",
+            tool_registry=reg,
+        )
+        asyncio.run(planner.decide(_ctx()))
+        content = llm.invocations[0][0].content
+
+        idx_persona = content.index("PERSONA_MARKER")
+        idx_xml = content.index("reading the `<agent-input>` envelope")
+        idx_protocol = content.index("autonomous QQ group bot agent")
+        idx_group = content.index("Group chat etiquette")
+        idx_tools = content.index("STUB-TOOL-ORDER-MARKER")
+
+        self.assertLess(idx_persona, idx_xml)
+        self.assertLess(idx_xml, idx_protocol)
+        self.assertLess(idx_protocol, idx_group)
+        self.assertLess(idx_group, idx_tools)
+
+    def test_reply_tool_usage_doc_renders_via_tool_registry(self) -> None:
+        """ReplyTool.usage_prompt（tools/reply.md）必须随 ToolRegistry.usage_docs
+        进 system prompt 的 tools_usage 段；reply 现在和 websearch / search_history
+        同构。"""
+        from qqbot.services.agent_loop.tools import build_default_registry
+
+        async def _noop() -> None:
+            return None
+
+        # session_factory 这里不会被 reply tool usage_docs 触发，传 stub 即可
+        reg = build_default_registry(session_factory=lambda: None)
+
+        llm = _StubLLM(
+            response_content='{"actions":[{"type":"idle","reason":"x"}]}'
+        )
+        planner = LLMPlanner(llm_client=llm, tool_registry=reg)
+        asyncio.run(planner.decide(_ctx()))
+        content = llm.invocations[0][0].content
+
+        # 按工具名分段的标题
+        self.assertIn("## Tool: reply", content)
+        # reply.md 标志性段落
+        self.assertIn("In QQ group chat", content)
+        # OneBot V11 段示例关键字面
         self.assertIn('"type": "at"', content)
-        # reply 引用回复段示例的关键字面
-        self.assertIn('"type": "reply"', content)
         # @ 全体成员的 qq:"all" 约定
         self.assertIn('"all"', content)
 
@@ -432,6 +538,75 @@ class LLMPlannerContractTest(unittest.TestCase):
         self.assertIn(f"data:image/png;base64,{b64_1}", urls)
         self.assertIn(f"data:image/jpeg;base64,{b64_2}", urls)
 
+    def test_multimodal_image_blocks_preceded_by_hash_label(self) -> None:
+        """每个 image_url block 前面必须有一个文本 block，内容包含该图的 hash。
+        这是 VLM 把 XML 里 `<image hash="X"/>` 占位符和实际像素绑定的桥梁——
+        没有这个 label，3 张图以上模型就会按出现顺序错位（用户说"上上一张图"
+        定位不到）。"""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p1 = Path(tmp) / "h1"
+            p1.write_bytes(b"\x89PNG-bytes-1")
+            p2 = Path(tmp) / "h2"
+            p2.write_bytes(b"\x89PNG-bytes-2")
+
+            ctx = DecisionContext(
+                scope_key="group:100",
+                correlation_id="CID",
+                tick_seq=1,
+                now=china_now(),
+                timeline=[
+                    TimelineItem(
+                        event_id="E1",
+                        occurred_at=china_now(),
+                        kind="message",
+                        render='<message><image hash="hash-A"/></message>',
+                        images=[
+                            ImageRef(
+                                file_hash="hash-A",
+                                local_path=str(p1),
+                                mime="image/png",
+                            )
+                        ],
+                    ),
+                    TimelineItem(
+                        event_id="E2",
+                        occurred_at=china_now(),
+                        kind="message",
+                        render='<message><image hash="hash-B"/></message>',
+                        images=[
+                            ImageRef(
+                                file_hash="hash-B",
+                                local_path=str(p2),
+                                mime="image/jpeg",
+                            )
+                        ],
+                    ),
+                ],
+            )
+
+            llm = _StubLLM(
+                response_content='{"actions":[{"type":"idle","reason":"x"}]}'
+            )
+            planner = LLMPlanner(llm_client=llm)
+            asyncio.run(planner.decide(ctx))
+
+        human_content = llm.invocations[0][1].content
+        # 每张 image_url 的前一个 block 必须是 text 且包含对应 hash
+        for i, b in enumerate(human_content):
+            if b.get("type") != "image_url":
+                continue
+            prev = human_content[i - 1]
+            self.assertEqual(prev["type"], "text")
+            # label 应该提到这张图的 hash —— 用 hash-A 出现在某 label 文本里
+            # 来锁定"label 紧挨 image"绑定关系
+            self.assertTrue(
+                "hash-A" in prev["text"] or "hash-B" in prev["text"],
+                f"image at index {i} not preceded by a hash label: {prev!r}",
+            )
+
     def test_multimodal_skips_missing_file(self) -> None:
         """落盘文件被清理 / 路径不存在 → 跳过该图，整 tick 仍然成功。
         text 里的 <image hash="..."/> 占位还在，LLM 知道图存在过。"""
@@ -468,6 +643,67 @@ class LLMPlannerContractTest(unittest.TestCase):
         self.assertEqual(
             [b for b in human_content if b["type"] == "image_url"], []
         )
+
+    def test_bot_user_id_rendered_as_agent_input_attribute(self) -> None:
+        """DecisionContext.bot_user_id 必须出现在 <agent-input> 的 attribute
+        里。LLM 据此对照 <at user="..."/> 判断是否在叫它。"""
+        ctx = DecisionContext(
+            scope_key="group:100",
+            correlation_id="CID",
+            tick_seq=1,
+            now=china_now(),
+            bot_user_id="3167291813",
+        )
+        llm = _StubLLM(
+            response_content='{"actions":[{"type":"idle","reason":"x"}]}'
+        )
+        planner = LLMPlanner(llm_client=llm)
+        asyncio.run(planner.decide(ctx))
+        human_text = llm.invocations[0][1].content[0]["text"]
+        self.assertIn('bot_user_id="3167291813"', human_text)
+        # scope/now/tick 也仍在
+        self.assertIn('scope="group:100"', human_text)
+        self.assertIn('tick="1"', human_text)
+
+    def test_no_bot_user_id_omits_attribute(self) -> None:
+        """bot_user_id 为 None 时不渲染该属性 —— prompt 体积稳定，
+        LLM 知道这是降级场景（启动初期 napcat 还没连上）。"""
+        ctx = DecisionContext(
+            scope_key="group:100",
+            correlation_id="CID",
+            tick_seq=1,
+            now=china_now(),
+        )
+        self.assertIsNone(ctx.bot_user_id)
+        llm = _StubLLM(
+            response_content='{"actions":[{"type":"idle","reason":"x"}]}'
+        )
+        planner = LLMPlanner(llm_client=llm)
+        asyncio.run(planner.decide(ctx))
+        human_text = llm.invocations[0][1].content[0]["text"]
+        self.assertNotIn("bot_user_id", human_text)
+
+    def test_agent_input_now_always_rendered_in_china_timezone(self) -> None:
+        """即便 caller 传入 UTC datetime，<agent-input now="..."> 也必须
+        渲染为 +08:00 —— 时区契约：暴露给 LLM 的所有时间都是北京时间。"""
+        from datetime import datetime, timezone
+
+        utc_now = datetime(2026, 5, 28, 1, 55, 46, tzinfo=timezone.utc)
+        ctx = DecisionContext(
+            scope_key="group:100",
+            correlation_id="CID",
+            tick_seq=1,
+            now=utc_now,
+        )
+        llm = _StubLLM(
+            response_content='{"actions":[{"type":"idle","reason":"x"}]}'
+        )
+        planner = LLMPlanner(llm_client=llm)
+        asyncio.run(planner.decide(ctx))
+        human_text = llm.invocations[0][1].content[0]["text"]
+        # UTC 01:55 → 北京 09:55 +08:00
+        self.assertIn('now="2026-05-28T09:55:46+08:00"', human_text)
+        self.assertNotIn("+00:00", human_text)
 
     def test_no_llm_client_returns_unavailable_idle(self) -> None:
         # llm_client=None and create_llm() will probably return None too

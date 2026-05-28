@@ -526,7 +526,7 @@ class BuildTimelineTests(unittest.TestCase):
         self.assertIn('status="pending"', items[0].render)
 
     def test_agent_reply_renders(self) -> None:
-        # ReplyAction.content 走 OneBot V11 segment 格式（data.text）
+        # reply 工具的 content 走 OneBot V11 segment 格式（data.text）
         evs = [
             _snap(
                 type="agent.reply_emitted",
@@ -663,6 +663,21 @@ class ProjectIntegrationTests(unittest.TestCase):
         self.assertEqual(context.timeline, [])
         self.assertEqual(context.active_tasks, [])
         self.assertEqual(context.pending_tool_results, [])
+        # bot_user_id 默认 None；未注入时不破坏旧用例
+        self.assertIsNone(context.bot_user_id)
+
+    def test_bot_user_id_propagates_into_decision_context(self) -> None:
+        """Projector.project 收到 bot_user_id 时必须透传到 DecisionContext，
+        让 LLMPlanner 渲染 <agent-input bot_user_id="..."> 属性。"""
+        context = Projector.project(
+            [],
+            scope_key="group:100",
+            correlation_id="c",
+            tick_seq=1,
+            now=BASE_TIME,
+            bot_user_id="3167291813",
+        )
+        self.assertEqual(context.bot_user_id, "3167291813")
 
 
 class ProgressNotesTests(unittest.TestCase):
@@ -827,6 +842,44 @@ class ToolResultTruncationTests(unittest.TestCase):
         views = Projector.fold_tool_results(evs)
         items = Projector.build_timeline(evs, tool_views=views)
         self.assertNotIn("<truncated/>", items[0].render)
+
+
+class TimezoneNormalizationTests(unittest.TestCase):
+    """asyncpg 读 TIMESTAMPTZ 列硬编码返回 UTC tzinfo（与 PG session timezone
+    无关）；_snapshot_from_row 必须把它 normalize 回 Asia/Shanghai，否则渲染
+    给 LLM 的 timeline 会出现 "+00:00" 这种和数据库写入语义（china_now() →
+    +08:00）不一致的尾巴。"""
+
+    def test_snapshot_normalizes_utc_occurred_at_to_china_time(self) -> None:
+        from datetime import datetime, timezone
+
+        from qqbot.core.time import CHINA_TIMEZONE
+        from qqbot.services.agent_loop.projection import _snapshot_from_row
+
+        # 模拟 asyncpg 给的 UTC datetime
+        utc_dt = datetime(2026, 5, 28, 1, 55, 46, tzinfo=timezone.utc)
+
+        class _FakeRow:
+            event_id = "E1"
+            occurred_at = utc_dt
+            origin = "external"
+            type = "external.message.group.normal"
+            scope = "group"
+            group_id = 100
+            user_id = 222
+            visibility = "agent_visible"
+            correlation_id = "c"
+            causation_id = None
+            payload: dict = {}
+
+        snap = _snapshot_from_row(_FakeRow())
+        self.assertEqual(snap.occurred_at.tzinfo, CHINA_TIMEZONE)
+        # UTC 01:55 → 北京 09:55
+        self.assertEqual(snap.occurred_at.hour, 9)
+        self.assertEqual(snap.occurred_at.minute, 55)
+        # isoformat 必须带 +08:00 尾巴 —— 这是 LLM 看到的字面
+        self.assertIn("+08:00", snap.occurred_at.isoformat())
+        self.assertNotIn("+00:00", snap.occurred_at.isoformat())
 
 
 class RecallRenderingNoteTests(unittest.TestCase):

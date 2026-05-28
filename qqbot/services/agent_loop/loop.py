@@ -35,7 +35,6 @@ from qqbot.services.agent_loop.decision import (
     IdleAction,
     NoteTaskProgressAction,
     Planner,
-    ReplyAction,
 )
 from qqbot.services.agent_loop.event_writer import (
     write_agent_event,
@@ -56,6 +55,7 @@ class AgentLoop:
         session_factory: SessionFactory,
         projector: Projector | None = None,
         supervisor: Any | None = None,
+        bot_user_id_resolver: Callable[[], str | None] | None = None,
     ) -> None:
         self._scope_key = scope_key
         self._planner = planner
@@ -64,6 +64,10 @@ class AgentLoop:
         # supervisor 鸭子类型注入，规避 supervisor → loop 的循环 import。
         # 用到的接口仅 notify_reply_pending()（reply 触发即时投递）。
         self._supervisor = supervisor
+        # bot_user_id 每 tick 重新 resolve —— bot 重连后 self_id 不变但实例
+        # 会换；启动初期可能返回 None，prompt 渲染层接受 None 优雅降级。
+        # None resolver 表示不注入（旧测试 / 早期骨架兼容）。
+        self._bot_user_id_resolver = bot_user_id_resolver
         self._wake = asyncio.Event()
         self._stopped = False
         self._tick_seq = 0
@@ -127,6 +131,21 @@ class AgentLoop:
             payload={"tick_seq": self._tick_seq},
         )
 
+        # bot_user_id resolve 失败不应让整 tick 翻车：捕一下、降为 None
+        # 走"老行为"（prompt 不渲染 bot_user_id 属性）。
+        bot_user_id: str | None = None
+        if self._bot_user_id_resolver is not None:
+            try:
+                resolved = self._bot_user_id_resolver()
+                if resolved is not None:
+                    bot_user_id = str(resolved)
+            except Exception as exc:
+                logger.warning(
+                    "[loop {}] bot_user_id_resolver failed: {}",
+                    self._scope_key,
+                    exc,
+                )
+
         # Projector 可选注入：未注入时回退为空 context（早期骨架兼容）
         if self._projector is not None:
             try:
@@ -135,6 +154,7 @@ class AgentLoop:
                     correlation_id=correlation_id,
                     tick_seq=self._tick_seq,
                     now=now,
+                    bot_user_id=bot_user_id,
                 )
             except Exception as exc:
                 logger.exception(
@@ -147,6 +167,7 @@ class AgentLoop:
                     correlation_id=correlation_id,
                     tick_seq=self._tick_seq,
                     now=now,
+                    bot_user_id=bot_user_id,
                 )
         else:
             context = DecisionContext(
@@ -154,6 +175,7 @@ class AgentLoop:
                 correlation_id=correlation_id,
                 tick_seq=self._tick_seq,
                 now=now,
+                bot_user_id=bot_user_id,
             )
 
         try:
@@ -296,34 +318,6 @@ class AgentLoop:
                         },
                     )
 
-            elif isinstance(action, ReplyAction):
-                reply_id = new_event_id()
-                await write_agent_event(
-                    self._session_factory,
-                    event_type="agent.reply_emitted",
-                    scope_key=self._scope_key,
-                    correlation_id=correlation_id,
-                    causation_id=decision_id,
-                    payload={
-                        "reply_id": reply_id,
-                        "content": action.content,
-                        "target": action.target,
-                        "related_msg_hashes": action.related_msg_hashes,
-                    },
-                )
-                # 推 + 拉 dispatcher 的推这一半：叫醒 ReplySendWorker 立即出货。
-                # notify 失败也无妨：下一条 reply 的 notify 会让 worker drain
-                # 全量 pending；最坏情况进程重启时 catchup 兜底。
-                if self._supervisor is not None:
-                    try:
-                        self._supervisor.notify_reply_pending()
-                    except Exception as exc:
-                        logger.warning(
-                            "[loop {}] notify_reply_pending failed: {}",
-                            self._scope_key,
-                            exc,
-                        )
-
             elif isinstance(action, CompleteTaskAction):
                 await write_agent_event(
                     self._session_factory,
@@ -398,41 +392,14 @@ def _validate_decision(decision: DecisionOutput, *, scope_key: str) -> str | Non
     """Return a short error string on invalid output, or None if valid.
 
     Rules (任务与决策契约 §3.1, §3.2.3):
-    - At most one ReplyAction.
     - IdleAction never co-exists with another action.
-    - ReplyAction.target.kind/group_id must match the loop's scope_key.
+
+    Reply 校验下沉到 ReplyTool.run() —— 由于 reply 现在是普通工具，
+    target.kind/group_id 与 scope_key 不匹配时 tool 自身 raise，
+    ToolWorker 写 agent.tool_failed；"一 tick 多回复"的硬约束移除，
+    由 group_chat_rules.md 软规范引导（多发短消息有时是合理选择）。
     """
     actions = decision.actions
-    reply_count = sum(1 for a in actions if isinstance(a, ReplyAction))
-    if reply_count > 1:
-        return "multiple_reply_actions"
-
     if any(isinstance(a, IdleAction) for a in actions) and len(actions) > 1:
         return "idle_with_other_actions"
-
-    for a in actions:
-        if isinstance(a, ReplyAction):
-            err = _validate_reply_target(a, scope_key=scope_key)
-            if err is not None:
-                return err
-
-    return None
-
-
-def _validate_reply_target(action: ReplyAction, *, scope_key: str) -> str | None:
-    target = action.target or {}
-    kind = target.get("kind")
-    if scope_key.startswith("group:"):
-        if kind != "group":
-            return "reply_target_scope_mismatch"
-        expected_gid = int(scope_key.split(":", 1)[1])
-        if target.get("group_id") != expected_gid:
-            return "reply_target_group_mismatch"
-    elif scope_key == "system":
-        # SystemAgentLoop may target either group or private — both allowed.
-        if kind not in ("group", "private"):
-            return "reply_target_scope_mismatch"
-    elif scope_key.startswith("private:"):
-        if kind != "private":
-            return "reply_target_scope_mismatch"
     return None

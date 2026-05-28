@@ -77,8 +77,10 @@ class V2MainPluginContractTests(unittest.TestCase):
         self.assertIn("swallowed", self.plugin_text)
 
     def test_plugin_loads_persona_into_llm_planner(self) -> None:
-        # qqbot/persona.md 是主人设文件，必须存在且非空
-        persona_path = ROOT / "qqbot" / "persona.md"
+        # persona.md 与其他 prompt 段共置于 services/agent_loop/prompts/
+        persona_path = (
+            ROOT / "qqbot" / "services" / "agent_loop" / "prompts" / "persona.md"
+        )
         self.assertTrue(persona_path.exists())
         persona_text = persona_path.read_text(encoding="utf-8").strip()
         self.assertTrue(len(persona_text) > 0)

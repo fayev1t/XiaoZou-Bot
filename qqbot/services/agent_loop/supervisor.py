@@ -22,6 +22,7 @@ from typing import Callable
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from qqbot.core.logging import get_logger
+from qqbot.services.agent_loop import bot_registry
 from qqbot.services.agent_loop.decision import Planner
 from qqbot.services.agent_loop.loop import AgentLoop
 from qqbot.services.agent_loop.projection import Projector
@@ -149,8 +150,24 @@ class LoopSupervisor:
                 session_factory=self._session_factory,
                 projector=self._projector,
                 supervisor=self,
+                bot_user_id_resolver=_default_bot_user_id_resolver,
             )
             loop.start()
             self._loops[scope_key] = loop
             logger.info("[supervisor] loop spawned: {}", scope_key)
             return loop
+
+
+def _default_bot_user_id_resolver() -> str | None:
+    """单 bot 部署的默认 resolver：从 bot_registry 取第一个已注册 self_id。
+
+    多账号场景（同一进程同时注册多个 Bot 实例）下应当按 scope_key 选合适的
+    bot——比如这个群里 bot A 是成员、bot B 不是——但目前 v2 还没有 scope →
+    bot 的路由表，先用单 bot 假设兜底，等真有多账号需求时再细化。
+
+    返回 None 时（启动初期，nonebot 还没把 Bot 注册进来）AgentLoop 把
+    bot_user_id 保持为 None，prompt 渲染层不输出该属性，LLM 退化为"靠
+    自己的 agent_reply 被引用反推"识别自己——这是降级而非错误。
+    """
+    ids = bot_registry.all_self_ids()
+    return ids[0] if ids else None

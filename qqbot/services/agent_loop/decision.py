@@ -54,20 +54,6 @@ class CallToolAction:
 
 
 @dataclass(frozen=True)
-class ReplyAction:
-    """The 'output tool': emit a message in the current scope.
-
-    `target.kind` is "group" or "private"; the loop validates it matches the
-    loop's own scope_key before writing the event.
-    """
-
-    content: list[dict] = field(default_factory=list)
-    target: dict | None = None
-    related_msg_hashes: list[str] = field(default_factory=list)
-    type: str = "reply"
-
-
-@dataclass(frozen=True)
 class CompleteTaskAction:
     task_id: str
     result_summary: str | None = None
@@ -95,11 +81,15 @@ class NoteTaskProgressAction:
 
 # Union of every action type the loop translates. Order matters only for
 # isinstance dispatch readability, not semantics.
+#
+# 注意：reply 不在这里 —— v2 中"发言"是 reply 工具的 CallToolAction，
+# 不再是一类独立的 Action。这是为了让 LLM 把"要不要说话"当成一次工具调
+# 用决策，与调 websearch / search_history 同构，避免被旧 ReplyAction 诱
+# 导成"群里每条消息都要选择回 vs idle"的二分法。
 Action = (
     IdleAction
     | CreateTaskAction
     | CallToolAction
-    | ReplyAction
     | CompleteTaskAction
     | FailTaskAction
     | NoteTaskProgressAction
@@ -199,6 +189,11 @@ class DecisionContext:
     # the projection layer (they come from separate sources).
     tool_catalog: list[Any] = field(default_factory=list)
     runtime_hints: list[Any] = field(default_factory=list)
+
+    # 当前 tick 上 bot 自己的 QQ user_id（由 bot_registry 提供，AgentLoop
+    # 在 tick() 时 resolve 后注入）。None 表示 bot 还没连接 napcat / 注册
+    # 第一条事件 —— prompt 渲染时不输出该属性，模型回退到"靠引用反推"。
+    bot_user_id: str | None = None
 
 
 class Planner(Protocol):

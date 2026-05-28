@@ -41,14 +41,22 @@ _ingest: EventIngest | None = None
 _supervisor: LoopSupervisor | None = None
 
 # qqbot/ 没有 __init__.py（namespace package），所以 `qqbot.__file__` 是
-# None，不能用来定位 persona。改用本文件的相对路径：
-#   qqbot/plugins/v2_main.py → parent = qqbot/plugins → parent = qqbot/
-_PERSONA_PATH = Path(__file__).resolve().parent.parent / "persona.md"
+# None，不能用来定位 persona。改用本文件的相对路径，persona 与其他 prompt
+# 段共置于 services/agent_loop/prompts/：
+#   qqbot/plugins/v2_main.py → parent.parent = qqbot/
+#   → services/agent_loop/prompts/persona.md
+_PERSONA_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "services"
+    / "agent_loop"
+    / "prompts"
+    / "persona.md"
+)
 
 
 def _load_persona_text() -> str | None:
-    """从 qqbot/persona.md 读主人设。文件缺失 / 为空返回 None，
-    LLMPlanner 会退化为纯决策协议 prompt（不报错，便于排障）。"""
+    """从 services/agent_loop/prompts/persona.md 读主人设。文件缺失 / 为空
+    返回 None，LLMPlanner 会退化为纯决策协议 prompt（不报错，便于排障）。"""
     try:
         if not _PERSONA_PATH.exists():
             logger.warning(
@@ -89,6 +97,11 @@ def _get_supervisor() -> LoopSupervisor:
             projector=projector,
             tool_registry=tool_registry,
         )
+        # ReplyTool 需要 supervisor.notify_reply_pending 来唤醒 ReplySendWorker，
+        # 但 supervisor 的 tool_registry 又要先就绪 —— 双向依赖只能后置回填。
+        reply_tool = tool_registry.get("reply")
+        if reply_tool is not None and hasattr(reply_tool, "set_wake_callback"):
+            reply_tool.set_wake_callback(_supervisor.notify_reply_pending)
     return _supervisor
 
 

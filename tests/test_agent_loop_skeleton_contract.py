@@ -196,6 +196,59 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
         await loop.stop()
         self.assertEqual(captured, [])
 
+    async def test_bot_user_id_resolver_called_each_tick(self) -> None:
+        """resolver 每 tick 被调一次 —— bot 重连后 self_id 可能变；每 tick
+        重新 resolve 比启动期 snapshot 更稳。"""
+        captured: list[Any] = []
+        call_count = {"n": 0}
+
+        def _resolver() -> str | None:
+            call_count["n"] += 1
+            return "3167291813"
+
+        loop = AgentLoop(
+            scope_key="group:12345",
+            planner=FakeIdlePlanner(),
+            session_factory=_factory_for(captured),
+            bot_user_id_resolver=_resolver,
+        )
+        loop.start()
+        loop.wake()
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if call_count["n"] >= 1:
+                break
+        await loop.stop()
+        # 至少跑了一 tick → resolver 至少被调一次
+        self.assertGreaterEqual(call_count["n"], 1)
+
+    async def test_bot_user_id_resolver_exception_does_not_break_tick(self) -> None:
+        """resolver 抛异常时整 tick 不应翻车 —— prompt 降级为没有 bot_user_id
+        属性，业务继续。"""
+        captured: list[Any] = []
+
+        def _broken_resolver() -> str | None:
+            raise RuntimeError("bot_registry unavailable")
+
+        loop = AgentLoop(
+            scope_key="group:12345",
+            planner=FakeIdlePlanner(),
+            session_factory=_factory_for(captured),
+            bot_user_id_resolver=_broken_resolver,
+        )
+        loop.start()
+        loop.wake()
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if len(captured) >= 4:
+                break
+        await loop.stop()
+        # 正常 4 条事件链都应当落地（tick_started / decision_emitted /
+        # idle_decision / tick_ended），不被 resolver 异常掐断
+        types = [_values_of(stmt).get("type") for stmt in captured]
+        self.assertIn("runtime.tick_started", types)
+        self.assertIn("runtime.tick_ended", types)
+
 
 class LoopSupervisorContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_start_spawns_system_loop(self) -> None:

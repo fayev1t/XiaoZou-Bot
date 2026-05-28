@@ -5,11 +5,14 @@ Covers (任务与决策契约 §3.1, §3.2, §7.1):
 - CreateTaskAction    → agent.task_created (+ records task_ref for in-tick reuse)
 - CallToolAction      → agent.tool_called (+ auto agent.task_state_changed pending→running)
 - CallToolAction with task_ref resolves to the just-minted task_id
-- ReplyAction         → agent.reply_emitted
 - CompleteTaskAction  → agent.task_state_changed (to=done)
 - FailTaskAction      → agent.task_state_changed (to=failed)
-- Validation: ≥2 reply, idle + other, reply target mismatch
-  all force runtime.llm_invalid_output + auto-idle
+- Validation: idle + other forces runtime.llm_invalid_output + auto-idle
+
+Reply is no longer a first-class action — it is invoked via CallToolAction
+with tool_name="reply" and dispatched through ToolWorker → ReplyTool. The
+target.kind/group_id mismatch and other reply-specific validations are now
+covered in test_reply_tool_contract.py.
 
 Pure unit-level: a recording session captures every insert.
 """
@@ -31,7 +34,6 @@ from qqbot.services.agent_loop import (
     FailTaskAction,
     IdleAction,
     NoteTaskProgressAction,
-    ReplyAction,
 )
 
 
@@ -198,28 +200,38 @@ class CallToolActionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_values(state_chg)["payload"]["task_id"], new_task_id)
 
 
-class ReplyActionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_reply_writes_agent_reply_emitted(self) -> None:
+class ReplyAsToolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reply_now_routes_as_tool_call(self) -> None:
+        """Reply 不再走专门的 ReplyAction 分支，而是普通的 CallToolAction —
+        loop 写 agent.tool_called，ToolWorker 后续执行 ReplyTool 才写
+        agent.reply_emitted。这里只断言 loop 层不再写 reply_emitted。"""
         out = DecisionOutput(actions=[
-            ReplyAction(
-                content=[{"type": "text", "text": "hi"}],
-                target={"kind": "group", "group_id": 12345},
-                related_msg_hashes=["abc"],
+            CallToolAction(
+                tool_name="reply",
+                arguments={
+                    "content": [{"type": "text", "data": {"text": "hi"}}],
+                    "target": {"kind": "group", "group_id": 12345},
+                },
             ),
         ])
         captured = await _run_one_tick(_StaticPlanner(out), "group:12345")
         types = _types_after_tick_started(captured)
-        self.assertIn("agent.reply_emitted", types)
+        self.assertIn("agent.tool_called", types)
+        # loop 层不再直接落 reply_emitted —— 它由 ReplyTool.run() 在
+        # ToolWorker 里发出。
+        self.assertNotIn("agent.reply_emitted", types)
         # 校验通过：没有 invalid_output 事件
         self.assertNotIn("runtime.llm_invalid_output", types)
-        emitted = next(
+        called = next(
             stmt for stmt in captured
-            if _values(stmt).get("type") == "agent.reply_emitted"
+            if _values(stmt).get("type") == "agent.tool_called"
         )
-        payload = _values(emitted)["payload"]
-        self.assertEqual(payload["content"], [{"type": "text", "text": "hi"}])
-        self.assertEqual(payload["related_msg_hashes"], ["abc"])
-        self.assertIsNotNone(payload["reply_id"])
+        payload = _values(called)["payload"]
+        self.assertEqual(payload["tool_name"], "reply")
+        self.assertEqual(
+            payload["arguments"]["target"],
+            {"kind": "group", "group_id": 12345},
+        )
 
 
 class CompleteAndFailTaskTests(unittest.IsolatedAsyncioTestCase):
@@ -288,28 +300,6 @@ class CreateTaskTriggeredByEventIdTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ValidationFailureTests(unittest.IsolatedAsyncioTestCase):
-    async def test_two_replies_force_idle_and_invalid_output(self) -> None:
-        out = DecisionOutput(actions=[
-            ReplyAction(content=[{"type": "text", "text": "a"}],
-                        target={"kind": "group", "group_id": 1}),
-            ReplyAction(content=[{"type": "text", "text": "b"}],
-                        target={"kind": "group", "group_id": 1}),
-        ])
-        captured = await _run_one_tick(_StaticPlanner(out), "group:1")
-        types = _types_after_tick_started(captured)
-        self.assertIn("runtime.llm_invalid_output", types)
-        # forced idle
-        self.assertIn("agent.idle_decision", types)
-        # original replies dropped
-        self.assertNotIn("agent.reply_emitted", types)
-        inv = next(
-            stmt for stmt in captured
-            if _values(stmt).get("type") == "runtime.llm_invalid_output"
-        )
-        self.assertEqual(
-            _values(inv)["payload"]["validation_error"], "multiple_reply_actions"
-        )
-
     async def test_idle_with_other_action_forces_idle(self) -> None:
         out = DecisionOutput(actions=[
             IdleAction(reason="nothing"),
@@ -327,33 +317,6 @@ class ValidationFailureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             _values(inv)["payload"]["validation_error"], "idle_with_other_actions"
         )
-
-    async def test_reply_target_group_mismatch_forces_idle(self) -> None:
-        # Loop is group:12345, but reply targets group:99999
-        out = DecisionOutput(actions=[
-            ReplyAction(content=[{"type": "text", "text": "x"}],
-                        target={"kind": "group", "group_id": 99999}),
-        ])
-        captured = await _run_one_tick(_StaticPlanner(out), "group:12345")
-        types = _types_after_tick_started(captured)
-        self.assertIn("runtime.llm_invalid_output", types)
-        self.assertNotIn("agent.reply_emitted", types)
-        inv = next(
-            stmt for stmt in captured
-            if _values(stmt).get("type") == "runtime.llm_invalid_output"
-        )
-        self.assertEqual(
-            _values(inv)["payload"]["validation_error"], "reply_target_group_mismatch"
-        )
-
-    async def test_reply_kind_mismatch_forces_idle(self) -> None:
-        out = DecisionOutput(actions=[
-            ReplyAction(content=[{"type": "text", "text": "x"}],
-                        target={"kind": "private", "user_id": 1}),
-        ])
-        captured = await _run_one_tick(_StaticPlanner(out), "group:1")
-        types = _types_after_tick_started(captured)
-        self.assertIn("runtime.llm_invalid_output", types)
 
 
 class CausationChainTests(unittest.IsolatedAsyncioTestCase):

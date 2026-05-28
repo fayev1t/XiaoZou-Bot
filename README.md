@@ -125,40 +125,7 @@ pip install -r requirements.txt
 python -m qqbot
 ```
 - **对接 NapCat**：Web 面板添加 WebSocket 客户端指向 `ws://<bot-host>:7500/onebot/v11/ws`。
-- **自定义人设**：编辑 `qqbot/persona.md`（实时生效，无需重启）。
-
-
-## 🧩 项目结构（关键目录）
-
-```
-qqbot/
-├── persona.md                          # 人设（PromptRegistry: persona section）
-├── core/                               # 基础设施：日志、settings、db、time、llm 工厂
-├── models/                             # SQLAlchemy 模型（agent_events 单表 + ids）
-├── plugins/
-│   ├── startup.py                      # init_db / 启动顺序
-│   └── v2_main.py                      # nonebot 事件入口 + AgentLoop 生命周期
-└── services/
-    ├── event_ingest/                   # napcat 事件 → agent_events
-    │   ├── ingest.py / mapper.py
-    │   ├── mappers/                    # 每种 OneBot 事件一个 mapper
-    │   ├── media.py                    # 图片同步下载 + sha256 + 落盘
-    │   └── heartbeat.py                # heartbeat 文件旁路（不进 DB）
-    └── agent_loop/
-        ├── loop.py / supervisor.py     # 每 scope 一个 AgentLoop
-        ├── projection.py               # agent_events → DecisionContext
-        ├── decision.py                 # Action / Task / DecisionContext schema
-        ├── llm_planner.py              # 调 VLM 输出 DecisionOutput
-        ├── prompt_registry.py          # 通用 prompt 拼装
-        ├── prompts/                    # protocol.md / reply.md
-        ├── tool_registry.py            # Tool Protocol + ToolRegistry
-        ├── tools/                      # 每个工具一对 .py + .md
-        │   ├── websearch.py + .md
-        │   └── search_history.py + .md
-        ├── reply_worker.py             # agent.reply_emitted → napcat
-        ├── tool_worker.py              # agent.tool_called → tool.run → result
-        └── event_writer.py             # 统一 agent_events 写入
-```
+- **自定义人设**：编辑 `qqbot/services/agent_loop/prompts/persona.md`（修改后重启进程生效）。
 
 
 ## 🍓 交流群
