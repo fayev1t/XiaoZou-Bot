@@ -18,7 +18,12 @@ import asyncio
 import unittest
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
+from qqbot.services.agent_loop.delivery_claims import (
+    DEFAULT_LEASE_SECONDS,
+    ClaimResult,
+)
 from qqbot.services.agent_loop.tool_registry import ToolRegistry
 from qqbot.services.agent_loop.tool_worker import ToolWorker
 
@@ -205,6 +210,68 @@ class ToolWorkerContractTest(unittest.TestCase):
         self.assertEqual(tool.calls, [{}])
         self.assertIn("agent.tool_result", _types(store))
 
+    def test_live_lease_skip_schedules_retry_without_running_tool(self) -> None:
+        reg = ToolRegistry()
+        tool = _StubTool("websearch")
+        reg.register(tool)
+        store: list[Any] = []
+        worker = ToolWorker(session_factory=_factory_for(store), registry=reg)
+        delays: list[float] = []
+        worker._schedule_retry = delays.append  # type: ignore[method-assign]
+
+        row = _row(
+            event_id="EID5",
+            payload={
+                "tool_call_id": "TCID5",
+                "tool_name": "websearch",
+                "arguments": {"query": "later"},
+            },
+        )
+        with patch(
+            "qqbot.services.agent_loop.tool_worker.claim_delivery",
+            new=AsyncMock(
+                return_value=ClaimResult(
+                    claimed=False, retry_after_seconds=5.0
+                )
+            ),
+        ):
+            result = asyncio.run(worker._process_one(row))
+
+        self.assertIsNone(result)
+        self.assertEqual(delays, [5.0])
+        self.assertEqual(tool.calls, [])
+        self.assertEqual(store, [])
+
+    def test_terminal_write_failure_schedules_lease_retry(self) -> None:
+        reg = ToolRegistry()
+        tool = _StubTool("websearch", return_value={"ok": True})
+        reg.register(tool)
+        store: list[Any] = []
+        worker = ToolWorker(session_factory=_factory_for(store), registry=reg)
+        delays: list[float] = []
+        worker._schedule_retry = delays.append  # type: ignore[method-assign]
+
+        row = _row(
+            event_id="EID6",
+            payload={
+                "tool_call_id": "TCID6",
+                "tool_name": "websearch",
+                "arguments": {"query": "x"},
+            },
+        )
+        with patch(
+            "qqbot.services.agent_loop.tool_worker.claim_delivery",
+            new=AsyncMock(return_value=ClaimResult(claimed=True)),
+        ), patch(
+            "qqbot.services.agent_loop.tool_worker.write_agent_event",
+            new=AsyncMock(side_effect=RuntimeError("db down")),
+        ):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(worker._process_one(row))
+
+        self.assertEqual(tool.calls, [{"query": "x"}])
+        self.assertEqual(delays, [float(DEFAULT_LEASE_SECONDS)])
+
 
 class _StubSupervisor:
     """Captures wake() invocations for assertions; mirrors LoopSupervisor's
@@ -336,7 +403,7 @@ class ToolWorkerSelfWakeTest(unittest.TestCase):
         self.assertIn("agent.tool_result", _types(store))
 
     def test_process_one_returns_scope_key(self) -> None:
-        """Drain 层依赖此返回值收集 scope 集合做 wake；任一分支都必须返回。"""
+        """会落终态事件的分支需返回 scope_key，供 drain 层收集 wake 集合。"""
         reg = ToolRegistry()
         reg.register(_StubTool("ok", return_value={"r": 1}))
         reg.register(_StubTool("boom", raise_exc=RuntimeError("x")))

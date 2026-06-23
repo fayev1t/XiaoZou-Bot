@@ -30,12 +30,17 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from qqbot.core.logging import get_logger
+from qqbot.services.agent_loop.delivery_claims import (
+    DEFAULT_LEASE_SECONDS,
+    claim_delivery,
+)
 from qqbot.services.agent_loop.event_writer import write_agent_event
 from qqbot.services.agent_loop.tool_registry import ToolRegistry
 
 logger = get_logger(__name__)
 
 SessionFactory = Callable[[], AsyncSession]
+_LEASE_RETRY_EPSILON_SECONDS = 0.1
 
 _PENDING_QUERY = text(
     """
@@ -74,6 +79,9 @@ class ToolWorker:
         self._wake = asyncio.Event()
         self._stopped = False
         self._task: asyncio.Task[None] | None = None
+        self._retry_handle: asyncio.TimerHandle | None = None
+        self._retry_deadline: float | None = None
+        self._last_drain_completed = 0
 
     def notify(self) -> None:
         if self._stopped:
@@ -89,6 +97,10 @@ class ToolWorker:
 
     async def stop(self) -> None:
         self._stopped = True
+        if self._retry_handle is not None:
+            self._retry_handle.cancel()
+            self._retry_handle = None
+            self._retry_deadline = None
         self._wake.set()
         if self._task is not None:
             try:
@@ -107,12 +119,13 @@ class ToolWorker:
                 if self._stopped:
                     break
                 try:
-                    processed = await self._drain_once()
-                    if processed > 0:
+                    scanned = await self._drain_once()
+                    if self._last_drain_completed > 0:
                         logger.info(
-                            "[tool_worker] processed {} tool calls", processed
+                            "[tool_worker] processed {} tool calls",
+                            self._last_drain_completed,
                         )
-                    if processed >= 100:
+                    if scanned >= 100 and self._last_drain_completed > 0:
                         self._wake.set()
                 except Exception as exc:
                     logger.exception("[tool_worker] drain failed: {}", exc)
@@ -125,9 +138,12 @@ class ToolWorker:
             rows = list(result.mappings().all())
 
         scopes_to_wake: set[str] = set()
+        completed = 0
         for row in rows:
             try:
                 scope_key = await self._process_one(row)
+                if scope_key is not None:
+                    completed += 1
                 if scope_key:
                     scopes_to_wake.add(scope_key)
             except Exception as exc:
@@ -155,6 +171,7 @@ class ToolWorker:
                         scope_key,
                         exc,
                     )
+        self._last_drain_completed = completed
         return len(rows)
 
     async def _process_one(self, row: Any) -> str | None:
@@ -190,35 +207,71 @@ class ToolWorker:
             )
             return scope_key
 
+        # 出货去重:抢占本条 tool_called 的执行权,再真正跑工具。抢不到(并发实例 /
+        # 上次尝试仍在租约内)→ 跳过;事件仍 pending,lease 到期后由延迟 wake
+        # 重新扫描,不再依赖后续恰好有新 tool_called 才能复活。
+        claim = await claim_delivery(self._session_factory, event_id, "tool")
+        if not claim.claimed:
+            retry_after = (
+                claim.retry_after_seconds
+                if claim.retry_after_seconds is not None
+                else float(DEFAULT_LEASE_SECONDS)
+            )
+            logger.info(
+                "[tool_worker] tool_called={} already claimed, retry in {:.1f}s",
+                event_id,
+                retry_after,
+            )
+            self._schedule_retry(retry_after)
+            return None
+
+        claimed_here = True
+        terminal_written = False
         try:
-            # 系统级 context 统一作为 kwargs 注入；每个工具收到的 context 完全
-            # 相同，按需消费、不需要的用 **_ 忽略（黑盒：系统只喂 input、收
-            # output，不必按名字特判任何工具）。
-            #   scope_key / task_id / correlation_id —— 路由与审计
-            #   session_factory                       —— 写/查 agent_events
-            #     (reply 写 reply_emitted；search_history 查历史)
-            #   notify_reply_pending                  —— reply 写完唤醒
-            #     ReplySendWorker 立即出货；supervisor 缺失时为 None（catchup 兜底）
-            result = await tool.run(
-                arguments,
-                scope_key=scope_key,
-                task_id=task_id,
-                correlation_id=correlation_id,
-                session_factory=self._session_factory,
-                # getattr 兜底：supervisor 鸭子类型注入，可能为 None（早期骨架）
-                # 或只实现了部分接口（测试 stub）；取不到回调就传 None，reply
-                # 工具据此退化为不主动唤醒（catchup 兜底）。
-                notify_reply_pending=getattr(
-                    self._supervisor, "notify_reply_pending", None
-                ),
-            )
-        except Exception as exc:
-            logger.warning(
-                "[tool_worker] {} raised: {}", tool_name, exc
-            )
+            try:
+                # 系统级 context 统一作为 kwargs 注入；每个工具收到的 context 完全
+                # 相同，按需消费、不需要的用 **_ 忽略（黑盒：系统只喂 input、收
+                # output，不必按名字特判任何工具）。
+                #   scope_key / task_id / correlation_id —— 路由与审计
+                #   session_factory                       —— 写/查 agent_events
+                #     (reply 写 reply_emitted；search_history 查历史)
+                #   notify_reply_pending                  —— reply 写完唤醒
+                #     ReplySendWorker 立即出货；supervisor 缺失时为 None（catchup 兜底）
+                result = await tool.run(
+                    arguments,
+                    scope_key=scope_key,
+                    task_id=task_id,
+                    correlation_id=correlation_id,
+                    session_factory=self._session_factory,
+                    # getattr 兜底：supervisor 鸭子类型注入，可能为 None（早期骨架）
+                    # 或只实现了部分接口（测试 stub）；取不到回调就传 None，reply
+                    # 工具据此退化为不主动唤醒（catchup 兜底）。
+                    notify_reply_pending=getattr(
+                        self._supervisor, "notify_reply_pending", None
+                    ),
+                )
+            except Exception as exc:
+                logger.warning("[tool_worker] {} raised: {}", tool_name, exc)
+                await write_agent_event(
+                    self._session_factory,
+                    event_type="agent.tool_failed",
+                    scope_key=scope_key,
+                    correlation_id=correlation_id,
+                    causation_id=event_id,
+                    payload={
+                        "tool_call_id": tool_call_id,
+                        "tool_name": tool_name,
+                        "task_id": task_id,
+                        "error_kind": type(exc).__name__,
+                        "error_message": str(exc)[:1000],
+                    },
+                )
+                terminal_written = True
+                return scope_key
+
             await write_agent_event(
                 self._session_factory,
-                event_type="agent.tool_failed",
+                event_type="agent.tool_result",
                 scope_key=scope_key,
                 correlation_id=correlation_id,
                 causation_id=event_id,
@@ -226,26 +279,38 @@ class ToolWorker:
                     "tool_call_id": tool_call_id,
                     "tool_name": tool_name,
                     "task_id": task_id,
-                    "error_kind": type(exc).__name__,
-                    "error_message": str(exc)[:1000],
+                    "result": result,
                 },
             )
+            terminal_written = True
             return scope_key
+        finally:
+            if claimed_here and not terminal_written:
+                self._schedule_retry(float(DEFAULT_LEASE_SECONDS))
 
-        await write_agent_event(
-            self._session_factory,
-            event_type="agent.tool_result",
-            scope_key=scope_key,
-            correlation_id=correlation_id,
-            causation_id=event_id,
-            payload={
-                "tool_call_id": tool_call_id,
-                "tool_name": tool_name,
-                "task_id": task_id,
-                "result": result,
-            },
+    def _schedule_retry(self, delay_seconds: float) -> None:
+        if self._stopped:
+            return
+        loop = asyncio.get_running_loop()
+        deadline = (
+            loop.time()
+            + max(delay_seconds, 0.0)
+            + _LEASE_RETRY_EPSILON_SECONDS
         )
-        return scope_key
+        if self._retry_handle is not None and not self._retry_handle.cancelled():
+            current_deadline = self._retry_deadline or 0.0
+            if current_deadline <= deadline:
+                return
+            self._retry_handle.cancel()
+        self._retry_deadline = deadline
+        self._retry_handle = loop.call_at(deadline, self._on_retry_deadline)
+
+    def _on_retry_deadline(self) -> None:
+        self._retry_handle = None
+        self._retry_deadline = None
+        if self._stopped:
+            return
+        self._wake.set()
 
 
 def _scope_key_from_row(

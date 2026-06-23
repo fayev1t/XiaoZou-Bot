@@ -117,10 +117,12 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
 async def init_db() -> None:
     """初始化数据库表
 
-    两张表：
+    三张表：
     - agent_events（append-only event stream，唯一真相源）
     - agent_tasks（任务读模型 / CQRS read model，从 agent.task_* 事件派生；
       允许 UPDATE，可从事件流 replay 重建。见 models/agent_task.py）
+    - agent_delivery_claims（worker 投递去重 / 租约表，运维协调用，允许 UPDATE；
+      丢了只退回"无去重"旧行为。见 models/agent_delivery_claim.py）
 
     pg_trgm 扩展先建好，AgentEvent.search_text 上的 GIN trgm 索引才能创建
     （供 search_history 关键字检索使用）。
@@ -133,10 +135,12 @@ async def init_db() -> None:
     create_all 直接建，无需 ALTER 补丁。
     """
     try:
-        # 触发模型模块加载以注册到 Base.metadata（agent_events + agent_tasks）
+        # 触发模型模块加载以注册到 Base.metadata
+        # （agent_events + agent_tasks + agent_delivery_claims）
         from qqbot.models import Base  # noqa: F401
         from qqbot.models import agent_event  # noqa: F401
         from qqbot.models import agent_task  # noqa: F401
+        from qqbot.models import agent_delivery_claim  # noqa: F401
 
         async with engine.begin() as conn:
             # 必须在 create_all 之前，否则 GIN trgm 索引创建会失败

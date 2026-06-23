@@ -18,8 +18,13 @@ import asyncio
 import unittest
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 from qqbot.services.agent_loop import bot_registry
+from qqbot.services.agent_loop.delivery_claims import (
+    DEFAULT_LEASE_SECONDS,
+    ClaimResult,
+)
 from qqbot.services.agent_loop.reply_worker import ReplySendWorker
 
 
@@ -253,6 +258,67 @@ class ReplyWorkerContractTest(unittest.TestCase):
         self.assertEqual(len(bot_b.calls), 1)
         delivered = _payloads_by_type(store)["agent.reply_delivered"]
         self.assertEqual(delivered["self_id"], "B")
+
+    def test_live_lease_skip_schedules_retry_without_sending(self) -> None:
+        bot = _StubBot()
+        bot_registry.register(bot)
+        store: list[Any] = []
+        worker = ReplySendWorker(session_factory=_factory_for(store))
+        delays: list[float] = []
+        worker._schedule_retry = delays.append  # type: ignore[method-assign]
+
+        row = _row(
+            event_id="EID7",
+            payload={
+                "reply_id": "RID7",
+                "content": [{"type": "text", "data": {"text": "later"}}],
+                "target": {"kind": "group", "group_id": 100},
+            },
+        )
+        with patch(
+            "qqbot.services.agent_loop.reply_worker.claim_delivery",
+            new=AsyncMock(
+                return_value=ClaimResult(
+                    claimed=False, retry_after_seconds=7.5
+                )
+            ),
+        ):
+            result = asyncio.run(worker._process_one(row))
+
+        self.assertFalse(result)
+        self.assertEqual(delays, [7.5])
+        self.assertEqual(bot.calls, [])
+        self.assertEqual(store, [])
+
+    def test_terminal_write_failure_schedules_lease_retry(self) -> None:
+        bot = _StubBot(return_value={"message_id": 888})
+        bot_registry.register(bot)
+        store: list[Any] = []
+        worker = ReplySendWorker(session_factory=_factory_for(store))
+        delays: list[float] = []
+        worker._schedule_retry = delays.append  # type: ignore[method-assign]
+
+        row = _row(
+            event_id="EID8",
+            payload={
+                "reply_id": "RID8",
+                "content": [{"type": "text", "data": {"text": "boom"}}],
+                "target": {"kind": "group", "group_id": 100},
+            },
+        )
+
+        with patch(
+            "qqbot.services.agent_loop.reply_worker.claim_delivery",
+            new=AsyncMock(return_value=ClaimResult(claimed=True)),
+        ), patch(
+            "qqbot.services.agent_loop.reply_worker.write_agent_event",
+            new=AsyncMock(side_effect=RuntimeError("db down")),
+        ):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(worker._process_one(row))
+
+        self.assertEqual(len(bot.calls), 1)
+        self.assertEqual(delays, [float(DEFAULT_LEASE_SECONDS)])
 
 
 if __name__ == "__main__":
