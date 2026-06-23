@@ -48,10 +48,34 @@ class Tool(Protocol):
         """Run the tool.
 
         `arguments` is the LLM-supplied dict matching `arguments_schema`.
-        `context` carries system-injected kwargs (scope_key, task_id, ...) —
-        tools that don't need them should accept **_ to ignore.
+        `context` carries system-injected kwargs (scope_key, task_id,
+        correlation_id, session_factory, notify_reply_pending, ...) — tools
+        that don't need them should accept **_ to ignore. ToolWorker injects
+        the SAME context for every tool, so no tool needs bespoke
+        construction wiring — see BaseTool.
         """
         ...
+
+
+class BaseTool:
+    """工具基类：把"可选属性"的默认值固化在一处，realize "系统只认输入输出"。
+
+    继承它后，工具只需覆盖与默认不同的字段（几乎总是 name / description /
+    arguments_schema / usage_prompt）；权限相关默认 GUEST / 非 bot-admin。
+    需要敏感权限的工具显式覆盖 `required_permission` / `require_bot_admin`
+    即可（如未来的踢人工具 = ADMIN + require_bot_admin）。
+
+    系统级依赖（session_factory / notify_reply_pending 等）一律由 ToolWorker
+    在 run() 的 context 里统一注入，不再走各工具自己的 __init__ —— 这样
+    build_default_registry 能无参构造所有工具，系统也不必按名字特判任何工具。
+
+    注：`get_tool_required_permission` / `get_tool_require_bot_admin` 仍保留为
+    防御层 —— 测试 stub 或第三方工具不继承 BaseTool 时也能拿到默认值。
+    """
+
+    usage_prompt: str = ""
+    required_permission: PermissionTier = PermissionTier.GUEST
+    require_bot_admin: bool = False
 
 
 def get_tool_required_permission(tool: Any) -> PermissionTier:

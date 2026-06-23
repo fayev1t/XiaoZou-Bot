@@ -65,6 +65,21 @@ class LoopSupervisor:
     async def start(self) -> None:
         if self._started or self._stopped:
             return
+        # 任务读模型回填：把最近 N 天未完成任务灌进 agent_tasks，覆盖"首次部署
+        # 本特性"和"读模型漂移"。在拉起任何 loop 之前跑，让 system/group loop
+        # 第一 tick 就能从表里看到窗口外的旧任务。best-effort，失败不挡启动。
+        try:
+            from qqbot.services.agent_loop.task_store import backfill_recent
+
+            replayed = await backfill_recent(self._session_factory)
+            logger.info(
+                "[supervisor] task read-model backfill: {} task event(s) replayed",
+                replayed,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[supervisor] task backfill failed (continuing): {}", exc
+            )
         # 先把 ReplySendWorker 跑起来：保证 SystemAgentLoop 第一 tick 出
         # reply 时也能马上发出。worker 自身 start() 即触发一次 catchup。
         self._reply_worker = ReplySendWorker(session_factory=self._session_factory)

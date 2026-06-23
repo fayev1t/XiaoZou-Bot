@@ -23,22 +23,19 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from qqbot.core.logging import get_logger
-from qqbot.core.permissions import PermissionTier
 from qqbot.core.time import normalize_china_time
 from qqbot.models.agent_event import AgentEvent
 from qqbot.services.agent_loop.event_writer import parse_scope_key
 from qqbot.services.agent_loop.projection import Projector, _snapshot_from_row
 from qqbot.services.agent_loop.prompts import load_sibling_md
+from qqbot.services.agent_loop.tool_registry import BaseTool
 
 logger = get_logger(__name__)
-
-SessionFactory = Callable[[], AsyncSession]
 
 _DEFAULT_LIMIT = 20
 _MAX_LIMIT = 50
@@ -46,8 +43,10 @@ _MAX_LIMIT = 50
 _USAGE_PROMPT = load_sibling_md(__file__, "search_history.md")
 
 
-class SearchHistoryTool:
-    """实现 Tool 协议。注入 session_factory 才能查 DB。"""
+class SearchHistoryTool(BaseTool):
+    """实现 Tool 协议。session_factory 从 run() 的 context 进（ToolWorker
+    统一注入），无构造依赖 —— 与 websearch / reply 同构。
+    """
 
     name = "search_history"
     description = (
@@ -61,9 +60,8 @@ class SearchHistoryTool:
         "format as the normal timeline."
     )
     usage_prompt = _USAGE_PROMPT
-    # 查历史属于内部知识检索，任何群员都能让小奏查；不需要管理员身份
-    required_permission = PermissionTier.GUEST
-    require_bot_admin = False
+    # required_permission / require_bot_admin 用 BaseTool 默认值（GUEST /
+    # False）：查历史属于内部知识检索，任何群员都能让小奏查，无需管理员。
     arguments_schema = {
         "type": "object",
         "properties": {
@@ -103,14 +101,15 @@ class SearchHistoryTool:
         },
     }
 
-    def __init__(self, session_factory: SessionFactory) -> None:
-        self._session_factory = session_factory
-
     async def run(self, arguments: dict, **context: Any) -> dict:
         scope_key = context.get("scope_key")
         if not scope_key or not isinstance(scope_key, str):
             # 由 ToolWorker 注入。理论上 system / group:N / private:N 总有一个。
             raise ValueError("search_history requires scope_key from caller context")
+        # session_factory 同样由 ToolWorker 在 context 里注入。ToolWorker 串行
+        # 执行工具且全局共用同一个 factory，落到 self 上供 _query /
+        # _resolve_task_anchor 复用是安全的（不存在并发 run 互相覆盖）。
+        self._session_factory = context.get("session_factory")
 
         try:
             scope, group_id, _user_id = parse_scope_key(scope_key)

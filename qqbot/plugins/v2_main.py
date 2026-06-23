@@ -85,7 +85,9 @@ def _get_supervisor() -> LoopSupervisor:
     global _supervisor
     if _supervisor is None:
         projector = Projector(session_factory=AsyncSessionLocal)
-        tool_registry = build_tool_registry(session_factory=AsyncSessionLocal)
+        # 工具无构造依赖：session_factory / notify_reply_pending 等系统依赖
+        # 由 ToolWorker 在 run() context 里统一注入（见 ToolWorker._process_one）。
+        tool_registry = build_tool_registry()
         persona_text = _load_persona_text()
         # LLMPlanner 对 LLM 不可用 / JSON 解析失败一律 fallback 为 IdleAction，
         # 不会让 supervisor 起不来。tool_registry 同时给 planner（prompt
@@ -101,11 +103,9 @@ def _get_supervisor() -> LoopSupervisor:
             projector=projector,
             tool_registry=tool_registry,
         )
-        # ReplyTool 需要 supervisor.notify_reply_pending 来唤醒 ReplySendWorker，
-        # 但 supervisor 的 tool_registry 又要先就绪 —— 双向依赖只能后置回填。
-        reply_tool = tool_registry.get("reply")
-        if reply_tool is not None and hasattr(reply_tool, "set_wake_callback"):
-            reply_tool.set_wake_callback(_supervisor.notify_reply_pending)
+        # 不再需要把 reply 的 wake 回调后置回填到工具上 —— ReplyTool 在 run()
+        # 时从 ToolWorker 注入的 context 里取 notify_reply_pending，supervisor →
+        # tool 的反向依赖随之消失（统一接口的副产物）。
     return _supervisor
 
 

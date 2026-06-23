@@ -73,7 +73,9 @@ class SearchHistoryToolContractTest(unittest.TestCase):
         anchor_returns: str | None = None,
     ) -> SearchHistoryTool:
         """构造工具，替换 _query 与 _resolve_task_anchor 为 stub。"""
-        tool = SearchHistoryTool(session_factory=lambda: None)  # session_factory 不会被走到
+        # 无构造依赖；session_factory 现从 run() context 进，且这些用例都 stub
+        # 掉了 _query / _resolve_task_anchor，session_factory 不会被走到。
+        tool = SearchHistoryTool()
         self.captured_query_kwargs: dict[str, Any] = {}
 
         async def _stub_query(**kwargs: Any) -> list[_StubRow]:

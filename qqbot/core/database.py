@@ -117,7 +117,10 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
 async def init_db() -> None:
     """初始化数据库表
 
-    v2 唯一表：agent_events（append-only event stream）。
+    两张表：
+    - agent_events（append-only event stream，唯一真相源）
+    - agent_tasks（任务读模型 / CQRS read model，从 agent.task_* 事件派生；
+      允许 UPDATE，可从事件流 replay 重建。见 models/agent_task.py）
 
     pg_trgm 扩展先建好，AgentEvent.search_text 上的 GIN trgm 索引才能创建
     （供 search_history 关键字检索使用）。
@@ -126,12 +129,14 @@ async def init_db() -> None:
     在加入 search_text 列**之前**就建过 agent_events，重启后 SELECT 会
     `UndefinedColumnError`——这里用 `ALTER TABLE IF EXISTS ADD COLUMN
     IF NOT EXISTS` 补上。第一次部署（表还没建）时这条 ALTER 是 no-op，
-    随后 create_all 直接建带 search_text 的全新表。
+    随后 create_all 直接建带 search_text 的全新表。agent_tasks 是全新表，
+    create_all 直接建，无需 ALTER 补丁。
     """
     try:
-        # 触发 agent_event 模块加载以注册到 Base.metadata
+        # 触发模型模块加载以注册到 Base.metadata（agent_events + agent_tasks）
         from qqbot.models import Base  # noqa: F401
         from qqbot.models import agent_event  # noqa: F401
+        from qqbot.models import agent_task  # noqa: F401
 
         async with engine.begin() as conn:
             # 必须在 create_all 之前，否则 GIN trgm 索引创建会失败

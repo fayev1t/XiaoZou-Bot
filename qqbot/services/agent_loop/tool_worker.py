@@ -191,14 +191,26 @@ class ToolWorker:
             return scope_key
 
         try:
-            # 系统级 context（scope_key / task_id / correlation_id）作为 kwargs
-            # 注入；具体工具按需消费，不需要的用 **_ 忽略。search_history 依赖
-            # scope_key 来限定查询范围。
+            # 系统级 context 统一作为 kwargs 注入；每个工具收到的 context 完全
+            # 相同，按需消费、不需要的用 **_ 忽略（黑盒：系统只喂 input、收
+            # output，不必按名字特判任何工具）。
+            #   scope_key / task_id / correlation_id —— 路由与审计
+            #   session_factory                       —— 写/查 agent_events
+            #     (reply 写 reply_emitted；search_history 查历史)
+            #   notify_reply_pending                  —— reply 写完唤醒
+            #     ReplySendWorker 立即出货；supervisor 缺失时为 None（catchup 兜底）
             result = await tool.run(
                 arguments,
                 scope_key=scope_key,
                 task_id=task_id,
                 correlation_id=correlation_id,
+                session_factory=self._session_factory,
+                # getattr 兜底：supervisor 鸭子类型注入，可能为 None（早期骨架）
+                # 或只实现了部分接口（测试 stub）；取不到回调就传 None，reply
+                # 工具据此退化为不主动唤醒（catchup 兜底）。
+                notify_reply_pending=getattr(
+                    self._supervisor, "notify_reply_pending", None
+                ),
             )
         except Exception as exc:
             logger.warning(

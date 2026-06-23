@@ -2,14 +2,19 @@
 
 Covers:
 - happy path: scope-matched group target writes agent.reply_emitted with
-  the right payload and triggers the wake callback.
+  the right payload and triggers the notify_reply_pending callback.
 - target.kind mismatch → ValueError (ToolWorker converts to tool_failed).
 - group_id mismatch → ValueError.
 - private target on private scope → happy.
 - private target with mismatched user_id → ValueError.
 - empty content → ValueError.
+- missing scope_key / correlation_id / session_factory in context → ValueError.
 - wake callback failures swallowed (do not raise out of run()).
 - usage_prompt loaded from sibling reply.md.
+
+统一接口后 ReplyTool 无构造依赖：session_factory（写事件）与
+notify_reply_pending（唤醒 ReplySendWorker）都从 run() 的 context 进，
+由 ToolWorker 注入。这里用 stub session 直接喂进 context 验证调用面。
 
 The session is a recording stub — we only verify write_agent_event was
 called and the payload shape matches the old ReplyAction path.
@@ -17,7 +22,6 @@ called and the payload shape matches the old ReplyAction path.
 
 from __future__ import annotations
 
-import asyncio
 import unittest
 from types import SimpleNamespace
 from typing import Any
@@ -57,10 +61,7 @@ class ReplyToolHappyPathTests(unittest.IsolatedAsyncioTestCase):
     async def test_group_target_writes_reply_emitted_event(self) -> None:
         captured: list[Any] = []
         wakes: list[int] = []
-        tool = ReplyTool(
-            session_factory=_factory_for(captured),
-            wake_reply_worker=lambda: wakes.append(1),
-        )
+        tool = ReplyTool()
 
         result = await tool.run(
             {
@@ -70,6 +71,8 @@ class ReplyToolHappyPathTests(unittest.IsolatedAsyncioTestCase):
             },
             scope_key="group:100",
             correlation_id="CID",
+            session_factory=_factory_for(captured),
+            notify_reply_pending=lambda: wakes.append(1),
         )
 
         # 写了恰好一条事件
@@ -96,7 +99,7 @@ class ReplyToolHappyPathTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_private_target_writes_event(self) -> None:
         captured: list[Any] = []
-        tool = ReplyTool(session_factory=_factory_for(captured))
+        tool = ReplyTool()
         await tool.run(
             {
                 "content": [{"type": "text", "data": {"text": "hi"}}],
@@ -104,6 +107,7 @@ class ReplyToolHappyPathTests(unittest.IsolatedAsyncioTestCase):
             },
             scope_key="private:555",
             correlation_id="CID",
+            session_factory=_factory_for(captured),
         )
         self.assertEqual(len(captured), 1)
         self.assertEqual(_values(captured[0])["scope"], "private")
@@ -111,7 +115,7 @@ class ReplyToolHappyPathTests(unittest.IsolatedAsyncioTestCase):
 
 class ReplyToolValidationTests(unittest.IsolatedAsyncioTestCase):
     async def test_kind_mismatch_raises(self) -> None:
-        tool = ReplyTool(session_factory=_factory_for([]))
+        tool = ReplyTool()
         with self.assertRaises(ValueError) as cm:
             await tool.run(
                 {
@@ -120,11 +124,12 @@ class ReplyToolValidationTests(unittest.IsolatedAsyncioTestCase):
                 },
                 scope_key="group:100",
                 correlation_id="CID",
+                session_factory=_factory_for([]),
             )
         self.assertIn("target.kind", str(cm.exception))
 
     async def test_group_id_mismatch_raises(self) -> None:
-        tool = ReplyTool(session_factory=_factory_for([]))
+        tool = ReplyTool()
         with self.assertRaises(ValueError) as cm:
             await tool.run(
                 {
@@ -133,11 +138,12 @@ class ReplyToolValidationTests(unittest.IsolatedAsyncioTestCase):
                 },
                 scope_key="group:100",
                 correlation_id="CID",
+                session_factory=_factory_for([]),
             )
         self.assertIn("group_id", str(cm.exception))
 
     async def test_private_user_id_mismatch_raises(self) -> None:
-        tool = ReplyTool(session_factory=_factory_for([]))
+        tool = ReplyTool()
         with self.assertRaises(ValueError):
             await tool.run(
                 {
@@ -146,10 +152,11 @@ class ReplyToolValidationTests(unittest.IsolatedAsyncioTestCase):
                 },
                 scope_key="private:111",
                 correlation_id="CID",
+                session_factory=_factory_for([]),
             )
 
     async def test_missing_content_raises(self) -> None:
-        tool = ReplyTool(session_factory=_factory_for([]))
+        tool = ReplyTool()
         with self.assertRaises(ValueError):
             await tool.run(
                 {
@@ -158,10 +165,11 @@ class ReplyToolValidationTests(unittest.IsolatedAsyncioTestCase):
                 },
                 scope_key="group:100",
                 correlation_id="CID",
+                session_factory=_factory_for([]),
             )
 
     async def test_missing_scope_key_raises(self) -> None:
-        tool = ReplyTool(session_factory=_factory_for([]))
+        tool = ReplyTool()
         with self.assertRaises(ValueError):
             await tool.run(
                 {
@@ -169,10 +177,11 @@ class ReplyToolValidationTests(unittest.IsolatedAsyncioTestCase):
                     "target": {"kind": "group", "group_id": 100},
                 },
                 correlation_id="CID",
+                session_factory=_factory_for([]),
             )
 
     async def test_missing_correlation_id_raises(self) -> None:
-        tool = ReplyTool(session_factory=_factory_for([]))
+        tool = ReplyTool()
         with self.assertRaises(ValueError):
             await tool.run(
                 {
@@ -180,14 +189,30 @@ class ReplyToolValidationTests(unittest.IsolatedAsyncioTestCase):
                     "target": {"kind": "group", "group_id": 100},
                 },
                 scope_key="group:100",
+                session_factory=_factory_for([]),
             )
+
+    async def test_missing_session_factory_raises(self) -> None:
+        # 统一接口后 session_factory 由 ToolWorker 注入；缺失说明调用方没按
+        # 约定注入系统依赖 → 明确 raise（ToolWorker 据此写 tool_failed）。
+        tool = ReplyTool()
+        with self.assertRaises(ValueError) as cm:
+            await tool.run(
+                {
+                    "content": [{"type": "text", "data": {"text": "hi"}}],
+                    "target": {"kind": "group", "group_id": 100},
+                },
+                scope_key="group:100",
+                correlation_id="CID",
+            )
+        self.assertIn("session_factory", str(cm.exception))
 
 
 class ReplyToolWakeCallbackTests(unittest.IsolatedAsyncioTestCase):
-    async def test_default_no_wake_callback_is_noop(self) -> None:
+    async def test_no_notify_callback_is_noop(self) -> None:
         captured: list[Any] = []
-        tool = ReplyTool(session_factory=_factory_for(captured))
-        # 不传 wake_reply_worker；应当不抛、事件仍写
+        tool = ReplyTool()
+        # context 不带 notify_reply_pending；应当不抛、事件仍写
         await tool.run(
             {
                 "content": [{"type": "text", "data": {"text": "hi"}}],
@@ -195,19 +220,17 @@ class ReplyToolWakeCallbackTests(unittest.IsolatedAsyncioTestCase):
             },
             scope_key="group:100",
             correlation_id="CID",
+            session_factory=_factory_for(captured),
         )
         self.assertEqual(len(captured), 1)
 
-    async def test_wake_callback_exception_swallowed(self) -> None:
+    async def test_notify_callback_exception_swallowed(self) -> None:
         def boom() -> None:
             raise RuntimeError("worker is on fire")
 
         captured: list[Any] = []
-        tool = ReplyTool(
-            session_factory=_factory_for(captured),
-            wake_reply_worker=boom,
-        )
-        # 不应当传播：事件仍写，结果仍返回
+        tool = ReplyTool()
+        # 回调抛错不应当传播：事件仍写，结果仍返回
         result = await tool.run(
             {
                 "content": [{"type": "text", "data": {"text": "hi"}}],
@@ -215,26 +238,11 @@ class ReplyToolWakeCallbackTests(unittest.IsolatedAsyncioTestCase):
             },
             scope_key="group:100",
             correlation_id="CID",
+            session_factory=_factory_for(captured),
+            notify_reply_pending=boom,
         )
         self.assertEqual(len(captured), 1)
         self.assertTrue(result["queued"])
-
-    async def test_set_wake_callback_replaces_callback(self) -> None:
-        wakes: list[str] = []
-        tool = ReplyTool(
-            session_factory=_factory_for([]),
-            wake_reply_worker=lambda: wakes.append("initial"),
-        )
-        tool.set_wake_callback(lambda: wakes.append("replaced"))
-        await tool.run(
-            {
-                "content": [{"type": "text", "data": {"text": "hi"}}],
-                "target": {"kind": "group", "group_id": 100},
-            },
-            scope_key="group:100",
-            correlation_id="CID",
-        )
-        self.assertEqual(wakes, ["replaced"])
 
 
 class ReplyToolMetadataTests(unittest.TestCase):

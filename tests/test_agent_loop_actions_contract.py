@@ -66,6 +66,18 @@ def _values(stmt: Any) -> dict:
     return {k: v for k, v in stmt.compile().params.items()}
 
 
+def _is_event_stmt(stmt: Any) -> bool:
+    """只保留写 agent_events 的语句。
+
+    自 2026-06-22 起，写 agent.task_* 事件会**额外**触发 agent_tasks 读模型双写
+    （task_store.apply_task_event_safe，走同一 session_factory），于是 recording
+    session 会一并捕获到 agent_tasks 的 INSERT/UPDATE。本测试只关心"动作→事件流"
+    的翻译，故在入口处把非 agent_events 语句过滤掉；读模型本身在
+    test_task_store_contract.py 单独覆盖。"""
+    table = getattr(stmt, "table", None)
+    return table is not None and getattr(table, "name", None) == "agent_events"
+
+
 def _types_after_tick_started(captured: list[Any]) -> list[str]:
     """Return event types written within a tick, skipping the leading
     runtime.tick_started so individual tests can focus on the action layer."""
@@ -100,7 +112,8 @@ async def _run_one_tick(planner: _StaticPlanner, scope_key: str) -> list[Any]:
             await asyncio.sleep(0.02)  # ensure trailing events settled
             break
     await loop.stop()
-    return captured
+    # 只回事件流语句 —— 过滤掉 task 事件触发的 agent_tasks 读模型双写副作用。
+    return [s for s in captured if _is_event_stmt(s)]
 
 
 class IdleActionTranslationTests(unittest.IsolatedAsyncioTestCase):

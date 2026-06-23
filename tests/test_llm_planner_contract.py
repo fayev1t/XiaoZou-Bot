@@ -340,11 +340,8 @@ class LLMPlannerContractTest(unittest.TestCase):
         同构。"""
         from qqbot.services.agent_loop.tools import build_default_registry
 
-        async def _noop() -> None:
-            return None
-
-        # session_factory 这里不会被 reply tool usage_docs 触发，传 stub 即可
-        reg = build_default_registry(session_factory=lambda: None)
+        # 工具无构造依赖；usage_docs 只读 usage_prompt，不触发任何运行期依赖
+        reg = build_default_registry()
 
         llm = _StubLLM(
             response_content='{"actions":[{"type":"idle","reason":"x"}]}'

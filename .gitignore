@@ -54,6 +54,7 @@ docker/crawl4ai/*
 # others
 开发文档/
 **/AGENTS.md
+CLAUDE.md
 
 # Local editor files
 .vscode/

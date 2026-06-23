@@ -41,8 +41,8 @@ from typing import Any
 import httpx
 
 from qqbot.core.logging import get_logger
-from qqbot.core.permissions import PermissionTier
 from qqbot.services.agent_loop.prompts import load_sibling_md
+from qqbot.services.agent_loop.tool_registry import BaseTool
 
 logger = get_logger(__name__)
 
@@ -55,7 +55,7 @@ _MAX_FETCH_TOP_N = 5  # 单次调用最多对前 N 条抓正文，防爆
 _USAGE_PROMPT = load_sibling_md(__file__, "websearch.md")
 
 
-class WebsearchTool:
+class WebsearchTool(BaseTool):
     name = "websearch"
     description = (
         "Search the web via a SearXNG meta-search and optionally fetch the "
@@ -63,9 +63,8 @@ class WebsearchTool:
         "up-to-date factual information beyond your training data."
     )
     usage_prompt = _USAGE_PROMPT
-    # 任意人都能让小奏查资料，且小奏自己不需要是管理员
-    required_permission = PermissionTier.GUEST
-    require_bot_admin = False
+    # required_permission / require_bot_admin 用 BaseTool 默认值（GUEST /
+    # False）：任意人都能让小奏查资料，小奏自己不需要是管理员。
     arguments_schema = {
         "type": "object",
         "properties": {

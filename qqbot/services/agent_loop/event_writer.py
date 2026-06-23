@@ -75,6 +75,20 @@ async def write_internal_event(
     )
     async with session_factory() as session:
         await persist_event(session, sys_event)
+    # 读模型双写：事件落定**之后**，独立事务 best-effort 投影进 agent_tasks。
+    # 刻意不与事件写同事务 —— 派生视图的失败不能拖垮 append-only 事件流的持久性
+    # （详见 task_store.apply_task_event_safe）。懒导入避免给非 task 写路径平白
+    # 拉进 task_store + 模型。
+    if event_type.startswith("agent.task_"):
+        from qqbot.services.agent_loop.task_store import apply_task_event_safe
+
+        await apply_task_event_safe(
+            session_factory,
+            event_type=event_type,
+            scope_key=scope_key,
+            occurred_at=sys_event.occurred_at,
+            payload=payload,
+        )
     return event_id
 
 

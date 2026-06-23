@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 
@@ -95,31 +94,3 @@ def get_env_value(key: str) -> str | None:
         return None
 
     return raw_value.strip().strip('"').strip("'")
-
-
-def get_bot_nicknames() -> tuple[str, ...]:
-    raw_value = get_env_value("NICKNAME")
-    if not raw_value:
-        return ("小奏",)
-
-    try:
-        parsed = json.loads(raw_value)
-    except json.JSONDecodeError:
-        parsed = raw_value
-
-    if isinstance(parsed, list):
-        names = tuple(
-            str(item).strip()
-            for item in parsed
-            if str(item).strip()
-        )
-        return names or ("小奏",)
-
-    if isinstance(parsed, str) and parsed.strip():
-        return (parsed.strip(),)
-
-    return ("小奏",)
-
-
-def get_primary_bot_name() -> str:
-    return get_bot_nicknames()[0]

@@ -1,50 +1,31 @@
 """V2 内置工具集中注册。
 
 每个文件实现一个 Tool（满足 qqbot.services.agent_loop.tool_registry.Tool
-协议）。`build_default_registry(session_factory, wake_reply_worker=None)`
-把所有内置工具注册到一个新的 ToolRegistry 实例返回，plugin 启动时调用
-并注入 LoopSupervisor / LLMPlanner。
+协议，继承 BaseTool 拿默认属性）。`build_default_registry()` 把所有内置
+工具无参注册到一个新的 ToolRegistry 实例返回，plugin 启动时调用并注入
+LoopSupervisor / LLMPlanner。
 
-session_factory 是必填项：所有工具都通过 EventWriter 写事件 / 部分工具
-（search_history）查 agent_events 表。
-
-wake_reply_worker 是可选回调：ReplyTool 写完 agent.reply_emitted 后调用
-它唤醒 ReplySendWorker 立即出货；None 时退化为不主动唤醒（worker 启动期
-catchup 兜底，仅延迟变长）。生产路径由 v2_main 注入
-supervisor.notify_reply_pending；测试路径常省略。
+工具不再有构造依赖：系统级依赖（session_factory 写/查 agent_events、
+notify_reply_pending 唤醒 ReplySendWorker）一律由 ToolWorker 在 run() 的
+context 里统一注入。这样新增工具只要 register 一行，系统也不必按名字
+特判任何工具（如旧的 reply.set_wake_callback 回填已删除）。
 
 不复用 v1 qqbot/services/web_search.py 等业务实现 —— v2 工具从零写。
 """
 
 from __future__ import annotations
 
-from typing import Callable
-
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from qqbot.services.agent_loop.tool_registry import ToolRegistry
 from qqbot.services.agent_loop.tools.reply import ReplyTool
 from qqbot.services.agent_loop.tools.search_history import SearchHistoryTool
 from qqbot.services.agent_loop.tools.websearch import WebsearchTool
 
-SessionFactory = Callable[[], AsyncSession]
-WakeCallback = Callable[[], None]
 
-
-def build_default_registry(
-    session_factory: SessionFactory,
-    *,
-    wake_reply_worker: WakeCallback | None = None,
-) -> ToolRegistry:
+def build_default_registry() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(WebsearchTool())
-    registry.register(SearchHistoryTool(session_factory=session_factory))
-    registry.register(
-        ReplyTool(
-            session_factory=session_factory,
-            wake_reply_worker=wake_reply_worker,
-        )
-    )
+    registry.register(SearchHistoryTool())
+    registry.register(ReplyTool())
     return registry
 
 

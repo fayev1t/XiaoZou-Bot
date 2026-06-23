@@ -194,11 +194,6 @@ class DecisionContext:
     active_tasks: list[TaskView] = field(default_factory=list)
     pending_tool_results: list[ToolResultView] = field(default_factory=list)
 
-    # Reserved for the tool layer and runtime reflector; not populated by
-    # the projection layer (they come from separate sources).
-    tool_catalog: list[Any] = field(default_factory=list)
-    runtime_hints: list[Any] = field(default_factory=list)
-
     # 当前 tick 上 bot 自己的 QQ user_id（由 bot_registry 提供,AgentLoop
     # 在 tick() 时 resolve 后注入）。None 表示 bot 还没连接 napcat / 注册
     # 第一条事件 —— prompt 渲染时不输出该属性，模型回退到"靠引用反推"。

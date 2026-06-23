@@ -138,7 +138,7 @@ class Projector:
         bot_role: str | None = None
         if scope == "group" and group_id is not None:
             bot_role = await self._fetch_latest_bot_role(group_id, bot_user_id)
-        return self.project(
+        ctx = self.project(
             events,
             scope_key=scope_key,
             correlation_id=correlation_id,
@@ -148,6 +148,53 @@ class Projector:
             bot_user_id=bot_user_id,
             bot_role=bot_role,
         )
+        # 任务持久化补全：fold_tasks 只看 lookback/300 窗口，未完成任务的
+        # task_created 被水群挤出窗口后会从 active_tasks 消失（与"任务跨 tick
+        # 持久"契约冲突，是 bug）。这里查 agent_tasks 读模型，把"仍 pending/
+        # running 但已不在窗口内"的任务补回来。窗口内折出的任务优先（更新、带
+        # 在途 tool_call_ids），表只填补缺口。读模型不可用时整段降级（仍返回
+        # 窗口折叠结果），绝不让 tick 因补全失败而崩。
+        return await self._augment_with_persisted_tasks(ctx, scope_key)
+
+    async def _augment_with_persisted_tasks(
+        self, ctx: DecisionContext, scope_key: str
+    ) -> DecisionContext:
+        try:
+            from qqbot.services.agent_loop.task_store import load_active_tasks
+
+            persisted = await load_active_tasks(self._session_factory, scope_key)
+        except Exception as exc:  # 读模型查询失败 → 降级为纯窗口折叠
+            logger.warning(
+                "[projection] load persisted tasks failed for {}: {}",
+                scope_key,
+                exc,
+            )
+            return ctx
+        merged = Projector.merge_active_tasks(ctx.active_tasks, persisted)
+        if merged is ctx.active_tasks:
+            return ctx
+        from dataclasses import replace
+
+        return replace(ctx, active_tasks=merged)
+
+    @staticmethod
+    def merge_active_tasks(
+        window_tasks: Sequence[TaskView],
+        persisted_tasks: Sequence[TaskView],
+    ) -> list[TaskView]:
+        """窗口折叠任务 ∪ 读模型任务，按 created_at 升序。
+
+        纯函数（无 DB），便于单测。窗口版本优先：同一 task_id 两边都有时保留
+        窗口版（它带在途 tool_call_ids、进度更新；读模型版 pending_tool_call_ids
+        恒为空）。读模型只补"窗口里没有"的未完成任务。无补充时原样返回入参
+        list（调用方据此判断是否需要 replace）。
+        """
+        window_ids = {t.task_id for t in window_tasks}
+        extra = [t for t in persisted_tasks if t.task_id not in window_ids]
+        if not extra:
+            # 原样返回入参对象 —— 调用方用 `is` 判断"无变化"省一次 replace。
+            return window_tasks  # type: ignore[return-value]
+        return sorted([*window_tasks, *extra], key=lambda t: t.created_at)
 
     async def _fetch_latest_bot_role(
         self,

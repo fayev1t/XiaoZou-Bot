@@ -9,10 +9,6 @@ def new_msg_hash() -> str:
     return uuid4().hex
 
 
-def new_call_hash() -> str:
-    return uuid4().hex
-
-
 _CROCKFORD_BASE32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
 
