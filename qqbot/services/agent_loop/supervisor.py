@@ -151,6 +151,7 @@ class LoopSupervisor:
                 projector=self._projector,
                 supervisor=self,
                 bot_user_id_resolver=_default_bot_user_id_resolver,
+                tool_registry=self._tool_registry,
             )
             loop.start()
             self._loops[scope_key] = loop
@@ -166,8 +167,8 @@ def _default_bot_user_id_resolver() -> str | None:
     bot 的路由表，先用单 bot 假设兜底，等真有多账号需求时再细化。
 
     返回 None 时（启动初期，nonebot 还没把 Bot 注册进来）AgentLoop 把
-    bot_user_id 保持为 None，prompt 渲染层不输出该属性，LLM 退化为"靠
-    自己的 agent_reply 被引用反推"识别自己——这是降级而非错误。
+    bot_user_id 保持为 None，prompt 渲染层不输出该属性；此时 LLM 仍可靠别人
+    <reply ... from="我(...)"/> 的自指标签识别"这条是回复我的"——这是降级而非错误。
     """
     ids = bot_registry.all_self_ids()
     return ids[0] if ids else None

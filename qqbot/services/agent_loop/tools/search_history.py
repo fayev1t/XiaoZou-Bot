@@ -29,6 +29,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from qqbot.core.logging import get_logger
+from qqbot.core.permissions import PermissionTier
 from qqbot.core.time import normalize_china_time
 from qqbot.models.agent_event import AgentEvent
 from qqbot.services.agent_loop.event_writer import parse_scope_key
@@ -60,6 +61,9 @@ class SearchHistoryTool:
         "format as the normal timeline."
     )
     usage_prompt = _USAGE_PROMPT
+    # 查历史属于内部知识检索，任何群员都能让小奏查；不需要管理员身份
+    required_permission = PermissionTier.GUEST
+    require_bot_admin = False
     arguments_schema = {
         "type": "object",
         "properties": {

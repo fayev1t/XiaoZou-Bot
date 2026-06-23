@@ -202,8 +202,8 @@ def _build_messages(
     .md 文件里独立维护。
 
     HumanMessage 的 text block 用 XML 信封而非 JSON 拼装：timeline 里每条
-    item 的 render 字段本身就是 `<message ...>` / `<agent-reply ...>` /
-    `<tool-call ...>` 等独立标签，所以外层再用 `<agent-input>` /
+    item 的 render 字段本身就是 `<message ...>` / `<tool-call ...>`（发言也是
+    reply 工具的 tool-call）/ `<notice ...>` 等独立标签，所以外层再用 `<agent-input>` /
     `<timeline>` 标签嵌套时上下引用关系（reply、at、tool_call ↔ result）
     依然连贯，而不会被 JSON 字符串转义压平成扁平的字段表。
 
@@ -267,11 +267,18 @@ def _render_input_xml(
     """
     parts: list[str] = []
     # bot_user_id 可选：未注入（启动初期 bot_registry 还空、或测试场景）
-    # 时不渲染属性，让模型走旧路径（看 <agent-reply> 引用反推自己是谁）。
+    # 时不渲染属性；此时模型仍可靠别人 <reply ... from="我(...)"/> 的自指
+    # 标签识别"这条是回复我的"（"我" 由投影层解析，与 bot_user_id 无关）。
     bot_attr = (
         f' bot_user_id="{_esc_attr(context.bot_user_id)}"'
         if context.bot_user_id
         else ""
+    )
+    # bot_role 同样可选：sweep 未完成时 None，不渲染。LLM 拿不到该属性即视
+    # 作"未知角色"，敏感工具 description 里有提示自然不会硬调；真硬调
+    # AgentLoop 闸门拦下。
+    role_attr = (
+        f' bot_role="{_esc_attr(context.bot_role)}"' if context.bot_role else ""
     )
     # 时区契约：所有暴露给 LLM 的时间都是北京时间（与数据库写入侧 china_now()
     # 一致）。caller 传错时区时 astimezone() 兜底，naive datetime 走 fromtz
@@ -284,7 +291,7 @@ def _render_input_xml(
     parts.append(
         f'<agent-input scope="{_esc_attr(context.scope_key)}" '
         f'now="{_esc_attr(now.isoformat())}" '
-        f'tick="{context.tick_seq}"{bot_attr}>'
+        f'tick="{context.tick_seq}"{bot_attr}{role_attr}>'
     )
 
     parts.append("<tool-catalog>")
@@ -292,8 +299,15 @@ def _render_input_xml(
         name = _esc_attr(str(tool.get("name", "")))
         desc = _esc_attr(str(tool.get("description", "")))
         schema_json = _safe_json(tool.get("arguments_schema") or {})
+        # required_permission / require_bot_admin 作为属性透出，让 LLM 调用前
+        # 即可判断 "我能不能调" 而不必非要触发 tool_failed 再学习。tool_registry
+        # 的 catalog() 已经兜底过缺失值。
+        req_perm = _esc_attr(str(tool.get("required_permission", "GUEST")))
+        req_bot_admin = "true" if tool.get("require_bot_admin") else "false"
         parts.append(
-            f'<tool name="{name}" description="{desc}">'
+            f'<tool name="{name}" description="{desc}" '
+            f'required_permission="{req_perm}" '
+            f'require_bot_admin="{req_bot_admin}">'
             f"<arguments-schema>{_esc_text(schema_json)}</arguments-schema>"
             f"</tool>"
         )
@@ -567,6 +581,7 @@ def _parse_action(raw: Any) -> Action | None:
                 arguments=args if isinstance(args, dict) else {},
                 task_id=raw.get("task_id") or None,
                 task_ref=raw.get("task_ref") or None,
+                triggered_by_event_id=raw.get("triggered_by_event_id") or None,
             )
         # NOTE: t == "reply" 已弃用——reply 现在是工具，走
         # {"type":"call_tool","tool_name":"reply","arguments":{...}}。

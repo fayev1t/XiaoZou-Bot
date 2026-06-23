@@ -31,6 +31,10 @@ from qqbot.services.agent_loop import (
     Projector,
     bot_registry,
 )
+from qqbot.services.agent_loop.bot_role_sweep import (
+    reflect_bot_role_from_meta,
+    reflect_bot_role_from_notice,
+)
 from qqbot.services.agent_loop.tools import build_default_registry as build_tool_registry
 from qqbot.services.event_ingest import EventIngest
 from qqbot.services.event_ingest.mappers import build_default_registry
@@ -159,6 +163,7 @@ async def _on_message(bot: Bot, event: Event) -> None:
 async def _on_notice(bot: Bot, event: Event) -> None:
     _remember_bot(bot)
     await _ingest_event(event)
+    await reflect_bot_role_from_notice(bot, event, AsyncSessionLocal)
 
 
 @_request_matcher.handle()
@@ -171,6 +176,7 @@ async def _on_request(bot: Bot, event: Event) -> None:
 async def _on_meta(bot: Bot, event: Event) -> None:
     _remember_bot(bot)
     await _ingest_event(event)
+    reflect_bot_role_from_meta(bot, event, AsyncSessionLocal)
 
 
 _driver = get_driver()

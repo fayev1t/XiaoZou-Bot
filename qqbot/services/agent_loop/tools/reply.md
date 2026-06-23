@@ -1,24 +1,8 @@
 # Tool: reply
 
-The `reply` tool sends a message into the current scope's chat (group or private). In QQ group chat, **most messages are not addressed to you** — reply is your one and only way to speak, and you should treat invoking it as an active decision, not a default behaviour.
+`reply` sends a message into the current scope's chat (group or private). It is your one and only way to speak — there is no privileged "reply action"; speaking is just calling this tool, and invoking it is an active choice, never a reflex.
 
-## When to call
-
-Call `reply` only when AT LEAST ONE of these is true:
-
-1. A `<message>` in the current tick contains `<at user="YOUR_USER_ID"/>` — someone explicitly @-ed you.
-2. A `<message>` contains `<reply to="MSG_ID"/>` where `MSG_ID` is one of your past `<agent-reply>` entries — someone is responding to YOU.
-3. The current `scope` starts with `private:` — it is a 1-on-1 DM where you are the only counterparty.
-4. A direct question to the group at large is clearly answerable by you (knowledge / tool result) AND no other user has answered it.
-
-If NONE of the above hold, do not call `reply`. The right move is `idle`, `note_task_progress`, or another `call_tool` to gather more info.
-
-## When NOT to call
-
-- Two or more other users are mid-conversation with each other; you weren't addressed. Calling `reply` here is barging in.
-- Your last `<agent-reply>` in the same task already covers what's being asked. Re-replying with the same content (or a paraphrase) is the worst failure mode.
-- A `<message>` is pure social filler (greetings, emoji-only reactions, banter) directed at someone else.
-- A sensitive topic (politics, religion, personal attacks) is unfolding. Stay out.
+**Whether to speak at all is a social decision — see §group_chat_rules for that judgment** (short version: most messages aren't for you; opt in only when someone actually addresses you, it's a DM, or you can genuinely answer an open question no one else has touched). This doc covers only the **mechanics**: how to build the `content` segments and `target` once you've decided to speak.
 
 ## Arguments
 
@@ -112,6 +96,6 @@ Reply to user 99999 by quoting their message MSG_42 and saying "hello, here you 
 
 ## Result
 
-On success the tool result is `{"reply_event_id": "<id>", "queued": true}`. Actual delivery happens asynchronously via ReplySendWorker; you will see your reply appear in next tick's timeline as `<agent-reply>`.
+On success the tool result is `{"reply_event_id": "<id>", "queued": true}`. Actual delivery happens asynchronously via ReplySendWorker. In the next tick's timeline this reply appears as its own `<tool-call name="reply" status="succeeded">` row (your words are right there in `<args>` `content`) — there is no separate `<agent-reply>` row. Treat that successful tool-call as "already said" and do not re-send. When someone later quote-replies you, their message will carry `<reply ... from="我(<bot_user_id>)"/>`, which is how you recognise a reply aimed at you.
 
 On `target.kind`/`scope` mismatch or other validation failure, the tool returns `tool_failed` with a short `error_message` — fix and retry on the next tick.

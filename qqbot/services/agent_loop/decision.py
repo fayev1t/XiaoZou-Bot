@@ -44,12 +44,21 @@ class CreateTaskAction:
 @dataclass(frozen=True)
 class CallToolAction:
     """Dispatch a tool call. Either `task_id` or `task_ref` may be used to
-    attach the call to a task; both omitted means a lightweight call."""
+    attach the call to a task; both omitted means a lightweight call.
+
+    `triggered_by_event_id` 是 LLM 显式声明"是哪条事件让我调这个工具"。对
+    敏感工具（required_permission > GUEST）AgentLoop 据此查触发用户角色做
+    权限校验；缺失时视作 GUEST，敏感工具自然失败。非敏感工具（reply /
+    websearch）可省略，仅作 audit 用。task 上若已挂了
+    triggered_by_event_id，CallToolAction 缺省时由 AgentLoop fall back 到
+    task 的 anchor。
+    """
 
     tool_name: str
     arguments: dict = field(default_factory=dict)
     task_id: str | None = None
     task_ref: str | None = None
+    triggered_by_event_id: str | None = None
     type: str = "call_tool"
 
 
@@ -109,7 +118,7 @@ class DecisionOutput:
 class ImageRef:
     """已下载落盘的图片素材引用。
 
-    projection 把 message/agent_reply 里 downloaded=true 的 image segment
+    projection 把 message 里 downloaded=true 的 image segment
     收集到 TimelineItem.images 上，llm_planner 再据此从 local_path 读
     bytes、base64 编码、按 hash 去重塞进 multimodal content block。
     downloaded=false 的图不进 ImageRef（只在 render 文本里留占位）。
@@ -126,7 +135,7 @@ class TimelineItem:
 
     event_id: str
     occurred_at: datetime
-    kind: Literal["message", "notice", "tool_call", "agent_reply", "system_hint"]
+    kind: Literal["message", "notice", "tool_call", "system_hint"]
     render: str
     related_event_ids: list[str] = field(default_factory=list)
     images: list[ImageRef] = field(default_factory=list)
@@ -190,10 +199,17 @@ class DecisionContext:
     tool_catalog: list[Any] = field(default_factory=list)
     runtime_hints: list[Any] = field(default_factory=list)
 
-    # 当前 tick 上 bot 自己的 QQ user_id（由 bot_registry 提供，AgentLoop
+    # 当前 tick 上 bot 自己的 QQ user_id（由 bot_registry 提供,AgentLoop
     # 在 tick() 时 resolve 后注入）。None 表示 bot 还没连接 napcat / 注册
     # 第一条事件 —— prompt 渲染时不输出该属性，模型回退到"靠引用反推"。
     bot_user_id: str | None = None
+
+    # 当前 tick 在该 group scope 下小奏自己的群角色（owner / admin / member）。
+    # 由 Projector.fold_bot_role() 从 runtime.bot_role_observed 事件折出最新值。
+    # None = 未观测到（启动初期 sweep 未跑完 / 该群从未写过 baseline）—— 这种
+    # 情况下 AgentLoop 闸门把 require_bot_admin=True 的工具调用直接拒绝（保守），
+    # 但工具仍出现在 catalog 里以便 LLM 看到失败后能解释。
+    bot_role: Literal["owner", "admin", "member"] | None = None
 
 
 class Planner(Protocol):

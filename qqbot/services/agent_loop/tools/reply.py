@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from qqbot.core.ids import new_event_id
 from qqbot.core.logging import get_logger
+from qqbot.core.permissions import PermissionTier
 from qqbot.services.agent_loop.event_writer import (
     parse_scope_key,
     write_agent_event,
@@ -61,6 +62,9 @@ class ReplyTool:
         "matching the current scope), and an optional related_msg_hashes."
     )
     usage_prompt = _USAGE_PROMPT
+    # 发言不分群员等级；小奏在普通群员状态也能说话
+    required_permission = PermissionTier.GUEST
+    require_bot_admin = False
     arguments_schema = {
         "type": "object",
         "properties": {

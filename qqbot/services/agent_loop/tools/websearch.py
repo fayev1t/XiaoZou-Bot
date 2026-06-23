@@ -41,6 +41,7 @@ from typing import Any
 import httpx
 
 from qqbot.core.logging import get_logger
+from qqbot.core.permissions import PermissionTier
 from qqbot.services.agent_loop.prompts import load_sibling_md
 
 logger = get_logger(__name__)
@@ -62,6 +63,9 @@ class WebsearchTool:
         "up-to-date factual information beyond your training data."
     )
     usage_prompt = _USAGE_PROMPT
+    # 任意人都能让小奏查资料，且小奏自己不需要是管理员
+    required_permission = PermissionTier.GUEST
+    require_bot_admin = False
     arguments_schema = {
         "type": "object",
         "properties": {

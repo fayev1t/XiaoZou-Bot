@@ -279,6 +279,42 @@ class BuildTimelineTests(unittest.TestCase):
         rendered = items[1].render
         self.assertIn('to="M-EARLIER"', rendered)
         self.assertIn('excerpt="天气怎么样"', rendered)
+        # from= 标注被引用消息的作者（u1/100），让 LLM 看清是"u2 引用 u1"，
+        # 而非"u1 在发言"。
+        self.assertIn('from="u1(100)"', rendered)
+
+    def test_reply_segment_attributes_quoted_author_not_self_speaking(
+        self,
+    ) -> None:
+        # 回归：别人引用群主（3167291813）时，reply 段必须把作者标成群主，
+        # 不能让 LLM 误以为是群主本人在发言而去接话。
+        evs = [
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "onebot_message_id": "M-OWNER",
+                    "segments": [{"type": "text", "data": {"text": "我饿了"}}],
+                    "sender": {"nickname": "群主", "user_id": 3167291813},
+                },
+                user_id=3167291813,
+                seconds_offset=0,
+            ),
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "onebot_message_id": "M-B",
+                    "segments": [
+                        {"type": "reply", "data": {"id": "M-OWNER"}},
+                        {"type": "text", "data": {"text": "那去吃饭啊"}},
+                    ],
+                    "sender": {"nickname": "路人B", "user_id": 222},
+                },
+                user_id=222,
+                seconds_offset=1,
+            ),
+        ]
+        rendered = Projector.build_timeline(evs, tool_views=[])[1].render
+        self.assertIn('from="群主(3167291813)"', rendered)
 
     def test_reply_segment_without_excerpt_renders_to_only(self) -> None:
         # 被回复消息在 timeline 窗口外 → 只渲染 to，无 excerpt
@@ -297,6 +333,8 @@ class BuildTimelineTests(unittest.TestCase):
         rendered = Projector.build_timeline(evs, tool_views=[])[0].render
         self.assertIn('to="M-OUTSIDE"', rendered)
         self.assertNotIn("excerpt=", rendered)
+        # 作者也查不到（被回复消息在窗口外）→ 不渲染 from=
+        self.assertNotIn("from=", rendered)
 
     def test_image_segment_uses_file_hash(self) -> None:
         # 富化字段（file_hash/local_path/...）由 event_ingest/media.py 写在
@@ -525,42 +563,110 @@ class BuildTimelineTests(unittest.TestCase):
         items = Projector.build_timeline([called], tool_views=tool_views)
         self.assertIn('status="pending"', items[0].render)
 
-    def test_agent_reply_renders(self) -> None:
-        # reply 工具的 content 走 OneBot V11 segment 格式（data.text）
+    def test_reply_emitted_produces_no_timeline_row(self) -> None:
+        # 架构一致性：发言统一表示为 reply 工具的 <tool-call name="reply">，
+        # agent.reply_emitted 本身不再渲染成独立的 <agent-reply> 行。
         evs = [
             _snap(
                 type="agent.reply_emitted",
                 payload={
-                    "content": [{"type": "text", "data": {"text": "hi back"}}]
+                    "reply_id": "R1",
+                    "content": [{"type": "text", "data": {"text": "hi back"}}],
                 },
             ),
         ]
         items = Projector.build_timeline(evs, tool_views=[])
-        self.assertEqual(items[0].kind, "agent_reply")
-        self.assertIn("hi back", items[0].render)
+        self.assertEqual(items, [])
 
-    def test_agent_reply_with_at_and_image_segments(self) -> None:
-        # bot 自己也会发 @ + 图，走同一套 segment 渲染
+    def test_reply_is_represented_as_reply_tool_call(self) -> None:
+        # reply 走和普通工具完全一样的 <tool-call> 渲染：content 在 <args> 里，
+        # 不再有 <agent-reply>。
+        called = _snap(
+            type="agent.tool_called",
+            payload={
+                "tool_call_id": "TC_R",
+                "tool_name": "reply",
+                "arguments": {
+                    "content": [{"type": "text", "data": {"text": "哼,带伞啦"}}],
+                    "target": {"kind": "group", "group_id": 100},
+                },
+            },
+            seconds_offset=0,
+        )
+        result = _snap(
+            type="agent.tool_result",
+            payload={"tool_call_id": "TC_R", "result": {"queued": True}},
+            seconds_offset=1,
+        )
+        tool_views = Projector.fold_tool_results([called, result])
+        items = Projector.build_timeline([called, result], tool_views=tool_views)
+        self.assertEqual([i.kind for i in items], ["tool_call"])
+        rendered = items[0].render
+        self.assertIn('<tool-call name="reply"', rendered)
+        self.assertIn("哼,带伞啦", rendered)
+        self.assertNotIn("<agent-reply", rendered)
+
+    def test_reply_to_bot_message_attributes_self(self) -> None:
+        # 别人引用 bot 自己的发言 → reply 段 from="我(self_id)"，QQ 命中
+        # bot_user_id 即知"被引用的是我自己"。
         evs = [
             _snap(
                 type="agent.reply_emitted",
                 payload={
-                    "content": [
-                        {"type": "at", "data": {"qq": "1"}},
-                        {"type": "text", "data": {"text": "你看"}},
-                        {
-                            "type": "image",
-                            "data": {},
-                            "file_hash": "deadbeef",
-                        },
-                    ]
+                    "reply_id": "R1",
+                    "content": [{"type": "text", "data": {"text": "随便你"}}],
+                },
+                seconds_offset=0,
+            ),
+            _snap(
+                type="agent.reply_delivered",
+                payload={
+                    "reply_id": "R1",
+                    "onebot_message_id": "M-BOT",
+                    "self_id": "1005089717",
+                },
+                seconds_offset=1,
+            ),
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "onebot_message_id": "M-C",
+                    "segments": [
+                        {"type": "reply", "data": {"id": "M-BOT"}},
+                        {"type": "text", "data": {"text": "你还嘴硬"}},
+                    ],
+                    "sender": {"nickname": "路人C", "user_id": 333},
+                },
+                user_id=333,
+                seconds_offset=2,
+            ),
+        ]
+        items = Projector.build_timeline(evs, tool_views=[])
+        msg = [i for i in items if i.kind == "message"][0].render
+        self.assertIn('from="我(1005089717)"', msg)
+
+    def test_mface_dice_rps_file_markdown_segments(self) -> None:
+        evs = [
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "segments": [
+                        {"type": "mface", "data": {"summary": "[羡慕]"}},
+                        {"type": "dice", "data": {"result": 4}},
+                        {"type": "rps", "data": {"result": 1}},
+                        {"type": "file", "data": {"name": "report.pdf"}},
+                        {"type": "markdown", "data": {"content": "# hi"}},
+                    ],
+                    "sender": {"nickname": "u", "user_id": 1},
                 },
             ),
         ]
-        rendered = Projector.build_timeline(evs, tool_views=[])[0].render
-        self.assertIn('<at user="1"/>', rendered)
-        self.assertIn("你看", rendered)
-        self.assertIn('<image hash="deadbeef"/>', rendered)
+        r = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertIn('<mface summary="[羡慕]"/>', r)
+        self.assertIn('<dice value="4"/>', r)
+        self.assertIn('<rps value="1"/>', r)
+        self.assertIn('<file name="report.pdf"/>', r)
+        self.assertIn("<markdown/>", r)
 
     def test_decision_emitted_idle_decision_are_filtered_out(self) -> None:
         evs = [
@@ -644,9 +750,10 @@ class ProjectIntegrationTests(unittest.TestCase):
         # The completed tool call is in pending_tool_results (succeeded != pending)
         self.assertEqual(len(context.pending_tool_results), 1)
         self.assertEqual(context.pending_tool_results[0].status, "succeeded")
-        # Timeline: message + tool_call + agent_reply (task events folded)
+        # Timeline: message + tool_call (task events folded; reply_emitted no
+        # longer renders — 发言统一走 reply 工具的 <tool-call name="reply">)
         kinds = [it.kind for it in context.timeline]
-        self.assertEqual(kinds, ["message", "tool_call", "agent_reply"])
+        self.assertEqual(kinds, ["message", "tool_call"])
 
     def test_decision_context_identity_fields_preserved(self) -> None:
         context = Projector.project(

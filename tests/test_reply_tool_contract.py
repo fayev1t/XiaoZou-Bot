@@ -248,7 +248,7 @@ class ReplyToolMetadataTests(unittest.TestCase):
 
     def test_usage_prompt_loaded_from_sibling_md(self) -> None:
         # tools/reply.md 内容必须随工具被 ToolRegistry.usage_docs 拾取
-        self.assertIn("In QQ group chat", ReplyTool.usage_prompt)
+        self.assertIn("your one and only way to speak", ReplyTool.usage_prompt)
         self.assertIn('"type": "at"', ReplyTool.usage_prompt)
 
 

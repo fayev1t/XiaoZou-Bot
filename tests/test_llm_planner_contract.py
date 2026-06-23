@@ -202,11 +202,11 @@ class LLMPlannerContractTest(unittest.TestCase):
         system_msg = messages[0]
         self.assertIn("你是小奏，傲娇但温柔。", system_msg.content)
         # 协议部分仍然存在
-        self.assertIn("autonomous QQ group bot agent", system_msg.content)
+        self.assertIn("tasks persist, conversation flows around them", system_msg.content)
         # 分隔符确认人设在前
         self.assertLess(
             system_msg.content.index("你是小奏"),
-            system_msg.content.index("autonomous QQ group bot agent"),
+            system_msg.content.index("tasks persist, conversation flows around them"),
         )
 
     def test_persona_none_falls_back_to_plain_protocol_prompt(self) -> None:
@@ -217,7 +217,7 @@ class LLMPlannerContractTest(unittest.TestCase):
         planner = LLMPlanner(llm_client=llm, persona_text=None)
         asyncio.run(planner.decide(_ctx()))
         system_msg = llm.invocations[0][0]
-        self.assertIn("autonomous QQ group bot agent", system_msg.content)
+        self.assertIn("tasks persist, conversation flows around them", system_msg.content)
         self.assertNotIn("persona", planner._prompt_registry.section_names())
 
     def test_persona_whitespace_only_treated_as_none(self) -> None:
@@ -285,11 +285,11 @@ class LLMPlannerContractTest(unittest.TestCase):
         content = llm.invocations[0][0].content
 
         # 文档头
-        self.assertIn("Group chat etiquette", content)
-        # 关键规则锚点（addressee 解析 + reply 默认沉默 + 强制社交推理链）
-        self.assertIn("Addressee Resolution", content)
-        self.assertIn("most messages are not for you", content)
-        self.assertIn("3-Step Social Reasoning Chain", content)
+        self.assertIn("在群里什么时候开口", content)
+        # 关键锚点（addressee 解析 + 默认沉默 + 判断而非清单，不再有强制三步链）
+        self.assertIn("这话是说给谁的", content)
+        self.assertIn("大部分话根本不是冲你来的", content)
+        self.assertIn("这些是直觉，不是清单", content)
         # 行为约束里仍要涉及备选决策
         self.assertIn("note_task_progress", content)
 
@@ -325,8 +325,8 @@ class LLMPlannerContractTest(unittest.TestCase):
 
         idx_persona = content.index("PERSONA_MARKER")
         idx_xml = content.index("reading the `<agent-input>` envelope")
-        idx_protocol = content.index("autonomous QQ group bot agent")
-        idx_group = content.index("Group chat etiquette")
+        idx_protocol = content.index("tasks persist, conversation flows around them")
+        idx_group = content.index("在群里什么时候开口")
         idx_tools = content.index("STUB-TOOL-ORDER-MARKER")
 
         self.assertLess(idx_persona, idx_xml)
@@ -356,7 +356,7 @@ class LLMPlannerContractTest(unittest.TestCase):
         # 按工具名分段的标题
         self.assertIn("## Tool: reply", content)
         # reply.md 标志性段落
-        self.assertIn("In QQ group chat", content)
+        self.assertIn("your one and only way to speak", content)
         # OneBot V11 段示例关键字面
         self.assertIn('"type": "at"', content)
         # @ 全体成员的 qq:"all" 约定
@@ -450,8 +450,8 @@ class LLMPlannerContractTest(unittest.TestCase):
         self.assertIn("active_tasks", content)
         self.assertIn("complete_task", content)
         self.assertIn("fail_task", content)
-        # 必须有硬约束：reasoning 先评估 active task
-        self.assertIn("MUST", content)
+        # reasoning 必须以 active_tasks 为中心（把它当作 standing agenda 逐条评估）
+        self.assertIn("standing agenda", content)
         # 必须明示"新消息不会自动取消 task"
         self.assertTrue(
             "do NOT cancel" in content or "does not implicitly close" in content,
@@ -704,6 +704,102 @@ class LLMPlannerContractTest(unittest.TestCase):
         # UTC 01:55 → 北京 09:55 +08:00
         self.assertIn('now="2026-05-28T09:55:46+08:00"', human_text)
         self.assertNotIn("+00:00", human_text)
+
+    def test_bot_role_rendered_as_agent_input_attribute(self) -> None:
+        """DecisionContext.bot_role 出现在 <agent-input> 属性里，让 LLM 知道
+        自己是 owner / admin / member。"""
+        ctx = DecisionContext(
+            scope_key="group:100",
+            correlation_id="CID",
+            tick_seq=1,
+            now=china_now(),
+            bot_role="admin",
+        )
+        llm = _StubLLM(response_content='{"actions":[{"type":"idle","reason":"x"}]}')
+        planner = LLMPlanner(llm_client=llm)
+        asyncio.run(planner.decide(ctx))
+        human_text = llm.invocations[0][1].content[0]["text"]
+        self.assertIn('bot_role="admin"', human_text)
+
+    def test_no_bot_role_omits_attribute(self) -> None:
+        ctx = DecisionContext(
+            scope_key="group:100",
+            correlation_id="CID",
+            tick_seq=1,
+            now=china_now(),
+        )
+        self.assertIsNone(ctx.bot_role)
+        llm = _StubLLM(response_content='{"actions":[{"type":"idle","reason":"x"}]}')
+        planner = LLMPlanner(llm_client=llm)
+        asyncio.run(planner.decide(ctx))
+        human_text = llm.invocations[0][1].content[0]["text"]
+        self.assertNotIn("bot_role=", human_text)
+
+    def test_tool_permission_metadata_rendered_in_catalog(self) -> None:
+        """tool_catalog 里 required_permission / require_bot_admin 必须出现在
+        每条 <tool> 标签的属性上 —— LLM 据此判断"我能调谁"。"""
+        from qqbot.core.permissions import PermissionTier
+        from qqbot.services.agent_loop.tool_registry import ToolRegistry
+
+        class _KickTool:
+            name = "kick_member"
+            description = "kick a member"
+            arguments_schema = {"type": "object"}
+            required_permission = PermissionTier.ADMIN
+            require_bot_admin = True
+
+            async def run(self, arguments: dict, **_: Any) -> Any:
+                return {}
+
+        registry = ToolRegistry()
+        registry.register(_KickTool())
+
+        ctx = DecisionContext(
+            scope_key="group:100",
+            correlation_id="CID",
+            tick_seq=1,
+            now=china_now(),
+        )
+        llm = _StubLLM(response_content='{"actions":[{"type":"idle","reason":"x"}]}')
+        planner = LLMPlanner(llm_client=llm, tool_registry=registry)
+        asyncio.run(planner.decide(ctx))
+        human_text = llm.invocations[0][1].content[0]["text"]
+        self.assertIn('name="kick_member"', human_text)
+        self.assertIn('required_permission="ADMIN"', human_text)
+        self.assertIn('require_bot_admin="true"', human_text)
+
+    def test_call_tool_action_parses_triggered_by_event_id(self) -> None:
+        """LLM 在 call_tool 上填 triggered_by_event_id 时必须解到
+        CallToolAction.triggered_by_event_id。"""
+        llm = _StubLLM(
+            response_content=(
+                '{"actions":[{"type":"call_tool","tool_name":"reply",'
+                '"arguments":{},"triggered_by_event_id":"E_msg_77"}]}'
+            )
+        )
+        planner = LLMPlanner(llm_client=llm)
+        out = asyncio.run(planner.decide(_ctx()))
+        from qqbot.services.agent_loop.decision import CallToolAction
+
+        self.assertEqual(len(out.actions), 1)
+        action = out.actions[0]
+        self.assertIsInstance(action, CallToolAction)
+        assert isinstance(action, CallToolAction)
+        self.assertEqual(action.triggered_by_event_id, "E_msg_77")
+
+    def test_call_tool_without_triggered_by_defaults_to_none(self) -> None:
+        llm = _StubLLM(
+            response_content=(
+                '{"actions":[{"type":"call_tool","tool_name":"reply","arguments":{}}]}'
+            )
+        )
+        planner = LLMPlanner(llm_client=llm)
+        out = asyncio.run(planner.decide(_ctx()))
+        from qqbot.services.agent_loop.decision import CallToolAction
+
+        action = out.actions[0]
+        assert isinstance(action, CallToolAction)
+        self.assertIsNone(action.triggered_by_event_id)
 
     def test_no_llm_client_returns_unavailable_idle(self) -> None:
         # llm_client=None and create_llm() will probably return None too
