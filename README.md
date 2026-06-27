@@ -1,3 +1,7 @@
+[简体中文](README.md) | [English](README_EN.md)
+
+***
+
 <div align="center">
 
 # 🌟 XiaoZou-Bot (小奏)
