@@ -7,12 +7,15 @@ Covers (任务与决策契约 §3.1, §3.2, §7.1):
 - CallToolAction with task_ref resolves to the just-minted task_id
 - CompleteTaskAction  → agent.task_state_changed (to=done)
 - FailTaskAction      → agent.task_state_changed (to=failed)
-- Validation: idle + other forces runtime.llm_invalid_output + auto-idle
+- Validation: idle + other → 同 tick 带 validation_feedback 重试至多 2 次
+  （每次失败写 runtime.llm_invalid_output，attempt 递增）；三次全败才强制
+  idle(reason="invalid_output_giveup")（契约 §7.1，2026-07-02 落地）
 
 Reply is no longer a first-class action — it is invoked via CallToolAction
-with tool_name="reply" and dispatched through ToolWorker → ReplyTool. The
-target.kind/group_id mismatch and other reply-specific validations are now
-covered in test_reply_tool_contract.py.
+with tool_name="send_message" and dispatched through ToolWorker →
+SendMessageTool. The target.kind/group_id mismatch and other
+send_message-specific validations are now covered in
+test_send_message_tool_contract.py.
 
 Pure unit-level: a recording session captures every insert.
 """
@@ -212,15 +215,39 @@ class CallToolActionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_values(called)["payload"]["task_id"], new_task_id)
         self.assertEqual(_values(state_chg)["payload"]["task_id"], new_task_id)
 
+    async def test_same_tick_tool_calls_share_batch_id_and_size(self) -> None:
+        """同一 tick 的全部 call_tool 打同一 tool_batch_id（=decision_id）+
+        tool_batch_size —— ToolWorker 据此判定批次收口（批次语义 2026-07-01）。"""
+        out = DecisionOutput(actions=[
+            CallToolAction(tool_name="send_message", arguments={}),
+            CallToolAction(tool_name="websearch", arguments={"q": "x"}),
+        ])
+        captured = await _run_one_tick(_StaticPlanner(out), "group:1")
+        decision = next(
+            stmt for stmt in captured
+            if _values(stmt).get("type") == "agent.decision_emitted"
+        )
+        decision_id = _values(decision)["event_id"]
+        calls = [
+            _values(stmt)["payload"]
+            for stmt in captured
+            if _values(stmt).get("type") == "agent.tool_called"
+        ]
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            {c["tool_batch_id"] for c in calls}, {decision_id}
+        )
+        self.assertEqual([c["tool_batch_size"] for c in calls], [2, 2])
 
-class ReplyAsToolTests(unittest.IsolatedAsyncioTestCase):
+
+class SendMessageAsToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_reply_now_routes_as_tool_call(self) -> None:
-        """Reply 不再走专门的 ReplyAction 分支，而是普通的 CallToolAction —
-        loop 写 agent.tool_called，ToolWorker 后续执行 ReplyTool 才写
-        agent.reply_emitted。这里只断言 loop 层不再写 reply_emitted。"""
+        """发言不再走专门的 ReplyAction 分支，而是普通的 CallToolAction —
+        loop 写 agent.tool_called，ToolWorker 后续同步执行 SendMessageTool 直接
+        发送。这里只断言 loop 层不写 reply_emitted。"""
         out = DecisionOutput(actions=[
             CallToolAction(
-                tool_name="reply",
+                tool_name="send_message",
                 arguments={
                     "content": [{"type": "text", "data": {"text": "hi"}}],
                     "target": {"kind": "group", "group_id": 12345},
@@ -230,8 +257,8 @@ class ReplyAsToolTests(unittest.IsolatedAsyncioTestCase):
         captured = await _run_one_tick(_StaticPlanner(out), "group:12345")
         types = _types_after_tick_started(captured)
         self.assertIn("agent.tool_called", types)
-        # loop 层不再直接落 reply_emitted —— 它由 ReplyTool.run() 在
-        # ToolWorker 里发出。
+        # loop 层不落 reply_emitted —— 发送由 SendMessageTool.run() 在
+        # ToolWorker 里同步完成。
         self.assertNotIn("agent.reply_emitted", types)
         # 校验通过：没有 invalid_output 事件
         self.assertNotIn("runtime.llm_invalid_output", types)
@@ -240,7 +267,7 @@ class ReplyAsToolTests(unittest.IsolatedAsyncioTestCase):
             if _values(stmt).get("type") == "agent.tool_called"
         )
         payload = _values(called)["payload"]
-        self.assertEqual(payload["tool_name"], "reply")
+        self.assertEqual(payload["tool_name"], "send_message")
         self.assertEqual(
             payload["arguments"]["target"],
             {"kind": "group", "group_id": 12345},
@@ -313,23 +340,73 @@ class CreateTaskTriggeredByEventIdTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ValidationFailureTests(unittest.IsolatedAsyncioTestCase):
-    async def test_idle_with_other_action_forces_idle(self) -> None:
+    async def test_persistent_invalid_retries_then_gives_up(self) -> None:
+        """契约 §7.1（2026-07-02 落地）：非法输出同 tick 重试至多 2 次（共 3
+        次调用），每次失败写一条 llm_invalid_output（attempt 递增）；三次仍
+        非法才强制 idle(reason="invalid_output_giveup")。"""
         out = DecisionOutput(actions=[
             IdleAction(reason="nothing"),
             CreateTaskAction(description="x"),
         ])
-        captured = await _run_one_tick(_StaticPlanner(out), "group:1")
+        planner = _StaticPlanner(out)  # 每次都返回同样的非法输出
+        captured = await _run_one_tick(planner, "group:1")
         types = _types_after_tick_started(captured)
-        self.assertIn("runtime.llm_invalid_output", types)
         # task_created should NOT be emitted
         self.assertNotIn("agent.task_created", types)
-        inv = next(
-            stmt for stmt in captured
+        invalids = [
+            _values(stmt)["payload"]
+            for stmt in captured
             if _values(stmt).get("type") == "runtime.llm_invalid_output"
+        ]
+        self.assertEqual(len(invalids), 3)
+        self.assertEqual([p["attempt"] for p in invalids], [1, 2, 3])
+        for p in invalids:
+            self.assertEqual(p["validation_error"], "idle_with_other_actions")
+        # 最终强制 idle，reason 按契约固定为 invalid_output_giveup
+        idle = next(
+            stmt for stmt in captured
+            if _values(stmt).get("type") == "agent.idle_decision"
         )
         self.assertEqual(
-            _values(inv)["payload"]["validation_error"], "idle_with_other_actions"
+            _values(idle)["payload"]["reason"], "invalid_output_giveup"
         )
+
+    async def test_invalid_then_valid_second_attempt_applies(self) -> None:
+        """重试带反馈：第二次调用的 context 必须携带 validation_feedback；
+        修好后动作正常落地，只留一条 invalid 事件，不强制 idle。"""
+
+        class _FixOnRetryPlanner:
+            def __init__(self) -> None:
+                self.contexts: list[DecisionContext] = []
+
+            async def decide(self, context: DecisionContext) -> DecisionOutput:
+                self.contexts.append(context)
+                if len(self.contexts) == 1:
+                    return DecisionOutput(actions=[
+                        IdleAction(reason="nothing"),
+                        CreateTaskAction(description="x"),
+                    ])
+                return DecisionOutput(actions=[
+                    CreateTaskAction(description="fixed"),
+                ])
+
+        planner = _FixOnRetryPlanner()
+        captured = await _run_one_tick(planner, "group:1")  # type: ignore[arg-type]
+        types = _types_after_tick_started(captured)
+
+        self.assertEqual(len(planner.contexts), 2)
+        self.assertIsNone(planner.contexts[0].validation_feedback)
+        self.assertIn(
+            "idle_with_other_actions",
+            planner.contexts[1].validation_feedback or "",
+        )
+        invalids = [
+            s for s in captured
+            if _values(s).get("type") == "runtime.llm_invalid_output"
+        ]
+        self.assertEqual(len(invalids), 1)
+        self.assertIn("agent.task_created", types)
+        self.assertNotIn("agent.idle_decision", types)
 
 
 class CausationChainTests(unittest.IsolatedAsyncioTestCase):

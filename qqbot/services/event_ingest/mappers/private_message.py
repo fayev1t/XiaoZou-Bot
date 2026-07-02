@@ -28,15 +28,11 @@ class PrivateMessageMapper:
         )
 
     def map(self, event: Any) -> PartialSystemEvent:
-        sender = getattr(event, "sender", None)
         payload = {
             "msg_hash": new_msg_hash(),
             "onebot_message_id": str(getattr(event, "message_id", "")),
             "raw_message": getattr(event, "raw_message", "") or "",
-            "sender": {
-                "user_id": getattr(sender, "user_id", None) if sender else None,
-                "nickname": getattr(sender, "nickname", None) if sender else None,
-            },
+            "sender": _dump_private_sender(event),
             "segments": dump_segments(getattr(event, "message", None)),
             "message_sub_type": getattr(event, "sub_type", "friend") or "friend",
         }
@@ -54,3 +50,24 @@ class PrivateMessageMapper:
                 getattr(event, "message_id", ""),
             ),
         )
+
+
+def _dump_private_sender(event: Any) -> dict:
+    """私聊 sender → payload dict。
+
+    OneBot 标准私聊 sender 有 user_id/nickname/sex/age 四个字段；核心 2 键
+    （user_id/nickname）恒在，sex/age "有值才落键"（napcat 不上报；仅入库
+    供未来用，投影层不渲染）。与 group_message._dump_sender 同一落库策略。
+    """
+    sender = getattr(event, "sender", None)
+    if sender is None:
+        return {"user_id": None, "nickname": None}
+    out = {
+        "user_id": getattr(sender, "user_id", None),
+        "nickname": getattr(sender, "nickname", None),
+    }
+    for attr in ("sex", "age"):
+        value = getattr(sender, attr, None)
+        if value is not None and str(value).strip() != "":
+            out[attr] = value
+    return out

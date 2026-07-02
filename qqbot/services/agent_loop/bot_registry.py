@@ -1,8 +1,8 @@
 """V2 自己的 nonebot Bot 实例缓存。
 
 每个连接上来的 Bot 实例由 v2 ingest plugin handler 在事件触发时调
-register() 写进这里；ReplySendWorker / 后续 ToolWorker 通过 self_id
-找回 Bot 实例来调 napcat API。
+register() 写进这里；ToolWorker 与各同步工具（send_message / kick / ...）
+通过 self_id 找回 Bot 实例来调 napcat API。
 
 不复用 v1 (group_chat.py 里的 _bot_instances)：v2 完全自包含。
 

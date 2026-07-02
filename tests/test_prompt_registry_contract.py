@@ -76,6 +76,44 @@ class PromptRegistryOrderingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             reg.register("", 0, "X")
 
+    def test_render_passes_scope_to_scope_aware_source(self) -> None:
+        # render(scope=...) 把 scope 传给"接受一个位置参"的 source（如
+        # ToolRegistry.usage_docs），字符串 / 无参 source 照常不受影响。这是
+        # tools_usage 按 scope 过滤、避免群↔system 工具用法互相泄漏的落地机制。
+        seen: list = []
+
+        def scope_aware(scope=None):
+            seen.append(scope)
+            return f"USAGE[{scope}]"
+
+        reg = PromptRegistry()
+        reg.register("persona", 0, "PERSONA")  # str
+        reg.register("noarg", 5, lambda: "NOARG")  # () -> str
+        reg.register("usage", 10, scope_aware)  # (scope) -> str
+
+        out = reg.render(scope="group")
+        self.assertIn("PERSONA", out)
+        self.assertIn("NOARG", out)
+        self.assertIn("USAGE[group]", out)
+        self.assertEqual(seen, ["group"])  # scope 确实传进去了
+
+    def test_render_default_scope_none_backward_compatible(self) -> None:
+        # 不传 scope（旧调用 / 单测）→ scope-aware source 收到 None（= 不过滤）；
+        # 无参 source 一如既往。
+        seen: list = []
+
+        def scope_aware(scope=None):
+            seen.append(scope)
+            return f"U[{scope}]"
+
+        reg = PromptRegistry()
+        reg.register("noarg", 0, lambda: "NOARG")
+        reg.register("usage", 10, scope_aware)
+        out = reg.render()  # 无 scope 参
+        self.assertIn("NOARG", out)
+        self.assertIn("U[None]", out)
+        self.assertEqual(seen, [None])
+
 
 if __name__ == "__main__":
     unittest.main()

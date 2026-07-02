@@ -69,7 +69,6 @@ class AgentLoopLazyImportTests(unittest.TestCase):
             "LLMPlanner": "llm_planner",
             "Projector": "projection",
             "LoopSupervisor": "supervisor",
-            "ReplySendWorker": "reply_worker",
             "ToolWorker": "tool_worker",
             "AgentLoop": "loop",
         }.items():

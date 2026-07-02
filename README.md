@@ -142,4 +142,10 @@ python -m qqbot
 
 
 ## ⭐ 难道有一天上热榜了？🤤
-[![Stargazers over time](https://starchart.cc/fayev1t/XiaoZou-Bot.svg?variant=adaptive)](https://starchart.cc/fayev1t/XiaoZou-Bot)
+<a href="https://www.star-history.com/?repos=fayev1t%2FXiaoZou-Bot&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=fayev1t/XiaoZou-Bot&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=fayev1t/XiaoZou-Bot&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=fayev1t/XiaoZou-Bot&type=date&legend=top-left" />
+ </picture>
+</a>

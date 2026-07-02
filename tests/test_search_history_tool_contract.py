@@ -2,7 +2,7 @@
 
 Covers:
 - arguments 参数解析（task_id / anchor_event_id / start_time / end_time / query / limit）
-- scope_key 上下文缺失 → raise ValueError（让 ToolWorker 写 tool_failed）
+- scope_key 缺失 / 非法 → 返回 ToolOutcome.failure(invalid_arguments)（工具永不 raise）
 - task_id 解析为 triggered_by_event_id 锚点；查不到 → warning，不报错
 - limit 兜底（默认 / 上限）
 - 返回结构复用 Projector 渲染器，items 字段同构
@@ -21,6 +21,13 @@ from zoneinfo import ZoneInfo
 
 from qqbot.services.agent_loop.projection import _EventSnapshot
 from qqbot.services.agent_loop.tools.search_history import SearchHistoryTool
+
+
+def _ok(tool: SearchHistoryTool, args: dict, **ctx: Any) -> dict:
+    """run() 现返回 ToolOutcome；happy-path 取 .result 复用既有断言。"""
+    outcome = asyncio.run(tool.run(args, **ctx))
+    assert outcome.ok, outcome
+    return outcome.result
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -90,26 +97,28 @@ class SearchHistoryToolContractTest(unittest.TestCase):
         tool._resolve_task_anchor = _stub_anchor  # type: ignore[method-assign]
         return tool
 
-    def test_scope_key_missing_raises(self) -> None:
+    def test_scope_key_missing_returns_invalid_arguments(self) -> None:
         tool = self._make_tool()
-        with self.assertRaises(ValueError):
-            asyncio.run(tool.run({"limit": 5}))  # 没传 scope_key
+        outcome = asyncio.run(tool.run({"limit": 5}))  # 没传 scope_key
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.error_kind, "invalid_arguments")
 
-    def test_invalid_scope_key_raises(self) -> None:
+    def test_invalid_scope_key_returns_invalid_arguments(self) -> None:
         tool = self._make_tool()
-        with self.assertRaises(ValueError):
-            asyncio.run(tool.run({}, scope_key="bogus:1"))
+        outcome = asyncio.run(tool.run({}, scope_key="bogus:1"))
+        self.assertEqual(outcome.error_kind, "invalid_arguments")
 
     def test_happy_path_returns_rendered_items(self) -> None:
         rows = [_msg("hello world", seconds_offset=i, event_id=f"E{i:02d}") for i in range(3)]
         tool = self._make_tool(query_returns=rows)
-        result = asyncio.run(tool.run({"limit": 10}, scope_key="group:999"))
+        result = _ok(tool, {"limit": 10}, scope_key="group:999")
         self.assertEqual(result["matched"], 3)
         self.assertEqual(len(result["items"]), 3)
-        # 渲染走 Projector：必带 sender + text
+        # 渲染走 Projector：必带 sender_name/sender_id（独立属性）+ text
         for item in result["items"]:
             self.assertEqual(item["kind"], "message")
-            self.assertIn("alice(222)", item["render"])
+            self.assertIn('sender_name="alice"', item["render"])
+            self.assertIn('sender_id="222"', item["render"])
             self.assertIn("hello world", item["render"])
 
     def test_limit_clamped_to_max(self) -> None:
@@ -140,9 +149,7 @@ class SearchHistoryToolContractTest(unittest.TestCase):
 
     def test_task_id_resolved_to_anchor(self) -> None:
         tool = self._make_tool(anchor_returns="RESOLVED_ANCHOR")
-        result = asyncio.run(
-            tool.run({"task_id": "T1"}, scope_key="group:999")
-        )
+        result = _ok(tool, {"task_id": "T1"}, scope_key="group:999")
         self.assertEqual(self.captured_query_kwargs["anchor_event_id"], "RESOLVED_ANCHOR")
         self.assertEqual(result["anchor_event_id"], "RESOLVED_ANCHOR")
         # 无 warning：解析成功
@@ -150,9 +157,7 @@ class SearchHistoryToolContractTest(unittest.TestCase):
 
     def test_task_id_with_no_anchor_warns(self) -> None:
         tool = self._make_tool(anchor_returns=None)
-        result = asyncio.run(
-            tool.run({"task_id": "T_MISSING"}, scope_key="group:999")
-        )
+        result = _ok(tool, {"task_id": "T_MISSING"}, scope_key="group:999")
         self.assertIsNone(self.captured_query_kwargs["anchor_event_id"])
         self.assertTrue(any("T_MISSING" in w for w in result["warnings"]))
 
@@ -186,9 +191,7 @@ class SearchHistoryToolContractTest(unittest.TestCase):
 
     def test_unparseable_time_yields_warning(self) -> None:
         tool = self._make_tool()
-        result = asyncio.run(
-            tool.run({"start_time": "not-a-time"}, scope_key="group:999")
-        )
+        result = _ok(tool, {"start_time": "not-a-time"}, scope_key="group:999")
         self.assertIsNone(self.captured_query_kwargs["start_dt"])
         self.assertTrue(any("not-a-time" in w for w in result["warnings"]))
 

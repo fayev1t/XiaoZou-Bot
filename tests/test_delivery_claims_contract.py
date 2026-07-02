@@ -60,7 +60,7 @@ def _factory(session: _ScriptedSession):
 
 
 def _claim(session: _ScriptedSession) -> bool:
-    return asyncio.run(try_claim(_factory(session), "EID1", "reply"))
+    return asyncio.run(try_claim(_factory(session), "EID1", "tool"))
 
 
 class TryClaimTests(unittest.TestCase):

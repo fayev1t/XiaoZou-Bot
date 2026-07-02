@@ -6,7 +6,7 @@ v2 系统里需要往 LLM 的 system prompt 注入的内容会越来越多：
 
   - 人设（persona.md）
   - 决策协议（protocol.md，原 _SYSTEM_PROMPT）
-  - reply 段的可用 segment 文档（reply.md）
+  - 发言工具 send_message 的用法与可用 segment 文档（send_message.md）
   - 每个 tool 的用法说明（tools/<name>.md）
   - 未来还会有 task 模板、风控指南、运行期反射……
 
@@ -30,10 +30,14 @@ v2 系统里需要往 LLM 的 system prompt 注入的内容会越来越多：
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from typing import Callable, Union
 
-PromptSource = Union[str, Callable[[], str]]
+# source 可以是纯字符串、无参 ``() -> str``、或接受一个 scope 位置参的
+# ``(scope) -> str``（如 ToolRegistry.usage_docs）。render(scope=...) 会按 arity
+# 自动决定是否把 scope 传进去——见 _resolve_source。
+PromptSource = Union[str, Callable[..., str]]
 
 
 @dataclass
@@ -62,7 +66,7 @@ class PromptRegistry:
         - order: 排序键，render 时升序拼接；约定区段：
             0-99    人设
             100-199 决策协议
-            200-299 输出动作文档（reply / 状态机动作等）
+            200-299 输出动作文档（状态机动作等）
             300+    工具用法（每个工具一段，order 内部相对随意）
         - content: 字符串或 () -> str；后者在 render 时才求值
         """
@@ -76,12 +80,18 @@ class PromptRegistry:
     def has(self, name: str) -> bool:
         return name in self._sections
 
-    def render(self) -> str:
+    def render(self, *, scope: str | None = None) -> str:
         """求值所有 section、按 order 升序拼出最终 system prompt。
 
-        空 section（求值后 strip 为 ""）忽略；不会产生 `---\n\n---` 这种
-        相邻分隔符。callable 抛异常时该段静默丢弃 —— 启动期 prompt 不应
-        阻断整个 tick，丢失的内容由日志暴露即可。
+        ``scope``（"group"/"private"/"system"）用于 **per-scope 过滤**：接受一个位置
+        参的 section source（如 ``ToolRegistry.usage_docs``）会收到它，据此只渲染当前
+        scope 可见的工具用法——群专用工具的用法文档不会泄漏进 system loop 的 prompt，
+        反之亦然（与 ``catalog(scope)`` 对齐，契约 §2.2）。无参 source（人设 / 协议等）
+        照常无参调用。``scope=None``（默认）= 不过滤，兼容旧调用。
+
+        空 section（求值后 strip 为 ""）忽略；不会产生 `---\n\n---` 这种相邻分隔符。
+        callable 抛异常时该段静默丢弃 —— 启动期 prompt 不应阻断整个 tick，丢失的内容
+        由日志暴露即可。
         """
         from qqbot.core.logging import get_logger
 
@@ -91,7 +101,7 @@ class PromptRegistry:
         parts: list[str] = []
         for sec in ordered:
             try:
-                text = sec.source() if callable(sec.source) else sec.source
+                text = _resolve_source(sec.source, scope)
             except Exception as exc:
                 logger.warning(
                     "[prompt_registry] section {!r} render failed: {}", sec.name, exc
@@ -111,3 +121,30 @@ class PromptRegistry:
             s.name
             for s in sorted(self._sections.values(), key=lambda s: (s.order, s.name))
         ]
+
+
+def _resolve_source(source: PromptSource, scope: str | None) -> str:
+    """求值一个 section source。字符串原样返回；callable 按 arity 调用：接受位置参
+    的传 ``scope``（per-scope 过滤），无参的直接调用（向后兼容 ``() -> str``）。"""
+    if not callable(source):
+        return source
+    if _accepts_positional_arg(source):
+        return source(scope)
+    return source()
+
+
+def _accepts_positional_arg(fn: Callable[..., str]) -> bool:
+    """fn 是否接受至少一个位置参数（用来接收 scope）。无法内省（内置 / C 实现）时
+    保守当作"不接受"，按无参调用——绝不会因内省失败而误传参把老 source 打挂。"""
+    try:
+        sig = inspect.signature(fn)
+    except (ValueError, TypeError):
+        return False
+    for p in sig.parameters.values():
+        if p.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.VAR_POSITIONAL,
+        ):
+            return True
+    return False

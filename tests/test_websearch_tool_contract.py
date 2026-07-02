@@ -29,6 +29,13 @@ from qqbot.services.agent_loop.tools.websearch import (
 )
 
 
+def _ok(tool: WebsearchTool, args: dict) -> dict:
+    """run() 现返回 ToolOutcome；happy-path 统一取 .result 复用既有断言。"""
+    outcome = asyncio.run(tool.run(args))
+    assert outcome.ok, outcome
+    return outcome.result
+
+
 class _FakeResponse:
     def __init__(self, json_payload: Any, status_code: int = 200) -> None:
         self._json = json_payload
@@ -87,17 +94,18 @@ class WebsearchToolContractTest(unittest.TestCase):
             http_client_factory=(lambda: client) if client is not None else None,
         )
 
-    def test_missing_searxng_base_url_raises(self) -> None:
+    def test_missing_searxng_base_url_returns_internal_error(self) -> None:
         with _patched_env(SEARXNG_BASE_URL=""):
             tool = self._build(client=_FakeHttpClient({}))
-            with self.assertRaises(RuntimeError):
-                asyncio.run(tool.run({"query": "anything"}))
+            outcome = asyncio.run(tool.run({"query": "anything"}))
+            self.assertFalse(outcome.ok)
+            self.assertEqual(outcome.error_kind, "internal_tool_error")
 
-    def test_empty_query_raises(self) -> None:
+    def test_empty_query_returns_invalid_arguments(self) -> None:
         with _patched_env(SEARXNG_BASE_URL="http://sx:1"):
             tool = self._build(client=_FakeHttpClient({}))
-            with self.assertRaises(ValueError):
-                asyncio.run(tool.run({"query": "   "}))
+            outcome = asyncio.run(tool.run({"query": "   "}))
+            self.assertEqual(outcome.error_kind, "invalid_arguments")
 
     def test_searxng_happy_path_no_crawl(self) -> None:
         client = _FakeHttpClient(
@@ -122,9 +130,7 @@ class WebsearchToolContractTest(unittest.TestCase):
         )
         with _patched_env(SEARXNG_BASE_URL="http://sx:1"):
             tool = self._build(client=client)
-            result = asyncio.run(
-                tool.run({"query": "rust async", "fetch_top_n": 0})
-            )
+            result = _ok(tool, {"query": "rust async", "fetch_top_n": 0})
 
         self.assertEqual(result["query"], "rust async")
         self.assertEqual(result["engine"], "searxng")
@@ -150,9 +156,7 @@ class WebsearchToolContractTest(unittest.TestCase):
         )
         with _patched_env(SEARXNG_BASE_URL="http://sx:1", CRAWL4AI_BASE_URL=""):
             tool = self._build(client=client)
-            result = asyncio.run(
-                tool.run({"query": "x", "fetch_top_n": 2})
-            )
+            result = _ok(tool, {"query": "x", "fetch_top_n": 2})
         self.assertEqual(len(client.calls), 1)
         self.assertTrue(any("CRAWL4AI_BASE_URL" in w for w in result["warnings"]))
         self.assertIsNone(result["results"][0]["fetched_text"])
@@ -186,7 +190,7 @@ class WebsearchToolContractTest(unittest.TestCase):
             SEARXNG_BASE_URL="http://sx:1", CRAWL4AI_BASE_URL="http://cr:2"
         ):
             tool = self._build(client=client)
-            result = asyncio.run(tool.run({"query": "q", "fetch_top_n": 2}))
+            result = _ok(tool, {"query": "q", "fetch_top_n": 2})
 
         self.assertEqual(
             result["results"][0]["fetched_text"], "BODY-of-https://a/"
@@ -227,7 +231,7 @@ class WebsearchToolContractTest(unittest.TestCase):
             SEARXNG_BASE_URL="http://sx:1", CRAWL4AI_BASE_URL="http://cr:2"
         ):
             tool = self._build(client=client)
-            result = asyncio.run(tool.run({"query": "q", "fetch_top_n": 2}))
+            result = _ok(tool, {"query": "q", "fetch_top_n": 2})
 
         self.assertEqual(result["results"][0]["fetched_text"], "OK")
         self.assertIsNone(result["results"][1]["fetched_text"])
@@ -248,9 +252,7 @@ class WebsearchToolContractTest(unittest.TestCase):
         )
         with _patched_env(SEARXNG_BASE_URL="http://sx:1"):
             tool = self._build(client=client)
-            result = asyncio.run(
-                tool.run({"query": "q", "max_results": 3})
-            )
+            result = _ok(tool, {"query": "q", "max_results": 3})
         self.assertEqual(len(result["results"]), 3)
 
     def test_fetch_top_n_clamped_to_upper_bound(self) -> None:

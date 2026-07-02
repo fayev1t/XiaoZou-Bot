@@ -22,12 +22,12 @@
     "warnings": [str, ...]              # SearXNG/Crawl4AI 部分失败的提示
   }
 
-错误策略：
-  - 配置缺失 (SEARXNG_BASE_URL 缺) → raise RuntimeError；ToolWorker 写
-    agent.tool_failed
-  - SearXNG HTTP 错 / 解析错 → raise，统一上层处理
+错误策略（统一结构化 ToolOutcome，全程无 raise 控制流，见契约 §7.2）：
+  - query 为空 → return ToolOutcome.failure(invalid_arguments)
+  - 配置缺失 (SEARXNG_BASE_URL 缺) → return ToolOutcome.failure(internal_tool_error)
+  - SearXNG 响应形态异常 / HTTP 错 / 网络超时 → 普通异常上抛 → BaseTool.run 兜底
+    internal_tool_error
   - Crawl4AI 抓取单条失败 → 不抛，吞到 fetch_error 字段；保持整体可用
-  - 网络超时 → raise（让 LLM 重试或换方向）
 
 不复用 v1 qqbot/services/web_search.py：v2 重写。仅复用 env 变量名
 （SEARXNG_BASE_URL / CRAWL4AI_BASE_URL）作为部署侧约定。
@@ -42,7 +42,7 @@ import httpx
 
 from qqbot.core.logging import get_logger
 from qqbot.services.agent_loop.prompts import load_sibling_md
-from qqbot.services.agent_loop.tool_registry import BaseTool
+from qqbot.services.agent_loop.tool_registry import BaseTool, ToolOutcome
 
 logger = get_logger(__name__)
 
@@ -63,8 +63,8 @@ class WebsearchTool(BaseTool):
         "up-to-date factual information beyond your training data."
     )
     usage_prompt = _USAGE_PROMPT
-    # required_permission / require_bot_admin 用 BaseTool 默认值（GUEST /
-    # False）：任意人都能让小奏查资料，小奏自己不需要是管理员。
+    # required_permission / required_bot_role 用 BaseTool 默认值（GUEST /
+    # 不限 bot 角色）：任意人都能让小奏查资料，小奏自己不需要是管理员。
     arguments_schema = {
         "type": "object",
         "properties": {
@@ -105,11 +105,16 @@ class WebsearchTool(BaseTool):
             lambda: httpx.AsyncClient(timeout=timeout_sec, follow_redirects=True)
         )
 
-    async def run(self, arguments: dict, **_: Any) -> dict:
-        # **_ 兼容 Tool 协议的 context kwargs（scope_key 等）；websearch 不需要。
+    async def execute(self, arguments: dict, **context: Any) -> ToolOutcome:
+        # GUEST + 不限 scope：enforce_access 实为 no-op，但统一保留首行调用。全程无 raise。
+        if fail := await self.enforce_access(context):
+            return fail
+
         query = (arguments.get("query") or "").strip()
         if not query:
-            raise ValueError("query is required and must be non-empty")
+            return ToolOutcome.failure(
+                "invalid_arguments", "query is required and must be non-empty"
+            )
         fetch_top_n = _clamp_int(
             arguments.get("fetch_top_n", 0), 0, _MAX_FETCH_TOP_N
         )
@@ -119,7 +124,10 @@ class WebsearchTool(BaseTool):
 
         searxng_base = (os.getenv("SEARXNG_BASE_URL") or "").strip()
         if not searxng_base:
-            raise RuntimeError("SEARXNG_BASE_URL is not configured")
+            # 部署侧未配 SearXNG —— 非用户参数问题、非 napcat 动作，归 internal。
+            return ToolOutcome.failure(
+                "internal_tool_error", "SEARXNG_BASE_URL is not configured"
+            )
 
         warnings: list[str] = []
 
@@ -141,12 +149,14 @@ class WebsearchTool(BaseTool):
                             hit["fetched_text"] = None
                             hit["fetch_error"] = f"{type(exc).__name__}: {exc}"
 
-        return {
-            "query": query,
-            "engine": "searxng",
-            "results": hits,
-            "warnings": warnings,
-        }
+        return ToolOutcome.success(
+            {
+                "query": query,
+                "engine": "searxng",
+                "results": hits,
+                "warnings": warnings,
+            }
+        )
 
     async def _search(
         self,
@@ -166,6 +176,8 @@ class WebsearchTool(BaseTool):
         response.raise_for_status()
         payload = response.json()
         if not isinstance(payload, dict):
+            # 内部不变量被打破（上游返回怪形态）——抛普通异常，由 BaseTool.run
+            # 兜底成 internal_tool_error（不属可预期业务失败）。
             raise RuntimeError(
                 f"unexpected SearXNG response shape: {type(payload).__name__}"
             )

@@ -113,6 +113,46 @@ class GroupMessageMapperContractTests(unittest.TestCase):
         partial = self.mapper.map(_make_message_event())
         self.assertEqual(partial.idempotency_key, "10000:msg:12345")
 
+    def test_optional_metadata_stored_when_present(self) -> None:
+        # "有才上报"的元数据（napcat 扩展 real_seq/group_name、OneBot 标准
+        # anonymous、sender 的 title/level/sex/age/area）有值才落键。
+        event = _make_message_event(
+            real_seq="7788",
+            group_name="测试群",
+            anonymous=SimpleNamespace(
+                id=80000001, name="匿名の马甲", flag="F_SECRET"
+            ),
+            sender=SimpleNamespace(
+                user_id=222,
+                nickname="alice",
+                card="A",
+                role="member",
+                title="大佬",
+                level="100",
+            ),
+        )
+        payload = self.mapper.map(event).payload
+        self.assertEqual(payload["real_seq"], "7788")
+        self.assertEqual(payload["group_name"], "测试群")
+        self.assertEqual(payload["anonymous"]["id"], 80000001)
+        self.assertEqual(payload["anonymous"]["name"], "匿名の马甲")
+        # flag 是 set_group_anonymous_ban 凭证：随事件入库（渲染层不透出）
+        self.assertEqual(payload["anonymous"]["flag"], "F_SECRET")
+        self.assertEqual(payload["sender"]["title"], "大佬")
+        self.assertEqual(payload["sender"]["level"], "100")
+
+    def test_optional_metadata_absent_when_missing(self) -> None:
+        # napcat 默认形态（无匿名/无头衔/无扩展序号）：键整个不出现，
+        # 而不是落一堆 None。
+        payload = self.mapper.map(_make_message_event()).payload
+        for key in ("anonymous", "real_seq", "message_seq", "group_name"):
+            self.assertNotIn(key, payload)
+        for key in ("title", "level", "sex", "age", "area"):
+            self.assertNotIn(key, payload["sender"])
+        # 核心 4 键恒在（既有 payload 形状不变）
+        for key in ("user_id", "nickname", "card", "role"):
+            self.assertIn(key, payload["sender"])
+
 
 class GroupRecallMapperContractTests(unittest.TestCase):
     def setUp(self) -> None:

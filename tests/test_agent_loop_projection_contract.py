@@ -121,7 +121,10 @@ class FoldTasksTests(unittest.TestCase):
 
 
 class FoldToolResultsTests(unittest.TestCase):
-    def test_pending_when_no_result_yet(self) -> None:
+    # 两态契约：status ∈ {processing, complete}；成败不是状态，靠 error_kind
+    # 区分（None=成功）。旧 pending/succeeded/failed 三态已收敛。
+
+    def test_processing_when_no_result_yet(self) -> None:
         evs = [
             _snap(
                 type="agent.tool_called",
@@ -130,10 +133,10 @@ class FoldToolResultsTests(unittest.TestCase):
         ]
         views = Projector.fold_tool_results(evs)
         self.assertEqual(len(views), 1)
-        self.assertEqual(views[0].status, "pending")
+        self.assertEqual(views[0].status, "processing")
         self.assertEqual(views[0].arguments, {"q": "x"})
 
-    def test_succeeded_view(self) -> None:
+    def test_complete_success_view(self) -> None:
         evs = [
             _snap(
                 type="agent.tool_called",
@@ -147,10 +150,12 @@ class FoldToolResultsTests(unittest.TestCase):
             ),
         ]
         views = Projector.fold_tool_results(evs)
-        self.assertEqual(views[0].status, "succeeded")
+        self.assertEqual(views[0].status, "complete")
         self.assertEqual(views[0].result, [1, 2])
+        # 成功的判据：complete 且 error_kind 为 None
+        self.assertIsNone(views[0].error_kind)
 
-    def test_failed_view(self) -> None:
+    def test_complete_failure_view(self) -> None:
         evs = [
             _snap(
                 type="agent.tool_called",
@@ -168,8 +173,72 @@ class FoldToolResultsTests(unittest.TestCase):
             ),
         ]
         views = Projector.fold_tool_results(evs)
-        self.assertEqual(views[0].status, "failed")
+        self.assertEqual(views[0].status, "complete")
         self.assertEqual(views[0].error_kind, "timeout")
+        # 无结构化附加字段时 error_extra 为 None（不是空 dict）。
+        self.assertIsNone(views[0].error_extra)
+
+    def test_failure_without_error_kind_folds_to_unknown(self) -> None:
+        # "complete + error_kind 非 None ⇒ 失败" 是渲染判据；tool_failed 缺
+        # error_kind（畸形 payload）时兜底 "unknown"，不得被误判成成功。
+        evs = [
+            _snap(
+                type="agent.tool_called",
+                payload={"tool_call_id": "TC1", "tool_name": "x"},
+                seconds_offset=0,
+            ),
+            _snap(
+                type="agent.tool_failed",
+                payload={"tool_call_id": "TC1", "error_message": "boom"},
+                seconds_offset=1,
+            ),
+        ]
+        views = Projector.fold_tool_results(evs)
+        self.assertEqual(views[0].status, "complete")
+        self.assertEqual(views[0].error_kind, "unknown")
+
+    def test_failed_view_captures_structured_error_extra(self) -> None:
+        # tool_failed.payload 顶层里 ToolOutcome.extra 平铺进来的结构化字段
+        # （required_tier / actual_tier ...）必须收进 error_extra 供渲染透给 LLM；
+        # 信封字段（tool_call_id / tool_name / task_id / error_*）不得泄漏进去。
+        evs = [
+            _snap(
+                type="agent.tool_called",
+                payload={
+                    "tool_call_id": "TC1",
+                    "tool_name": "kick",
+                    "task_id": "T1",
+                },
+                seconds_offset=0,
+            ),
+            _snap(
+                type="agent.tool_failed",
+                payload={
+                    "tool_call_id": "TC1",
+                    "tool_name": "kick",
+                    "task_id": "T1",
+                    "error_kind": "permission_denied_user_tier",
+                    "error_message": "kick requires ADMIN; user tier is GUEST",
+                    "required_tier": "ADMIN",
+                    "actual_tier": "GUEST",
+                },
+                seconds_offset=1,
+            ),
+        ]
+        view = Projector.fold_tool_results(evs)[0]
+        self.assertEqual(view.status, "complete")
+        self.assertEqual(view.error_kind, "permission_denied_user_tier")
+        self.assertEqual(
+            view.error_extra, {"required_tier": "ADMIN", "actual_tier": "GUEST"}
+        )
+        for envelope_key in (
+            "tool_call_id",
+            "tool_name",
+            "task_id",
+            "error_kind",
+            "error_message",
+        ):
+            self.assertNotIn(envelope_key, view.error_extra)
 
 
 class BuildTimelineTests(unittest.TestCase):
@@ -187,7 +256,9 @@ class BuildTimelineTests(unittest.TestCase):
         items = Projector.build_timeline(evs, tool_views=[])
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0].kind, "message")
-        self.assertIn("alice(222)", items[0].render)
+        # sender_name / sender_id 是两个独立属性，不再拼 "昵称(QQ)" 复合串
+        self.assertIn('sender_name="alice"', items[0].render)
+        self.assertIn('sender_id="222"', items[0].render)
         self.assertIn("hello", items[0].render)
 
     def test_message_uses_segments_not_raw_message(self) -> None:
@@ -281,7 +352,10 @@ class BuildTimelineTests(unittest.TestCase):
         self.assertIn('excerpt="天气怎么样"', rendered)
         # from= 标注被引用消息的作者（u1/100），让 LLM 看清是"u2 引用 u1"，
         # 而非"u1 在发言"。
-        self.assertIn('from="u1(100)"', rendered)
+        self.assertIn('from_name="u1"', rendered)
+        self.assertIn('from_id="100"', rendered)
+        # 外部作者不渲染 from_self（该属性只在被引消息是 bot 自己发的时出现）
+        self.assertNotIn("from_self=", rendered)
 
     def test_reply_segment_attributes_quoted_author_not_self_speaking(
         self,
@@ -314,7 +388,8 @@ class BuildTimelineTests(unittest.TestCase):
             ),
         ]
         rendered = Projector.build_timeline(evs, tool_views=[])[1].render
-        self.assertIn('from="群主(3167291813)"', rendered)
+        self.assertIn('from_name="群主"', rendered)
+        self.assertIn('from_id="3167291813"', rendered)
 
     def test_reply_segment_without_excerpt_renders_to_only(self) -> None:
         # 被回复消息在 timeline 窗口外 → 只渲染 to，无 excerpt
@@ -333,8 +408,118 @@ class BuildTimelineTests(unittest.TestCase):
         rendered = Projector.build_timeline(evs, tool_views=[])[0].render
         self.assertIn('to="M-OUTSIDE"', rendered)
         self.assertNotIn("excerpt=", rendered)
-        # 作者也查不到（被回复消息在窗口外）→ 不渲染 from=
-        self.assertNotIn("from=", rendered)
+        # 作者也查不到（被回复消息在窗口外）→ 三个作者属性都不渲染
+        self.assertNotIn("from_name=", rendered)
+        self.assertNotIn("from_id=", rendered)
+        self.assertNotIn("from_self=", rendered)
+
+    def _reply_render_to(self, quoted_segments: list[dict]) -> str:
+        """helper：构造"一条被回复消息 + 一条 reply 它的消息"，返回后者渲染。"""
+        evs = [
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "onebot_message_id": "M-RICH",
+                    "segments": quoted_segments,
+                    "sender": {"nickname": "u1", "user_id": 100},
+                },
+                user_id=100,
+                seconds_offset=0,
+            ),
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "segments": [
+                        {"type": "reply", "data": {"id": "M-RICH"}},
+                        {"type": "text", "data": {"text": "哈哈哈"}},
+                    ],
+                    "sender": {"nickname": "u2", "user_id": 200},
+                },
+                user_id=200,
+                seconds_offset=1,
+            ),
+        ]
+        return Projector.build_timeline(evs, tool_views=[])[1].render
+
+    def test_reply_excerpt_uses_sticker_summary_gloss(self) -> None:
+        # 被回复的是表情包：excerpt 与消息体渲染同源取 image.data.summary，
+        # 不再退化成 "[image]" 类型占位——回复链语义打通。
+        rendered = self._reply_render_to(
+            [{"type": "image", "data": {"summary": "[贴贴]", "emoji_id": "e1"}}]
+        )
+        self.assertIn('excerpt="[贴贴]"', rendered)
+
+    def test_reply_excerpt_uses_card_summary_gloss(self) -> None:
+        # 被回复的是 ark 卡片（B 站分享等）：excerpt 用卡片外显文案 prompt
+        import json as json_mod
+
+        ark = json_mod.dumps(
+            {
+                "app": "com.tencent.miniapp_01",
+                "prompt": "[QQ小程序]哔哩哔哩",
+                "meta": {"detail_1": {"title": "哔哩哔哩"}},
+            }
+        )
+        rendered = self._reply_render_to(
+            [{"type": "json", "data": {"data": ark}}]
+        )
+        self.assertIn('excerpt="[QQ小程序]哔哩哔哩"', rendered)
+
+    def test_reply_excerpt_mixes_text_and_media_gloss(self) -> None:
+        # 文本 + 无 summary 的普通图片：文本原文 + "[图片]" 语义占位
+        rendered = self._reply_render_to(
+            [
+                {"type": "text", "data": {"text": "看这个"}},
+                {"type": "image", "data": {"sub_type": 0}},
+            ]
+        )
+        self.assertIn('excerpt="看这个[图片]"', rendered)
+
+    def test_anonymous_message_renders_marker_and_anon_name(self) -> None:
+        # 匿名群消息（OneBot 标准；napcat 不产生）：sender_name 退到匿名马甲
+        # 名 + anonymous="true" 标记；flag 凭证只入库、绝不进 prompt。
+        evs = [
+            _snap(
+                type="external.message.group.anonymous",
+                payload={
+                    "message_sub_type": "anonymous",
+                    "anonymous": {
+                        "id": 80000001,
+                        "name": "匿名の马甲",
+                        "flag": "F_SECRET",
+                    },
+                    "segments": [{"type": "text", "data": {"text": "悄悄说"}}],
+                    "sender": {
+                        "user_id": 80000001,
+                        "nickname": None,
+                        "card": None,
+                    },
+                },
+                user_id=80000001,
+            ),
+        ]
+        r = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertIn('sender_name="匿名の马甲"', r)
+        self.assertIn('anonymous="true"', r)
+        self.assertNotIn("F_SECRET", r)
+
+    def test_sender_title_rendered_when_present(self) -> None:
+        # 群专属头衔（napcat 消息事件不上报；其他 OneBot 实现可能给）
+        evs = [
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "segments": [{"type": "text", "data": {"text": "hi"}}],
+                    "sender": {
+                        "nickname": "u",
+                        "user_id": 1,
+                        "title": "镇群之宝",
+                    },
+                },
+            ),
+        ]
+        r = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertIn('sender_title="镇群之宝"', r)
 
     def test_image_segment_uses_file_hash(self) -> None:
         # 富化字段（file_hash/local_path/...）由 event_ingest/media.py 写在
@@ -430,6 +615,221 @@ class BuildTimelineTests(unittest.TestCase):
         # 有 hash 即使没下载也照常 render，给 LLM 留个"曾有图"的信号
         self.assertIn('<image hash="h2"/>', item.render)
 
+    def test_image_sticker_renders_kind_and_summary(self) -> None:
+        # napcat data.sub_type=1（自定义表情/表情包）→ kind="sticker"；
+        # summary 是 QQ 外显文案，下载失败时它是唯一语义兜底。
+        evs = [
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "segments": [
+                        {
+                            "type": "image",
+                            "data": {"summary": "[动画表情]", "sub_type": 1},
+                            "file_hash": "h-stk",
+                        }
+                    ],
+                    "sender": {"nickname": "u", "user_id": 1},
+                },
+            ),
+        ]
+        r = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertIn(
+            '<image kind="sticker" summary="[动画表情]" hash="h-stk"/>', r
+        )
+
+    def test_image_photo_renders_kind_photo(self) -> None:
+        # napcat data.sub_type=0（普通图片）→ kind="photo"
+        evs = [
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "segments": [
+                        {
+                            "type": "image",
+                            "data": {"sub_type": 0},
+                            "file_hash": "h-pho",
+                        }
+                    ],
+                    "sender": {"nickname": "u", "user_id": 1},
+                },
+            ),
+        ]
+        r = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertIn('<image kind="photo" hash="h-pho"/>', r)
+
+    def test_market_sticker_image_gets_sticker_kind_without_subtype(
+        self,
+    ) -> None:
+        # napcat 的商城表情（mface）接收侧折成 image 段：无 sub_type，但带
+        # emoji_id/emoji_package_id 特征字段 → kind="sticker"，summary 是
+        # 表情名。下载失败无 hash 时 summary 仍在，语义不丢。
+        evs = [
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "segments": [
+                        {
+                            "type": "image",
+                            "data": {
+                                "summary": "[赞]",
+                                "emoji_id": "e-1",
+                                "emoji_package_id": 231182,
+                            },
+                        }
+                    ],
+                    "sender": {"nickname": "u", "user_id": 1},
+                },
+            ),
+        ]
+        r = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertIn('<image kind="sticker" summary="[赞]"/>', r)
+
+    def test_image_unknown_subtype_omits_kind(self) -> None:
+        # sub_type 2..7（KHOT 等罕见类型）不猜——缺失=未知是属性总语义
+        evs = [
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "segments": [
+                        {
+                            "type": "image",
+                            "data": {"sub_type": 3},
+                            "file_hash": "h-x",
+                        }
+                    ],
+                    "sender": {"nickname": "u", "user_id": 1},
+                },
+            ),
+        ]
+        r = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertIn('<image hash="h-x"/>', r)
+        self.assertNotIn("kind=", r)
+
+    def test_face_renders_name_from_napcat_raw_facetext(self) -> None:
+        # napcat 在 data.raw.faceText 里给了表情释义；老版本带 "/" 前缀要去掉。
+        # LLM 背不出 QQ 表情 id 表，没名字的 face id 是纯噪声。
+        evs = [
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "segments": [
+                        {
+                            "type": "face",
+                            "data": {"id": "14", "raw": {"faceText": "/微笑"}},
+                        }
+                    ],
+                    "sender": {"nickname": "u", "user_id": 1},
+                },
+            ),
+        ]
+        r = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertIn('<face id="14" name="微笑"/>', r)
+
+    def test_json_ark_card_renders_structured_fields(self) -> None:
+        # ark 卡片（B 站分享 / 小程序 / 公众号文章在 napcat 全走 json 段）：
+        # app=应用标识, summary=QQ 外显文案(prompt), title/desc=meta.* 内容,
+        # url=跳转链接（qqdocurl 优先）。此前渲染 <card type="json"/> 等于
+        # 把"别人分享了什么"整个丢掉。
+        import json as json_mod
+
+        ark = json_mod.dumps(
+            {
+                "app": "com.tencent.miniapp_01",
+                "prompt": "[QQ小程序]哔哩哔哩",
+                "meta": {
+                    "detail_1": {
+                        "title": "哔哩哔哩",
+                        "desc": "某个视频标题",
+                        "qqdocurl": "https://b23.tv/xyz",
+                    }
+                },
+            }
+        )
+        evs = [
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "segments": [{"type": "json", "data": {"data": ark}}],
+                    "sender": {"nickname": "u", "user_id": 1},
+                },
+            ),
+        ]
+        r = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertIn('app="com.tencent.miniapp_01"', r)
+        self.assertIn('summary="[QQ小程序]哔哩哔哩"', r)
+        self.assertIn('title="哔哩哔哩"', r)
+        self.assertIn('desc="某个视频标题"', r)
+        self.assertIn('url="https://b23.tv/xyz"', r)
+
+    def test_json_ark_unparseable_falls_back_to_opaque_card(self) -> None:
+        # data 不是合法 JSON / 解析不出任何字段 → 回退旧形态（type= 表示
+        # 未解析的原始段格式）
+        evs = [
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "segments": [
+                        {"type": "json", "data": {"data": "not-json{{{"}}
+                    ],
+                    "sender": {"nickname": "u", "user_id": 1},
+                },
+            ),
+        ]
+        r = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertIn('<card type="json"/>', r)
+
+    def test_share_segment_renders_card_fields(self) -> None:
+        # OneBot 标准 share 段（napcat 不产生，兼容其他实现）；content→desc
+        # 与 ark 卡片属性名对齐。
+        evs = [
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "segments": [
+                        {
+                            "type": "share",
+                            "data": {
+                                "url": "https://s.example/1",
+                                "title": "标题",
+                                "content": "描述",
+                            },
+                        }
+                    ],
+                    "sender": {"nickname": "u", "user_id": 1},
+                },
+            ),
+        ]
+        r = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertIn(
+            '<card type="share" title="标题" desc="描述"'
+            ' url="https://s.example/1"/>',
+            r,
+        )
+
+    def test_sender_role_rendered_for_admin_and_owner_only(self) -> None:
+        # sender_role=发送者在本群的角色；member 是绝大多数不渲染，
+        # 缺省语义（普通成员或未知）在 xml_format.md 写死。
+        def _one(role: str | None) -> str:
+            sender = {"nickname": "u", "user_id": 1}
+            if role is not None:
+                sender["role"] = role
+            evs = [
+                _snap(
+                    type="external.message.group.normal",
+                    payload={
+                        "segments": [{"type": "text", "data": {"text": "hi"}}],
+                        "sender": sender,
+                    },
+                ),
+            ]
+            return Projector.build_timeline(evs, tool_views=[])[0].render
+
+        self.assertIn('sender_role="admin"', _one("admin"))
+        self.assertIn('sender_role="owner"', _one("owner"))
+        self.assertNotIn("sender_role=", _one("member"))
+        self.assertNotIn("sender_role=", _one(None))
+
     def test_misc_segment_types(self) -> None:
         evs = [
             _snap(
@@ -522,6 +922,201 @@ class BuildTimelineTests(unittest.TestCase):
         self.assertIn('kind="group_increase"', items[0].render)
         self.assertIn('sub_type="approve"', items[0].render)
 
+    def test_notice_attaches_names_resolved_from_recent_messages(self) -> None:
+        # notice 的 user/operator 是裸 QQ 号；近期消息里出现过的人要补
+        # user_name/operator_name，否则 LLM 得自己翻 timeline 对号入座。
+        evs = [
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "segments": [{"type": "text", "data": {"text": "在"}}],
+                    "sender": {"card": "张三", "user_id": 555},
+                },
+                user_id=555,
+                seconds_offset=0,
+            ),
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "segments": [{"type": "text", "data": {"text": "好"}}],
+                    "sender": {"nickname": "管理员A", "user_id": 666},
+                },
+                user_id=666,
+                seconds_offset=1,
+            ),
+            _snap(
+                type="external.notice.group_ban",
+                payload={"sub_type": "ban", "operator_id": 666, "duration": 600},
+                user_id=555,
+                seconds_offset=2,
+            ),
+        ]
+        r = Projector.build_timeline(evs, tool_views=[])[-1].render
+        self.assertIn('user="555"', r)
+        self.assertIn('user_name="张三"', r)
+        self.assertIn('operator="666"', r)
+        self.assertIn('operator_name="管理员A"', r)
+
+    def test_group_ban_notice_renders_duration_seconds(self) -> None:
+        evs = [
+            _snap(
+                type="external.notice.group_ban",
+                payload={"sub_type": "ban", "operator_id": 666, "duration": 600},
+                user_id=555,
+            ),
+        ]
+        r = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertIn('duration_seconds="600"', r)
+
+    def test_lift_ban_notice_omits_duration(self) -> None:
+        # 解禁没有时长概念（napcat 报 duration=0），不渲染该属性
+        evs = [
+            _snap(
+                type="external.notice.group_ban",
+                payload={
+                    "sub_type": "lift_ban",
+                    "operator_id": 666,
+                    "duration": 0,
+                },
+                user_id=555,
+            ),
+        ]
+        r = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertNotIn("duration_seconds=", r)
+
+    def test_group_card_notice_renders_old_and_new(self) -> None:
+        # new_card 空串=清空名片，与"缺失=mapper 没拿到"区分，所以空串也渲染
+        evs = [
+            _snap(
+                type="external.notice.group_card",
+                payload={"card_old": "旧名", "card_new": ""},
+                user_id=555,
+            ),
+        ]
+        r = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertIn('old_card="旧名"', r)
+        self.assertIn('new_card=""', r)
+
+    def test_group_upload_notice_renders_file_name_and_size(self) -> None:
+        evs = [
+            _snap(
+                type="external.notice.group_upload",
+                payload={
+                    "file": {
+                        "id": "f1",
+                        "name": "月报.xlsx",
+                        "size": 20480,
+                        "busid": 102,
+                    }
+                },
+                user_id=555,
+            ),
+        ]
+        r = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertIn('file_name="月报.xlsx"', r)
+        self.assertIn('file_size_bytes="20480"', r)
+        # busid 是 napcat 内部路由参数，对模型零信息量，不透出
+        self.assertNotIn("busid", r)
+
+    def test_emoji_like_notice_renders_target_message_and_likes(self) -> None:
+        # likes 两种表情形态：emoji_id 是 unicode codepoint（128077→👍）
+        # 直接给字符；小整数是 QQ 黄豆 face id → "face:N"（与消息里
+        # <face id=.../> 同一 id 空间）。
+        evs = [
+            _snap(
+                type="external.notice.emoji_like",
+                payload={
+                    "onebot_message_id": "M77",
+                    "likes": [
+                        {"emoji_id": "128077", "count": 2},
+                        {"emoji_id": "66", "count": 1},
+                    ],
+                },
+                user_id=555,
+            ),
+        ]
+        r = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertIn('message_id="M77"', r)
+        self.assertIn("👍×2", r)
+        self.assertIn("face:66×1", r)
+
+    def test_essence_notice_renders_target_message_id(self) -> None:
+        evs = [
+            _snap(
+                type="external.notice.essence",
+                payload={
+                    "sub_type": "add",
+                    "onebot_message_id": "M88",
+                    "operator_id": 666,
+                },
+                user_id=555,
+            ),
+        ]
+        r = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertIn('message_id="M88"', r)
+
+    def test_honor_notice_renders_honor_type(self) -> None:
+        evs = [
+            _snap(
+                type="external.notice.honor",
+                payload={"honor_type": "talkative"},
+                user_id=555,
+            ),
+        ]
+        r = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertIn('honor_type="talkative"', r)
+
+    def test_friend_request_renders_with_event_id_and_hides_flag(self) -> None:
+        # external.request.friend → <request kind="friend" event_id=...>，
+        # event_id 必须暴露（LLM 据此调 respond_to_request），flag 不暴露
+        # （napcat 凭证由工具用 event_id 反查，不经 LLM）。
+        evs = [
+            _snap(
+                type="external.request.friend",
+                payload={
+                    "user_id": 12345,
+                    "comment": "求加好友",
+                    "flag": "FLAG_SECRET_xyz",
+                },
+                scope="system",
+                group_id=None,
+                user_id=12345,
+                event_id="REQ_F1",
+            ),
+        ]
+        items = Projector.build_timeline(evs, tool_views=[])
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].kind, "request")
+        render = items[0].render
+        self.assertIn('kind="friend"', render)
+        self.assertIn('event_id="REQ_F1"', render)
+        self.assertIn('user="12345"', render)
+        self.assertIn('comment="求加好友"', render)
+        self.assertNotIn("FLAG_SECRET", render)
+
+    def test_group_add_request_renders_group_and_kind(self) -> None:
+        evs = [
+            _snap(
+                type="external.request.group.add",
+                payload={
+                    "sub_type": "add",
+                    "group_id": 67890,
+                    "user_id": 222,
+                    "comment": "想进群",
+                    "flag": "GFLAG",
+                },
+                scope="system",
+                group_id=None,
+                user_id=222,
+                event_id="REQ_G1",
+            ),
+        ]
+        render = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertIn('kind="group.add"', render)
+        self.assertIn('event_id="REQ_G1"', render)
+        self.assertIn('group="67890"', render)
+        self.assertIn('user="222"', render)
+
     def test_task_events_do_not_produce_timeline_rows(self) -> None:
         evs = [
             _snap(type="agent.task_created", payload={"task_id": "T1"}),
@@ -551,21 +1146,82 @@ class BuildTimelineTests(unittest.TestCase):
         items = Projector.build_timeline([called, result], tool_views=tool_views)
         self.assertEqual(len(items), 1)  # tool_result alone produces nothing
         self.assertEqual(items[0].kind, "tool_call")
-        self.assertIn('status="succeeded"', items[0].render)
+        # complete + <result> = 成功完成（状态只回答"结束没有"）
+        self.assertIn('status="complete"', items[0].render)
+        self.assertIn("<result>", items[0].render)
         self.assertIn("[1, 2]", items[0].render)
 
-    def test_tool_called_without_result_renders_pending(self) -> None:
+    def test_tool_called_without_result_renders_processing(self) -> None:
         called = _snap(
             type="agent.tool_called",
             payload={"tool_call_id": "TC1", "tool_name": "x"},
         )
         tool_views = Projector.fold_tool_results([called])
         items = Projector.build_timeline([called], tool_views=tool_views)
-        self.assertIn('status="pending"', items[0].render)
+        self.assertIn('status="processing"', items[0].render)
+        self.assertIn("<processing/>", items[0].render)
+
+    def test_failed_tool_call_renders_error_extra_as_attributes(self) -> None:
+        # 回归防护：结构化失败字段（required_tier/actual_tier）必须作为 <error>
+        # 属性透给 LLM，而非只有 kind + message —— 曾经被 view/render 丢掉。
+        called = _snap(
+            type="agent.tool_called",
+            payload={
+                "tool_call_id": "TC1",
+                "tool_name": "kick",
+                "arguments": {"user_id": 5},
+            },
+            seconds_offset=0,
+        )
+        failed = _snap(
+            type="agent.tool_failed",
+            payload={
+                "tool_call_id": "TC1",
+                "tool_name": "kick",
+                "error_kind": "permission_denied_user_tier",
+                "error_message": "needs ADMIN",
+                "required_tier": "ADMIN",
+                "actual_tier": "GUEST",
+            },
+            seconds_offset=1,
+        )
+        tool_views = Projector.fold_tool_results([called, failed])
+        items = Projector.build_timeline([called, failed], tool_views=tool_views)
+        rendered = items[0].render
+        # complete + <error> = 失败完成
+        self.assertIn('status="complete"', rendered)
+        self.assertIn("<error", rendered)
+        self.assertIn('kind="permission_denied_user_tier"', rendered)
+        self.assertIn('required_tier="ADMIN"', rendered)
+        self.assertIn('actual_tier="GUEST"', rendered)
+        self.assertIn("needs ADMIN", rendered)
+
+    def test_tool_batch_completed_renders_system_hint_without_ulid(self) -> None:
+        """批次收口标记（agent_visible）必须进 timeline —— 渲染成
+        <system-hint kind="tool_batch_completed">，且内部 ULID
+        （tool_batch_id）被剔除，只透 tool_count / tool_batch_size。"""
+        ev = _snap(
+            type="runtime.tool_batch_completed",
+            visibility="agent_visible",
+            payload={
+                "tool_batch_id": "01JBATCHULIDNOISE0000000000",
+                "tool_count": 2,
+                "tool_batch_size": 2,
+            },
+        )
+        items = Projector.build_timeline([ev], tool_views=[])
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].kind, "system_hint")
+        rendered = items[0].render
+        self.assertIn('kind="tool_batch_completed"', rendered)
+        self.assertIn("tool_count", rendered)
+        self.assertNotIn("01JBATCHULIDNOISE0000000000", rendered)
+        self.assertNotIn("tool_batch_id", rendered)
 
     def test_reply_emitted_produces_no_timeline_row(self) -> None:
-        # 架构一致性：发言统一表示为 reply 工具的 <tool-call name="reply">，
-        # agent.reply_emitted 本身不再渲染成独立的 <agent-reply> 行。
+        # 架构一致性：发言统一表示为 send_message 工具的 <tool-call
+        # name="send_message">，agent.reply_emitted 本身不再渲染成独立的
+        # <agent-reply> 行。
         evs = [
             _snap(
                 type="agent.reply_emitted",
@@ -579,13 +1235,13 @@ class BuildTimelineTests(unittest.TestCase):
         self.assertEqual(items, [])
 
     def test_reply_is_represented_as_reply_tool_call(self) -> None:
-        # reply 走和普通工具完全一样的 <tool-call> 渲染：content 在 <args> 里，
-        # 不再有 <agent-reply>。
+        # send_message 走和普通工具完全一样的 <tool-call> 渲染：content 在
+        # <args> 里，不再有 <agent-reply>。
         called = _snap(
             type="agent.tool_called",
             payload={
                 "tool_call_id": "TC_R",
-                "tool_name": "reply",
+                "tool_name": "send_message",
                 "arguments": {
                     "content": [{"type": "text", "data": {"text": "哼,带伞啦"}}],
                     "target": {"kind": "group", "group_id": 100},
@@ -602,28 +1258,40 @@ class BuildTimelineTests(unittest.TestCase):
         items = Projector.build_timeline([called, result], tool_views=tool_views)
         self.assertEqual([i.kind for i in items], ["tool_call"])
         rendered = items[0].render
-        self.assertIn('<tool-call name="reply"', rendered)
+        self.assertIn('<tool-call name="send_message"', rendered)
         self.assertIn("哼,带伞啦", rendered)
         self.assertNotIn("<agent-reply", rendered)
 
     def test_reply_to_bot_message_attributes_self(self) -> None:
-        # 别人引用 bot 自己的发言 → reply 段 from="我(self_id)"，QQ 命中
-        # bot_user_id 即知"被引用的是我自己"。
+        # 别人引用 bot 自己的发言 → reply 段 from_self="true"（服务端事实标注，
+        # 不依赖 bot_user_id 在场）+ from_id=self_id；bot 显示名未知，不渲染
+        # from_name。
+        # 发言同步后，bot 自己发言的 message_id + self_id 来自 send_message 工具的
+        # tool_called（认出是发言）+ tool_result（result.message_id/self_id）。
         evs = [
             _snap(
-                type="agent.reply_emitted",
+                type="agent.tool_called",
                 payload={
-                    "reply_id": "R1",
-                    "content": [{"type": "text", "data": {"text": "随便你"}}],
+                    "tool_call_id": "TC_R",
+                    "tool_name": "send_message",
+                    "arguments": {
+                        "content": [
+                            {"type": "text", "data": {"text": "随便你"}}
+                        ],
+                        "target": {"kind": "group", "group_id": 999},
+                    },
                 },
                 seconds_offset=0,
             ),
             _snap(
-                type="agent.reply_delivered",
+                type="agent.tool_result",
                 payload={
-                    "reply_id": "R1",
-                    "onebot_message_id": "M-BOT",
-                    "self_id": "1005089717",
+                    "tool_call_id": "TC_R",
+                    "result": {
+                        "message_id": "M-BOT",
+                        "self_id": "1005089717",
+                        "sent": True,
+                    },
                 },
                 seconds_offset=1,
             ),
@@ -643,7 +1311,62 @@ class BuildTimelineTests(unittest.TestCase):
         ]
         items = Projector.build_timeline(evs, tool_views=[])
         msg = [i for i in items if i.kind == "message"][0].render
-        self.assertIn('from="我(1005089717)"', msg)
+        self.assertIn('from_self="true"', msg)
+        self.assertIn('from_id="1005089717"', msg)
+        self.assertNotIn("from_name=", msg)  # bot 显示名未知，不渲染
+
+    def test_reply_to_bot_message_attributes_self_legacy_reply_name(
+        self,
+    ) -> None:
+        # 兼容：改名前落库的发言事件 tool_name 仍是旧的 "reply"（事件表
+        # append-only）。_build_author_index 两个名都认，旧发言在一个 lookback
+        # 窗口内仍能被标 from_self="true"。见 send_message工具黑盒设计 §12.2。
+        evs = [
+            _snap(
+                type="agent.tool_called",
+                payload={
+                    "tool_call_id": "TC_OLD",
+                    "tool_name": "reply",  # 改名前的旧事件
+                    "arguments": {
+                        "content": [
+                            {"type": "text", "data": {"text": "旧发言"}}
+                        ],
+                        "target": {"kind": "group", "group_id": 999},
+                    },
+                },
+                seconds_offset=0,
+            ),
+            _snap(
+                type="agent.tool_result",
+                payload={
+                    "tool_call_id": "TC_OLD",
+                    "result": {
+                        "message_id": "M-OLD",
+                        "self_id": "1005089717",
+                        "sent": True,
+                    },
+                },
+                seconds_offset=1,
+            ),
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "onebot_message_id": "M-D",
+                    "segments": [
+                        {"type": "reply", "data": {"id": "M-OLD"}},
+                        {"type": "text", "data": {"text": "还嘴硬"}},
+                    ],
+                    "sender": {"nickname": "路人D", "user_id": 444},
+                },
+                user_id=444,
+                seconds_offset=2,
+            ),
+        ]
+        items = Projector.build_timeline(evs, tool_views=[])
+        msg = [i for i in items if i.kind == "message"][0].render
+        self.assertIn('from_self="true"', msg)
+        self.assertIn('from_id="1005089717"', msg)
+        self.assertNotIn("from_name=", msg)  # bot 显示名未知，不渲染
 
     def test_mface_dice_rps_file_markdown_segments(self) -> None:
         evs = [
@@ -666,12 +1389,73 @@ class BuildTimelineTests(unittest.TestCase):
         self.assertIn('<dice value="4"/>', r)
         self.assertIn('<rps value="1"/>', r)
         self.assertIn('<file name="report.pdf"/>', r)
+        # markdown 段有 content 时渲染正文（napcat data.content；官方
+        # 机器人消息常见），不再吞成 <markdown/>。
+        self.assertIn("<markdown># hi</markdown>", r)
+
+    def test_markdown_without_content_stays_empty_tag(self) -> None:
+        evs = [
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "segments": [{"type": "markdown", "data": {}}],
+                    "sender": {"nickname": "u", "user_id": 1},
+                },
+            ),
+        ]
+        r = Projector.build_timeline(evs, tool_views=[])[0].render
         self.assertIn("<markdown/>", r)
 
-    def test_decision_emitted_idle_decision_are_filtered_out(self) -> None:
+    def test_markdown_long_content_clipped(self) -> None:
+        evs = [
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "segments": [
+                        {"type": "markdown", "data": {"content": "x" * 600}}
+                    ],
+                    "sender": {"nickname": "u", "user_id": 1},
+                },
+            ),
+        ]
+        r = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertIn("x" * 500 + "…</markdown>", r)
+        self.assertNotIn("x" * 501, r)
+
+    def test_file_segment_renders_size_and_file_id(self) -> None:
+        # napcat file 段带 file_size（字节）与 file_id（下载凭证，供未来
+        # 文件类工具回填）；缺失时属性不渲染（缺失=未知）。
+        evs = [
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "segments": [
+                        {
+                            "type": "file",
+                            "data": {
+                                "file": "月报.xlsx",
+                                "file_size": "20480",
+                                "file_id": "UUID-42",
+                            },
+                        }
+                    ],
+                    "sender": {"nickname": "u", "user_id": 1},
+                },
+            ),
+        ]
+        r = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertIn(
+            '<file name="月报.xlsx" size_bytes="20480" file_id="UUID-42"/>', r
+        )
+
+    def test_reply_lifecycle_events_are_filtered_out(self) -> None:
+        # 发言已同步：reply_emitted/delivered/failed 不再产生（历史遗留事件也
+        # 只 skip）；decision/idle 同为运营事件不进 timeline。发送结果由
+        # send_message 工具的 <tool-call>（succeeded/failed）表达，没有独立行。
         evs = [
             _snap(type="agent.decision_emitted", payload={}),
             _snap(type="agent.idle_decision", payload={"reason": "x"}),
+            _snap(type="agent.reply_emitted", payload={}),
             _snap(type="agent.reply_delivered", payload={}),
             _snap(type="agent.reply_failed", payload={}),
         ]
@@ -747,13 +1531,18 @@ class ProjectIntegrationTests(unittest.TestCase):
         # Active task should still be pending (no state_changed → done)
         self.assertEqual(len(context.active_tasks), 1)
         self.assertEqual(context.active_tasks[0].state, "pending")
-        # The completed tool call is in pending_tool_results (succeeded != pending)
-        self.assertEqual(len(context.pending_tool_results), 1)
-        self.assertEqual(context.pending_tool_results[0].status, "succeeded")
+        # 2026-07-02：DecisionContext 不再有 pending_tool_results 字段——工具
+        # 结果只在 timeline 的 <tool-call status="complete"> 行呈现一次
+        # （旧的双重渲染 + 无消费切割是复读诱饵）
+        self.assertFalse(hasattr(context, "pending_tool_results"))
         # Timeline: message + tool_call (task events folded; reply_emitted no
-        # longer renders — 发言统一走 reply 工具的 <tool-call name="reply">)
+        # longer renders — 发言统一走 send_message 工具的 <tool-call name="send_message">)
         kinds = [it.kind for it in context.timeline]
         self.assertEqual(kinds, ["message", "tool_call"])
+        # timeline 的 tool_call 行必须携带完整结果（唯一出口）
+        tool_row = context.timeline[1]
+        self.assertIn('status="complete"', tool_row.render)
+        self.assertIn("sunny", tool_row.render)
 
     def test_decision_context_identity_fields_preserved(self) -> None:
         context = Projector.project(
@@ -769,9 +1558,96 @@ class ProjectIntegrationTests(unittest.TestCase):
         self.assertEqual(context.now, BASE_TIME)
         self.assertEqual(context.timeline, [])
         self.assertEqual(context.active_tasks, [])
-        self.assertEqual(context.pending_tool_results, [])
         # bot_user_id 默认 None；未注入时不破坏旧用例
         self.assertIsNone(context.bot_user_id)
+        # 窗口内无历史决策 → 跨拍记忆为空
+        self.assertIsNone(context.last_reasoning)
+        self.assertIsNone(context.last_reasoning_at)
+
+    def test_last_reasoning_folds_latest_decision(self) -> None:
+        """模型的跨拍自我记忆（2026-07-02）：取窗口内最近一条
+        agent.decision_emitted 的 reasoning；空 reasoning 的决策跳过。"""
+        evs = [
+            _snap(
+                type="agent.decision_emitted",
+                payload={"reasoning": "第一拍：先观望"},
+                seconds_offset=1,
+            ),
+            _snap(
+                type="agent.decision_emitted",
+                payload={"reasoning": "第二拍：小徐在贴日志，等他贴完"},
+                seconds_offset=2,
+            ),
+            _snap(
+                type="agent.decision_emitted",
+                payload={"reasoning": "   "},  # 空白 → 跳过，取上一条
+                seconds_offset=3,
+            ),
+        ]
+        context = Projector.project(
+            evs,
+            scope_key="group:999",
+            correlation_id="c",
+            tick_seq=2,
+            now=BASE_TIME + timedelta(seconds=10),
+        )
+        self.assertEqual(
+            context.last_reasoning, "第二拍：小徐在贴日志，等他贴完"
+        )
+        self.assertEqual(
+            context.last_reasoning_at, BASE_TIME + timedelta(seconds=2)
+        )
+        # decision_emitted 仍不逐条进 timeline（只折叠最近一条 reasoning）
+        self.assertEqual(context.timeline, [])
+
+    def test_task_closed_renders_timeline_row(self) -> None:
+        """任务收束的事后记忆（2026-07-02）：done/failed 渲染 <task-closed>
+        行（正文 = result_summary / 失败原因）；中间态迁移仍消隐。"""
+        evs = [
+            _snap(
+                type="agent.task_state_changed",
+                payload={
+                    "task_id": "T1",
+                    "from_state": "pending",
+                    "to_state": "running",
+                },
+                seconds_offset=1,
+            ),
+            _snap(
+                type="agent.task_state_changed",
+                payload={
+                    "task_id": "T1",
+                    "to_state": "done",
+                    "reason": "已把天气告诉小徐",
+                },
+                seconds_offset=2,
+            ),
+            _snap(
+                type="agent.task_state_changed",
+                payload={
+                    "task_id": "T2",
+                    "to_state": "failed",
+                    "reason": "查不到这首歌",
+                },
+                seconds_offset=3,
+            ),
+        ]
+        context = Projector.project(
+            evs,
+            scope_key="group:999",
+            correlation_id="c",
+            tick_seq=1,
+            now=BASE_TIME + timedelta(seconds=10),
+        )
+        kinds = [it.kind for it in context.timeline]
+        self.assertEqual(kinds, ["task_closed", "task_closed"])
+        done_row = context.timeline[0].render
+        self.assertIn('id="T1"', done_row)
+        self.assertIn('outcome="done"', done_row)
+        self.assertIn("已把天气告诉小徐", done_row)
+        failed_row = context.timeline[1].render
+        self.assertIn('outcome="failed"', failed_row)
+        self.assertIn("查不到这首歌", failed_row)
 
     def test_bot_user_id_propagates_into_decision_context(self) -> None:
         """Projector.project 收到 bot_user_id 时必须透传到 DecisionContext，

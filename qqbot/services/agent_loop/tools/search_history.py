@@ -16,7 +16,7 @@
 返回结构复用 Projector 渲染器，与正向 timeline 完全同构。
 
 错误策略：
-  - 参数全空 / scope_key 缺失 → raise ValueError；ToolWorker 写 tool_failed
+  - scope_key 缺失 / 非法 → return ToolOutcome.failure(invalid_arguments)（不 raise）
   - 锚点 task 查不到 / triggered_by_event_id 缺失 → 加 warning，不报错
 """
 
@@ -33,7 +33,7 @@ from qqbot.models.agent_event import AgentEvent
 from qqbot.services.agent_loop.event_writer import parse_scope_key
 from qqbot.services.agent_loop.projection import Projector, _snapshot_from_row
 from qqbot.services.agent_loop.prompts import load_sibling_md
-from qqbot.services.agent_loop.tool_registry import BaseTool
+from qqbot.services.agent_loop.tool_registry import BaseTool, ToolOutcome
 
 logger = get_logger(__name__)
 
@@ -45,7 +45,7 @@ _USAGE_PROMPT = load_sibling_md(__file__, "search_history.md")
 
 class SearchHistoryTool(BaseTool):
     """实现 Tool 协议。session_factory 从 run() 的 context 进（ToolWorker
-    统一注入），无构造依赖 —— 与 websearch / reply 同构。
+    统一注入），无构造依赖 —— 与 websearch / send_message 同构。
     """
 
     name = "search_history"
@@ -60,8 +60,8 @@ class SearchHistoryTool(BaseTool):
         "format as the normal timeline."
     )
     usage_prompt = _USAGE_PROMPT
-    # required_permission / require_bot_admin 用 BaseTool 默认值（GUEST /
-    # False）：查历史属于内部知识检索，任何群员都能让小奏查，无需管理员。
+    # required_permission / required_bot_role 用 BaseTool 默认值（GUEST /
+    # 不限 bot 角色）：查历史属于内部知识检索，任何群员都能让小奏查，无需管理员。
     arguments_schema = {
         "type": "object",
         "properties": {
@@ -101,11 +101,18 @@ class SearchHistoryTool(BaseTool):
         },
     }
 
-    async def run(self, arguments: dict, **context: Any) -> dict:
+    async def execute(self, arguments: dict, **context: Any) -> ToolOutcome:
+        # GUEST + 不限 scope：enforce_access 实为 no-op，但统一保留首行调用。全程无 raise。
+        if fail := await self.enforce_access(context):
+            return fail
+
         scope_key = context.get("scope_key")
         if not scope_key or not isinstance(scope_key, str):
             # 由 ToolWorker 注入。理论上 system / group:N / private:N 总有一个。
-            raise ValueError("search_history requires scope_key from caller context")
+            return ToolOutcome.failure(
+                "invalid_arguments",
+                "search_history requires scope_key from caller context",
+            )
         # session_factory 同样由 ToolWorker 在 context 里注入。ToolWorker 串行
         # 执行工具且全局共用同一个 factory，落到 self 上供 _query /
         # _resolve_task_anchor 复用是安全的（不存在并发 run 互相覆盖）。
@@ -114,7 +121,9 @@ class SearchHistoryTool(BaseTool):
         try:
             scope, group_id, _user_id = parse_scope_key(scope_key)
         except ValueError as exc:
-            raise ValueError(f"invalid scope_key {scope_key!r}: {exc}") from exc
+            return ToolOutcome.failure(
+                "invalid_arguments", f"invalid scope_key {scope_key!r}: {exc}"
+            )
 
         warnings: list[str] = []
 
@@ -161,20 +170,22 @@ class SearchHistoryTool(BaseTool):
         tool_views = Projector.fold_tool_results(snapshots)
         items = Projector.build_timeline(snapshots, tool_views=tool_views)
 
-        return {
-            "matched": len(items),
-            "anchor_event_id": anchor_event_id,
-            "items": [
-                {
-                    "event_id": it.event_id,
-                    "occurred_at": it.occurred_at.isoformat(),
-                    "kind": it.kind,
-                    "render": it.render,
-                }
-                for it in items
-            ],
-            "warnings": warnings,
-        }
+        return ToolOutcome.success(
+            {
+                "matched": len(items),
+                "anchor_event_id": anchor_event_id,
+                "items": [
+                    {
+                        "event_id": it.event_id,
+                        "occurred_at": it.occurred_at.isoformat(),
+                        "kind": it.kind,
+                        "render": it.render,
+                    }
+                    for it in items
+                ],
+                "warnings": warnings,
+            }
+        )
 
     async def _resolve_task_anchor(self, task_id: str) -> str | None:
         """查 agent.task_created 事件的 payload.triggered_by_event_id。

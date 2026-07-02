@@ -1,6 +1,19 @@
 """Map OneBot V11 GroupMessageEvent → external.message.group.*
 
 Contract: 开发文档/v2.0/事件系统设计.md §4.1
+
+Self-message 回流策略（明确不回流）：bot 自己发出的群消息**不会**进入
+external.message.group.*，有两道闸——
+① napcat 上报自身消息用的是 post_type="message_sent"（且默认关闭
+   reportSelfMessage），nonebot 的 on_message 只匹配 type="message"，
+   v2_main 的四个 matcher 都不会接到它；
+② 本 mapper 的 can_map 也只认 post_type=="message"。
+因此 bot 的发言在事件流里只有一种形态：send_message 工具的
+agent.tool_called/tool_result 对（projection 渲染成 <tool-call
+name="send_message">，author 索引据其 result 里的 message_id+self_id 折出
+reply 段的 from_self="true"）。若未来想让"bot 账号在别的设备上手动发的消息"对模型可见，
+需要显式开 napcat reportSelfMessage 并新增 message_sent 的 mapper——那是一个
+有意的契约变更，不要顺手放行。
 """
 
 from __future__ import annotations
@@ -45,6 +58,23 @@ class GroupMessageMapper:
             "segments": dump_segments(getattr(event, "message", None)),
             "message_sub_type": msg_sub_type,
         }
+        # 可选补充字段——"有才落键"，不给一库 None：
+        # - anonymous：OneBot 标准匿名消息对象（napcat 无匿名支持、恒缺失；
+        #   标准实现才会给）。含 flag（set_group_anonymous_ban 凭证），只入库
+        #   不渲染——投影层用 name 当 sender_name 兜底并标 anonymous="true"。
+        # - real_seq：napcat 扩展的群内真实消息序号（get_group_msg_history
+        #   锚点，供未来历史工具用，不渲染）。
+        # - message_seq：go-cqhttp 系实现的消息序号（napcat 里恒等于
+        #   message_id、无增量信息；非 napcat 实现有真值）。
+        # - group_name：napcat 事件级附带的群名（供未来渲染到 agent-input，
+        #   让 LLM 知道自己在哪个群——群号被提示词禁止复述，群名可以说）。
+        anonymous = _dump_anonymous(getattr(event, "anonymous", None))
+        if anonymous:
+            payload["anonymous"] = anonymous
+        for attr in ("real_seq", "message_seq", "group_name"):
+            value = getattr(event, attr, None)
+            if value is not None and str(value).strip() != "":
+                payload[attr] = value
 
         return PartialSystemEvent(
             origin="external",
@@ -63,12 +93,46 @@ class GroupMessageMapper:
 
 
 def _dump_sender(event: Any) -> dict:
+    """群消息 sender → payload dict。
+
+    OneBot 标准 sender 有 9 个字段；napcat 实际只给 user_id/nickname/card/
+    role 四个（title/level/sex/age/area 在其接收转换器里不赋值——NapCatQQ
+    helper/data.ts 实测），但其他 OneBot 实现可能给全。核心 4 键**恒在**
+    （保持既有 payload 形状，下游渲染直接 .get），其余 5 键"有值才落键"。
+    投影层只渲染 title（sender_title=，社交语境线索）；level/sex/age/area
+    仅入库供未来工具/分析用，不进 prompt。
+    """
     sender = getattr(event, "sender", None)
     if sender is None:
         return {"user_id": getattr(event, "user_id", None)}
-    return {
+    out = {
         "user_id": getattr(sender, "user_id", None),
         "nickname": getattr(sender, "nickname", None),
         "card": getattr(sender, "card", None),
         "role": getattr(sender, "role", None),
     }
+    for attr in ("title", "level", "sex", "age", "area"):
+        value = getattr(sender, attr, None)
+        if value is not None and str(value).strip() != "":
+            out[attr] = value
+    return out
+
+
+def _dump_anonymous(anonymous: Any) -> dict | None:
+    """OneBot 匿名消息 anonymous 对象 → dict（id/name/flag），全空 → None。
+
+    兼容 pydantic 对象与 dict 两种形态（nonebot 的 Anonymous 模型 /
+    测试 fake）。flag 是后续匿名禁言 API 的凭证，随事件入库、不渲染给 LLM。
+    """
+    if anonymous is None:
+        return None
+
+    def _pick(key: str) -> Any:
+        if isinstance(anonymous, dict):
+            return anonymous.get(key)
+        return getattr(anonymous, key, None)
+
+    out = {"id": _pick("id"), "name": _pick("name"), "flag": _pick("flag")}
+    if all(v is None for v in out.values()):
+        return None
+    return out

@@ -72,6 +72,33 @@ class PrivateMessageMapperTests(unittest.TestCase):
         self.assertEqual(p.visibility, "agent_visible")
         self.assertEqual(p.idempotency_key, "10000:msg:5")
 
+    def test_sender_optional_sex_age_stored_when_present(self) -> None:
+        # OneBot 标准私聊 sender 的 sex/age：有值才落键（napcat 不上报，
+        # 标准实现可能给；仅入库供未来用，投影层不渲染）。
+        event = _ev(
+            post_type="message",
+            message_type="private",
+            sub_type="friend",
+            message_id=6,
+            user_id=222,
+            raw_message="hi",
+            message=[],
+            sender=SimpleNamespace(
+                user_id=222, nickname="bob", sex="male", age=18
+            ),
+        )
+        p = self.mapper.map(event)
+        self.assertEqual(p.payload["sender"]["sex"], "male")
+        self.assertEqual(p.payload["sender"]["age"], 18)
+
+    def test_sender_optional_fields_absent_by_default(self) -> None:
+        p = self.mapper.map(self.event)
+        self.assertNotIn("sex", p.payload["sender"])
+        self.assertNotIn("age", p.payload["sender"])
+        # 核心 2 键恒在
+        self.assertIn("user_id", p.payload["sender"])
+        self.assertIn("nickname", p.payload["sender"])
+
 
 class GroupIncreaseMapperTests(unittest.TestCase):
     def test_partial(self) -> None:

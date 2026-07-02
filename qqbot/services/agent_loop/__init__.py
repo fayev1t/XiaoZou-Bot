@@ -47,7 +47,6 @@ _LAZY: dict[str, str] = {
     "FakeIdlePlanner": "planner",
     "Projector": "projection",
     "PromptRegistry": "prompt_registry",
-    "ReplySendWorker": "reply_worker",
     "LoopSupervisor": "supervisor",
     "Tool": "tool_registry",
     "ToolRegistry": "tool_registry",
@@ -78,7 +77,6 @@ if TYPE_CHECKING:  # 静态分析仍看得到惰性符号
     from qqbot.services.agent_loop.planner import FakeIdlePlanner
     from qqbot.services.agent_loop.projection import Projector
     from qqbot.services.agent_loop.prompt_registry import PromptRegistry
-    from qqbot.services.agent_loop.reply_worker import ReplySendWorker
     from qqbot.services.agent_loop.supervisor import LoopSupervisor
     from qqbot.services.agent_loop.tool_registry import Tool, ToolRegistry
     from qqbot.services.agent_loop.tool_worker import ToolWorker
@@ -103,7 +101,6 @@ __all__ = [
     "build_default_prompt_registry",
     "ProgressNote",
     "Projector",
-    "ReplySendWorker",
     "TaskView",
     "TimelineItem",
     "Tool",

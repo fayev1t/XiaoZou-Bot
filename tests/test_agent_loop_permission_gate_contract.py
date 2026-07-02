@@ -1,17 +1,19 @@
-"""Contract tests for AgentLoop permission gate.
+"""Contract tests for AgentLoop tool dispatch（权限闸门已全部下放工具）。
 
-覆盖 AgentLoop._apply_actions 在 CallToolAction 上的两层校验：
+权限模型现状：AgentLoop **不做任何 role / tier / scope 判定**——它只把工具调用
+所需的触发线索注入 ``agent.tool_called.payload``，判定全交给工具内的
+``BaseTool.enforce_access``（enforce_scope + 现场解析发起人 tier + enforce_bot_admin）。
 
-- require_bot_admin=True + bot_role=admin/owner → 通过，写 tool_called。
-- require_bot_admin=True + bot_role=member → tool_failed(bot_role)，不写 tool_called。
-- require_bot_admin=True + bot_role=None (sweep 未完成) → tool_failed(bot_role)。
-- required_permission=ADMIN + 触发用户是 owner/admin → 通过。
-- required_permission=ADMIN + 触发用户是 member → tool_failed(user_tier)。
-- required_permission=ADMIN + SUPERUSER 即使群里 member → 通过。
-- required_permission=ADMIN + 缺 triggered_by_event_id 且 task 也没 anchor → 失败。
-- required_permission=ADMIN + 缺 action.triggered_by_event_id 但 task 有 anchor → fall back。
-- GUEST 工具（默认）无需 triggered_by → 直接通过。
-- tool_registry=None → 整个闸门跳过（旧 skeleton 测试兼容）。
+故本组测试钉死的是 loop 的"无为"：
+- 任何工具 / 任何 bot_role / 任何 scope → loop 都照常 dispatch ``tool_called``，
+  从不写 ``tool_failed``（scope/tier/bot 角色的实际拒绝发生在工具内）。
+- payload 注入 ``triggered_by_event_id``（action 给的；缺则回退到 task anchor 补
+  因果链）+ ``bot_role``。
+- payload **不含** ``triggered_by_user_tier`` / ``triggered_by_user_id``——loop
+  不再解析触发用户 tier（移交工具 enforce_permission 现场解析）。
+
+发起人 tier / bot 角色 / scope 的实际拒绝由各工具 contract 测试 +
+test_tool_permission_enforcement_contract 元测试覆盖。
 """
 
 from __future__ import annotations
@@ -38,12 +40,7 @@ class _RecordingSession:
 
     async def execute(self, stmt: Any) -> Any:
         self._store.append(stmt)
-        # 给 resolve_user_tier_from_event 用——它 await execute() 后
-        # .scalar_one_or_none()。我们的测试路径会 mock resolve 函数本身，
-        # 这里返回一个 dummy 以防 ungaurded 调用。
-        return SimpleNamespace(
-            rowcount=1, scalar_one_or_none=lambda: None
-        )
+        return SimpleNamespace(rowcount=1, scalar_one_or_none=lambda: None)
 
     async def commit(self) -> None:
         return None
@@ -73,29 +70,14 @@ def _payloads_by_type(captured: list[Any]) -> dict[str, list[dict]]:
     return out
 
 
-# ── Stub tools with different permission requirements ──
-
-
 class _AdminTool:
+    """敏感工具：ADMIN + 须 bot admin。loop 不再据此拦任何东西（仅工具内判）。"""
+
     name = "kick_member"
     description = "kick"
     arguments_schema = {"type": "object"}
     required_permission = PermissionTier.ADMIN
     require_bot_admin = True
-
-    async def run(self, arguments: dict, **_: Any) -> Any:
-        return {}
-
-
-class _AdminUserNoBotAdmin:
-    """需要 admin 用户触发，但小奏不一定要是管理员（比如纯查询类需要鉴权但
-    本身只读）。"""
-
-    name = "audit_log"
-    description = "audit"
-    arguments_schema = {"type": "object"}
-    required_permission = PermissionTier.ADMIN
-    require_bot_admin = False
 
     async def run(self, arguments: dict, **_: Any) -> Any:
         return {}
@@ -112,7 +94,9 @@ class _GuestTool:
         return {}
 
 
-def _ctx(*, bot_role: str | None, active_tasks: list[TaskView] | None = None) -> DecisionContext:
+def _ctx(
+    *, bot_role: str | None, active_tasks: list[TaskView] | None = None
+) -> DecisionContext:
     from qqbot.core.time import china_now
 
     return DecisionContext(
@@ -128,7 +112,7 @@ def _ctx(*, bot_role: str | None, active_tasks: list[TaskView] | None = None) ->
 def _loop(*, registry: ToolRegistry | None, store: list[Any]) -> AgentLoop:
     return AgentLoop(
         scope_key="group:100",
-        planner=mock.Mock(),  # 不会真的被调
+        planner=mock.Mock(),
         session_factory=_factory_for(store),
         tool_registry=registry,
     )
@@ -140,31 +124,9 @@ async def _dispatch(
     await loop._apply_actions([action], "CID", "DID", context)
 
 
-class RequireBotAdminGateTest(unittest.IsolatedAsyncioTestCase):
-    async def test_bot_admin_passes_when_bot_role_admin(self) -> None:
-        reg = ToolRegistry()
-        reg.register(_AdminTool())
-        store: list[Any] = []
-        # mock tier resolution → ADMIN（不影响这个测试，因为 require_bot_admin
-        # 的检查在 tier 检查之前；保险起见还是给个 ADMIN）
-        with mock.patch(
-            "qqbot.services.agent_loop.loop.resolve_user_tier_from_event",
-            new=mock.AsyncMock(return_value=(PermissionTier.ADMIN, "42")),
-        ):
-            await _dispatch(
-                _loop(registry=reg, store=store),
-                CallToolAction(
-                    tool_name="kick_member",
-                    arguments={"target": 1},
-                    triggered_by_event_id="E1",
-                ),
-                _ctx(bot_role="admin"),
-            )
-        types = _payloads_by_type(store)
-        self.assertIn("agent.tool_called", types)
-        self.assertNotIn("agent.tool_failed", types)
-
-    async def test_bot_admin_blocks_when_bot_role_member(self) -> None:
+class LoopIsPermissionAgnosticTest(unittest.IsolatedAsyncioTestCase):
+    async def test_sensitive_tool_dispatched_without_gate(self) -> None:
+        # 敏感工具 + bot 非 admin：loop 仍 dispatch、绝不写 tool_failed。
         reg = ToolRegistry()
         reg.register(_AdminTool())
         store: list[Any] = []
@@ -172,19 +134,20 @@ class RequireBotAdminGateTest(unittest.IsolatedAsyncioTestCase):
             _loop(registry=reg, store=store),
             CallToolAction(
                 tool_name="kick_member",
-                arguments={},
+                arguments={"user_id": 1},
                 triggered_by_event_id="E1",
             ),
             _ctx(bot_role="member"),
         )
         types = _payloads_by_type(store)
-        self.assertNotIn("agent.tool_called", types)
-        failed = types["agent.tool_failed"][0]
-        self.assertEqual(failed["error_kind"], "permission_denied_bot_role")
-        self.assertEqual(failed["actual_bot_role"], "member")
+        self.assertIn("agent.tool_called", types)
+        self.assertNotIn("agent.tool_failed", types)
+        called = types["agent.tool_called"][0]
+        self.assertEqual(called["bot_role"], "member")
+        self.assertEqual(called["triggered_by_event_id"], "E1")
 
-    async def test_bot_admin_blocks_when_bot_role_unknown(self) -> None:
-        """sweep 未完成 → bot_role=None → 保守拒绝。"""
+    async def test_payload_omits_resolved_tier(self) -> None:
+        # loop 不再解析触发用户 tier：payload 不含 tier / user_id 字段。
         reg = ToolRegistry()
         reg.register(_AdminTool())
         store: list[Any] = []
@@ -195,130 +158,41 @@ class RequireBotAdminGateTest(unittest.IsolatedAsyncioTestCase):
                 arguments={},
                 triggered_by_event_id="E1",
             ),
-            _ctx(bot_role=None),
+            _ctx(bot_role="admin"),
         )
-        types = _payloads_by_type(store)
-        self.assertNotIn("agent.tool_called", types)
-        self.assertEqual(
-            types["agent.tool_failed"][0]["error_kind"],
-            "permission_denied_bot_role",
-        )
+        called = _payloads_by_type(store)["agent.tool_called"][0]
+        self.assertNotIn("triggered_by_user_tier", called)
+        self.assertNotIn("triggered_by_user_id", called)
 
-
-class RequiredPermissionGateTest(unittest.IsolatedAsyncioTestCase):
-    async def test_admin_user_passes(self) -> None:
+    async def test_no_resolution_call(self) -> None:
+        # loop 既不 import 也不调用 resolve_user_tier_from_event；patch 它，断言
+        # 从未被 await（解析已彻底移交工具）。
         reg = ToolRegistry()
-        reg.register(_AdminUserNoBotAdmin())
+        reg.register(_AdminTool())
         store: list[Any] = []
         with mock.patch(
-            "qqbot.services.agent_loop.loop.resolve_user_tier_from_event",
-            new=mock.AsyncMock(return_value=(PermissionTier.ADMIN, "100")),
-        ):
-            await _dispatch(
-                _loop(registry=reg, store=store),
-                CallToolAction(
-                    tool_name="audit_log",
-                    arguments={},
-                    triggered_by_event_id="E_admin_msg",
-                ),
-                _ctx(bot_role="member"),  # bot 不需要是 admin
-            )
-        types = _payloads_by_type(store)
-        self.assertIn("agent.tool_called", types)
-        called = types["agent.tool_called"][0]
-        self.assertEqual(called["triggered_by_user_tier"], "ADMIN")
-        self.assertEqual(called["triggered_by_user_id"], "100")
-        self.assertEqual(called["triggered_by_event_id"], "E_admin_msg")
-
-    async def test_member_user_blocked(self) -> None:
-        reg = ToolRegistry()
-        reg.register(_AdminUserNoBotAdmin())
-        store: list[Any] = []
-        with mock.patch(
-            "qqbot.services.agent_loop.loop.resolve_user_tier_from_event",
-            new=mock.AsyncMock(return_value=(PermissionTier.GUEST, "200")),
-        ):
-            await _dispatch(
-                _loop(registry=reg, store=store),
-                CallToolAction(
-                    tool_name="audit_log",
-                    arguments={},
-                    triggered_by_event_id="E_member_msg",
-                ),
-                _ctx(bot_role="member"),
-            )
-        types = _payloads_by_type(store)
-        self.assertNotIn("agent.tool_called", types)
-        failed = types["agent.tool_failed"][0]
-        self.assertEqual(failed["error_kind"], "permission_denied_user_tier")
-        self.assertEqual(failed["required_tier"], "ADMIN")
-        self.assertEqual(failed["actual_tier"], "GUEST")
-
-    async def test_superuser_overrides_member_role(self) -> None:
-        reg = ToolRegistry()
-        reg.register(_AdminUserNoBotAdmin())
-        store: list[Any] = []
-        # 模拟 resolve 已经识别 SUPERUSER → SYSTEM_ADMIN
-        with mock.patch(
-            "qqbot.services.agent_loop.loop.resolve_user_tier_from_event",
-            new=mock.AsyncMock(
-                return_value=(PermissionTier.SYSTEM_ADMIN, "999")
-            ),
-        ):
-            await _dispatch(
-                _loop(registry=reg, store=store),
-                CallToolAction(
-                    tool_name="audit_log",
-                    arguments={},
-                    triggered_by_event_id="E_su_msg",
-                ),
-                _ctx(bot_role="member"),
-            )
-        types = _payloads_by_type(store)
-        self.assertIn("agent.tool_called", types)
-        self.assertEqual(
-            types["agent.tool_called"][0]["triggered_by_user_tier"],
-            "SYSTEM_ADMIN",
-        )
-
-    async def test_missing_triggered_by_treated_as_guest(self) -> None:
-        """LLM 漏填 triggered_by_event_id 且 task 也没挂 anchor →
-        resolve 返回 GUEST → ADMIN 工具失败。"""
-        reg = ToolRegistry()
-        reg.register(_AdminUserNoBotAdmin())
-        store: list[Any] = []
-        with mock.patch(
-            "qqbot.services.agent_loop.loop.resolve_user_tier_from_event",
-            new=mock.AsyncMock(return_value=(PermissionTier.GUEST, None)),
+            "qqbot.core.permissions.resolve_user_tier_from_event",
+            new=mock.AsyncMock(),
         ) as patched:
             await _dispatch(
                 _loop(registry=reg, store=store),
                 CallToolAction(
-                    tool_name="audit_log",
+                    tool_name="kick_member",
                     arguments={},
-                    # triggered_by_event_id 故意省略
+                    triggered_by_event_id="E1",
                 ),
                 _ctx(bot_role="admin"),
             )
-            # 闸门把 event_id=None 传给了 resolve
-            patched.assert_awaited_with(
-                None, session_factory=mock.ANY, superusers=mock.ANY
-            )
-        types = _payloads_by_type(store)
-        self.assertNotIn("agent.tool_called", types)
-        self.assertEqual(
-            types["agent.tool_failed"][0]["error_kind"],
-            "permission_denied_user_tier",
-        )
+            patched.assert_not_awaited()
 
     async def test_fallback_to_task_anchor_when_action_missing(self) -> None:
-        """LLM 没在 call_tool 上填 triggered_by_event_id，但工具挂在的 task
-        有 anchor → 用 task 的 anchor 兜底解析。"""
-        reg = ToolRegistry()
-        reg.register(_AdminUserNoBotAdmin())
-        store: list[Any] = []
+        # action 没填 triggered_by_event_id，但工具挂的 task 有 anchor →
+        # loop 用 task anchor 补 triggered_by_event_id（因果链），不解析 tier。
         from qqbot.core.time import china_now
 
+        reg = ToolRegistry()
+        reg.register(_AdminTool())
+        store: list[Any] = []
         ctx = _ctx(
             bot_role="admin",
             active_tasks=[
@@ -326,7 +200,7 @@ class RequiredPermissionGateTest(unittest.IsolatedAsyncioTestCase):
                     task_id="T1",
                     scope_key="group:100",
                     description="anchor task",
-                    related_tools=["audit_log"],
+                    related_tools=["kick_member"],
                     parent_task_id=None,
                     state="running",
                     created_at=china_now(),
@@ -337,70 +211,42 @@ class RequiredPermissionGateTest(unittest.IsolatedAsyncioTestCase):
                 )
             ],
         )
-        with mock.patch(
-            "qqbot.services.agent_loop.loop.resolve_user_tier_from_event",
-            new=mock.AsyncMock(return_value=(PermissionTier.ADMIN, "42")),
-        ) as patched:
-            await _dispatch(
-                _loop(registry=reg, store=store),
-                CallToolAction(
-                    tool_name="audit_log",
-                    arguments={},
-                    task_id="T1",
-                    # 不填 triggered_by_event_id，期望 fallback 到 T1 的 anchor
-                ),
-                ctx,
-            )
-            patched.assert_awaited_with(
-                "E_anchor", session_factory=mock.ANY, superusers=mock.ANY
-            )
-        types = _payloads_by_type(store)
-        self.assertIn("agent.tool_called", types)
-        self.assertEqual(
-            types["agent.tool_called"][0]["triggered_by_event_id"], "E_anchor"
+        await _dispatch(
+            _loop(registry=reg, store=store),
+            CallToolAction(tool_name="kick_member", arguments={}, task_id="T1"),
+            ctx,
         )
+        called = _payloads_by_type(store)["agent.tool_called"][0]
+        self.assertEqual(called["triggered_by_event_id"], "E_anchor")
 
-
-class GuestToolBypassesGateTest(unittest.IsolatedAsyncioTestCase):
-    async def test_guest_tool_skips_tier_check(self) -> None:
-        """GUEST 工具应该直接通过；resolve 函数甚至不会被调（节省一次 DB 查）。"""
+    async def test_guest_tool_dispatched(self) -> None:
         reg = ToolRegistry()
         reg.register(_GuestTool())
         store: list[Any] = []
-        with mock.patch(
-            "qqbot.services.agent_loop.loop.resolve_user_tier_from_event",
-            new=mock.AsyncMock(),
-        ) as patched:
-            await _dispatch(
-                _loop(registry=reg, store=store),
-                CallToolAction(tool_name="echo", arguments={"x": 1}),
-                _ctx(bot_role="member"),
-            )
-            patched.assert_not_awaited()
+        await _dispatch(
+            _loop(registry=reg, store=store),
+            CallToolAction(tool_name="echo", arguments={"x": 1}),
+            _ctx(bot_role="member"),
+        )
         types = _payloads_by_type(store)
         self.assertIn("agent.tool_called", types)
-        # GUEST 路径下 tier audit 字段仍写 "GUEST"
-        self.assertEqual(
-            types["agent.tool_called"][0]["triggered_by_user_tier"], "GUEST"
+        self.assertNotIn("agent.tool_failed", types)
+        self.assertIsNone(
+            types["agent.tool_called"][0]["triggered_by_event_id"]
         )
 
-
-class NoRegistryNoGateTest(unittest.IsolatedAsyncioTestCase):
-    async def test_no_registry_means_no_gate(self) -> None:
-        """旧 skeleton / 测试场景注入 tool_registry=None 时闸门退化 ——
-        所有 call_tool 直接通过。"""
+    async def test_no_registry_still_dispatches(self) -> None:
+        # registry=None（loop 不再依赖工具元数据做 dispatch）→ 照常 dispatch。
         store: list[Any] = []
         await _dispatch(
             _loop(registry=None, store=store),
-            CallToolAction(
-                tool_name="anything",
-                arguments={},
-            ),
+            CallToolAction(tool_name="anything", arguments={}),
             _ctx(bot_role=None),
         )
         types = _payloads_by_type(store)
         self.assertIn("agent.tool_called", types)
         self.assertNotIn("agent.tool_failed", types)
+        self.assertIsNone(types["agent.tool_called"][0]["bot_role"])
 
 
 if __name__ == "__main__":

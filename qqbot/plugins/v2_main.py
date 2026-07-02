@@ -2,12 +2,12 @@
 
 职责（v1 已删除，v2 是唯一路径）：
   1. on_message / on_notice / on_request / on_metaevent 四个通道接收 nonebot
-     事件，每次调 bot_registry.register(bot) 让 ReplySendWorker / ToolWorker
+     事件，每次调 bot_registry.register(bot) 让 ToolWorker / 各工具
      能反查到对应 bot 实例
   2. 把事件交给 EventIngest 走 mapper → 媒体副作用 → 入库 → 唤醒 supervisor
      的完整流水线（meta_event.heartbeat 走文件旁路，详见 EventIngest契约 §7）
-  3. 启动期：拉起 LoopSupervisor（含 SystemAgentLoop + ReplySendWorker +
-     ToolWorker）；关停期：优雅停止
+  3. 启动期：拉起 LoopSupervisor（含 SystemAgentLoop + ToolWorker）；
+     关停期：优雅停止
   4. 任何 handler 异常一律 swallow —— 单条事件失败不能让 napcat 重推爆炸
 
 priority 取较低值（10）以避免与可能存在的调试 plugin 抢先；block=True
@@ -85,8 +85,8 @@ def _get_supervisor() -> LoopSupervisor:
     global _supervisor
     if _supervisor is None:
         projector = Projector(session_factory=AsyncSessionLocal)
-        # 工具无构造依赖：session_factory / notify_reply_pending 等系统依赖
-        # 由 ToolWorker 在 run() context 里统一注入（见 ToolWorker._process_one）。
+        # 工具无构造依赖：session_factory / scope_key 等系统依赖由 ToolWorker
+        # 在 run() context 里统一注入（见 ToolWorker._process_one）。
         tool_registry = build_tool_registry()
         persona_text = _load_persona_text()
         # LLMPlanner 对 LLM 不可用 / JSON 解析失败一律 fallback 为 IdleAction，
@@ -103,9 +103,8 @@ def _get_supervisor() -> LoopSupervisor:
             projector=projector,
             tool_registry=tool_registry,
         )
-        # 不再需要把 reply 的 wake 回调后置回填到工具上 —— ReplyTool 在 run()
-        # 时从 ToolWorker 注入的 context 里取 notify_reply_pending，supervisor →
-        # tool 的反向依赖随之消失（统一接口的副产物）。
+        # 无需 supervisor→tool 的反向回调接线：系统依赖（session_factory 等）
+        # 由 ToolWorker 在 run() 的 context 统一注入，工具侧不持有 supervisor。
     return _supervisor
 
 
@@ -136,7 +135,7 @@ async def _ingest_event(event: Event) -> None:
 
 
 def _remember_bot(bot: Bot) -> None:
-    """每个 handler 入口缓存 bot；供 ReplySendWorker / ToolWorker 反查。"""
+    """每个 handler 入口缓存 bot；供 ToolWorker / 各工具反查。"""
     try:
         bot_registry.register(bot)
     except Exception as exc:

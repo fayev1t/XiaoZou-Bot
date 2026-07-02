@@ -8,7 +8,7 @@ The default `timeline` shows you only the most recent ~100 events in this scope.
 - You're in a long-running task and need to recall what was said when the task was first created (use `task_id` to resolve the anchor automatically).
 - You need to verify whether a topic / question has been asked before in this group.
 
-Do **NOT** call this when the answer is already visible in the timeline or `pending_tool_results`.
+Do **NOT** call this when the answer is already visible in the timeline (including completed `<tool-call>` rows from earlier ticks).
 
 ## Arguments — filters combine with AND
 
@@ -26,4 +26,4 @@ Same XML envelope as the normal timeline (`<message ...>`, `<notice ... />`, etc
 
 ## After the call
 
-The result lands in `pending_tool_results`. If it answers your current task, proceed to `reply` / `complete_task`. If it surfaced more questions, you may chain another `search_history` with tightened filters, but avoid loops — three searches without progress means the information probably isn't in the DB.
+The result appears on your `<tool-call name="search_history">` timeline row (status="complete") on the next tick. If it answers your current task, proceed to `send_message` / `complete_task`. If it surfaced more questions, you may chain another `search_history` with tightened filters, but avoid loops — three searches without progress means the information probably isn't in the DB.

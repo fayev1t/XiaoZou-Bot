@@ -6,8 +6,10 @@ Strategy:
 - Fetch agent_visible events for this scope within a lookback window.
 - Fold `agent.task_*` into TaskView snapshots (active_tasks).
 - Pair `agent.tool_called` with `agent.tool_result | agent.tool_failed`
-  into ToolResultView; only completed pairs (status != pending) end up in
-  `pending_tool_results`.
+  into ToolResultView。工具视图只有两态：processing（还没 terminal）/
+  complete（已 terminal；error_kind 区分成败）。视图**只**用于渲染 timeline
+  的 <tool-call> 行——2026-07-02 起不再有独立的 pending_tool_results 区，
+  工具结果在 timeline 单点呈现（旧的双重渲染是复读诱饵）。
 - Build the timeline from messages / notices / tool-call pairs / replies /
   agent-visible runtime hints. Task and tool-result events are folded
   upstream and do NOT produce timeline rows of their own.
@@ -99,7 +101,10 @@ def _snapshot_from_row(row: AgentEvent) -> _EventSnapshot:
 class Projector:
     # 单条 tool_result 渲染上限：超过即截断尾部并加 <truncated/>。websearch
     # 等工具的 results 列表很容易爆掉 prompt token，必须兜底。
-    MAX_TOOL_RESULT_CHARS = 2048
+    # 2026-07-02 从 2048 上调：timeline 的 <tool-call> 行现在是工具结果的
+    # **唯一**出口（pending-tool-results 区已删除——它曾是不截断的全量渲染，
+    # 模型看长结果全靠它），不上调会让长 websearch 结果的可见部分缩水。
+    MAX_TOOL_RESULT_CHARS = 6144
 
     # 单 task 折叠时保留的最近进度笔记条数。LLM 关心的是最近"我自己想到啥"，
     # 老笔记换 token 不划算。
@@ -271,10 +276,9 @@ class Projector:
         bot_role: str | None = None,
     ) -> DecisionContext:
         active_tasks = Projector.fold_tasks(events, scope_key=scope_key)
+        # tool_views 只喂给 timeline 渲染（<tool-call> 行按两态折叠）；不再
+        # 另出 pending_tool_results 区——同一调用双重渲染曾是复读的直接诱饵。
         tool_views = Projector.fold_tool_results(events)
-        pending_tool_results = [
-            tv for tv in tool_views if tv.status != "pending"
-        ]
         timeline = Projector.build_timeline(events, tool_views=tool_views)
         # 裁到尾部 max_timeline_items 条 —— fetch 上限给得宽是为了 fold 任务/
         # 工具结果时能看到足够长的事件链，但塞给 LLM 的不必那么多。
@@ -293,6 +297,7 @@ class Projector:
             low = bot_role.strip().lower()
             if low in ("owner", "admin", "member"):
                 normalized_role = low
+        last_reasoning, last_reasoning_at = Projector.fold_last_reasoning(events)
         return DecisionContext(
             scope_key=scope_key,
             correlation_id=correlation_id,
@@ -300,10 +305,30 @@ class Projector:
             now=now,
             timeline=timeline,
             active_tasks=active_tasks,
-            pending_tool_results=pending_tool_results,
+            last_reasoning=last_reasoning,
+            last_reasoning_at=last_reasoning_at,
             bot_user_id=bot_user_id,
             bot_role=normalized_role,  # type: ignore[arg-type]
         )
+
+    @staticmethod
+    def fold_last_reasoning(
+        events: Sequence[_EventSnapshot],
+    ) -> tuple[str | None, Any]:
+        """取窗口内最近一条 agent.decision_emitted 的 reasoning（+时间）。
+
+        模型的跨拍自我记忆（2026-07-02）：decision/idle 事件仍不逐条进
+        timeline（每拍一条会淹掉真实对话），但**最近一拍**的 reasoning 折叠
+        出来渲染成 <last-reasoning>——模型不再每拍失忆。reasoning 为空串 /
+        缺失的决策跳过，继续向前找。
+        """
+        for ev in reversed(events):
+            if ev.type != "agent.decision_emitted":
+                continue
+            reasoning = (ev.payload or {}).get("reasoning")
+            if isinstance(reasoning, str) and reasoning.strip():
+                return reasoning.strip(), ev.occurred_at
+        return None, None
 
     @staticmethod
     def fold_bot_role(
@@ -403,7 +428,13 @@ class Projector:
     def fold_tool_results(
         events: Iterable[_EventSnapshot],
     ) -> list[ToolResultView]:
-        """All tool calls in window, paired with their result/failure if any."""
+        """All tool calls in window, paired with their result/failure if any.
+
+        两态折叠：tool_called → processing；terminal（tool_result /
+        tool_failed）→ complete。成败不再是独立状态，靠 error_kind 区分
+        （None=成功；tool_failed 缺 error_kind 时兜底 "unknown"，保证
+        "failed ⇒ error_kind 非 None" 的渲染判据成立）。
+        """
         calls: dict[str, dict] = {}
         for ev in events:
             if ev.type == "agent.tool_called":
@@ -414,22 +445,26 @@ class Projector:
                     "tool_call_id": tc_id,
                     "tool_name": ev.payload.get("tool_name", ""),
                     "arguments": dict(ev.payload.get("arguments") or {}),
-                    "status": "pending",
+                    "status": "processing",
                     "result": None,
                     "error_kind": None,
                     "error_message": None,
+                    "error_extra": None,
                 }
             elif ev.type == "agent.tool_result":
                 tc_id = ev.payload.get("tool_call_id")
                 if tc_id in calls:
-                    calls[tc_id]["status"] = "succeeded"
+                    calls[tc_id]["status"] = "complete"
                     calls[tc_id]["result"] = ev.payload.get("result")
             elif ev.type == "agent.tool_failed":
                 tc_id = ev.payload.get("tool_call_id")
                 if tc_id in calls:
-                    calls[tc_id]["status"] = "failed"
-                    calls[tc_id]["error_kind"] = ev.payload.get("error_kind")
+                    calls[tc_id]["status"] = "complete"
+                    calls[tc_id]["error_kind"] = (
+                        ev.payload.get("error_kind") or "unknown"
+                    )
                     calls[tc_id]["error_message"] = ev.payload.get("error_message")
+                    calls[tc_id]["error_extra"] = _extract_error_extra(ev.payload)
         return [ToolResultView(**d) for d in calls.values()]
 
     @staticmethod
@@ -443,15 +478,31 @@ class Projector:
         # 让单条消息渲染时无需再遍历全部事件。
         excerpt_by_msg_id = _build_excerpt_index(events)
         name_by_user_id = _build_user_name_index(events)
-        # author_by_msg_id：被回复消息的作者 "昵称(QQ)"。reply 段渲染时据此标
-        # from=，让 LLM 一眼看清"是 B 在引用某人"而不是"某人在发言"——这是
-        # addressee 误判（把别人引用你当成你说话）的根因修复。覆盖外部消息 +
-        # bot 自己已投递的 reply（后者标 from="我(self_id)"，与 bot_user_id 比对
-        # 即知"别人引用的是你自己的发言"）。
+        # author_by_msg_id：被回复消息的作者（_AuthorRef）。reply 段渲染时据此
+        # 标 from_name/from_id/from_self 三个独立属性，让 LLM 一眼看清"是 B 在
+        # 引用某人"而不是"某人在发言"——这是 addressee 误判（把别人引用你当成
+        # 你说话）的根因修复。覆盖外部消息 + bot 自己已投递的发言（后者标
+        # from_self="true"，无需比对 bot_user_id 即知"别人引用的是你自己"）。
         author_by_msg_id = _build_author_index(events)
 
         items: list[TimelineItem] = []
         for ev in events:
+            if ev.type == "agent.task_state_changed":
+                # 任务收束（done/failed）渲染为 <task-closed> 行——模型对
+                # "自己刚完成/放弃了什么、结论是什么"的事后记忆（2026-07-02，
+                # 此前任务一收束就从 active_tasks 消失、result_summary 蒸发）。
+                # 中间态迁移（pending→running 等）仍消隐。
+                to_state = (ev.payload or {}).get("to_state")
+                if to_state in ("done", "failed"):
+                    items.append(
+                        TimelineItem(
+                            event_id=ev.event_id,
+                            occurred_at=ev.occurred_at,
+                            kind="task_closed",
+                            render=Projector._render_task_closed(ev, to_state),
+                        )
+                    )
+                continue
             if ev.type.startswith("agent.task_"):
                 # folded into active_tasks
                 continue
@@ -465,12 +516,13 @@ class Projector:
                 "agent.idle_decision",
                 "agent.decision_emitted",
             ):
-                # 发言统一表示为 reply 工具的 <tool-call name="reply"> 行（架构
-                # 一致性：reply 是工具，与 websearch 等同构），不再单独渲染
-                # <agent-reply>。reply_emitted 仍写入事件流供 ReplySendWorker
-                # 消费、并经 reply_delivered 折出 author/quote 信息，只是它本身
-                # 不进 timeline。delivered/failed/decision/idle 同为运营事件，
-                # 不进 prompt 以免 context 膨胀。
+                # 发言现已**同步**：发送结果直接体现在 send_message 工具的
+                # <tool-call>（complete + <result> 带 message_id / complete +
+                # <error> 带原因，由 _render_tool_call 渲染），不再有独立的
+                # reply_emitted/delivered/
+                # failed 事件。这里保留对历史遗留事件的 skip（迁移期旧库可能还有
+                # 这三类），新代码不再产生它们。decision/idle 同为运营事件，不进
+                # prompt 以免膨胀。
                 continue
 
             if ev.type == "agent.tool_called":
@@ -504,7 +556,16 @@ class Projector:
                         event_id=ev.event_id,
                         occurred_at=ev.occurred_at,
                         kind="notice",
-                        render=Projector._render_notice(ev),
+                        render=Projector._render_notice(ev, name_by_user_id),
+                    )
+                )
+            elif ev.type.startswith("external.request."):
+                items.append(
+                    TimelineItem(
+                        event_id=ev.event_id,
+                        occurred_at=ev.occurred_at,
+                        kind="request",
+                        render=Projector._render_request(ev),
                     )
                 )
             elif ev.type.startswith("runtime.") and ev.visibility == "agent_visible":
@@ -526,11 +587,22 @@ class Projector:
         ev: _EventSnapshot,
         excerpt_by_msg_id: dict[str, str],
         name_by_user_id: dict[str, str],
-        author_by_msg_id: dict[str, str] | None = None,
+        author_by_msg_id: "dict[str, _AuthorRef] | None" = None,
     ) -> tuple[str, list[ImageRef]]:
         sender = ev.payload.get("sender") or {}
-        name = sender.get("card") or sender.get("nickname") or "?"
-        qq = sender.get("user_id") or ev.user_id or "?"
+        name = sender.get("card") or sender.get("nickname")
+        qq = sender.get("user_id") or ev.user_id
+        # 匿名群消息（OneBot 标准字段；napcat 不支持匿名、恒缺失）：发送者
+        # 顶着匿名马甲，sender_name 退到匿名昵称，并标 anonymous="true" 让
+        # LLM 知道这名字不是真实群成员身份。anonymous.flag 是禁言凭证，
+        # 只入库不渲染（凭证不经 LLM，与 request.flag 同策略）。
+        anonymous = ev.payload.get("anonymous")
+        if not isinstance(anonymous, dict):
+            anonymous = None
+        if not name and anonymous:
+            anon_name = anonymous.get("name")
+            if anon_name:
+                name = str(anon_name)
         msg_id = ev.payload.get("onebot_message_id") or ""
         time_str = ev.occurred_at.isoformat(timespec="seconds")
 
@@ -544,16 +616,51 @@ class Projector:
             if raw:
                 body = _esc_text(str(raw))
 
-        attrs = [
-            f'sender="{_esc_attr(str(name))}({qq})"',
-            f'at="{time_str}"',
-        ]
+        # sender_name / sender_id 是两个独立属性——不再拼 "昵称(QQ)" 复合串，
+        # 模型无需拆括号即可拿到 @人 / 工具 user_id 参数要用的号。缺哪个省
+        # 哪个（=未知），不造 "?" 占位。
+        attrs = []
+        if name:
+            attrs.append(f'sender_name="{_esc_attr(str(name))}"')
+        if qq is not None:
+            attrs.append(f'sender_id="{_esc_attr(str(qq))}"')
+        # sender_role：发送者在本群的角色。只在 owner/admin 时渲染——napcat 的
+        # sender.role 三值 owner/admin/member，member 是绝大多数，逐条渲染纯耗
+        # token；缺省语义（普通成员或未知）在 xml_format.md 里写死，无歧义。
+        role = str(sender.get("role") or "").strip().lower()
+        if role in ("owner", "admin"):
+            attrs.append(f'sender_role="{role}"')
+        # sender_title：群专属头衔（napcat 消息事件不上报，其他 OneBot 实现
+        # 可能给）。有才渲染，社交语境线索。
+        title = str(sender.get("title") or "").strip()
+        if title:
+            attrs.append(f'sender_title="{_esc_attr(title)}"')
+        if anonymous:
+            attrs.append('anonymous="true"')
+        attrs.append(f'at="{time_str}"')
         if msg_id:
             attrs.append(f'id="{_esc_attr(str(msg_id))}"')
         return f"<message {' '.join(attrs)}>{body}</message>", images
 
     @staticmethod
-    def _render_notice(ev: _EventSnapshot) -> str:
+    def _render_notice(
+        ev: _EventSnapshot,
+        name_by_user_id: dict[str, str] | None = None,
+    ) -> str:
+        """渲染 ``<notice/>``。属性语义（缺失一律表示"未知/不适用"）：
+
+        - ``user``   事件的当事人 QQ（谁入群/被禁言/被戳/名片被改/消息被回应）
+        - ``operator`` 执行动作的人 QQ（禁言的管理员、撤回的人）
+        - ``target`` 动作的承受方 QQ（poke 里被戳的人）
+        - ``user_name`` / ``operator_name`` / ``target_name``：上述 QQ 在近期
+          消息里出现过时反查到的名字——mapper 只存了裸 QQ 号，不给名字的话
+          LLM 得自己翻 timeline 对号入座，经常对错。
+        - kind 专属明细（duration_seconds / old_card / new_card / file_name /
+          file_size_bytes / message_id / likes / honor_type）见
+          ``_notice_detail_attrs``。这些字段 mapper 早已入库，历史上渲染时全部
+          丢弃，是"事件发生了但 LLM 不知道内容"的主要来源。
+        """
+        names = name_by_user_id or {}
         kind = ev.type.replace("external.notice.", "")
         attrs = [f'kind="{_esc_attr(kind)}"']
         sub = ev.payload.get("sub_type")
@@ -561,48 +668,115 @@ class Projector:
             attrs.append(f'sub_type="{_esc_attr(str(sub))}"')
         if ev.user_id is not None:
             attrs.append(f'user="{ev.user_id}"')
+            _append_name_attr(attrs, "user_name", ev.user_id, names)
         op = ev.payload.get("operator_id")
         if op:
             attrs.append(f'operator="{op}"')
+            _append_name_attr(attrs, "operator_name", op, names)
         target = ev.payload.get("target_id")
         if target:
             attrs.append(f'target="{target}"')
+            _append_name_attr(attrs, "target_name", target, names)
+        attrs.extend(_notice_detail_attrs(kind, ev.payload))
         attrs.append(f'at="{ev.occurred_at.isoformat(timespec="seconds")}"')
         return f"<notice {' '.join(attrs)}/>"
+
+    @staticmethod
+    def _render_request(ev: _EventSnapshot) -> str:
+        """渲染 external.request.*（加好友 / 加群申请 / 邀请入群）。
+
+        只有 SystemAgentLoop 会拿到这类事件，据此决定同意 / 拒绝 / 忽略，
+        并调 respond_to_request 工具回执 napcat（事件系统设计.md §10.2）。
+
+        关键：渲染必须带 event_id —— LLM 调 respond_to_request 时回填它，
+        工具用 event_id 反查事件 payload 里的 flag，这样 napcat 的 flag
+        凭证不经过 LLM 复述，避免长串照抄出错。kind 取 friend / group.add /
+        group.invite；comment 是申请人填的验证留言（决策的主要依据）。
+        """
+        kind = ev.type.replace("external.request.", "")
+        attrs = [
+            f'kind="{_esc_attr(kind)}"',
+            f'event_id="{_esc_attr(str(ev.event_id))}"',
+        ]
+        if ev.user_id is not None:
+            attrs.append(f'user="{ev.user_id}"')
+        group_id = ev.payload.get("group_id")
+        if group_id:
+            attrs.append(f'group="{group_id}"')
+        comment = ev.payload.get("comment")
+        if comment:
+            attrs.append(f'comment="{_esc_attr(str(comment))}"')
+        attrs.append(f'at="{ev.occurred_at.isoformat(timespec="seconds")}"')
+        return f"<request {' '.join(attrs)}/>"
 
     @staticmethod
     def _render_tool_call(
         ev: _EventSnapshot, tv: ToolResultView | None
     ) -> str:
+        """两态渲染：processing → <processing/>；complete → <result>（成功，
+        error_kind 为 None）或 <error>（失败）。status 属性只回答"结束没有"，
+        成败让 LLM 看子元素——与 ToolResultView 的两态语义一致。"""
         name = str(ev.payload.get("tool_name", "?"))
         args = ev.payload.get("arguments", {})
         args_json = _safe_json(args)
-        if tv is None or tv.status == "pending":
-            inner = "<pending/>"
-            status = "pending"
-        elif tv.status == "succeeded":
+        if tv is None or tv.status == "processing":
+            inner = "<processing/>"
+            status = "processing"
+        elif tv.error_kind is None:
             result_json = _safe_json(tv.result)
             truncated = ""
             if len(result_json) > Projector.MAX_TOOL_RESULT_CHARS:
                 result_json = result_json[: Projector.MAX_TOOL_RESULT_CHARS]
                 truncated = "<truncated/>"
             inner = f"<result>{_esc_text(result_json)}{truncated}</result>"
-            status = "succeeded"
+            status = "complete"
         else:
-            inner = (
-                f'<error kind="{_esc_attr(str(tv.error_kind or ""))}">'
-                f"{_esc_text(str(tv.error_message or ''))}</error>"
+            inner = _render_error_element(
+                tv.error_kind, tv.error_message, tv.error_extra
             )
-            status = "failed"
+            status = "complete"
         return (
             f'<tool-call name="{_esc_attr(name)}" status="{status}">'
             f"<args>{_esc_text(args_json)}</args>{inner}</tool-call>"
         )
 
     @staticmethod
+    def _render_task_closed(ev: _EventSnapshot, outcome: str) -> str:
+        """agent.task_state_changed(done|failed) → <task-closed> 行。
+
+        正文是模型自己写的 result_summary / 失败原因（complete_task.result_summary
+        / fail_task.reason 落进 payload.reason）——收束后 active_tasks 里不再有
+        这个任务，本行是"这事我已经办完了、结论是什么"的唯一事后记忆。防御性
+        截 600 字（模型摘要正常远短于此）。
+        """
+        payload = ev.payload or {}
+        task_id = str(payload.get("task_id") or "?")
+        reason = payload.get("reason")
+        body = ""
+        if isinstance(reason, str) and reason.strip():
+            body = _esc_text(reason.strip()[:600])
+        at = ev.occurred_at.isoformat(timespec="seconds")
+        return (
+            f'<task-closed id="{_esc_attr(task_id)}" '
+            f'outcome="{_esc_attr(outcome)}" at="{_esc_attr(at)}">'
+            f"{body}</task-closed>"
+        )
+
+    @staticmethod
     def _render_runtime(ev: _EventSnapshot) -> str:
         kind = ev.type.replace("runtime.", "")
-        payload_json = _safe_json(ev.payload)
+        payload = ev.payload or {}
+        if ev.type == "runtime.tool_batch_completed":
+            # 批次收口标记（agent_visible）：让模型显式看到"上一批工具已
+            # 整体到终态"的边界。payload 里的 tool_batch_id 是内部 ULID，
+            # 只服务于 ToolWorker 的收口查重，对模型零信息量——渲染时剔除，
+            # 只留 tool_count / tool_batch_size。
+            payload = {
+                k: v
+                for k, v in payload.items()
+                if k in ("tool_count", "tool_batch_size") and v is not None
+            }
+        payload_json = _safe_json(payload)
         return (
             f'<system-hint kind="{_esc_attr(kind)}">'
             f"{_esc_text(payload_json)}</system-hint>"
@@ -635,6 +809,76 @@ def _safe_json(value) -> str:
         return str(value)
 
 
+# agent.tool_failed.payload 顶层的"信封字段"——不属于结构化失败附加信息（extra）。
+# ToolWorker 把 payload 拼成 {tool_call_id, tool_name, task_id, error_kind,
+# error_message, **outcome.extra}，fold_tool_results 据此把其余键收进
+# ToolResultView.error_extra，再由 _render_error_element 透给 LLM。
+_TOOL_FAILED_ENVELOPE_KEYS = frozenset(
+    {"tool_call_id", "tool_name", "task_id", "error_kind", "error_message"}
+)
+
+
+def _extract_error_extra(payload: dict) -> dict | None:
+    """从 tool_failed.payload 顶层收出结构化失败附加字段（ToolOutcome.extra
+    平铺进来的那些：required_tier / actual_tier / retcode / action ...），
+    剔除信封字段与 None 值。全空则返回 None。"""
+    extra = {
+        k: v
+        for k, v in (payload or {}).items()
+        if k not in _TOOL_FAILED_ENVELOPE_KEYS and v is not None
+    }
+    return extra or None
+
+
+def _is_safe_attr_key(key: object) -> bool:
+    """extra 键能否安全当 XML 属性名：仅允许 ASCII 字母/数字/下划线且非数字开头。
+
+    extra 键全是代码字面量（required_tier / retcode / ...），本无注入风险；这里
+    只是防御未来某个工具塞进奇怪键名破坏 <error> 标签。不合规的键静默跳过。"""
+    if not isinstance(key, str) or not key:
+        return False
+    if not (key[0].isascii() and (key[0].isalpha() or key[0] == "_")):
+        return False
+    return all(c.isascii() and (c.isalnum() or c == "_") for c in key)
+
+
+def _render_error_element(
+    error_kind: str | None,
+    error_message: str | None,
+    error_extra: dict | None = None,
+) -> str:
+    """渲染失败 ``<error>`` 元素：``kind`` + 结构化 ``error_extra`` 全部作为属性
+    透出，人类可读原因作正文。timeline ``<tool-call>`` 的失败渲染唯一入口
+    （曾与 llm_planner 的 pending-tool-results 区共用；该区已删除）。
+
+    ``error_extra``（required_tier / actual_tier / required_bot_role /
+    actual_bot_role / retcode / action / allowed_scopes ...）是工具失败时
+    ``ToolOutcome.extra`` 平铺进 ``tool_failed.payload`` 的结构化字段。历史上这里
+    只渲染 kind+message，把它们丢了——protocol.md 承诺 payload 带
+    required_tier/actual_tier，却从没真到模型。现在逐个作属性透出：标量原样、
+    列表/字典 JSON 编码，让 LLM 精确解释"差在哪一级权限 / napcat 具体报了什么"。
+
+    键做标识符白名单过滤（``_is_safe_attr_key``）防属性注入；单值超 200 字截断，
+    避免个别工具塞大对象撑爆 prompt。"""
+    attrs = [f'kind="{_esc_attr(str(error_kind or ""))}"']
+    for key, value in (error_extra or {}).items():
+        if value is None or not _is_safe_attr_key(key):
+            continue
+        if isinstance(value, bool):
+            rendered = "true" if value else "false"
+        elif isinstance(value, (str, int, float)):
+            rendered = str(value)
+        else:
+            rendered = _safe_json(value)
+        if len(rendered) > 200:
+            rendered = rendered[:200] + "…"
+        attrs.append(f'{key}="{_esc_attr(rendered)}"')
+    return (
+        f"<error {' '.join(attrs)}>"
+        f"{_esc_text(str(error_message or ''))}</error>"
+    )
+
+
 # ─── Segment-level rendering ───
 
 
@@ -642,28 +886,49 @@ def _render_segments(
     segments: Iterable,
     excerpt_by_msg_id: dict[str, str],
     name_by_user_id: dict[str, str],
-    author_by_msg_id: dict[str, str] | None = None,
+    author_by_msg_id: "dict[str, _AuthorRef] | None" = None,
 ) -> tuple[str, list[ImageRef]]:
     """把 OneBot V11 段数组翻译成内联 XML 标签 + 收集已落盘的 ImageRef。
 
-    支持的段类型 → 标签：
+    支持的段类型 → 标签（属性一律"缺失=未知/不适用"，语义与 xml_format.md
+    §Inline segments 一一对应，两处必须同步改）：
       text     → 原文（XML escape）
       at       → <at user="..." name="..."/> 或 <at-all/>
-      reply    → <reply to="msg_id" from="昵称(QQ)" excerpt="..."/>
-                 （from= 标注被引用消息的作者，author_by_msg_id 命中时；
-                  excerpt= 在 timeline 内可查时）
-      image    → <image hash="<sha256>"/> 或 <image/>（无 hash 或下载失败）
-      face     → <face id="N"/>          (QQ 原生黄豆表情)
-      mface    → <mface summary="[赞]"/>  (商城/魔法表情，动图贴纸)
+      reply    → <reply to="msg_id" from_name="昵称" from_id="QQ"
+                        from_self="true" excerpt="..."/>
+                 （作者三属性各自独立、缺哪个省哪个：from_name/from_id 标注
+                  被引用消息的作者，author_by_msg_id 命中时；from_self 仅在
+                  被引消息是 bot 自己发的时渲染 "true"；excerpt= 在 timeline
+                  内可查时）
+      image    → <image kind="photo|sticker" summary="外显文案" hash="sha256"/>
+                 kind：napcat data.sub_type 0→photo（相册照片/截图类），
+                 1→sticker（表情包），或 data.emoji_id 存在→sticker（商城
+                 表情——napcat 接收侧 mface 一律折成 image 段到达）；判断
+                 不出则不渲染该属性。summary：QQ 的外显文案（如 "[动画表情]"
+                 或商城表情名 "[赞]"），下载失败时它是唯一语义兜底。
+      face     → <face id="N" name="[微笑]"/>（QQ 原生黄豆表情；name 取
+                 napcat data.raw.faceText，LLM 背不出表情 id 表，没名字
+                 的 face id 是纯噪声）
+      mface    → <mface summary="[赞]"/>（兼容非 napcat 的 OneBot 实现；
+                 napcat 不会在接收侧产生 mface 段，见 image 行）
       record   → <voice/>            (LLM 当前不消费语音内容)
       video    → <video/>            (同上)
-      file     → <file name="..."/>  (聊天文件)
-      poke     → <poke target="qq"/>
+      file     → <file name="..." size_bytes="..." file_id="..."/>
+                 （size_bytes 单位字节；file_id 是 napcat 文件凭证，供
+                  未来的文件下载类工具回填）
+      poke     → <poke target="qq"/>（napcat 群内拍一拍段不带目标 → <poke/>）
       dice     → <dice value="N"/>   (掷骰子结果 1-6)
       rps      → <rps value="N"/>    (猜拳 1=石头 2=剪刀 3=布)
-      markdown → <markdown/>         (内容不展开)
+      markdown → <markdown>正文</markdown>（napcat 给了 data.content，官方
+                 机器人消息常见；超 _MAX_MARKDOWN_CHARS 截断加 "…"）
       forward  → <forward id="..."/>
-      json/xml/share → <card type="..."/>
+      json     → ark 卡片，走 _render_card_segment 解析出
+                 <card app/summary/title/desc/url>；B 站分享、小程序、公众号
+                 文章等在 napcat 全部以 json 段到达，解析不出任何字段才回退
+                 <card type="json"/>
+      share    → <card type="share" title="..." desc="..." url="..."/>
+                 （OneBot 标准段；napcat 不产生，兼容保留）
+      xml      → <card type="xml"/>（napcat 收发均不产生，兼容保留）
       其他     → <misc type="..."/>
 
     image segment 的富化字段 (file_hash / local_path / mime / downloaded)
@@ -698,11 +963,21 @@ def _render_segments(
             rid = str(d.get("id", "")).strip()
             if rid:
                 attrs = [f'to="{_esc_attr(rid)}"']
-                # from=：被引用消息的作者。这是"别人引用我 ≠ 我在发言"的关键——
-                # 没有它，LLM 看到被引用内容内联在画面里，容易当成对方刚说的话。
+                # from_name/from_id/from_self：被引用消息的作者，三个独立属性
+                # （不再拼 "昵称(QQ)" / "我(id)" 复合串，模型无需拆括号）。这是
+                # "别人引用我 ≠ 我在发言"的关键——没有它，LLM 看到被引用内容
+                # 内联在画面里，容易当成对方刚说的话。缺哪个省哪个（=未知）。
                 author = (author_by_msg_id or {}).get(rid)
                 if author:
-                    attrs.append(f'from="{_esc_attr(author)}"')
+                    if author.name:
+                        attrs.append(f'from_name="{_esc_attr(author.name)}"')
+                    if author.user_id:
+                        attrs.append(f'from_id="{_esc_attr(author.user_id)}"')
+                    # 仅 bot 自己的消息渲染 from_self="true"；外部作者不渲染
+                    # false——"是不是我"的常规判据是 from_id == bot_user_id，
+                    # from_self 出现即铁证（服务端标注，不依赖 bot_user_id）。
+                    if author.is_self:
+                        attrs.append('from_self="true"')
                 excerpt = excerpt_by_msg_id.get(rid)
                 if excerpt:
                     attrs.append(f'excerpt="{_esc_attr(excerpt)}"')
@@ -710,10 +985,17 @@ def _render_segments(
             else:
                 parts.append("<reply/>")
         elif t == "image":
+            attrs = []
+            kind = _image_kind(d)
+            if kind:
+                attrs.append(f'kind="{kind}"')
+            summary = str(d.get("summary") or "").strip()
+            if summary:
+                attrs.append(f'summary="{_esc_attr(_clip(summary, 50))}"')
             # 富化字段写在 segment 顶层（media.py 契约），不在 data 内
             file_hash = seg.get("file_hash")
             if file_hash:
-                parts.append(f'<image hash="{_esc_attr(str(file_hash))}"/>')
+                attrs.append(f'hash="{_esc_attr(str(file_hash))}"')
                 if seg.get("downloaded") and seg.get("local_path"):
                     images.append(
                         ImageRef(
@@ -722,11 +1004,15 @@ def _render_segments(
                             mime=str(seg.get("mime") or "image/png"),
                         )
                     )
-            else:
-                parts.append("<image/>")
+            parts.append(f"<image {' '.join(attrs)}/>" if attrs else "<image/>")
         elif t == "face":
             fid = str(d.get("id", "")).strip()
-            if fid:
+            fname = _face_name(d)
+            if fid and fname:
+                parts.append(
+                    f'<face id="{_esc_attr(fid)}" name="{_esc_attr(fname)}"/>'
+                )
+            elif fid:
                 parts.append(f'<face id="{_esc_attr(fid)}"/>')
             else:
                 parts.append("<face/>")
@@ -743,11 +1029,17 @@ def _render_segments(
         elif t == "video":
             parts.append("<video/>")
         elif t == "file":
+            attrs = []
             fname = str(d.get("name", "") or d.get("file", "")).strip()
             if fname:
-                parts.append(f'<file name="{_esc_attr(fname)}"/>')
-            else:
-                parts.append("<file/>")
+                attrs.append(f'name="{_esc_attr(fname)}"')
+            fsize = d.get("file_size")
+            if fsize is not None and str(fsize).strip():
+                attrs.append(f'size_bytes="{_esc_attr(str(fsize))}"')
+            file_id = d.get("file_id")
+            if file_id is not None and str(file_id).strip():
+                attrs.append(f'file_id="{_esc_attr(str(file_id))}"')
+            parts.append(f"<file {' '.join(attrs)}/>" if attrs else "<file/>")
         elif t == "poke":
             target = d.get("qq") or d.get("user_id")
             if target:
@@ -762,26 +1054,382 @@ def _render_segments(
             val = str(d.get("result", "") or d.get("value", "")).strip()
             parts.append(f'<rps value="{_esc_attr(val)}"/>' if val else "<rps/>")
         elif t == "markdown":
-            parts.append("<markdown/>")
+            content = str(d.get("content") or "").strip()
+            if content:
+                parts.append(
+                    f"<markdown>{_esc_text(_clip(content, _MAX_MARKDOWN_CHARS))}"
+                    "</markdown>"
+                )
+            else:
+                parts.append("<markdown/>")
         elif t == "forward":
             fid = str(d.get("id", "")).strip()
             if fid:
                 parts.append(f'<forward id="{_esc_attr(fid)}"/>')
             else:
                 parts.append("<forward/>")
-        elif t in ("json", "xml", "share"):
-            parts.append(f'<card type="{_esc_attr(str(t))}"/>')
+        elif t == "json":
+            parts.append(_render_card_segment(d))
+        elif t == "share":
+            # OneBot 标准 share 段（napcat 不产生，兼容其他实现）。字段名
+            # 与 ark 卡片对齐：content → desc。
+            attrs = ['type="share"']
+            title = str(d.get("title") or "").strip()
+            if title:
+                attrs.append(f'title="{_esc_attr(_clip(title, 100))}"')
+            desc = str(d.get("content") or "").strip()
+            if desc:
+                attrs.append(f'desc="{_esc_attr(_clip(desc, 200))}"')
+            url = str(d.get("url") or "").strip()
+            if url:
+                attrs.append(f'url="{_esc_attr(_clip(url, 300))}"')
+            parts.append(f"<card {' '.join(attrs)}/>")
+        elif t == "xml":
+            parts.append('<card type="xml"/>')
         else:
             parts.append(f'<misc type="{_esc_attr(str(t or "unknown"))}"/>')
     return "".join(parts), images
 
 
-def _build_excerpt_index(events: Iterable[_EventSnapshot]) -> dict[str, str]:
-    """timeline 内 onebot_message_id → 文本摘要（前 40 字）。
+# markdown 段正文渲染上限：官方机器人可能发整页 md，塞满 prompt 不值。
+_MAX_MARKDOWN_CHARS = 500
 
-    用于渲染 reply 段时给 LLM 提供"被回复消息说了啥"的上下文；命中不到
-    （消息在 lookback 窗口外或被 napcat 抛弃了）就只渲染 reply.to 不带
-    excerpt。
+
+def _clip(s: str, limit: int) -> str:
+    """超长截断加 "…"。属性值通用，保证单个字段不会撑爆 prompt。"""
+    return s if len(s) <= limit else s[:limit] + "…"
+
+
+def _image_kind(d: dict) -> str | None:
+    """推断图片语义类别，返回 "photo" / "sticker" / None（判断不出）。
+
+    依据（NapCatQQ rawToOb11Converters 实测行为）：
+    - data.emoji_id 存在 → 商城表情（napcat 把 marketFace 折成 image 段上报，
+      带 emoji_id / emoji_package_id / key）→ sticker；
+    - data.sub_type 是 NTQQ PicSubType：0=KNORMAL 普通图片 → photo，
+      1=KCUSTOM 自定义表情/表情包 → sticker；
+    - 其余取值（2=KHOT 等罕见类型）与缺失一律 None——宁可不标也不猜错，
+      "缺失=未知"是本渲染器的属性总语义。
+    """
+    if d.get("emoji_id"):
+        return "sticker"
+    sub = d.get("sub_type")
+    if sub is None:
+        return None
+    s = str(sub).strip()
+    if s == "0":
+        return "photo"
+    if s == "1":
+        return "sticker"
+    return None
+
+
+def _face_name(d: dict) -> str | None:
+    """从 napcat face 段的 data.raw.faceText 取表情释义（如 "[微笑]"）。
+
+    faceText 在部分老版本里带 QQ 输入法风格的 "/" 前缀（"/微笑"），去掉；
+    raw 缺失 / faceText 为空 → None（渲染方退回只有 id 的形态）。
+    """
+    raw = d.get("raw")
+    if not isinstance(raw, dict):
+        return None
+    text = raw.get("faceText")
+    if not isinstance(text, str):
+        return None
+    cleaned = text.strip().lstrip("/").strip()
+    return cleaned or None
+
+
+def _parse_ark_card(d: dict) -> dict[str, str] | None:
+    """解析 json（ark）段的语义字段，供 XML 渲染与 excerpt 摘要两处复用。
+
+    返回只含非空值的 dict（键：app / summary / title / desc / url），
+    啥都解析不出（data 非法 JSON / 空对象）→ None。字段语义：
+    - app     ark 应用标识（如 com.tencent.structmsg 链接分享、
+              com.tencent.miniapp_01 小程序），LLM 可据此判断卡片种类
+    - summary QQ 自己的外显文案（ark 顶层 prompt，如 "[QQ小程序]哔哩哔哩"），
+              最稳的一句话摘要
+    - title / desc  卡片标题与描述（meta.* 内首个命中的 title/desc；小程序
+              卡片里 title 常是应用名、desc 是内容标题，照实透传不加工）
+    - url     卡片跳转链接（qqdocurl > jumpUrl > url > musicUrl 择先）
+    """
+    raw = d.get("data")
+    obj = None
+    if isinstance(raw, dict):
+        obj = raw
+    elif isinstance(raw, str) and raw.strip():
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            obj = None
+    if not isinstance(obj, dict):
+        return None
+
+    card: dict[str, str] = {}
+    app = obj.get("app")
+    if isinstance(app, str) and app.strip():
+        card["app"] = app.strip()
+    prompt = obj.get("prompt")
+    if isinstance(prompt, str) and prompt.strip():
+        card["summary"] = prompt.strip()
+    meta = obj.get("meta")
+    if isinstance(meta, dict):
+        for detail in meta.values():
+            if not isinstance(detail, dict):
+                continue
+            if "title" not in card:
+                title = _nonempty_str(detail.get("title"))
+                if title:
+                    card["title"] = title
+            if "desc" not in card:
+                desc = _nonempty_str(detail.get("desc"))
+                if desc:
+                    card["desc"] = desc
+            if "url" not in card:
+                url = (
+                    _nonempty_str(detail.get("qqdocurl"))
+                    or _nonempty_str(detail.get("jumpUrl"))
+                    or _nonempty_str(detail.get("url"))
+                    or _nonempty_str(detail.get("musicUrl"))
+                )
+                if url:
+                    card["url"] = url
+    return card or None
+
+
+def _render_card_segment(d: dict) -> str:
+    """json（ark）段 → ``<card/>``。napcat 接收侧一切富卡片——链接分享、
+    B 站/小程序、公众号文章、位置、群推荐——都以 json 段到达，历史上渲染
+    成 `<card type="json"/>` 等于把"别人分享了什么"整个丢掉。
+
+    字段语义见 :func:`_parse_ark_card`（全部可缺省，缺失=该字段解析不到）。
+    解析不出任何字段 → 回退 `<card type="json"/>`（与旧行为一致，type=
+    表示"未解析的原始段格式"）。
+    """
+    card = _parse_ark_card(d)
+    if not card:
+        return '<card type="json"/>'
+    attrs: list[str] = []
+    for key, limit in (
+        ("app", 60),
+        ("summary", 100),
+        ("title", 100),
+        ("desc", 200),
+        ("url", 300),
+    ):
+        value = card.get(key)
+        if value:
+            attrs.append(f'{key}="{_esc_attr(_clip(value, limit))}"')
+    return f"<card {' '.join(attrs)}/>"
+
+
+def _nonempty_str(value) -> str | None:
+    """str 且去空白后非空才返回；其他类型（数字/dict）不硬转——ark 字段
+    类型不受我们控制，硬转出 "{'x': 1}" 这种属性值比缺失更有歧义。"""
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _append_name_attr(
+    attrs: list[str], attr_name: str, user_id, names: dict[str, str]
+) -> None:
+    """user/operator/target 的 QQ 号能在近期消息里反查到名字时，紧跟着追加
+    `<attr_name>="名字"` 属性。查不到就什么都不加（缺失=未知）。"""
+    name = names.get(str(user_id))
+    if name:
+        attrs.append(f'{attr_name}="{_esc_attr(name)}"')
+
+
+def _notice_detail_attrs(kind: str, payload: dict) -> list[str]:
+    """按 notice kind 透出 mapper 已存储的明细字段（此前渲染时全部丢弃）。
+
+    每个属性一种含义，不复用模糊名：
+    - group_ban    → duration_seconds=禁言秒数（仅 sub_type=ban 且 >0 时给；
+                     lift_ban / 解禁没有时长概念，不渲染）
+    - group_card   → old_card= / new_card=（改名片前后值；空串=没有名片，
+                     与"缺失=mapper 没拿到"区分开，所以空串也渲染）
+    - group_upload → file_name= / file_size_bytes=
+    - emoji_like   → message_id=被贴表情的消息（对应 timeline 里同 id 的
+                     <message>）+ likes=表情统计（格式见 _emoji_likes_label）
+    - essence      → message_id=被设/取消精华的消息
+    - honor        → honor_type=荣誉类型（talkative 龙王 / performer /
+                     emotion，OneBot 原值透传）
+    """
+    attrs: list[str] = []
+    if kind == "group_ban":
+        duration = payload.get("duration")
+        try:
+            seconds = int(str(duration).strip())
+        except (TypeError, ValueError):
+            seconds = 0
+        if seconds > 0:
+            attrs.append(f'duration_seconds="{seconds}"')
+    elif kind == "group_card":
+        for key, attr in (("card_old", "old_card"), ("card_new", "new_card")):
+            value = payload.get(key)
+            if value is not None:
+                attrs.append(f'{attr}="{_esc_attr(str(value))}"')
+    elif kind == "group_upload":
+        file_info = payload.get("file") or {}
+        if isinstance(file_info, dict):
+            fname = file_info.get("name")
+            if fname:
+                attrs.append(f'file_name="{_esc_attr(_clip(str(fname), 100))}"')
+            fsize = file_info.get("size")
+            if fsize is not None and str(fsize).strip():
+                attrs.append(f'file_size_bytes="{_esc_attr(str(fsize))}"')
+    elif kind == "emoji_like":
+        mid = payload.get("onebot_message_id")
+        if mid:
+            attrs.append(f'message_id="{_esc_attr(str(mid))}"')
+        label = _emoji_likes_label(payload.get("likes") or [])
+        if label:
+            attrs.append(f'likes="{_esc_attr(label)}"')
+    elif kind == "essence":
+        mid = payload.get("onebot_message_id")
+        if mid:
+            attrs.append(f'message_id="{_esc_attr(str(mid))}"')
+    elif kind == "honor":
+        honor_type = payload.get("honor_type")
+        if honor_type:
+            attrs.append(f'honor_type="{_esc_attr(str(honor_type))}"')
+    return attrs
+
+
+def _emoji_likes_label(likes) -> str | None:
+    """把 emoji_like 的 likes 数组压成一个可读属性值，如 "👍×2,face:66×1"。
+
+    每项 "表情×人数"，逗号分隔；表情的两种形态（napcat 的 emoji_id 两义）：
+    - unicode 表情：emoji_id 是十进制 codepoint（128077 → 👍），直接给字符——
+      LLM 读 "👍" 比读 "128077" 无歧义得多；
+    - QQ 黄豆表情：emoji_id 是小整数 face id，渲染 "face:<id>"（与消息里
+      <face id=.../> 同一 id 空间）。
+    条目上限 5，防御异常 payload 撑爆属性。全部无效 → None（不渲染 likes=）。
+    """
+    parts: list[str] = []
+    for item in list(likes)[:5]:
+        if not isinstance(item, dict):
+            continue
+        symbol = _emoji_symbol(item.get("emoji_id"))
+        if symbol is None:
+            continue
+        count = item.get("count")
+        if count is not None and str(count).strip():
+            parts.append(f"{symbol}×{count}")
+        else:
+            parts.append(symbol)
+    return ",".join(parts) or None
+
+
+def _emoji_symbol(emoji_id) -> str | None:
+    """emoji_id → 显示符号。≥0x2000 视作 unicode codepoint 转字符（QQ 的
+    unicode 类回应都在 emoji 区段，远高于黄豆 face id 的几百量级；排除
+    surrogate 区），小整数按 QQ face id 渲染 "face:N"，非数字原样截断透传。"""
+    if emoji_id is None:
+        return None
+    s = str(emoji_id).strip()
+    if not s:
+        return None
+    try:
+        value = int(s)
+    except ValueError:
+        return _clip(s, 20)
+    if 0x2000 <= value <= 0x10FFFF and not (0xD800 <= value <= 0xDFFF):
+        try:
+            return chr(value)
+        except ValueError:
+            pass
+    return f"face:{value}"
+
+
+def _bracket(s: str) -> str:
+    """gloss 用的 "[语义]" 占位包装：没带 "[" 前缀的才包（napcat 的 summary /
+    faceText 常自带方括号，如 "[动画表情]"；商城表情名 "贴贴" 则是裸文本）。"""
+    return s if s.startswith("[") else f"[{s}]"
+
+
+def _segment_gloss(seg: dict) -> str | None:
+    """单个 segment 的纯文本摘要，用于 reply 段的 excerpt。
+
+    与 ``_render_segments`` 的 XML 渲染**同源取语义字段**——消息体里渲得出
+    的信息（图片/商城表情 summary、face 名、ark 卡片外显文案、markdown 正文、
+    文件名……），被回复时的 excerpt 里也要看得到；否则"回复一张表情包 / 一个
+    B 站卡片"会退化成 [image] / [json] 类型占位，回复链语义断掉。两处新增
+    段类型时必须同步改。
+
+    样式对齐 QQ 会话列表习惯：非文本段用 "[语义]" 占位、@ 用 "@号"。
+    返回 None = 该段对摘要无贡献（嵌套 reply 标记本身）。
+    """
+    t = seg.get("type")
+    d = seg.get("data") or {}
+    if t == "text":
+        return str(d.get("text", ""))
+    if t == "image":
+        summary = str(d.get("summary") or "").strip()
+        if summary:
+            return _bracket(summary)
+        return "[表情]" if _image_kind(d) == "sticker" else "[图片]"
+    if t == "face":
+        name = _face_name(d)
+        return _bracket(name) if name else "[表情]"
+    if t == "mface":
+        summary = str(d.get("summary") or "").strip()
+        return _bracket(summary) if summary else "[表情]"
+    if t == "markdown":
+        content = str(d.get("content") or "").strip()
+        return content or "[markdown]"
+    if t == "json":
+        card = _parse_ark_card(d) or {}
+        # prompt（QQ 外显文案）通常已是 "[QQ小程序]哔哩哔哩" 形态，原样用；
+        # 没有 prompt 时退 title，标上 [卡片] 出处。
+        if card.get("summary"):
+            return card["summary"]
+        if card.get("title"):
+            return f"[卡片]{card['title']}"
+        return "[卡片]"
+    if t == "share":
+        title = str(d.get("title") or "").strip()
+        return f"[分享]{title}" if title else "[分享]"
+    if t == "xml":
+        return "[卡片]"
+    if t == "file":
+        fname = str(d.get("name", "") or d.get("file", "")).strip()
+        return f"[文件]{fname}" if fname else "[文件]"
+    if t == "record":
+        return "[语音]"
+    if t == "video":
+        return "[视频]"
+    if t == "at":
+        qq = str(d.get("qq", "")).strip()
+        if qq == "all":
+            return "@全体成员"
+        return f"@{qq}" if qq else "@?"
+    if t == "dice":
+        val = str(d.get("result", "") or d.get("value", "")).strip()
+        return f"[骰子:{val}]" if val else "[骰子]"
+    if t == "rps":
+        val = str(d.get("result", "") or d.get("value", "")).strip()
+        return f"[猜拳:{val}]" if val else "[猜拳]"
+    if t == "poke":
+        return "[戳一戳]"
+    if t == "forward":
+        return "[聊天记录]"
+    if t == "reply":
+        # 被回复消息自己又引用了别人——嵌套引用标记不进摘要，摘要只描述
+        # 这条消息"说了什么"。
+        return None
+    return f"[{t}]" if t else None
+
+
+def _build_excerpt_index(events: Iterable[_EventSnapshot]) -> dict[str, str]:
+    """timeline 内 onebot_message_id → 摘要（前 40 字）。
+
+    用于渲染 reply 段时给 LLM 提供"被回复消息说了啥"的上下文。逐段取
+    ``_segment_gloss``：文本段取原文，富媒体段取与消息体渲染同源的语义占位
+    （不再是旧版 "[image, at]" 这种裸类型列表）。空白规整成单空格（摘要是
+    单行属性值，不该带换行）。命中不到（消息在 lookback 窗口外或被 napcat
+    抛弃了）就只渲染 reply.to 不带 excerpt。
     """
     out: dict[str, str] = {}
     for ev in events:
@@ -791,21 +1439,18 @@ def _build_excerpt_index(events: Iterable[_EventSnapshot]) -> dict[str, str]:
         if not mid:
             continue
         segs = ev.payload.get("segments") or []
-        text_parts: list[str] = []
+        parts: list[str] = []
         for seg in segs:
             if not isinstance(seg, dict):
                 continue
-            if seg.get("type") == "text":
-                text_parts.append(str((seg.get("data") or {}).get("text", "")))
-        excerpt = "".join(text_parts).strip()
-        if not excerpt:
-            # 无文本段时（纯图 / 纯表情）给 segment 摘要
-            tags = [s.get("type") for s in segs if isinstance(s, dict)]
-            if tags:
-                excerpt = "[" + ", ".join(tags) + "]"
+            gloss = _segment_gloss(seg)
+            if gloss:
+                parts.append(gloss)
+        excerpt = " ".join("".join(parts).split())
         if len(excerpt) > 40:
             excerpt = excerpt[:40] + "…"
-        out[str(mid)] = excerpt
+        if excerpt:
+            out[str(mid)] = excerpt
     return out
 
 
@@ -827,62 +1472,79 @@ def _build_user_name_index(
     return out
 
 
-def _build_reply_msgid_index(
-    events: Iterable[_EventSnapshot],
-) -> dict[str, str]:
-    """reply_id → onebot_message_id，从 agent.reply_delivered 折出。
+@dataclass(frozen=True)
+class _AuthorRef:
+    """被回复消息的作者信息，供 reply 段拆成独立属性渲染。
 
-    reply 工具写 agent.reply_emitted（带 reply_id），ReplySendWorker 投递成功后
-    写 agent.reply_delivered（带同一 reply_id + napcat 分配的 onebot_message_id）。
-    这里把两者对上，供 _build_author_index 给 bot 自己已发出的消息标 from=，
-    从而让别人 <reply to="MSG_ID"> 引用 bot 时，reply 段能渲染 from="我(self_id)"，
-    LLM 据此判定"这条是在回复我"。（发言本身的 timeline 表示走 reply 工具的
-    <tool-call name="reply">，不再有独立的 <agent-reply>。）
+    - ``name`` / ``user_id``：作者名（card/nickname 择先）与 QQ 号，任一可为
+      None（=未知，渲染时省略对应属性，不造 "?" 占位）。
+    - ``is_self``：该消息是 bot 自己发出的（来自 send_message 工具的
+      tool_result）。这是**服务端事实标注**，独立于当 tick 是否拿得到
+      bot_user_id——渲染成 `from_self="true"`，取代旧的 `from="我(...)"`
+      魔法名字。
     """
-    out: dict[str, str] = {}
-    for ev in events:
-        if ev.type != "agent.reply_delivered":
-            continue
-        payload = ev.payload or {}
-        reply_id = payload.get("reply_id")
-        msgid = payload.get("onebot_message_id")
-        if reply_id and msgid is not None:
-            out[str(reply_id)] = str(msgid)
-    return out
+
+    name: str | None
+    user_id: str | None
+    is_self: bool = False
 
 
 def _build_author_index(
     events: Iterable[_EventSnapshot],
-) -> dict[str, str]:
-    """onebot_message_id → 作者标签 "昵称(QQ)"。用于 reply 段标 from=。
+) -> dict[str, _AuthorRef]:
+    """onebot_message_id → :class:`_AuthorRef`。用于 reply 段标
+    from_name / from_id / from_self 三个独立属性。
 
     覆盖两类来源：
     - 外部消息：作者 = sender 的 card/nickname + user_id。别人引用某人时，
       LLM 据此判断被引用的是谁（含群主自己）——而不是误以为那人在发言。
-    - bot 自己已投递的 reply：作者标 "我(self_id)"，onebot_message_id 来自
-      配对的 reply_delivered。这样别人引用 bot 时 from= 的 QQ 命中 bot_user_id，
-      LLM 用同一条规则（比对 from 的 QQ）即可判定"被引用的是我自己"。
+    - bot 自己同步发出的消息：``is_self=True``，message_id + self_id 取自
+      send_message 工具的 tool_result（send_message 已是**同步**工具、直接返回
+      napcat 的 message_id，不再有 reply_delivered 事件）。别人引用 bot 时渲染
+      `from_self="true"`（且 from_id 命中 bot_user_id），LLM 无需比对也能判定
+      "被引用的是我自己"。
+
+    工具名兼容：发言工具已从 `reply` 改名为 `send_message`（§12.2）；事件表
+    append-only，改名前落库的 tool_called 里 tool_name 仍是 `reply`，故这里两个名
+    都认，避免改名后一个 lookback 窗口内旧发言丢掉 from_self 标注。
     """
-    out: dict[str, str] = {}
-    delivered_msgid_by_reply_id = _build_reply_msgid_index(events)
-    reply_self_id_by_reply_id: dict[str, str | None] = {}
+    out: dict[str, _AuthorRef] = {}
+    # 先收集发言工具调用的 tool_call_id，用来认出哪些 tool_result 是发言的。
+    # 认 send_message（新）+ reply（改名前的旧事件，见 docstring 兼容说明）。
+    send_call_ids: set[str] = set()
     for ev in events:
-        if ev.type == "agent.reply_delivered":
+        if ev.type == "agent.tool_called" and (
+            (ev.payload or {}).get("tool_name") in ("send_message", "reply")
+        ):
+            tc_id = (ev.payload or {}).get("tool_call_id")
+            if tc_id is not None:
+                send_call_ids.add(str(tc_id))
+    for ev in events:
+        # bot 自己同步发出的消息：从其 tool_result 取 message_id + self_id。
+        if ev.type == "agent.tool_result":
             payload = ev.payload or {}
-            reply_id = payload.get("reply_id")
-            if reply_id:
-                reply_self_id_by_reply_id[str(reply_id)] = payload.get("self_id")
+            tc_id = payload.get("tool_call_id")
+            if tc_id is not None and str(tc_id) in send_call_ids:
+                result = payload.get("result") or {}
+                mid = result.get("message_id")
+                if mid is not None:
+                    self_id = result.get("self_id")
+                    out[str(mid)] = _AuthorRef(
+                        name=None,
+                        user_id=str(self_id) if self_id else None,
+                        is_self=True,
+                    )
+        # 外部消息作者。
         if not ev.type.startswith("external.message."):
             continue
         mid = ev.payload.get("onebot_message_id")
         if not mid:
             continue
         sender = ev.payload.get("sender") or {}
-        name = sender.get("card") or sender.get("nickname") or "?"
+        name = sender.get("card") or sender.get("nickname")
         qq = sender.get("user_id") or ev.user_id
-        out[str(mid)] = f"{name}({qq})" if qq is not None else str(name)
-    # bot 自己的发言：reply_id → onebot_message_id（delivered）+ self_id。
-    for reply_id, msgid in delivered_msgid_by_reply_id.items():
-        self_id = reply_self_id_by_reply_id.get(reply_id)
-        out[msgid] = f"我({self_id})" if self_id else "我"
+        out[str(mid)] = _AuthorRef(
+            name=str(name) if name else None,
+            user_id=str(qq) if qq is not None else None,
+        )
     return out

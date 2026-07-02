@@ -6,8 +6,9 @@ Covers (任务与决策契约 §5.1, §6, dispatcher 设计 2026-05-26):
 - tool raises → agent.tool_failed with error_kind / error_message
 - unknown tool_name → agent.tool_failed(unknown_tool)
 - arguments 透传给 tool.run()
-- self-wake: _drain_once 完成后对每个 scope 调一次 supervisor.wake()
-  （拓扑 README §5.3 修复）
+- self-wake（遗留路径）：无批次标记的 tool_called 在 drain 后仍按 scope 直接
+  supervisor.wake()；带 tool_batch_id 的批次收口唤醒契约见
+  test_tool_batch_contract.py。
 
 直接测 `_process_one()`，跳过 SQL SELECT 路径，session 用 _RecordingSession 捕获 inserts。
 """
@@ -24,7 +25,10 @@ from qqbot.services.agent_loop.delivery_claims import (
     DEFAULT_LEASE_SECONDS,
     ClaimResult,
 )
-from qqbot.services.agent_loop.tool_registry import ToolRegistry
+from qqbot.services.agent_loop.tool_registry import (
+    ToolOutcome,
+    ToolRegistry,
+)
 from qqbot.services.agent_loop.tool_worker import ToolWorker
 
 
@@ -145,7 +149,9 @@ class ToolWorkerContractTest(unittest.TestCase):
             {"query": "x", "results": [{"url": "u"}]},
         )
 
-    def test_tool_raises_writes_tool_failed(self) -> None:
+    def test_unexpected_exception_is_internal_tool_error(self) -> None:
+        # 工具（裸 stub）抛预料外异常 → ToolWorker 兜底 internal_tool_error
+        # （不泄漏 type(exc).__name__；契约 §7.2）。BaseTool 工具永不 raise。
         reg = ToolRegistry()
         reg.register(
             _StubTool("websearch", raise_exc=RuntimeError("upstream 500"))
@@ -171,8 +177,57 @@ class ToolWorkerContractTest(unittest.TestCase):
         failed = _payloads_by_type(store)["agent.tool_failed"]
         self.assertEqual(failed["tool_call_id"], "TCID2")
         self.assertEqual(failed["tool_name"], "websearch")
-        self.assertEqual(failed["error_kind"], "RuntimeError")
+        self.assertEqual(failed["error_kind"], "internal_tool_error")
         self.assertIn("upstream 500", failed["error_message"])
+
+    def test_returned_failure_outcome_is_persisted(self) -> None:
+        # 工具**返回** ToolOutcome.failure（黑盒工具永不 raise）→ ToolWorker 原样
+        # 搬运 error_kind/message/extra 到 tool_failed（extra 平铺，不解释、不改写）。
+        reg = ToolRegistry()
+        reg.register(
+            _StubTool(
+                "kick",
+                return_value=ToolOutcome.failure(
+                    "upstream_action_failed",
+                    "群成员不存在",
+                    action="set_group_kick",
+                    retcode=1404,
+                ),
+            )
+        )
+        store: list[Any] = []
+        worker = ToolWorker(session_factory=_factory_for(store), registry=reg)
+
+        row = _row(
+            event_id="EID2b",
+            payload={"tool_call_id": "TCID2b", "tool_name": "kick"},
+        )
+        asyncio.run(worker._process_one(row))
+
+        failed = _payloads_by_type(store)["agent.tool_failed"]
+        self.assertEqual(failed["error_kind"], "upstream_action_failed")
+        self.assertEqual(failed["error_message"], "群成员不存在")
+        # extra 字段平铺进 payload，供审计与 protocol.md 描述的渲染
+        self.assertEqual(failed["retcode"], 1404)
+        self.assertEqual(failed["action"], "set_group_kick")
+
+    def test_tool_returns_tool_outcome_success(self) -> None:
+        # 工具直接返回 ToolOutcome.success → tool_result.result 取 outcome.result。
+        reg = ToolRegistry()
+        reg.register(
+            _StubTool("kick", return_value=ToolOutcome.success(group_id=1, ok=True))
+        )
+        store: list[Any] = []
+        worker = ToolWorker(session_factory=_factory_for(store), registry=reg)
+
+        row = _row(
+            event_id="EID2c",
+            payload={"tool_call_id": "TCID2c", "tool_name": "kick"},
+        )
+        asyncio.run(worker._process_one(row))
+
+        result_payload = _payloads_by_type(store)["agent.tool_result"]
+        self.assertEqual(result_payload["result"]["group_id"], 1)
 
     def test_unknown_tool_writes_failed_unknown_tool(self) -> None:
         reg = ToolRegistry()  # empty
@@ -327,6 +382,10 @@ def _drain_factory(store: list[Any], select_rows: list[dict]):
 
 
 class ToolWorkerSelfWakeTest(unittest.TestCase):
+    # 注意：本类的行都**没有** tool_batch_id —— 走的是"升级前遗留 tool_called"
+    # 的兼容路径（drain 后按 scope 直接 wake）。新的批次收口唤醒（先写
+    # runtime.tool_batch_completed 再 notify 一次）见 test_tool_batch_contract.py。
+
     def test_drain_wakes_supervisor_per_scope(self) -> None:
         reg = ToolRegistry()
         reg.register(_StubTool("websearch", return_value={"ok": True}))
@@ -402,8 +461,9 @@ class ToolWorkerSelfWakeTest(unittest.TestCase):
         self.assertEqual(processed, 1)
         self.assertIn("agent.tool_result", _types(store))
 
-    def test_process_one_returns_scope_key(self) -> None:
-        """会落终态事件的分支需返回 scope_key，供 drain 层收集 wake 集合。"""
+    def test_process_one_returns_processed_call(self) -> None:
+        """会落终态事件的分支需返回 _ProcessedCall（scope + 批次线索 +
+        terminal 事件 id），供 drain 层做遗留唤醒 / 批次收口判定。"""
         reg = ToolRegistry()
         reg.register(_StubTool("ok", return_value={"r": 1}))
         reg.register(_StubTool("boom", raise_exc=RuntimeError("x")))
@@ -412,16 +472,21 @@ class ToolWorkerSelfWakeTest(unittest.TestCase):
             session_factory=_factory_for(store), registry=reg
         )
 
-        scope_ok = asyncio.run(
+        done_ok = asyncio.run(
             worker._process_one(
                 _row(
                     scope="group",
                     group_id=100,
-                    payload={"tool_call_id": "T1", "tool_name": "ok"},
+                    payload={
+                        "tool_call_id": "T1",
+                        "tool_name": "ok",
+                        "tool_batch_id": "B9",
+                        "tool_batch_size": 1,
+                    },
                 )
             )
         )
-        scope_err = asyncio.run(
+        done_err = asyncio.run(
             worker._process_one(
                 _row(
                     scope="group",
@@ -430,7 +495,7 @@ class ToolWorkerSelfWakeTest(unittest.TestCase):
                 )
             )
         )
-        scope_unknown = asyncio.run(
+        done_unknown = asyncio.run(
             worker._process_one(
                 _row(
                     scope="private",
@@ -440,9 +505,18 @@ class ToolWorkerSelfWakeTest(unittest.TestCase):
                 )
             )
         )
-        self.assertEqual(scope_ok, "group:100")
-        self.assertEqual(scope_err, "group:200")
-        self.assertEqual(scope_unknown, "private:42")
+        assert done_ok is not None
+        self.assertEqual(done_ok.scope_key, "group:100")
+        self.assertEqual(done_ok.tool_batch_id, "B9")
+        self.assertEqual(done_ok.tool_batch_size, 1)
+        self.assertTrue(done_ok.terminal_event_id)
+        # 无批次标记（遗留行）→ 批次字段为 None
+        assert done_err is not None
+        self.assertEqual(done_err.scope_key, "group:200")
+        self.assertIsNone(done_err.tool_batch_id)
+        assert done_unknown is not None
+        self.assertEqual(done_unknown.scope_key, "private:42")
+        self.assertIsNone(done_unknown.tool_batch_id)
 
 
 if __name__ == "__main__":

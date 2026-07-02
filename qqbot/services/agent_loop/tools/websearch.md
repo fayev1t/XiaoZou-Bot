@@ -8,7 +8,7 @@
 
 Do **NOT** call websearch for:
 - Pure opinion / chat / casual jokes — just reply.
-- Information already present in the timeline or in a prior `pending_tool_results` entry.
+- Information already present in the timeline (including a completed `<tool-call name="websearch">` row from an earlier tick).
 - Looking up an internal QQ user (use `search_history` instead).
 
 ## Arguments
@@ -23,4 +23,4 @@ Each item has `title`, `url`, `snippet`, optionally `fetched_text` (if `fetch_to
 
 ## After the call
 
-The result lands in `pending_tool_results` on the next tick. Read it BEFORE issuing another search — don't search the same thing twice. When replying, cite the source URL inline so users can verify.
+The result appears on your `<tool-call name="websearch">` timeline row (status="complete") on the next tick. Read it BEFORE issuing another search — don't search the same thing twice. When replying, cite the source URL inline so users can verify.

@@ -1,9 +1,8 @@
 """agent_delivery_claims —— worker 投递去重 / 租约表(claim-with-lease)。
 
 为什么存在(②"至少一次重发"修复 / ⑤异步worker调用 §6 关联):
-  ReplySendWorker / ToolWorker 都靠 `NOT EXISTS(终态事件)` 找 pending,然后
-  **先执行外部副作用(发 napcat / 跑工具)、后写 *_delivered|*_result**。这中间
-  没有 claim/lease:
+  ToolWorker 靠 `NOT EXISTS(终态事件)` 找 pending,然后**先执行外部副作用(跑工具 /
+  经工具发 napcat)、后写 *_result|*_failed**。这中间没有 claim/lease:
   - 多实例并发 → 同一条被两个 worker 同时取走、各发一次(代码注释自己承认"重复发送")
   - 单实例:发送成功后、写终态前进程崩 / 写终态那步抛瞬时 DB 异常 → 下一轮
     drain 把它当 pending 再发一次
@@ -31,9 +30,9 @@ from qqbot.models.base import Base
 class AgentDeliveryClaim(Base):
     __tablename__ = "agent_delivery_claims"
 
-    # 被投递事件的 event_id(reply_emitted / tool_called)。一条事件一把锁。
+    # 被投递事件的 event_id(tool_called)。一条事件一把锁。
     event_id = Column(Text, primary_key=True)
-    # "reply" / "tool" —— 仅供排查观测
+    # "tool" —— 仅供排查观测
     kind = Column(Text, nullable=False)
     claimed_at = Column(DateTime(timezone=True), nullable=False)
     # 租约到期时刻;超过即视作 stale,可被重新抢占

@@ -73,12 +73,12 @@ class LLMPlannerContractTest(unittest.TestCase):
         self.assertEqual(out.actions[0].reason, "nothing happening")
 
     def test_reply_now_parsed_as_call_tool(self) -> None:
-        """Reply 不再是独立 action：LLM 必须用 call_tool tool_name=reply 发言。
+        """Reply 不再是独立 action：LLM 必须用 call_tool tool_name=send_message 发言。
         裸 {"type":"reply"} 会走入 _parse_action 的"未知 type"分支 → IdleAction(bad_action)。
-        这条断言把"reply 是普通工具"的契约钉死。"""
+        这条断言把"发言是普通工具"的契约钉死。"""
         body = (
             '{"reasoning":"hi","actions":[{"type":"call_tool",'
-            '"tool_name":"reply",'
+            '"tool_name":"send_message",'
             '"arguments":{"content":[{"type":"text","data":{"text":"hi"}}],'
             '"target":{"kind":"group","group_id":100}}}]}'
         )
@@ -87,7 +87,7 @@ class LLMPlannerContractTest(unittest.TestCase):
         out = asyncio.run(planner.decide(_ctx()))
         self.assertEqual(len(out.actions), 1)
         self.assertIsInstance(out.actions[0], CallToolAction)
-        self.assertEqual(out.actions[0].tool_name, "reply")
+        self.assertEqual(out.actions[0].tool_name, "send_message")
         self.assertEqual(
             out.actions[0].arguments["target"],
             {"kind": "group", "group_id": 100},
@@ -211,7 +211,7 @@ class LLMPlannerContractTest(unittest.TestCase):
 
     def test_persona_none_falls_back_to_plain_protocol_prompt(self) -> None:
         # persona=None：PromptRegistry 应当不注册 persona section，
-        # 协议段仍在；reply_usage / tools_usage 之间的分隔符与 persona
+        # 协议段仍在；protocol / tools_usage 之间的分隔符与 persona
         # 无关，因此不再断言 "no ---"。
         llm = _StubLLM(response_content='{"actions":[{"type":"idle","reason":"x"}]}')
         planner = LLMPlanner(llm_client=llm, persona_text=None)
@@ -268,15 +268,20 @@ class LLMPlannerContractTest(unittest.TestCase):
         # 关键标签必须解释过
         self.assertIn("<tool-catalog>", content)
         self.assertIn("<active-tasks>", content)
-        self.assertIn("<pending-tool-results>", content)
         self.assertIn("<timeline>", content)
+        # 2026-07-02 起不再有 pending-tool-results 区（工具结果只在 timeline
+        # 单点呈现，防双重渲染诱发复读）——文档不得再教这个标签
+        self.assertNotIn("<pending-tool-results>", content)
         # 特殊标记
         self.assertIn("<truncated/>", content)
-        self.assertIn("<pending/>", content)
+        self.assertIn("<processing/>", content)
+        # 两态语义必须教过：status 只有 processing / complete
+        self.assertIn('status="complete"', content)
+        self.assertIn('status="processing"', content)
 
     def test_system_prompt_includes_group_chat_rules_doc(self) -> None:
         """group_chat_rules.md 必须注入 system prompt —— LLM 据此决定什么时候
-        reply / 什么时候 idle / 怎么称呼对方。"""
+        发言 / 什么时候 idle / 怎么称呼对方。"""
         llm = _StubLLM(
             response_content='{"actions":[{"type":"idle","reason":"x"}]}'
         )
@@ -292,12 +297,32 @@ class LLMPlannerContractTest(unittest.TestCase):
         self.assertIn("这些是直觉，不是清单", content)
         # 行为约束里仍要涉及备选决策
         self.assertIn("note_task_progress", content)
+        # 复读禁令（2026-07-01 批次语义）：已 complete 的 send_message = 已说
+        # 出，绝不再发。protocol 与 group_chat_rules 两处都要教。
+        self.assertIn("别复读自己", content)
+        self.assertIn("One tick, one tool batch", content)
+
+    def test_system_prompt_explicitly_forbids_bare_text_as_reply(self) -> None:
+        """system prompt 必须明确：想让群里看到的话只能放进 send_message 工具，
+        不能塞进 reasoning / task 字段假装已经回复。"""
+        llm = _StubLLM(
+            response_content='{"actions":[{"type":"idle","reason":"x"}]}'
+        )
+        planner = LLMPlanner(llm_client=llm)
+        asyncio.run(planner.decide(_ctx()))
+        content = llm.invocations[0][0].content
+
+        self.assertIn(
+            'it must live inside `call_tool(tool_name="send_message").arguments.content`',
+            content,
+        )
+        self.assertIn("没调 `send_message` 就等于你还没说", content)
 
     def test_default_prompt_section_order(self) -> None:
         """xml_format 与 group_chat_rules 必须按 order 升序拼接：
-        persona < xml_format < protocol < group_chat_rules < tools_usage。
-        LLM 按"身份→输入语言→决策→社交→工具"递进读。reply.md 段已废除
-        （reply 现在是工具，文档归入 tools_usage）。"""
+        persona < xml_format < group_chat_rules < protocol < tools_usage。
+        LLM 按"身份→输入语言→社交判断→决策协议→工具"递进读。reply.md 段已废除
+        （发言现在是工具 send_message，文档归入 tools_usage）。"""
         from qqbot.services.agent_loop.tool_registry import ToolRegistry
 
         class _StubTool:
@@ -330,14 +355,14 @@ class LLMPlannerContractTest(unittest.TestCase):
         idx_tools = content.index("STUB-TOOL-ORDER-MARKER")
 
         self.assertLess(idx_persona, idx_xml)
-        self.assertLess(idx_xml, idx_protocol)
-        self.assertLess(idx_protocol, idx_group)
-        self.assertLess(idx_group, idx_tools)
+        self.assertLess(idx_xml, idx_group)
+        self.assertLess(idx_group, idx_protocol)
+        self.assertLess(idx_protocol, idx_tools)
 
     def test_reply_tool_usage_doc_renders_via_tool_registry(self) -> None:
-        """ReplyTool.usage_prompt（tools/reply.md）必须随 ToolRegistry.usage_docs
-        进 system prompt 的 tools_usage 段；reply 现在和 websearch / search_history
-        同构。"""
+        """SendMessageTool.usage_prompt（tools/send_message.md）必须随
+        ToolRegistry.usage_docs 进 system prompt 的 tools_usage 段；send_message
+        现在和 websearch / search_history 同构。"""
         from qqbot.services.agent_loop.tools import build_default_registry
 
         # 工具无构造依赖；usage_docs 只读 usage_prompt，不触发任何运行期依赖
@@ -351,8 +376,8 @@ class LLMPlannerContractTest(unittest.TestCase):
         content = llm.invocations[0][0].content
 
         # 按工具名分段的标题
-        self.assertIn("## Tool: reply", content)
-        # reply.md 标志性段落
+        self.assertIn("## Tool: send_message", content)
+        # send_message.md 标志性段落
         self.assertIn("your one and only way to speak", content)
         # OneBot V11 段示例关键字面
         self.assertIn('"type": "at"', content)
@@ -733,7 +758,7 @@ class LLMPlannerContractTest(unittest.TestCase):
         self.assertNotIn("bot_role=", human_text)
 
     def test_tool_permission_metadata_rendered_in_catalog(self) -> None:
-        """tool_catalog 里 required_permission / require_bot_admin 必须出现在
+        """tool_catalog 里 required_permission / required_bot_role 必须出现在
         每条 <tool> 标签的属性上 —— LLM 据此判断"我能调谁"。"""
         from qqbot.core.permissions import PermissionTier
         from qqbot.services.agent_loop.tool_registry import ToolRegistry
@@ -763,14 +788,16 @@ class LLMPlannerContractTest(unittest.TestCase):
         human_text = llm.invocations[0][1].content[0]["text"]
         self.assertIn('name="kick_member"', human_text)
         self.assertIn('required_permission="ADMIN"', human_text)
-        self.assertIn('require_bot_admin="true"', human_text)
+        # _KickTool 用旧字段 require_bot_admin=True，经 get_tool_required_bot_role
+        # 回退渲染成 required_bot_role="admin"（验证新旧字段兼容打通）。
+        self.assertIn('required_bot_role="admin"', human_text)
 
     def test_call_tool_action_parses_triggered_by_event_id(self) -> None:
         """LLM 在 call_tool 上填 triggered_by_event_id 时必须解到
         CallToolAction.triggered_by_event_id。"""
         llm = _StubLLM(
             response_content=(
-                '{"actions":[{"type":"call_tool","tool_name":"reply",'
+                '{"actions":[{"type":"call_tool","tool_name":"send_message",'
                 '"arguments":{},"triggered_by_event_id":"E_msg_77"}]}'
             )
         )
@@ -787,7 +814,7 @@ class LLMPlannerContractTest(unittest.TestCase):
     def test_call_tool_without_triggered_by_defaults_to_none(self) -> None:
         llm = _StubLLM(
             response_content=(
-                '{"actions":[{"type":"call_tool","tool_name":"reply","arguments":{}}]}'
+                '{"actions":[{"type":"call_tool","tool_name":"send_message","arguments":{}}]}'
             )
         )
         planner = LLMPlanner(llm_client=llm)
@@ -811,6 +838,92 @@ class LLMPlannerContractTest(unittest.TestCase):
         out = asyncio.run(planner.decide(_ctx()))
         self.assertIsInstance(out.actions[0], IdleAction)
         self.assertEqual(out.actions[0].reason, "llm_unavailable")
+
+
+# 2026-07-02：<pending-tool-results> 区已删除（工具结果只在 timeline 的
+# <tool-call> 行呈现一次），planner 侧的 _render_tool_result_xml 随之移除。
+# 失败 <error> 的结构化属性渲染契约由 test_agent_loop_projection_contract 的
+# timeline 渲染用例继续把守（fold 层 + <tool-call> 渲染层双覆盖）。
+
+
+class EnvelopeSelfMemoryTests(unittest.TestCase):
+    """<last-reasoning> / <validation-error>（2026-07-02 模型自主性增强）。"""
+
+    def _render_with(self, **overrides: Any) -> str:
+        from dataclasses import replace
+
+        llm = _StubLLM(
+            response_content='{"actions":[{"type":"idle","reason":"x"}]}'
+        )
+        planner = LLMPlanner(llm_client=llm)
+        ctx = replace(_ctx(), **overrides)
+        asyncio.run(planner.decide(ctx))
+        return llm.invocations[0][1].content[0]["text"]
+
+    def test_last_reasoning_rendered_with_at(self) -> None:
+        xml = self._render_with(
+            last_reasoning="上一拍：小徐在贴日志，等他贴完再答",
+            last_reasoning_at=china_now(),
+        )
+        self.assertIn("<last-reasoning at=", xml)
+        self.assertIn("等他贴完再答", xml)
+
+    def test_last_reasoning_absent_when_none(self) -> None:
+        xml = self._render_with()
+        self.assertNotIn("<last-reasoning", xml)
+        self.assertNotIn("<validation-error", xml)
+
+    def test_validation_feedback_rendered_on_retry_context(self) -> None:
+        xml = self._render_with(
+            validation_feedback="attempt 1 rejected: idle_with_other_actions"
+        )
+        self.assertIn("<validation-error>", xml)
+        self.assertIn("idle_with_other_actions", xml)
+
+
+class _SequenceLLM:
+    """按序返回多个响应的 stub——覆盖解析失败重试链路。"""
+
+    def __init__(self, responses: list[str]) -> None:
+        self._responses = list(responses)
+        self.invocations: list[Any] = []
+
+    async def ainvoke(self, messages: Any) -> Any:
+        self.invocations.append(messages)
+        content = self._responses[min(len(self.invocations) - 1, len(self._responses) - 1)]
+        return SimpleNamespace(content=content)
+
+
+class JsonParseRetryTests(unittest.TestCase):
+    """契约 §7.1（2026-07-02 落地）：JSON 不可解析时 planner 内重试至多 2 次
+    （共 3 次调用），重试消息携带原始输出 + 解析错误；全败才回退 idle。"""
+
+    def test_bad_then_good_json_recovers(self) -> None:
+        llm = _SequenceLLM([
+            "呃，我想想……（不是 JSON）",
+            '{"actions":[{"type":"idle","reason":"fixed"}]}',
+        ])
+        planner = LLMPlanner(llm_client=llm)
+        out = asyncio.run(planner.decide(_ctx()))
+        self.assertEqual(len(llm.invocations), 2)
+        self.assertIsInstance(out.actions[0], IdleAction)
+        self.assertEqual(out.actions[0].reason, "fixed")
+        # 重试对话必须带回原始输出（AIMessage）+ 纠错指令（HumanMessage）
+        retry_messages = llm.invocations[1]
+        self.assertGreater(len(retry_messages), len(llm.invocations[0]))
+        tail_texts = [
+            str(getattr(m, "content", "")) for m in retry_messages[-2:]
+        ]
+        self.assertIn("不是 JSON", tail_texts[0])
+        self.assertIn("valid JSON", tail_texts[1])
+
+    def test_persistent_bad_json_gives_up_after_three(self) -> None:
+        llm = _SequenceLLM(["x", "y", "z"])
+        planner = LLMPlanner(llm_client=llm)
+        out = asyncio.run(planner.decide(_ctx()))
+        self.assertEqual(len(llm.invocations), 3)
+        self.assertIsInstance(out.actions[0], IdleAction)
+        self.assertTrue(str(out.actions[0].reason).startswith("llm_json_error"))
 
 
 if __name__ == "__main__":

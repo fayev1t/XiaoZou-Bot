@@ -4,8 +4,8 @@
 不含 v1 业务）。Prompt 与解析逻辑均按 v2 任务与决策契约从零写。
 
 System prompt 不再硬编码 —— 完全交给 PromptRegistry 组装。默认 registry
-（build_default_prompt_registry）注册四段：persona / protocol / reply
-usage / tools usage。需要把人设、协议、动作文档或工具说明独立迭代时
+（build_default_prompt_registry）注册五段：persona / xml_format / protocol /
+group_chat_rules / tools usage。需要把人设、协议、动作文档或工具说明独立迭代时
 直接改对应 .md 即可，不需要碰 planner。
 
 错误兜底：LLM 不可用 / 接口报错 / JSON 不可解析 / schema 不符
@@ -40,7 +40,11 @@ from qqbot.services.agent_loop.decision import (
     ImageRef,
     NoteTaskProgressAction,
 )
-from qqbot.services.agent_loop.projection import _esc_attr, _esc_text, _safe_json
+from qqbot.services.agent_loop.projection import (
+    _esc_attr,
+    _esc_text,
+    _safe_json,
+)
 from qqbot.services.agent_loop.prompt_registry import PromptRegistry
 from qqbot.services.agent_loop.tool_registry import ToolRegistry
 
@@ -50,15 +54,16 @@ logger = get_logger(__name__)
 # 默认 prompt section order 约定（PromptRegistry 文档 §register）：
 #   0   persona            人设
 #   50  xml_format         输入 XML 信封语法与读法
-#   100 protocol           决策协议（任务状态机、JSON 输出规则）
-#   150 group_chat_rules   群聊行为规范（什么时候说话 / 怎么称呼对方）
-#   300 tools_usage        每个工具的 sibling .md 汇总（含 reply 工具）
+#   100 group_chat_rules   群聊行为规范（什么时候说话 / 怎么称呼对方）
+#   150 protocol           决策协议（任务状态机、JSON 输出规则）
+#   300 tools_usage        每个工具的 sibling .md 汇总（含 send_message 工具）
 #
-# 逻辑递进：你是谁 → 你怎么读输入 → 你怎么决定 → 你怎么社交 → 你能调什么工具
+# 逻辑递进：你是谁 → 你怎么读输入 → 你在群里该不该开口 → 你怎么决定 →
+# 你能调什么工具
 #
-# 旧版的 SECTION_REPLY_USAGE 段（prompts/reply.md）已经移除：reply 现在是
-# 普通工具，其用法文档 tools/reply.md 自动通过 ToolRegistry.usage_docs()
-# 进入 tools_usage 段，与 websearch / search_history 同构。
+# 旧版的 SECTION_REPLY_USAGE 段（prompts/reply.md）已经移除：发言现在是普通
+# 工具 send_message，其用法文档 tools/send_message.md 自动通过
+# ToolRegistry.usage_docs() 进入 tools_usage 段，与 websearch / search_history 同构。
 SECTION_PERSONA = "persona"
 SECTION_XML_FORMAT = "xml_format"
 SECTION_PROTOCOL = "protocol"
@@ -74,7 +79,7 @@ def build_default_prompt_registry(
 
     各段从对应 .md 文件懒加载，缺失即静默跳过（PromptRegistry render 会
     忽略空 section）。tools_usage 在 render 时才遍历 ToolRegistry，新增 /
-    下架工具立即生效，无需重启 planner。reply 工具的 sibling .md 也走
+    下架工具立即生效，无需重启 planner。send_message 工具的 sibling .md 也走
     tools_usage 渲染。
     """
     from qqbot.services.agent_loop import prompts as prompts_pkg
@@ -93,14 +98,14 @@ def build_default_prompt_registry(
         lambda: load_sibling_md(anchor, "xml_format.md"),
     )
     registry.register(
-        SECTION_PROTOCOL,
+        SECTION_GROUP_CHAT_RULES,
         100,
-        lambda: load_sibling_md(anchor, "protocol.md"),
+        lambda: load_sibling_md(anchor, "group_chat_rules.md"),
     )
     registry.register(
-        SECTION_GROUP_CHAT_RULES,
+        SECTION_PROTOCOL,
         150,
-        lambda: load_sibling_md(anchor, "group_chat_rules.md"),
+        lambda: load_sibling_md(anchor, "protocol.md"),
     )
 
     if tool_registry is not None:
@@ -152,11 +157,8 @@ class LLMPlanner:
                 context, self._tool_registry, self._prompt_registry
             )
             _log_request(context, messages)
-            raw = await llm.ainvoke(messages)
-            text = _extract_text(raw)
-            _log_response(context, text)
         except Exception as exc:
-            logger.warning("[llm_planner] LLM call failed: {}", exc)
+            logger.warning("[llm_planner] build messages failed: {}", exc)
             return DecisionOutput(
                 actions=[
                     IdleAction(reason=f"llm_call_error:{type(exc).__name__}")
@@ -164,22 +166,68 @@ class LLMPlanner:
                 reasoning=str(exc)[:200],
             )
 
-        try:
-            parsed = _parse_json(text)
-        except Exception as exc:
-            logger.warning(
-                "[llm_planner] JSON parse failed: {} raw={!r}",
-                exc,
-                text[:200],
-            )
-            return DecisionOutput(
-                actions=[
-                    IdleAction(reason=f"llm_json_error:{type(exc).__name__}")
-                ],
-                reasoning=f"unparseable: {text[:120]}",
-            )
+        # ─── JSON 解析重试（任务与决策契约 §7.1：非法输出同 tick 重试至多
+        # 2 次，共 3 次调用）───
+        # 输出不是合法 JSON 时，把模型原始输出 + 解析错误追加回对话再问一次，
+        # 让模型自己修——一次格式抖动不再没收整拍的响应权。传输层异常（网络/
+        # 超时）不重试：可能很慢，维持原 llm_call_error 回退等下一次唤醒。
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                raw = await llm.ainvoke(messages)
+                text = _extract_text(raw)
+                _log_response(context, text)
+            except Exception as exc:
+                logger.warning("[llm_planner] LLM call failed: {}", exc)
+                return DecisionOutput(
+                    actions=[
+                        IdleAction(
+                            reason=f"llm_call_error:{type(exc).__name__}"
+                        )
+                    ],
+                    reasoning=str(exc)[:200],
+                )
+            try:
+                parsed = _parse_json(text)
+            except Exception as exc:
+                logger.warning(
+                    "[llm_planner] JSON parse failed (attempt {}/{}): {} raw={!r}",
+                    attempt,
+                    max_attempts,
+                    exc,
+                    text[:200],
+                )
+                if attempt >= max_attempts:
+                    return DecisionOutput(
+                        actions=[
+                            IdleAction(
+                                reason=f"llm_json_error:{type(exc).__name__}"
+                            )
+                        ],
+                        reasoning=(
+                            f"unparseable after {max_attempts} attempts: "
+                            f"{text[:120]}"
+                        ),
+                    )
+                from langchain_core.messages import AIMessage, HumanMessage
 
-        return _parse_decision_output(parsed)
+                messages = list(messages) + [
+                    AIMessage(content=text),
+                    HumanMessage(
+                        content=(
+                            "Your previous response could not be parsed as "
+                            f"the required JSON ({type(exc).__name__}: {exc}). "
+                            "Re-emit your COMPLETE decision as ONE valid JSON "
+                            "object only — no prose, no markdown fences."
+                        )
+                    ),
+                ]
+                continue
+            return _parse_decision_output(parsed)
+        # for 循环内必 return；此处只为类型完备
+        return DecisionOutput(
+            actions=[IdleAction(reason="llm_json_error:exhausted")],
+        )
 
     async def _ensure_llm(self) -> Any:
         if self._llm is not None:
@@ -198,12 +246,12 @@ def _build_messages(
     """构造 chat 输入。langchain_core.messages 在 langchain_openai 已是必依赖。
 
     System prompt 完全由 PromptRegistry.render() 输出 —— 默认装配里包含
-    persona / protocol / reply_usage / tools_usage 四段，每段在自己的
-    .md 文件里独立维护。
+    persona / xml_format / protocol / group_chat_rules / tools_usage 五段，
+    每段在自己的 .md 文件里独立维护。
 
     HumanMessage 的 text block 用 XML 信封而非 JSON 拼装：timeline 里每条
     item 的 render 字段本身就是 `<message ...>` / `<tool-call ...>`（发言也是
-    reply 工具的 tool-call）/ `<notice ...>` 等独立标签，所以外层再用 `<agent-input>` /
+    send_message 工具的 tool-call）/ `<notice ...>` 等独立标签，所以外层再用 `<agent-input>` /
     `<timeline>` 标签嵌套时上下引用关系（reply、at、tool_call ↔ result）
     依然连贯，而不会被 JSON 字符串转义压平成扁平的字段表。
 
@@ -214,9 +262,16 @@ def _build_messages(
     """
     from langchain_core.messages import HumanMessage, SystemMessage
 
-    system_content = prompt_registry.render()
-
-    tool_catalog = tool_registry.catalog() if tool_registry is not None else []
+    # 按当前 loop 的 scope 过滤 catalog **与 tools_usage 文档**：allowed_scopes 限定
+    # 的工具（如 respond_to_request 仅 system）既不出现在别的 scope 的 tool-catalog
+    # 里，其用法文档也不进别的 scope 的 system prompt——否则群专用工具的说明会泄漏
+    # 到 system loop、system 专用工具的说明会泄漏到群 loop，徒增提示噪音与误判
+    # （§2.2；catalog 与 usage 同一把 scope 尺子）。
+    scope = context.scope_key.split(":", 1)[0]
+    system_content = prompt_registry.render(scope=scope)
+    tool_catalog = (
+        tool_registry.catalog(scope) if tool_registry is not None else []
+    )
     xml_text = _render_input_xml(context, tool_catalog)
 
     text_block = {"type": "text", "text": xml_text}
@@ -253,30 +308,33 @@ def _render_input_xml(
             </progress-notes>
           </task>
         </active-tasks>
-        <pending-tool-results>
-          <tool-result id="..." name="..." status="...">
-            <args>{json}</args>
-            <result>{json}</result>            或
-            <error kind="...">message</error>
-          </tool-result>
-        </pending-tool-results>
+        <last-reasoning at="...">上一拍的 reasoning 原文</last-reasoning>   (有才出)
+        <validation-error>attempt N rejected: ...</validation-error>       (仅校验重试)
         <timeline>
           {item.render \n item.render ...}
         </timeline>
       </agent-input>
+
+    工具结果只在 <timeline> 的 <tool-call status="complete"> 行呈现一次
+    （2026-07-02 删除了 <pending-tool-results> 区——同一调用双重渲染、且无
+    消费切割地每拍重复出现，是模型复读的直接诱饵）。<last-reasoning> 是模型
+    的跨拍自我记忆（最近一条 decision_emitted 的 reasoning）；
+    <validation-error> 只在同 tick 校验重试的调用里出现（契约 §7.1）。
     """
     parts: list[str] = []
     # bot_user_id 可选：未注入（启动初期 bot_registry 还空、或测试场景）
-    # 时不渲染属性；此时模型仍可靠别人 <reply ... from="我(...)"/> 的自指
-    # 标签识别"这条是回复我的"（"我" 由投影层解析，与 bot_user_id 无关）。
+    # 时不渲染属性；此时模型仍可靠别人 <reply ... from_self="true"/> 的服务端
+    # 标注识别"这条是回复我的"（from_self 由投影层解析，与 bot_user_id 无关）。
     bot_attr = (
         f' bot_user_id="{_esc_attr(context.bot_user_id)}"'
         if context.bot_user_id
         else ""
     )
-    # bot_role 同样可选：sweep 未完成时 None，不渲染。LLM 拿不到该属性即视
-    # 作"未知角色"，敏感工具 description 里有提示自然不会硬调；真硬调
-    # AgentLoop 闸门拦下。
+    # bot_role 同样可选：sweep 未完成时 None，不渲染。这是**折叠快照**，仅作给
+    # LLM 的角色提示——真正判 bot 权限时工具会**实时**复查当前角色（见
+    # tool_registry._effective_bot_role），快照过期也不会误判。故 prompt 明确要求
+    # LLM 不要据此快照"该调不调"：真无权限时工具返回 permission_denied_bot_role，
+    # 快照过低但已实际升权的调用照样能过（消除规划层假阴性）。
     role_attr = (
         f' bot_role="{_esc_attr(context.bot_role)}"' if context.bot_role else ""
     )
@@ -299,15 +357,20 @@ def _render_input_xml(
         name = _esc_attr(str(tool.get("name", "")))
         desc = _esc_attr(str(tool.get("description", "")))
         schema_json = _safe_json(tool.get("arguments_schema") or {})
-        # required_permission / require_bot_admin 作为属性透出，让 LLM 调用前
+        # required_permission / required_bot_role 作为属性透出，让 LLM 调用前
         # 即可判断 "我能不能调" 而不必非要触发 tool_failed 再学习。tool_registry
-        # 的 catalog() 已经兜底过缺失值。
+        # 的 catalog() 已经兜底过缺失值；required_bot_role=None 的工具不渲染该
+        # 属性（绝大多数工具不需要 bot 是管理员，省 token + 减噪音）。
         req_perm = _esc_attr(str(tool.get("required_permission", "GUEST")))
-        req_bot_admin = "true" if tool.get("require_bot_admin") else "false"
+        req_bot_role = tool.get("required_bot_role")
+        role_attr = (
+            f' required_bot_role="{_esc_attr(str(req_bot_role))}"'
+            if req_bot_role
+            else ""
+        )
         parts.append(
             f'<tool name="{name}" description="{desc}" '
-            f'required_permission="{req_perm}" '
-            f'require_bot_admin="{req_bot_admin}">'
+            f'required_permission="{req_perm}"{role_attr}>'
             f"<arguments-schema>{_esc_text(schema_json)}</arguments-schema>"
             f"</tool>"
         )
@@ -318,10 +381,27 @@ def _render_input_xml(
         parts.append(_render_task_xml(task))
     parts.append("</active-tasks>")
 
-    parts.append("<pending-tool-results>")
-    for tr in context.pending_tool_results:
-        parts.append(_render_tool_result_xml(tr))
-    parts.append("</pending-tool-results>")
+    # ─── 模型的跨拍自我记忆：上一拍 reasoning 原文（有才渲染）───
+    last_reasoning = getattr(context, "last_reasoning", None)
+    if last_reasoning:
+        last_at = getattr(context, "last_reasoning_at", None)
+        at_attr = (
+            f' at="{_esc_attr(last_at.isoformat(timespec="seconds"))}"'
+            if last_at is not None
+            else ""
+        )
+        parts.append(
+            f"<last-reasoning{at_attr}>"
+            f"{_esc_text(last_reasoning[:800])}</last-reasoning>"
+        )
+
+    # ─── 同 tick 校验重试反馈（仅重试调用渲染，契约 §7.1）───
+    validation_feedback = getattr(context, "validation_feedback", None)
+    if validation_feedback:
+        parts.append(
+            "<validation-error>"
+            f"{_esc_text(validation_feedback)}</validation-error>"
+        )
 
     parts.append("<timeline>")
     # 每条 item.render 单独占一行，纯字符串拼接已足够；不再 JSON 包装。
@@ -366,26 +446,6 @@ def _render_task_xml(task: Any) -> str:
         f'description="{_esc_attr(task.description)}">'
         f"{''.join(inner)}</task>"
     )
-
-
-def _render_tool_result_xml(r: Any) -> str:
-    """单条 ToolResultView → <tool-result> 块。
-    args / result 仍以 JSON 字符串塞进文本节点（结构化对象，无注入风险，
-    且 LLM 对 JSON 内容的理解能力很强），整段被 XML 包裹。"""
-    parts: list[str] = [
-        f'<tool-result id="{_esc_attr(r.tool_call_id)}" '
-        f'name="{_esc_attr(r.tool_name)}" status="{_esc_attr(r.status)}">'
-    ]
-    parts.append(f"<args>{_esc_text(_safe_json(r.arguments or {}))}</args>")
-    if r.status == "succeeded":
-        parts.append(f"<result>{_esc_text(_safe_json(r.result))}</result>")
-    elif r.status == "failed":
-        parts.append(
-            f'<error kind="{_esc_attr(str(r.error_kind or ""))}">'
-            f"{_esc_text(str(r.error_message or ''))}</error>"
-        )
-    parts.append("</tool-result>")
-    return "".join(parts)
 
 
 def _build_image_blocks(context: DecisionContext) -> list[dict]:
@@ -443,7 +503,7 @@ def _log_request(context: DecisionContext, messages: list[Any]) -> None:
 
     布局优先可读：用换行 + 分隔条把 system / user / response 三段切开，
     避免一行 5KB+ 撑爆 terminal。system prompt 只打首尾几行 + 长度，
-    因为它基本静态（persona + protocol + reply.md + tools usage）；
+    因为它基本静态（persona + protocol + group_chat_rules + tools usage）；
     user 段（XML 信封）是 tick 之间真正变化的东西，原样全打。
     """
     # messages = [SystemMessage, HumanMessage]
@@ -583,8 +643,8 @@ def _parse_action(raw: Any) -> Action | None:
                 task_ref=raw.get("task_ref") or None,
                 triggered_by_event_id=raw.get("triggered_by_event_id") or None,
             )
-        # NOTE: t == "reply" 已弃用——reply 现在是工具，走
-        # {"type":"call_tool","tool_name":"reply","arguments":{...}}。
+        # NOTE: t == "reply" 已弃用——发言现在是工具，走
+        # {"type":"call_tool","tool_name":"send_message","arguments":{...}}。
         if t == "complete_task":
             return CompleteTaskAction(
                 task_id=str(raw.get("task_id", "")),

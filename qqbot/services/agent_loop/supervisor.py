@@ -12,6 +12,15 @@ Behaviour:
 - wake() before start() is a no-op (events keep accumulating in
   agent_events; the loop will see them once it tickets).
 - stop() cancels every running loop with a 5s grace timeout.
+
+工具批次与唤醒（2026-07-02 起无门闩）：ToolWorker 在整批 terminal + 写完
+runtime.tool_batch_completed 后经 notify_tool_batch_completed **批次级唤醒
+一次**（不是每个工具一次）。批次进行期间到达的其它 wake（新消息等）**不再
+被推迟**——AgentLoop 随时开拍，模型自己看 timeline 里的
+<tool-call status="processing"> 行决定等还是先处理新事件（prompt 教它不重拨）。
+这是"模型+prompt 优先"哲学的落地：曾经的批次门闩（tool batch latch，上闩/
+解闩/180s 超时兜底）是替弱模型防复读的程序级闸门，已随 pending_tool_results
+一起拆除；防复读责任回归 prompt（§protocol tool batch 一节）。
 """
 
 from __future__ import annotations
@@ -26,7 +35,6 @@ from qqbot.services.agent_loop import bot_registry
 from qqbot.services.agent_loop.decision import Planner
 from qqbot.services.agent_loop.loop import AgentLoop
 from qqbot.services.agent_loop.projection import Projector
-from qqbot.services.agent_loop.reply_worker import ReplySendWorker
 from qqbot.services.agent_loop.tool_registry import ToolRegistry
 from qqbot.services.agent_loop.tool_worker import ToolWorker
 
@@ -51,7 +59,6 @@ class LoopSupervisor:
         self._lock = asyncio.Lock()
         self._started = False
         self._stopped = False
-        self._reply_worker: ReplySendWorker | None = None
         self._tool_worker: ToolWorker | None = None
 
     @property
@@ -80,13 +87,11 @@ class LoopSupervisor:
             logger.warning(
                 "[supervisor] task backfill failed (continuing): {}", exc
             )
-        # 先把 ReplySendWorker 跑起来：保证 SystemAgentLoop 第一 tick 出
-        # reply 时也能马上发出。worker 自身 start() 即触发一次 catchup。
-        self._reply_worker = ReplySendWorker(session_factory=self._session_factory)
-        self._reply_worker.start()
-        # ToolWorker：只有注入 registry 才启动；catchup 同 reply worker。
-        # 把自己注入进去让 worker 在 drain 完后自驱唤醒对应 scope 的 AgentLoop
-        # （拓扑 README §5.3 修复）。
+        # ToolWorker：只有注入 registry 才启动；start() 即触发一次 catchup。把
+        # 自己注入进去让 worker 在**整批工具收口后**（写完 runtime.
+        # tool_batch_completed）经 notify_tool_batch_completed 批次级唤醒对应
+        # scope 的 AgentLoop——不再是每 drain 一轮就按 scope wake 一次。
+        # send_message 已是同步工具，不再需要 ReplySendWorker。
         if self._tool_registry is not None:
             self._tool_worker = ToolWorker(
                 session_factory=self._session_factory,
@@ -99,7 +104,7 @@ class LoopSupervisor:
         await self._ensure("system")
         self._started = True
         logger.info(
-            "[supervisor] started, system loop + reply worker + tool worker={} online",
+            "[supervisor] started, system loop + tool worker={} online",
             "yes" if self._tool_worker is not None else "no",
         )
 
@@ -110,13 +115,6 @@ class LoopSupervisor:
         await asyncio.gather(
             *(loop.stop() for loop in loops), return_exceptions=True
         )
-        if self._reply_worker is not None:
-            try:
-                await self._reply_worker.stop()
-            except Exception as exc:
-                logger.warning("[supervisor] reply_worker.stop failed: {}", exc)
-            finally:
-                self._reply_worker = None
         if self._tool_worker is not None:
             try:
                 await self._tool_worker.stop()
@@ -139,20 +137,27 @@ class LoopSupervisor:
             return
         loop.wake()
 
-    def notify_reply_pending(self) -> None:
-        """AgentLoop 写完 reply_emitted 后调，叫醒 ReplySendWorker。
-
-        无 worker（未 start / 已 stop）时静默忽略；catchup 流程保证
-        worker 启动时会扫到这条遗留事件。
-        """
-        if self._reply_worker is not None:
-            self._reply_worker.notify()
-
     def notify_tool_pending(self) -> None:
-        """AgentLoop 写完 tool_called 后调，叫醒 ToolWorker。语义同
-        notify_reply_pending；未注入 tool_registry 时是 no-op。"""
+        """AgentLoop 写完 tool_called 后调，叫醒 ToolWorker 立即执行；未注入
+        tool_registry 时是 no-op。"""
         if self._tool_worker is not None:
             self._tool_worker.notify()
+
+    async def notify_tool_batch_completed(
+        self, scope_key: str, tool_batch_id: str
+    ) -> None:
+        """ToolWorker 在 runtime.tool_batch_completed 落库后调用：批次级唤醒
+        一次（不是每个工具一次——聚合唤醒是效率取舍，与"限制模型"无关）。
+
+        2026-07-02 起没有批次门闩：这里只负责唤醒，不再有解闩/stale 匹配逻辑。
+        批次进行期间的其它 wake 早已随时开拍。
+        """
+        logger.info(
+            "[supervisor] tool batch completed, waking scope={} batch={}",
+            scope_key,
+            tool_batch_id,
+        )
+        await self.wake(scope_key)
 
     async def _ensure(self, scope_key: str) -> AgentLoop:
         async with self._lock:
@@ -183,7 +188,7 @@ def _default_bot_user_id_resolver() -> str | None:
 
     返回 None 时（启动初期，nonebot 还没把 Bot 注册进来）AgentLoop 把
     bot_user_id 保持为 None，prompt 渲染层不输出该属性；此时 LLM 仍可靠别人
-    <reply ... from="我(...)"/> 的自指标签识别"这条是回复我的"——这是降级而非错误。
+    <reply ... from_self="true"/> 的服务端标注识别"这条是回复我的"——这是降级而非错误。
     """
     ids = bot_registry.all_self_ids()
     return ids[0] if ids else None
