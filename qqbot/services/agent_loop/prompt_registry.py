@@ -4,10 +4,10 @@
 ----
 v2 系统里需要往 LLM 的 system prompt 注入的内容会越来越多：
 
-  - 人设（persona.md）
+  - 机器身份（identity.md：决策引擎操作一个 QQ 账号）
   - 决策协议（protocol.md，原 _SYSTEM_PROMPT）
-  - 发言工具 send_message 的用法与可用 segment 文档（send_message.md）
-  - 每个 tool 的用法说明（tools/<name>.md）
+  - 参与规则（group_chat_rules.md：什么时候有理由调 send_message）
+  - 每个 tool 的用法说明（tools/<name>.md；小奏角色卡在 send_message.md 里）
   - 未来还会有 task 模板、风控指南、运行期反射……
 
 把这些散在 llm_planner 里硬拼会越来越乱。PromptRegistry 提供一个最小内核：
@@ -64,9 +64,10 @@ class PromptRegistry:
 
         - name: 唯一标识，调试和单测用；同名再 register 直接覆盖
         - order: 排序键，render 时升序拼接；约定区段：
-            0-99    人设
-            100-199 决策协议
-            200-299 输出动作文档（状态机动作等）
+            0-49    机器身份（identity）
+            50-99   输入格式（xml_format）
+            100-149 参与规则（group_chat_rules）
+            150-299 决策协议（protocol）
             300+    工具用法（每个工具一段，order 内部相对随意）
         - content: 字符串或 () -> str；后者在 render 时才求值
         """

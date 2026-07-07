@@ -4,9 +4,11 @@
 不含 v1 业务）。Prompt 与解析逻辑均按 v2 任务与决策契约从零写。
 
 System prompt 不再硬编码 —— 完全交给 PromptRegistry 组装。默认 registry
-（build_default_prompt_registry）注册五段：persona / xml_format / protocol /
-group_chat_rules / tools usage。需要把人设、协议、动作文档或工具说明独立迭代时
-直接改对应 .md 即可，不需要碰 planner。
+（build_default_prompt_registry）注册五段：identity / xml_format /
+group_chat_rules / protocol / tools usage。人格不再是独立段：决策层（规划、
+任务、工具选择、reasoning）无人格，角色卡随 tools/send_message.md 进
+tools_usage 段——人格只作用于 send_message 的 content 文本。需要迭代协议、
+参与规则或工具说明时直接改对应 .md 即可，不需要碰 planner。
 
 错误兜底：LLM 不可用 / 接口报错 / JSON 不可解析 / schema 不符
 一律 fallback 为单一 IdleAction，并把错误细节塞进 reasoning。
@@ -52,19 +54,19 @@ logger = get_logger(__name__)
 
 
 # 默认 prompt section order 约定（PromptRegistry 文档 §register）：
-#   0   persona            人设
+#   0   identity           机器身份：决策引擎操作一个 QQ 账号（无人格层）
 #   50  xml_format         输入 XML 信封语法与读法
-#   100 group_chat_rules   群聊行为规范（什么时候说话 / 怎么称呼对方）
+#   100 group_chat_rules   参与规则（什么时候有理由调 send_message）
 #   150 protocol           决策协议（任务状态机、JSON 输出规则）
 #   300 tools_usage        每个工具的 sibling .md 汇总（含 send_message 工具）
 #
-# 逻辑递进：你是谁 → 你怎么读输入 → 你在群里该不该开口 → 你怎么决定 →
+# 逻辑递进：你是什么 → 你怎么读输入 → 什么时候需要发言 → 你怎么决定 →
 # 你能调什么工具
 #
-# 旧版的 SECTION_REPLY_USAGE 段（prompts/reply.md）已经移除：发言现在是普通
-# 工具 send_message，其用法文档 tools/send_message.md 自动通过
-# ToolRegistry.usage_docs() 进入 tools_usage 段，与 websearch / search_history 同构。
-SECTION_PERSONA = "persona"
+# 人格（小奏角色卡）不设独立段：它只作用于 send_message 的 content 文本，
+# 所以直接写在 tools/send_message.md 的 Voice 节里，随 tools_usage 按 scope
+# 过滤进 prompt——send_message 限 group/private，system loop 因此天然无人设。
+SECTION_IDENTITY = "identity"
 SECTION_XML_FORMAT = "xml_format"
 SECTION_PROTOCOL = "protocol"
 SECTION_GROUP_CHAT_RULES = "group_chat_rules"
@@ -72,15 +74,14 @@ SECTION_TOOLS_USAGE = "tools_usage"
 
 def build_default_prompt_registry(
     *,
-    persona_text: str | None = None,
     tool_registry: ToolRegistry | None = None,
 ) -> PromptRegistry:
     """v2 默认 system prompt 装配。
 
     各段从对应 .md 文件懒加载，缺失即静默跳过（PromptRegistry render 会
     忽略空 section）。tools_usage 在 render 时才遍历 ToolRegistry，新增 /
-    下架工具立即生效，无需重启 planner。send_message 工具的 sibling .md 也走
-    tools_usage 渲染。
+    下架工具立即生效，无需重启 planner。send_message 工具的 sibling .md（含
+    小奏角色卡）也走 tools_usage 渲染。
     """
     from qqbot.services.agent_loop import prompts as prompts_pkg
     from qqbot.services.agent_loop.prompts import load_sibling_md
@@ -89,18 +90,25 @@ def build_default_prompt_registry(
 
     registry = PromptRegistry()
 
-    if persona_text and persona_text.strip():
-        registry.register(SECTION_PERSONA, 0, persona_text.strip())
-
+    registry.register(
+        SECTION_IDENTITY,
+        0,
+        lambda: load_sibling_md(anchor, "identity.md"),
+    )
     registry.register(
         SECTION_XML_FORMAT,
         50,
         lambda: load_sibling_md(anchor, "xml_format.md"),
     )
+    # 参与规则只对有聊天面的 scope 有意义；system loop（审批请求）不渲染，
+    # 少一段无关噪音。arity-1 callable：PromptRegistry.render(scope=...) 会把
+    # scope 传进来（scope=None 的旧调用不过滤，照常渲染）。
     registry.register(
         SECTION_GROUP_CHAT_RULES,
         100,
-        lambda: load_sibling_md(anchor, "group_chat_rules.md"),
+        lambda scope=None: ""
+        if scope == "system"
+        else load_sibling_md(anchor, "group_chat_rules.md"),
     )
     registry.register(
         SECTION_PROTOCOL,
@@ -125,21 +133,18 @@ class LLMPlanner:
         self,
         llm_client: Any | None = None,
         tool_registry: ToolRegistry | None = None,
-        persona_text: str | None = None,
         prompt_registry: PromptRegistry | None = None,
     ) -> None:
         # 测试场景下可注入一个 stub client（提供 ainvoke(messages) 即可）；
         # 生产场景留 None，首次 decide() 时通过 create_llm() 建好缓存。
         self._llm = llm_client
         self._tool_registry = tool_registry
-        # 人设文本（由 plugin 启动期从 services/agent_loop/prompts/persona.md
-        # 读入）—— 只在 prompt_registry 未注入时用于装配默认 registry。
-        # 装好后通过 registry render 输出，不再单独存。
-        # prompt_registry 优先：调用方明确传入就用它；否则按 persona +
-        # tool_registry 装配默认 registry。
+        # prompt_registry 优先：调用方明确传入就用它；否则按 tool_registry
+        # 装配默认 registry（identity/xml_format/group_chat_rules/protocol/
+        # tools_usage 五段；角色卡在 send_message 的用法文档里）。
         if prompt_registry is None:
             prompt_registry = build_default_prompt_registry(
-                persona_text=persona_text, tool_registry=tool_registry
+                tool_registry=tool_registry
             )
         self._prompt_registry = prompt_registry
         self._init_lock = asyncio.Lock()
@@ -246,7 +251,7 @@ def _build_messages(
     """构造 chat 输入。langchain_core.messages 在 langchain_openai 已是必依赖。
 
     System prompt 完全由 PromptRegistry.render() 输出 —— 默认装配里包含
-    persona / xml_format / protocol / group_chat_rules / tools_usage 五段，
+    identity / xml_format / group_chat_rules / protocol / tools_usage 五段，
     每段在自己的 .md 文件里独立维护。
 
     HumanMessage 的 text block 用 XML 信封而非 JSON 拼装：timeline 里每条
@@ -263,7 +268,7 @@ def _build_messages(
     from langchain_core.messages import HumanMessage, SystemMessage
 
     # 按当前 loop 的 scope 过滤 catalog **与 tools_usage 文档**：allowed_scopes 限定
-    # 的工具（如 respond_to_request 仅 system）既不出现在别的 scope 的 tool-catalog
+    # 的工具（如 ban / respond_to_group_join_request 仅 group）既不出现在别的 scope 的 tool-catalog
     # 里，其用法文档也不进别的 scope 的 system prompt——否则群专用工具的说明会泄漏
     # 到 system loop、system 专用工具的说明会泄漏到群 loop，徒增提示噪音与误判
     # （§2.2；catalog 与 usage 同一把 scope 尺子）。
@@ -292,23 +297,25 @@ def _render_input_xml(
     结构（顺序刻意从静态参考 → 动态状态 → 时间线尾部，让 timeline 紧贴
     LLM 输出位置，吃满 recency bias）：
 
-      <agent-input scope="..." now="..." tick="N">
+      <agent-input scope="..." now="..." tick="N" bot_qq="..." bot_role="...">
         <tool-catalog>
           <tool name="..." description="...">
             <arguments-schema>{json schema 文本}</arguments-schema>
           </tool>
         </tool-catalog>
         <active-tasks>
-          <task id="..." state="..." description="...">
+          <task task_id="..." state="..." description="...">
             <related-tools>tool1,tool2</related-tools>
             <triggered-by event_id="..."/>            (可选)
             <pending-tool-call-ids>tc1,tc2</pending-tool-call-ids>  (有才出)
             <progress-notes>
-              <note at="...">...</note>
+              <note time="...">...</note>
             </progress-notes>
           </task>
         </active-tasks>
-        <last-reasoning at="...">上一拍的 reasoning 原文</last-reasoning>   (有才出)
+        <saved-memes>
+          <meme hash="..." saved_at="...">描述</meme>
+        </saved-memes>                                  (有收藏才出)
         <validation-error>attempt N rejected: ...</validation-error>       (仅校验重试)
         <timeline>
           {item.render \n item.render ...}
@@ -317,16 +324,20 @@ def _render_input_xml(
 
     工具结果只在 <timeline> 的 <tool-call status="complete"> 行呈现一次
     （2026-07-02 删除了 <pending-tool-results> 区——同一调用双重渲染、且无
-    消费切割地每拍重复出现，是模型复读的直接诱饵）。<last-reasoning> 是模型
-    的跨拍自我记忆（最近一条 decision_emitted 的 reasoning）；
-    <validation-error> 只在同 tick 校验重试的调用里出现（契约 §7.1）。
+    消费切割地每拍重复出现，是模型复读的直接诱饵）。模型的跨拍自我记忆
+    2026-07-06 起也在 timeline 内——最近 K 条 decision_emitted 渲染为
+    <my-thought> 行（投影层负责，见 projection.build_timeline；独立的
+    <last-reasoning> 区块已删除）。<validation-error> 只在同 tick 校验重试
+    的调用里出现（契约 §7.1）。
     """
     parts: list[str] = []
-    # bot_user_id 可选：未注入（启动初期 bot_registry 还空、或测试场景）
-    # 时不渲染属性；此时模型仍可靠别人 <reply ... from_self="true"/> 的服务端
-    # 标注识别"这条是回复我的"（from_self 由投影层解析，与 bot_user_id 无关）。
+    # bot_qq 可选（值来自 context.bot_user_id）：未注入（启动初期 bot_registry
+    # 还空、或测试场景）时不渲染属性；此时模型仍可靠别人
+    # <reply ... from_self="true"/> 的服务端标注识别"这条是回复我的"
+    # （from_self 由投影层解析，不依赖本属性）。属性名用 _qq 后缀与
+    # sender_qq / from_qq 同一 ID 空间记法。
     bot_attr = (
-        f' bot_user_id="{_esc_attr(context.bot_user_id)}"'
+        f' bot_qq="{_esc_attr(context.bot_user_id)}"'
         if context.bot_user_id
         else ""
     )
@@ -381,19 +392,21 @@ def _render_input_xml(
         parts.append(_render_task_xml(task))
     parts.append("</active-tasks>")
 
-    # ─── 模型的跨拍自我记忆：上一拍 reasoning 原文（有才渲染）───
-    last_reasoning = getattr(context, "last_reasoning", None)
-    if last_reasoning:
-        last_at = getattr(context, "last_reasoning_at", None)
-        at_attr = (
-            f' at="{_esc_attr(last_at.isoformat(timespec="seconds"))}"'
-            if last_at is not None
-            else ""
-        )
-        parts.append(
-            f"<last-reasoning{at_attr}>"
-            f"{_esc_text(last_reasoning[:800])}</last-reasoning>"
-        )
+    # ─── 表情包收藏夹（有才渲染）：send_meme 凭 hash 精确发送的选图目录。
+    # 空收藏整段省略——不给模型一个空 <saved-memes> 去好奇。───
+    saved_memes = getattr(context, "saved_memes", None) or []
+    if saved_memes:
+        parts.append("<saved-memes>")
+        for meme in saved_memes:
+            saved_attr = _esc_attr(
+                meme.saved_at.isoformat(timespec="seconds")
+            )
+            parts.append(
+                f'<meme hash="{_esc_attr(meme.file_hash)}" '
+                f'saved_at="{saved_attr}">'
+                f"{_esc_text(meme.description)}</meme>"
+            )
+        parts.append("</saved-memes>")
 
     # ─── 同 tick 校验重试反馈（仅重试调用渲染，契约 §7.1）───
     validation_feedback = getattr(context, "validation_feedback", None)
@@ -435,13 +448,15 @@ def _render_task_xml(task: Any) -> str:
         note_parts = ["<progress-notes>"]
         for n in notes:
             note_parts.append(
-                f'<note at="{_esc_attr(n.at.isoformat())}">'
+                f'<note time="{_esc_attr(n.at.isoformat())}">'
                 f"{_esc_text(n.note)}</note>"
             )
         note_parts.append("</progress-notes>")
         inner.append("".join(note_parts))
+    # task_id= 而非裸 id=：与动作 JSON 里要回填的字段名（complete_task /
+    # call_tool 的 "task_id"）同名直抄，且与 message_id / event_id 空间区分。
     return (
-        f'<task id="{_esc_attr(task.task_id)}" '
+        f'<task task_id="{_esc_attr(task.task_id)}" '
         f'state="{_esc_attr(task.state)}" '
         f'description="{_esc_attr(task.description)}">'
         f"{''.join(inner)}</task>"
@@ -503,7 +518,7 @@ def _log_request(context: DecisionContext, messages: list[Any]) -> None:
 
     布局优先可读：用换行 + 分隔条把 system / user / response 三段切开，
     避免一行 5KB+ 撑爆 terminal。system prompt 只打首尾几行 + 长度，
-    因为它基本静态（persona + protocol + group_chat_rules + tools usage）；
+    因为它基本静态（identity + protocol + group_chat_rules + tools usage）；
     user 段（XML 信封）是 tick 之间真正变化的东西，原样全打。
     """
     # messages = [SystemMessage, HumanMessage]

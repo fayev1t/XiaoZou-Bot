@@ -24,7 +24,7 @@ Schedules a wake-up for yourself after `seconds` seconds. Use it whenever the ri
 ## What happens
 
 1. The call returns immediately with `{"scheduled": true, "wake_at": ...}` — the confirmation tick right after may show this completed call; that alone is **not** a reason to speak or act.
-2. When the timer fires, you get a new tick whose timeline ends with `<system-hint kind="wait_elapsed">{"seconds": N, "wake_at": "...", "note": "your memo"}</system-hint>`. Read your note and do what it says (or idle, if the situation resolved itself meanwhile — check the timeline first).
+2. When the timer fires, you get a new tick whose timeline ends with `<system-hint kind="wait_elapsed" time="...">{"seconds": N, "wake_at": "...", "note": "your memo"}</system-hint>`. Read your note and do what it says (or idle, if the situation resolved itself meanwhile — check the timeline first).
 
 ## Caveat — timers do not survive restarts
 

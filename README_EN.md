@@ -1,7 +1,3 @@
-[简体中文](README.md) | [English](README_EN.md)
-
-***
-
 <div align="center">
 
 # 🌟 XiaoZou-Bot (XiaoZou)
@@ -16,6 +12,10 @@
 ![VLM](https://img.shields.io/badge/LLM-VLM%20native-purple?style=flat-square)
 
 </div>
+
+<p align="center">
+  [简体中文](README.md) | [English](README_EN.md)
+</p>
 
 ## 🤖 Who is she?
 
@@ -43,7 +43,7 @@ v2.0 is a complete rewrite based on the ideas of AGENT LOOP/HARNESS. The core ch
 | **Task Concept** | None; each message processed independently | Explicit `active_tasks` state machine (pending → running → done/failed), persisting across ticks |
 | **Images** | Invoke "image tool" then ask secondary question | VLM native multimodality: image bytes sent directly as image_url blocks along with HumanMessage, de-duplicated by hash |
 | **Reply Segments** | Text only | Full OneBot V11 segments: text / at / at-all / reply quote reply / face emoji, taught to the LLM via prompts |
-| **System Prompt** | Hardcoded strings | `PromptRegistry` assembled from multiple sections: persona / protocol / reply_usage / tools_usage, with each section in an independent `.md` file |
+| **System Prompt** | Hardcoded strings | `PromptRegistry` assembled from multiple sections: identity / xml_format / group_chat_rules / protocol / tools_usage, with each section in an independent `.md` file |
 | **Tools** | Hardcoded registration | `Tool` Protocol + sibling `.md` usage instructions; adding new tools does not touch the planner |
 | **Isolation** | Voluntary separation between groups in business code | Enforced scope isolation (`group:<id>` / `private:<id>` / `system`); LLM cannot fetch data across scopes |
 
@@ -123,7 +123,7 @@ pip install -r requirements.txt
 python -m qqbot
 ```
 - **Connect NapCat**: Add a WebSocket client on the Web Panel pointing to `ws://<bot-host>:7500/onebot/v11/ws`.
-- **Customize Persona**: Edit `qqbot/services/agent_loop/prompts/persona.md` (reboot the process to take effect after modifications).
+- **Customize Persona**: Edit the Voice section of `qqbot/services/agent_loop/tools/send_message.md` (the character card only shapes outgoing message text; reboot the process to take effect).
 
 ## 🍓 Community Group
 

@@ -20,7 +20,7 @@ This rewrites how another person is shown to the whole group, so treat it as a s
 }
 ```
 
-- `user_id` (required, int) — the QQ number of the member whose card to set. Read it from a `<message sender_id="USER_ID">` row in the timeline, or from an inline `<at user="USER_ID"/>` segment. Don't invent ids.
+- `user_id` (required, int) — the QQ number of the member whose card to set. Read it from a `<message sender_qq="USER_QQ">` row in the timeline, or from an inline `<at qq="USER_QQ"/>` segment. Don't invent ids.
 - `card` (optional, string, default `""`) — the new display name. An **empty string clears** the card (the member falls back to their QQ nickname). Keep it civil and within QQ's length limits; an over-long card may be rejected by napcat.
 
 The target group is **always the current one** — `group_id` is taken from your scope automatically; you cannot edit cards in another group and there is no `group_id` argument.

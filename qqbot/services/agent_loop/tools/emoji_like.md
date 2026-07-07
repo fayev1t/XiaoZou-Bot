@@ -19,7 +19,7 @@ This is a light, friendly way to acknowledge a message without sending a full re
 }
 ```
 
-- `message_id` (required, int) — the `onebot_message_id` of the target message. Read it from the `id` attribute of a `<message ... id="MESSAGE_ID">` row in the timeline (that `id` **is** the `onebot_message_id`). Don't invent ids.
+- `message_id` (required, int) — the `onebot_message_id` of the target message. Read it from the `message_id` attribute of a `<message ... message_id="MESSAGE_ID">` row in the timeline (same field name as this argument — copy it verbatim). Don't invent ids.
 - `emoji_id` (required, number or string) — the QQ emoji / face id to react with.
 - `set` (optional, bool, default `true`) — `true` adds the reaction; `false` removes a reaction you previously added.
 

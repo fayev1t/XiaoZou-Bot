@@ -17,7 +17,7 @@ This is a **read-only** lookup. Use it when you need the public profile of a QQ 
 }
 ```
 
-- `user_id` (required, int) — the QQ number of the user to look up. Read it from a `<message sender_id="USER_ID">` row, an inline `<at user="USER_ID"/>` segment, or wherever the number was given. Don't invent ids.
+- `user_id` (required, int) — the QQ number of the user to look up. Read it from a `<message sender_qq="USER_QQ">` row, an inline `<at qq="USER_QQ"/>` segment, or wherever the number was given. Don't invent ids.
 
 Unlike the group lookups, there is **no group scope** here — this tool does not take or use a `group_id` and can run in any scope.
 

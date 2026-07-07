@@ -76,18 +76,43 @@ class V2MainPluginContractTests(unittest.TestCase):
         self.assertIn("except Exception", self.plugin_text)
         self.assertIn("swallowed", self.plugin_text)
 
-    def test_plugin_loads_persona_into_llm_planner(self) -> None:
-        # persona.md 与其他 prompt 段共置于 services/agent_loop/prompts/
+    def test_plugin_has_no_persona_plumbing(self) -> None:
+        # 2026-07-02 起决策层无人格：prompts/persona.md 删除，角色卡并入
+        # tools/send_message.md（Voice 节），随 tools_usage 段按 scope 进
+        # prompt；v2_main 的 persona 读取/注入链路一并移除。
         persona_path = (
             ROOT / "qqbot" / "services" / "agent_loop" / "prompts" / "persona.md"
         )
-        self.assertTrue(persona_path.exists())
-        persona_text = persona_path.read_text(encoding="utf-8").strip()
-        self.assertTrue(len(persona_text) > 0)
-        # v2_main 必须读取 persona.md 并注入 LLMPlanner
-        self.assertIn("persona.md", self.plugin_text)
-        self.assertIn("_load_persona_text", self.plugin_text)
-        self.assertIn("persona_text=persona_text", self.plugin_text)
+        self.assertFalse(persona_path.exists())
+        self.assertNotIn("persona", self.plugin_text)
+        # 机器身份段（identity.md）与角色卡的新居所必须存在且非空
+        prompts_dir = ROOT / "qqbot" / "services" / "agent_loop" / "prompts"
+        identity_text = (prompts_dir / "identity.md").read_text(encoding="utf-8")
+        self.assertIn("decision engine", identity_text)
+        send_message_md = (
+            ROOT
+            / "qqbot"
+            / "services"
+            / "agent_loop"
+            / "tools"
+            / "send_message.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("小奏", send_message_md)
+        self.assertIn("那个特殊的人", send_message_md)
+
+    def test_request_handler_wires_auto_approval(self) -> None:
+        # 2026-07-03 拆分：request handler 在 ingest 返回后调自动审批（好友申请 /
+        # 邀请入群不走 LLM，见事件系统设计.md §10.2）。_ingest_event 须把
+        # IngestResult 传出来供其判断 inserted / 事件类型。
+        self.assertIn(
+            "from qqbot.services.request_auto_approval import maybe_auto_approve",
+            self.plugin_text,
+        )
+        self.assertIn(
+            "await maybe_auto_approve(bot, result, AsyncSessionLocal)",
+            self.plugin_text,
+        )
+        self.assertIn("result = await _ingest_event(event)", self.plugin_text)
 
     def test_plugin_starts_and_stops_supervisor(self) -> None:
         self.assertIn("@_driver.on_startup", self.plugin_text)

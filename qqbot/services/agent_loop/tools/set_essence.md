@@ -18,7 +18,7 @@ Group essence is a curated, group-wide highlight list — pinning something ther
 }
 ```
 
-- `message_id` (required, int) — the `onebot_message_id` of the target message. Read it from the `id` attribute of a `<message ... id="MESSAGE_ID">` row in the timeline (that `id` **is** the `onebot_message_id`). Don't invent ids.
+- `message_id` (required, int) — the `onebot_message_id` of the target message. Read it from the `message_id` attribute of a `<message ... message_id="MESSAGE_ID">` row in the timeline (same field name as this argument — copy it verbatim). Don't invent ids.
 - `action` (optional, string, default `"set"`) — `"set"` adds the message to the group essence list; `"delete"` removes it from the list.
 
 The target message is located by `message_id` alone — there is **no** `group_id` argument. The tool still confirms you are acting inside the current group's scope, but napcat needs only the message id.

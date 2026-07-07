@@ -110,6 +110,13 @@ class Projector:
     # 老笔记换 token 不划算。
     MAX_PROGRESS_NOTES_PER_TASK = 5
 
+    # ─── 思考轨迹内联（2026-07-06，待办清单#4）───
+    # timeline 渲染的 <my-thought> 行数上限与单条截断长度。每拍（含 idle）
+    # 都写 agent.decision_emitted，全量渲染会淹掉真实对话；只保留最近 K 条、
+    # 单条截断，且不挤占消息行预算（见 project() 的裁剪逻辑）。
+    MAX_THOUGHT_ROWS = 10
+    MAX_THOUGHT_CHARS = 300
+
     def __init__(
         self,
         session_factory: SessionFactory,
@@ -159,7 +166,11 @@ class Projector:
         # running 但已不在窗口内"的任务补回来。窗口内折出的任务优先（更新、带
         # 在途 tool_call_ids），表只填补缺口。读模型不可用时整段降级（仍返回
         # 窗口折叠结果），绝不让 tick 因补全失败而崩。
-        return await self._augment_with_persisted_tasks(ctx, scope_key)
+        ctx = await self._augment_with_persisted_tasks(ctx, scope_key)
+        # 表情包收藏夹注入：查 agent_memes 挂到 ctx.saved_memes，llm_planner
+        # 渲染成 <saved-memes>（send_meme 凭 hash 发送的选图目录）。同样
+        # best-effort 降级——查不到收藏夹只影响本 tick 发不了表情包。
+        return await self._augment_with_saved_memes(ctx, scope_key)
 
     async def _augment_with_persisted_tasks(
         self, ctx: DecisionContext, scope_key: str
@@ -181,6 +192,37 @@ class Projector:
         from dataclasses import replace
 
         return replace(ctx, active_tasks=merged)
+
+    async def _augment_with_saved_memes(
+        self, ctx: DecisionContext, scope_key: str
+    ) -> DecisionContext:
+        """收藏夹注入：全局 agent_memes → ctx.saved_memes。
+
+        收藏夹全 bot 一份、所有聊天 scope 共用（隔离契约 §9.2 第 6 条例外，
+        见 meme_store 模块 docstring），查询不带 scope 过滤；scope_key 只用来
+        判断"有没有聊天面"——system scope 没有（save_meme / send_meme 的
+        allowed_scopes 也不含它），跳过查询省一次 SQL。查询失败整段降级
+        （本 tick 不渲染 <saved-memes>，模型只是暂时"想不起收藏"），绝不让
+        tick 崩。
+        """
+        if not scope_key.startswith(("group:", "private:")):
+            return ctx
+        try:
+            from qqbot.services.agent_loop.meme_store import load_saved_memes
+
+            memes = await load_saved_memes(self._session_factory)
+        except Exception as exc:  # 读表失败 → 降级为无收藏夹
+            logger.warning(
+                "[projection] load saved memes failed for {}: {}",
+                scope_key,
+                exc,
+            )
+            return ctx
+        if not memes:
+            return ctx
+        from dataclasses import replace
+
+        return replace(ctx, saved_memes=memes)
 
     @staticmethod
     def merge_active_tasks(
@@ -279,11 +321,24 @@ class Projector:
         # tool_views 只喂给 timeline 渲染（<tool-call> 行按两态折叠）；不再
         # 另出 pending_tool_results 区——同一调用双重渲染曾是复读的直接诱饵。
         tool_views = Projector.fold_tool_results(events)
-        timeline = Projector.build_timeline(events, tool_views=tool_views)
+        timeline = Projector.build_timeline(
+            events,
+            tool_views=tool_views,
+            unseen_message_ids=Projector.fold_unseen_message_ids(events),
+        )
         # 裁到尾部 max_timeline_items 条 —— fetch 上限给得宽是为了 fold 任务/
         # 工具结果时能看到足够长的事件链，但塞给 LLM 的不必那么多。
-        if max_timeline_items is not None and len(timeline) > max_timeline_items:
-            timeline = timeline[-max_timeline_items:]
+        # <my-thought> 行不占消息行预算（待办清单#4"不挤占"约定）：从尾部
+        # 数满 max 条**非思考行**为止，区间内的思考行顺带保留——它们本身已被
+        # MAX_THOUGHT_ROWS 封顶，不会失控。无思考行时与旧 [-max:] 完全等价。
+        if max_timeline_items is not None:
+            non_thought = 0
+            for i in range(len(timeline) - 1, -1, -1):
+                if timeline[i].kind != "my_thought":
+                    non_thought += 1
+                    if non_thought >= max_timeline_items:
+                        timeline = timeline[i:]
+                        break
         # 如果 caller 没单独传 bot_role（pure project() 测试常常如此），尝试从
         # 事件列表里 fold 一次——支持纯函数测试不需要 DB 也能验证 fold 逻辑。
         if bot_role is None:
@@ -297,7 +352,6 @@ class Projector:
             low = bot_role.strip().lower()
             if low in ("owner", "admin", "member"):
                 normalized_role = low
-        last_reasoning, last_reasoning_at = Projector.fold_last_reasoning(events)
         return DecisionContext(
             scope_key=scope_key,
             correlation_id=correlation_id,
@@ -305,30 +359,40 @@ class Projector:
             now=now,
             timeline=timeline,
             active_tasks=active_tasks,
-            last_reasoning=last_reasoning,
-            last_reasoning_at=last_reasoning_at,
             bot_user_id=bot_user_id,
             bot_role=normalized_role,  # type: ignore[arg-type]
         )
 
     @staticmethod
-    def fold_last_reasoning(
+    def fold_unseen_message_ids(
         events: Sequence[_EventSnapshot],
-    ) -> tuple[str | None, Any]:
-        """取窗口内最近一条 agent.decision_emitted 的 reasoning（+时间）。
+    ) -> frozenset[str]:
+        """第一拍判定（2026-07-06，待办清单#1 群聊拆句观望）：找出"还没有
+        任何一拍决策看过"的新外部消息。
 
-        模型的跨拍自我记忆（2026-07-02）：decision/idle 事件仍不逐条进
-        timeline（每拍一条会淹掉真实对话），但**最近一拍**的 reasoning 折叠
-        出来渲染成 <last-reasoning>——模型不再每拍失忆。reasoning 为空串 /
-        缺失的决策跳过，继续向前找。
+        每条消息入库即 wake(scope)，第一拍常在对方话说到一半时开拍。这里以
+        窗口内**最后一条** agent.decision_emitted 为水位线：其后到达的
+        external.message.* 即"未见过"，渲染时标 `unseen="true"`（见
+        _render_message），把"这拍是这些消息的第一拍"变成结构性事实——
+        不靠模型比对 <last-reasoning time=> 自行推断。窗口内从没有过决策时
+        全部消息算未见过（该 scope 真正意义上的第一拍）。政策侧（半句先
+        wait 观望、不叠加闹钟、醒来无新 unseen 即作答）见
+        group_chat_rules.md §半句话先等等。
+
+        planner 抛异常的残拍不写 decision_emitted（loop._tick 直接收尾），
+        不推进水位线——那一拍确实没"看到"消息，语义自洽。bot 自己的发言
+        不会误触发：send_message 走 agent.tool_called，不产生
+        external.message 事件（napcat 的 message_sent 自身消息上报未开启，
+        见 event_ingest/mappers/group_message.py 模块注释）。notice /
+        request / runtime hint 亦不参与——观望语义只对"人还在说话"成立。
         """
-        for ev in reversed(events):
-            if ev.type != "agent.decision_emitted":
-                continue
-            reasoning = (ev.payload or {}).get("reasoning")
-            if isinstance(reasoning, str) and reasoning.strip():
-                return reasoning.strip(), ev.occurred_at
-        return None, None
+        unseen: list[str] = []
+        for ev in events:
+            if ev.type == "agent.decision_emitted":
+                unseen.clear()
+            elif ev.type.startswith("external.message."):
+                unseen.append(ev.event_id)
+        return frozenset(unseen)
 
     @staticmethod
     def fold_bot_role(
@@ -472,6 +536,7 @@ class Projector:
         events: Sequence[_EventSnapshot],
         *,
         tool_views: Sequence[ToolResultView],
+        unseen_message_ids: frozenset[str] | set[str] = frozenset(),
     ) -> list[TimelineItem]:
         tool_view_by_id = {tv.tool_call_id: tv for tv in tool_views}
         # 预扫一遍构建 reply 段引用所需的索引（被回复消息摘要 + 用户名映射），
@@ -479,11 +544,27 @@ class Projector:
         excerpt_by_msg_id = _build_excerpt_index(events)
         name_by_user_id = _build_user_name_index(events)
         # author_by_msg_id：被回复消息的作者（_AuthorRef）。reply 段渲染时据此
-        # 标 from_name/from_id/from_self 三个独立属性，让 LLM 一眼看清"是 B 在
+        # 标 from_name/from_qq/from_self 三个独立属性，让 LLM 一眼看清"是 B 在
         # 引用某人"而不是"某人在发言"——这是 addressee 误判（把别人引用你当成
         # 你说话）的根因修复。覆盖外部消息 + bot 自己已投递的发言（后者标
-        # from_self="true"，无需比对 bot_user_id 即知"别人引用的是你自己"）。
+        # from_self="true"，无需比对 bot_qq 即知"别人引用的是你自己"）。
         author_by_msg_id = _build_author_index(events)
+
+        # ─── 思考轨迹内联（2026-07-06，待办清单#4）───
+        # 预扫出要渲染成 <my-thought> 行的决策事件：只保留最近
+        # MAX_THOUGHT_ROWS 条、reasoning 非空白的（idle 拍照样渲染——它也
+        # 推 unseen 水位线，跳过会造成"消息在最后一行可见思考之后却没标
+        # unseen"的表面矛盾；空白 reasoning 没有内容可看，跳过）。更早的
+        # 决策不渲染：思考是辅助记忆，K 之外的旧念头换 token 不划算。
+        thought_ids: set[str] = set()
+        for ev in reversed(events):
+            if len(thought_ids) >= Projector.MAX_THOUGHT_ROWS:
+                break
+            if ev.type != "agent.decision_emitted":
+                continue
+            reasoning = (ev.payload or {}).get("reasoning")
+            if isinstance(reasoning, str) and reasoning.strip():
+                thought_ids.add(ev.event_id)
 
         items: list[TimelineItem] = []
         for ev in events:
@@ -509,20 +590,34 @@ class Projector:
             if ev.type in ("agent.tool_result", "agent.tool_failed"):
                 # rendered alongside the matching tool_called row
                 continue
+            if ev.type == "agent.decision_emitted":
+                # 思考轨迹内联（待办清单#4）：最近 K 条渲染 <my-thought> 行
+                # ——模型跨拍看得到自己一路在想什么，链条强度不再取决于
+                # 单拍深的 <last-reasoning>（该独立区块已随本行删除，防最新
+                # 一条双重渲染）。K 之外 / 空白 reasoning 的决策仍消隐。
+                if ev.event_id in thought_ids:
+                    items.append(
+                        TimelineItem(
+                            event_id=ev.event_id,
+                            occurred_at=ev.occurred_at,
+                            kind="my_thought",
+                            render=Projector._render_my_thought(ev),
+                        )
+                    )
+                continue
             if ev.type in (
                 "agent.reply_emitted",
                 "agent.reply_delivered",
                 "agent.reply_failed",
                 "agent.idle_decision",
-                "agent.decision_emitted",
             ):
                 # 发言现已**同步**：发送结果直接体现在 send_message 工具的
                 # <tool-call>（complete + <result> 带 message_id / complete +
                 # <error> 带原因，由 _render_tool_call 渲染），不再有独立的
                 # reply_emitted/delivered/
                 # failed 事件。这里保留对历史遗留事件的 skip（迁移期旧库可能还有
-                # 这三类），新代码不再产生它们。decision/idle 同为运营事件，不进
-                # prompt 以免膨胀。
+                # 这三类），新代码不再产生它们。idle_decision 是纯运营事件（当拍
+                # 的 reasoning 已在 decision_emitted 上渲染 <my-thought>），仍消隐。
                 continue
 
             if ev.type == "agent.tool_called":
@@ -539,7 +634,11 @@ class Projector:
                 )
             elif ev.type.startswith("external.message."):
                 render, images = Projector._render_message(
-                    ev, excerpt_by_msg_id, name_by_user_id, author_by_msg_id
+                    ev,
+                    excerpt_by_msg_id,
+                    name_by_user_id,
+                    author_by_msg_id,
+                    unseen=ev.event_id in unseen_message_ids,
                 )
                 items.append(
                     TimelineItem(
@@ -588,6 +687,8 @@ class Projector:
         excerpt_by_msg_id: dict[str, str],
         name_by_user_id: dict[str, str],
         author_by_msg_id: "dict[str, _AuthorRef] | None" = None,
+        *,
+        unseen: bool = False,
     ) -> tuple[str, list[ImageRef]]:
         sender = ev.payload.get("sender") or {}
         name = sender.get("card") or sender.get("nickname")
@@ -616,14 +717,15 @@ class Projector:
             if raw:
                 body = _esc_text(str(raw))
 
-        # sender_name / sender_id 是两个独立属性——不再拼 "昵称(QQ)" 复合串，
-        # 模型无需拆括号即可拿到 @人 / 工具 user_id 参数要用的号。缺哪个省
-        # 哪个（=未知），不造 "?" 占位。
+        # sender_name / sender_qq 是两个独立属性——不再拼 "昵称(QQ)" 复合串，
+        # 模型无需拆括号即可拿到 @人 / 工具 user_id 参数要用的号。_qq 后缀
+        # 显式标注 ID 空间（QQ 号），与 message_id / event_id 一眼可分。缺哪个
+        # 省哪个（=未知），不造 "?" 占位。
         attrs = []
         if name:
             attrs.append(f'sender_name="{_esc_attr(str(name))}"')
         if qq is not None:
-            attrs.append(f'sender_id="{_esc_attr(str(qq))}"')
+            attrs.append(f'sender_qq="{_esc_attr(str(qq))}"')
         # sender_role：发送者在本群的角色。只在 owner/admin 时渲染——napcat 的
         # sender.role 三值 owner/admin/member，member 是绝大多数，逐条渲染纯耗
         # token；缺省语义（普通成员或未知）在 xml_format.md 里写死，无歧义。
@@ -637,9 +739,19 @@ class Projector:
             attrs.append(f'sender_title="{_esc_attr(title)}"')
         if anonymous:
             attrs.append('anonymous="true"')
-        attrs.append(f'at="{time_str}"')
+        # time= 而非 at=：时间戳属性名与 <at>（@人）标签撞词是模型混淆源，
+        # 全 timeline 统一用 time=。
+        attrs.append(f'time="{time_str}"')
+        # message_id= 而非裸 id=：显式标注这是 OneBot 消息 ID 空间（引用 /
+        # recall / set_essence 等工具参数同名直抄），与 task_id / event_id 区分。
         if msg_id:
-            attrs.append(f'id="{_esc_attr(str(msg_id))}"')
+            attrs.append(f'message_id="{_esc_attr(str(msg_id))}"')
+        # unseen="true"：该消息在最后一条 agent.decision_emitted 之后到达，
+        # 还没有任何一拍处理过（fold_unseen_message_ids）。缺失 = 已经历过
+        # 至少一拍。属性总语义"缺失=默认"的又一实例；政策见
+        # group_chat_rules.md §半句话先等等。
+        if unseen:
+            attrs.append('unseen="true"')
         return f"<message {' '.join(attrs)}>{body}</message>", images
 
     @staticmethod
@@ -649,9 +761,9 @@ class Projector:
     ) -> str:
         """渲染 ``<notice/>``。属性语义（缺失一律表示"未知/不适用"）：
 
-        - ``user``   事件的当事人 QQ（谁入群/被禁言/被戳/名片被改/消息被回应）
-        - ``operator`` 执行动作的人 QQ（禁言的管理员、撤回的人）
-        - ``target`` 动作的承受方 QQ（poke 里被戳的人）
+        - ``user_qq``   事件的当事人 QQ（谁入群/被禁言/被戳/名片被改/消息被回应）
+        - ``operator_qq`` 执行动作的人 QQ（禁言的管理员、撤回的人）
+        - ``target_qq`` 动作的承受方 QQ（poke 里被戳的人）
         - ``user_name`` / ``operator_name`` / ``target_name``：上述 QQ 在近期
           消息里出现过时反查到的名字——mapper 只存了裸 QQ 号，不给名字的话
           LLM 得自己翻 timeline 对号入座，经常对错。
@@ -667,31 +779,33 @@ class Projector:
         if sub:
             attrs.append(f'sub_type="{_esc_attr(str(sub))}"')
         if ev.user_id is not None:
-            attrs.append(f'user="{ev.user_id}"')
+            attrs.append(f'user_qq="{ev.user_id}"')
             _append_name_attr(attrs, "user_name", ev.user_id, names)
         op = ev.payload.get("operator_id")
         if op:
-            attrs.append(f'operator="{op}"')
+            attrs.append(f'operator_qq="{op}"')
             _append_name_attr(attrs, "operator_name", op, names)
         target = ev.payload.get("target_id")
         if target:
-            attrs.append(f'target="{target}"')
+            attrs.append(f'target_qq="{target}"')
             _append_name_attr(attrs, "target_name", target, names)
         attrs.extend(_notice_detail_attrs(kind, ev.payload))
-        attrs.append(f'at="{ev.occurred_at.isoformat(timespec="seconds")}"')
+        attrs.append(f'time="{ev.occurred_at.isoformat(timespec="seconds")}"')
         return f"<notice {' '.join(attrs)}/>"
 
     @staticmethod
     def _render_request(ev: _EventSnapshot) -> str:
-        """渲染 external.request.*（加好友 / 加群申请 / 邀请入群）。
+        """渲染 external.request.*。
 
-        只有 SystemAgentLoop 会拿到这类事件，据此决定同意 / 拒绝 / 忽略，
-        并调 respond_to_request 工具回执 napcat（事件系统设计.md §10.2）。
+        2026-07-03 拆分后实际会渲染的只有入群申请（``external.request.group.add``，
+        scope=group 进目标群 timeline）：群内 LLM 看到后可提醒，管理员明确授权后
+        调 respond_to_group_join_request 回执 napcat（事件系统设计.md §10.2）。
+        好友申请 / 邀请入群是 runtime_only（自动审批），永远不会走到这里；渲染
+        逻辑仍按 type 前缀泛化，不对 kind 特判。
 
-        关键：渲染必须带 event_id —— LLM 调 respond_to_request 时回填它，
-        工具用 event_id 反查事件 payload 里的 flag，这样 napcat 的 flag
-        凭证不经过 LLM 复述，避免长串照抄出错。kind 取 friend / group.add /
-        group.invite；comment 是申请人填的验证留言（决策的主要依据）。
+        关键：渲染必须带 event_id —— LLM 调工具时回填它，工具用 event_id 反查
+        事件 payload 里的 flag，这样 napcat 的 flag 凭证不经过 LLM 复述，避免
+        长串照抄出错。comment 是申请人填的验证留言（提醒/决策的主要依据）。
         """
         kind = ev.type.replace("external.request.", "")
         attrs = [
@@ -699,14 +813,14 @@ class Projector:
             f'event_id="{_esc_attr(str(ev.event_id))}"',
         ]
         if ev.user_id is not None:
-            attrs.append(f'user="{ev.user_id}"')
+            attrs.append(f'user_qq="{ev.user_id}"')
         group_id = ev.payload.get("group_id")
         if group_id:
-            attrs.append(f'group="{group_id}"')
+            attrs.append(f'group_id="{group_id}"')
         comment = ev.payload.get("comment")
         if comment:
             attrs.append(f'comment="{_esc_attr(str(comment))}"')
-        attrs.append(f'at="{ev.occurred_at.isoformat(timespec="seconds")}"')
+        attrs.append(f'time="{ev.occurred_at.isoformat(timespec="seconds")}"')
         return f"<request {' '.join(attrs)}/>"
 
     @staticmethod
@@ -715,7 +829,11 @@ class Projector:
     ) -> str:
         """两态渲染：processing → <processing/>；complete → <result>（成功，
         error_kind 为 None）或 <error>（失败）。status 属性只回答"结束没有"，
-        成败让 LLM 看子元素——与 ToolResultView 的两态语义一致。"""
+        成败让 LLM 看子元素——与 ToolResultView 的两态语义一致。
+
+        time= 是**发起时刻**（tool_called 事件时间）。它曾是全 timeline 唯一
+        没有时间戳的行类型——偏偏 bot 自己的发言（send_message）就渲染在这里，
+        模型判断"我多久前刚说过话"只能靠行序猜，补上让远近判断有锚。"""
         name = str(ev.payload.get("tool_name", "?"))
         args = ev.payload.get("arguments", {})
         args_json = _safe_json(args)
@@ -735,8 +853,10 @@ class Projector:
                 tv.error_kind, tv.error_message, tv.error_extra
             )
             status = "complete"
+        time_str = ev.occurred_at.isoformat(timespec="seconds")
         return (
-            f'<tool-call name="{_esc_attr(name)}" status="{status}">'
+            f'<tool-call name="{_esc_attr(name)}" status="{status}" '
+            f'time="{_esc_attr(time_str)}">'
             f"<args>{_esc_text(args_json)}</args>{inner}</tool-call>"
         )
 
@@ -755,11 +875,29 @@ class Projector:
         body = ""
         if isinstance(reason, str) and reason.strip():
             body = _esc_text(reason.strip()[:600])
-        at = ev.occurred_at.isoformat(timespec="seconds")
+        time_str = ev.occurred_at.isoformat(timespec="seconds")
         return (
-            f'<task-closed id="{_esc_attr(task_id)}" '
-            f'outcome="{_esc_attr(outcome)}" at="{_esc_attr(at)}">'
+            f'<task-closed task_id="{_esc_attr(task_id)}" '
+            f'outcome="{_esc_attr(outcome)}" time="{_esc_attr(time_str)}">'
             f"{body}</task-closed>"
+        )
+
+    @staticmethod
+    def _render_my_thought(ev: _EventSnapshot) -> str:
+        """agent.decision_emitted → <my-thought> 行（思考轨迹内联，待办清单#4）。
+
+        正文是模型当拍的 reasoning 原文，截 MAX_THOUGHT_CHARS 字防长独白
+        挤占窗口。它是记忆不是指令——配套硬规则（念头≠动作：念头后没有对应
+        tool-call 即那件事没发生；旧思考里的草稿措辞不得直接当消息发出）在
+        protocol.md §Reasoning 与 xml_format.md §<my-thought>。
+        """
+        reasoning = str((ev.payload or {}).get("reasoning") or "").strip()
+        if len(reasoning) > Projector.MAX_THOUGHT_CHARS:
+            reasoning = reasoning[: Projector.MAX_THOUGHT_CHARS] + "…"
+        time_str = ev.occurred_at.isoformat(timespec="seconds")
+        return (
+            f'<my-thought time="{_esc_attr(time_str)}">'
+            f"{_esc_text(reasoning)}</my-thought>"
         )
 
     @staticmethod
@@ -777,8 +915,10 @@ class Projector:
                 if k in ("tool_count", "tool_batch_size") and v is not None
             }
         payload_json = _safe_json(payload)
+        time_str = ev.occurred_at.isoformat(timespec="seconds")
         return (
-            f'<system-hint kind="{_esc_attr(kind)}">'
+            f'<system-hint kind="{_esc_attr(kind)}" '
+            f'time="{_esc_attr(time_str)}">'
             f"{_esc_text(payload_json)}</system-hint>"
         )
 
@@ -893,10 +1033,11 @@ def _render_segments(
     支持的段类型 → 标签（属性一律"缺失=未知/不适用"，语义与 xml_format.md
     §Inline segments 一一对应，两处必须同步改）：
       text     → 原文（XML escape）
-      at       → <at user="..." name="..."/> 或 <at-all/>
-      reply    → <reply to="msg_id" from_name="昵称" from_id="QQ"
+      at       → <at qq="..." name="..."/> 或 <at-all/>（qq= 与出站段
+                 data.qq 同名同值，模型可直抄）
+      reply    → <reply to_message_id="..." from_name="昵称" from_qq="QQ"
                         from_self="true" excerpt="..."/>
-                 （作者三属性各自独立、缺哪个省哪个：from_name/from_id 标注
+                 （作者三属性各自独立、缺哪个省哪个：from_name/from_qq 标注
                   被引用消息的作者，author_by_msg_id 命中时；from_self 仅在
                   被引消息是 bot 自己发的时渲染 "true"；excerpt= 在 timeline
                   内可查时）
@@ -906,7 +1047,7 @@ def _render_segments(
                  表情——napcat 接收侧 mface 一律折成 image 段到达）；判断
                  不出则不渲染该属性。summary：QQ 的外显文案（如 "[动画表情]"
                  或商城表情名 "[赞]"），下载失败时它是唯一语义兜底。
-      face     → <face id="N" name="[微笑]"/>（QQ 原生黄豆表情；name 取
+      face     → <face face_id="N" name="[微笑]"/>（QQ 原生黄豆表情；name 取
                  napcat data.raw.faceText，LLM 背不出表情 id 表，没名字
                  的 face id 是纯噪声）
       mface    → <mface summary="[赞]"/>（兼容非 napcat 的 OneBot 实现；
@@ -916,20 +1057,20 @@ def _render_segments(
       file     → <file name="..." size_bytes="..." file_id="..."/>
                  （size_bytes 单位字节；file_id 是 napcat 文件凭证，供
                   未来的文件下载类工具回填）
-      poke     → <poke target="qq"/>（napcat 群内拍一拍段不带目标 → <poke/>）
+      poke     → <poke target_qq="..."/>（napcat 群内拍一拍段不带目标 → <poke/>）
       dice     → <dice value="N"/>   (掷骰子结果 1-6)
       rps      → <rps value="N"/>    (猜拳 1=石头 2=剪刀 3=布)
       markdown → <markdown>正文</markdown>（napcat 给了 data.content，官方
                  机器人消息常见；超 _MAX_MARKDOWN_CHARS 截断加 "…"）
-      forward  → <forward id="..."/>
+      forward  → <forward forward_id="..."/>
       json     → ark 卡片，走 _render_card_segment 解析出
                  <card app/summary/title/desc/url>；B 站分享、小程序、公众号
                  文章等在 napcat 全部以 json 段到达，解析不出任何字段才回退
-                 <card type="json"/>
-      share    → <card type="share" title="..." desc="..." url="..."/>
+                 <card format="json"/>
+      share    → <card format="share" title="..." desc="..." url="..."/>
                  （OneBot 标准段；napcat 不产生，兼容保留）
-      xml      → <card type="xml"/>（napcat 收发均不产生，兼容保留）
-      其他     → <misc type="..."/>
+      xml      → <card format="xml"/>（napcat 收发均不产生，兼容保留）
+      其他     → <misc segment_type="..."/>
 
     image segment 的富化字段 (file_hash / local_path / mime / downloaded)
     由 event_ingest/media.py 写在 segment 顶层（不在 data 内），见
@@ -953,17 +1094,17 @@ def _render_segments(
                 nm = name_by_user_id.get(qq)
                 if nm:
                     parts.append(
-                        f'<at user="{_esc_attr(qq)}" name="{_esc_attr(nm)}"/>'
+                        f'<at qq="{_esc_attr(qq)}" name="{_esc_attr(nm)}"/>'
                     )
                 else:
-                    parts.append(f'<at user="{_esc_attr(qq)}"/>')
+                    parts.append(f'<at qq="{_esc_attr(qq)}"/>')
             else:
                 parts.append("<at/>")
         elif t == "reply":
             rid = str(d.get("id", "")).strip()
             if rid:
-                attrs = [f'to="{_esc_attr(rid)}"']
-                # from_name/from_id/from_self：被引用消息的作者，三个独立属性
+                attrs = [f'to_message_id="{_esc_attr(rid)}"']
+                # from_name/from_qq/from_self：被引用消息的作者，三个独立属性
                 # （不再拼 "昵称(QQ)" / "我(id)" 复合串，模型无需拆括号）。这是
                 # "别人引用我 ≠ 我在发言"的关键——没有它，LLM 看到被引用内容
                 # 内联在画面里，容易当成对方刚说的话。缺哪个省哪个（=未知）。
@@ -972,10 +1113,10 @@ def _render_segments(
                     if author.name:
                         attrs.append(f'from_name="{_esc_attr(author.name)}"')
                     if author.user_id:
-                        attrs.append(f'from_id="{_esc_attr(author.user_id)}"')
+                        attrs.append(f'from_qq="{_esc_attr(author.user_id)}"')
                     # 仅 bot 自己的消息渲染 from_self="true"；外部作者不渲染
-                    # false——"是不是我"的常规判据是 from_id == bot_user_id，
-                    # from_self 出现即铁证（服务端标注，不依赖 bot_user_id）。
+                    # false——"是不是我"的常规判据是 from_qq == bot_qq，
+                    # from_self 出现即铁证（服务端标注，不依赖 bot_qq）。
                     if author.is_self:
                         attrs.append('from_self="true"')
                 excerpt = excerpt_by_msg_id.get(rid)
@@ -1010,10 +1151,10 @@ def _render_segments(
             fname = _face_name(d)
             if fid and fname:
                 parts.append(
-                    f'<face id="{_esc_attr(fid)}" name="{_esc_attr(fname)}"/>'
+                    f'<face face_id="{_esc_attr(fid)}" name="{_esc_attr(fname)}"/>'
                 )
             elif fid:
-                parts.append(f'<face id="{_esc_attr(fid)}"/>')
+                parts.append(f'<face face_id="{_esc_attr(fid)}"/>')
             else:
                 parts.append("<face/>")
         elif t == "mface":
@@ -1043,7 +1184,7 @@ def _render_segments(
         elif t == "poke":
             target = d.get("qq") or d.get("user_id")
             if target:
-                parts.append(f'<poke target="{_esc_attr(str(target))}"/>')
+                parts.append(f'<poke target_qq="{_esc_attr(str(target))}"/>')
             else:
                 parts.append("<poke/>")
         elif t == "dice":
@@ -1065,7 +1206,7 @@ def _render_segments(
         elif t == "forward":
             fid = str(d.get("id", "")).strip()
             if fid:
-                parts.append(f'<forward id="{_esc_attr(fid)}"/>')
+                parts.append(f'<forward forward_id="{_esc_attr(fid)}"/>')
             else:
                 parts.append("<forward/>")
         elif t == "json":
@@ -1073,7 +1214,7 @@ def _render_segments(
         elif t == "share":
             # OneBot 标准 share 段（napcat 不产生，兼容其他实现）。字段名
             # 与 ark 卡片对齐：content → desc。
-            attrs = ['type="share"']
+            attrs = ['format="share"']
             title = str(d.get("title") or "").strip()
             if title:
                 attrs.append(f'title="{_esc_attr(_clip(title, 100))}"')
@@ -1085,9 +1226,11 @@ def _render_segments(
                 attrs.append(f'url="{_esc_attr(_clip(url, 300))}"')
             parts.append(f"<card {' '.join(attrs)}/>")
         elif t == "xml":
-            parts.append('<card type="xml"/>')
+            parts.append('<card format="xml"/>')
         else:
-            parts.append(f'<misc type="{_esc_attr(str(t or "unknown"))}"/>')
+            parts.append(
+                f'<misc segment_type="{_esc_attr(str(t or "unknown"))}"/>'
+            )
     return "".join(parts), images
 
 
@@ -1200,15 +1343,15 @@ def _parse_ark_card(d: dict) -> dict[str, str] | None:
 def _render_card_segment(d: dict) -> str:
     """json（ark）段 → ``<card/>``。napcat 接收侧一切富卡片——链接分享、
     B 站/小程序、公众号文章、位置、群推荐——都以 json 段到达，历史上渲染
-    成 `<card type="json"/>` 等于把"别人分享了什么"整个丢掉。
+    成 `<card format="json"/>` 等于把"别人分享了什么"整个丢掉。
 
     字段语义见 :func:`_parse_ark_card`（全部可缺省，缺失=该字段解析不到）。
-    解析不出任何字段 → 回退 `<card type="json"/>`（与旧行为一致，type=
-    表示"未解析的原始段格式"）。
+    解析不出任何字段 → 回退 `<card format="json"/>`（format= 表示"未解析的
+    原始段格式"；改名自 type=——与 notice/hint 的 kind= 用词不统一且语义含糊）。
     """
     card = _parse_ark_card(d)
     if not card:
-        return '<card type="json"/>'
+        return '<card format="json"/>'
     attrs: list[str] = []
     for key, limit in (
         ("app", 60),
@@ -1250,11 +1393,17 @@ def _notice_detail_attrs(kind: str, payload: dict) -> list[str]:
     - group_card   → old_card= / new_card=（改名片前后值；空串=没有名片，
                      与"缺失=mapper 没拿到"区分开，所以空串也渲染）
     - group_upload → file_name= / file_size_bytes=
+    - poke         → action=动作文案 + action_suffix=后缀（napcat raw_info
+                     提炼，如 拍了拍…的头；缺失=普通戳一戳/未知）
     - emoji_like   → message_id=被贴表情的消息（对应 timeline 里同 id 的
                      <message>）+ likes=表情统计（格式见 _emoji_likes_label）
     - essence      → message_id=被设/取消精华的消息
     - honor        → honor_type=荣誉类型（talkative 龙王 / performer /
                      emotion，OneBot 原值透传）
+    - group_recall / friend_recall
+                   → message_id=被撤回的消息（对应 timeline 里同 id 的
+                     <message>；没有它 LLM 只知道"有人撤回了"，不知道撤的
+                     是哪条，会继续引用已撤回的内容）
     """
     attrs: list[str] = []
     if kind == "group_ban":
@@ -1279,6 +1428,11 @@ def _notice_detail_attrs(kind: str, payload: dict) -> list[str]:
             fsize = file_info.get("size")
             if fsize is not None and str(fsize).strip():
                 attrs.append(f'file_size_bytes="{_esc_attr(str(fsize))}"')
+    elif kind == "poke":
+        for key in ("action", "action_suffix"):
+            value = payload.get(key)
+            if value is not None and str(value).strip():
+                attrs.append(f'{key}="{_esc_attr(str(value).strip())}"')
     elif kind == "emoji_like":
         mid = payload.get("onebot_message_id")
         if mid:
@@ -1287,6 +1441,10 @@ def _notice_detail_attrs(kind: str, payload: dict) -> list[str]:
         if label:
             attrs.append(f'likes="{_esc_attr(label)}"')
     elif kind == "essence":
+        mid = payload.get("onebot_message_id")
+        if mid:
+            attrs.append(f'message_id="{_esc_attr(str(mid))}"')
+    elif kind in ("group_recall", "friend_recall"):
         mid = payload.get("onebot_message_id")
         if mid:
             attrs.append(f'message_id="{_esc_attr(str(mid))}"')
@@ -1304,7 +1462,7 @@ def _emoji_likes_label(likes) -> str | None:
     - unicode 表情：emoji_id 是十进制 codepoint（128077 → 👍），直接给字符——
       LLM 读 "👍" 比读 "128077" 无歧义得多；
     - QQ 黄豆表情：emoji_id 是小整数 face id，渲染 "face:<id>"（与消息里
-      <face id=.../> 同一 id 空间）。
+      <face face_id=.../> 同一 id 空间）。
     条目上限 5，防御异常 payload 撑爆属性。全部无效 → None（不渲染 likes=）。
     """
     parts: list[str] = []
@@ -1429,7 +1587,7 @@ def _build_excerpt_index(events: Iterable[_EventSnapshot]) -> dict[str, str]:
     ``_segment_gloss``：文本段取原文，富媒体段取与消息体渲染同源的语义占位
     （不再是旧版 "[image, at]" 这种裸类型列表）。空白规整成单空格（摘要是
     单行属性值，不该带换行）。命中不到（消息在 lookback 窗口外或被 napcat
-    抛弃了）就只渲染 reply.to 不带 excerpt。
+    抛弃了）就只渲染 reply.to_message_id 不带 excerpt。
     """
     out: dict[str, str] = {}
     for ev in events:
@@ -1493,7 +1651,7 @@ def _build_author_index(
     events: Iterable[_EventSnapshot],
 ) -> dict[str, _AuthorRef]:
     """onebot_message_id → :class:`_AuthorRef`。用于 reply 段标
-    from_name / from_id / from_self 三个独立属性。
+    from_name / from_qq / from_self 三个独立属性。
 
     覆盖两类来源：
     - 外部消息：作者 = sender 的 card/nickname + user_id。别人引用某人时，
@@ -1501,20 +1659,24 @@ def _build_author_index(
     - bot 自己同步发出的消息：``is_self=True``，message_id + self_id 取自
       send_message 工具的 tool_result（send_message 已是**同步**工具、直接返回
       napcat 的 message_id，不再有 reply_delivered 事件）。别人引用 bot 时渲染
-      `from_self="true"`（且 from_id 命中 bot_user_id），LLM 无需比对也能判定
+      `from_self="true"`（且 from_qq 命中 bot_qq），LLM 无需比对也能判定
       "被引用的是我自己"。
 
     工具名兼容：发言工具已从 `reply` 改名为 `send_message`（§12.2）；事件表
     append-only，改名前落库的 tool_called 里 tool_name 仍是 `reply`，故这里两个名
     都认，避免改名后一个 lookback 窗口内旧发言丢掉 from_self 标注。
+    `send_meme`（发表情包）同样是"bot 发出一条消息"的工具、result 同样带
+    message_id + self_id，一并认——别人引用 bot 发的表情包时也要 from_self。
     """
     out: dict[str, _AuthorRef] = {}
     # 先收集发言工具调用的 tool_call_id，用来认出哪些 tool_result 是发言的。
-    # 认 send_message（新）+ reply（改名前的旧事件，见 docstring 兼容说明）。
+    # 认 send_message / send_meme（发消息类工具）+ reply（改名前的旧事件，见
+    # docstring 兼容说明）。
     send_call_ids: set[str] = set()
     for ev in events:
         if ev.type == "agent.tool_called" and (
-            (ev.payload or {}).get("tool_name") in ("send_message", "reply")
+            (ev.payload or {}).get("tool_name")
+            in ("send_message", "send_meme", "reply")
         ):
             tc_id = (ev.payload or {}).get("tool_call_id")
             if tc_id is not None:

@@ -94,6 +94,7 @@ class SendMessageToolHappyPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(outcome.ok)
         self.assertEqual(outcome.result["message_id"], 999)
         self.assertEqual(outcome.result["self_id"], "10001")
+        self.assertNotIn("related_image_hashes", outcome.result)
         self.assertTrue(outcome.result["sent"])
 
     async def test_private_send(self) -> None:
@@ -261,6 +262,21 @@ class SendMessageToolValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.error_kind, "invalid_arguments")
         self.assertEqual(outcome.extra["reason_code"], "content_empty")
 
+    async def test_removed_related_image_hashes_field_is_rejected(self) -> None:
+        bot_registry.register(_StubBot())
+        outcome = await SendMessageTool().run(
+            {
+                "content": [{"type": "text", "data": {"text": "hi"}}],
+                "target": {"kind": "group", "group_id": 100},
+                "related_image_hashes": ["abc123"],
+            },
+            scope_key="group:100",
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.error_kind, "invalid_arguments")
+        self.assertEqual(outcome.extra["field"], "related_image_hashes")
+        self.assertEqual(outcome.extra["reason_code"], "unsupported_field")
+
     async def test_content_all_blank_invalid_arguments(self) -> None:
         bot_registry.register(_StubBot())
         outcome = await SendMessageTool().run(
@@ -386,6 +402,10 @@ class SendMessageToolMetadataTests(unittest.TestCase):
         required = SendMessageTool.arguments_schema["required"]
         self.assertIn("content", required)
         self.assertIn("target", required)
+        self.assertNotIn(
+            "related_image_hashes",
+            SendMessageTool.arguments_schema["properties"],
+        )
 
     def test_usage_prompt_loaded_from_sibling_md(self) -> None:
         self.assertIn(

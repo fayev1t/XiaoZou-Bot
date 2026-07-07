@@ -10,7 +10,10 @@ from typing import Any
 
 from qqbot.core.ids import new_msg_hash
 from qqbot.services.event_ingest import idempotency
-from qqbot.services.event_ingest.napcat_helpers import dump_event, dump_segments
+from qqbot.services.event_ingest.napcat_helpers import (
+    dump_event,
+    dump_message_segments,
+)
 from qqbot.services.event_ingest.system_event import PartialSystemEvent
 
 
@@ -33,7 +36,7 @@ class PrivateMessageMapper:
             "onebot_message_id": str(getattr(event, "message_id", "")),
             "raw_message": getattr(event, "raw_message", "") or "",
             "sender": _dump_private_sender(event),
-            "segments": dump_segments(getattr(event, "message", None)),
+            "segments": dump_message_segments(event),
             "message_sub_type": getattr(event, "sub_type", "friend") or "friend",
         }
         return PartialSystemEvent(

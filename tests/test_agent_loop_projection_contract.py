@@ -256,9 +256,9 @@ class BuildTimelineTests(unittest.TestCase):
         items = Projector.build_timeline(evs, tool_views=[])
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0].kind, "message")
-        # sender_name / sender_id 是两个独立属性，不再拼 "昵称(QQ)" 复合串
+        # sender_name / sender_qq 是两个独立属性，不再拼 "昵称(QQ)" 复合串
         self.assertIn('sender_name="alice"', items[0].render)
-        self.assertIn('sender_id="222"', items[0].render)
+        self.assertIn('sender_qq="222"', items[0].render)
         self.assertIn("hello", items[0].render)
 
     def test_message_uses_segments_not_raw_message(self) -> None:
@@ -277,7 +277,7 @@ class BuildTimelineTests(unittest.TestCase):
             ),
         ]
         rendered = Projector.build_timeline(evs, tool_views=[])[0].render
-        self.assertIn('<at user="999"/>', rendered)
+        self.assertIn('<at qq="999"/>', rendered)
         self.assertIn("hi", rendered)
         # 不能出现 CQ 码原文
         self.assertNotIn("CQ:at", rendered)
@@ -306,7 +306,7 @@ class BuildTimelineTests(unittest.TestCase):
         ]
         items = Projector.build_timeline(evs, tool_views=[])
         at_render = items[1].render
-        self.assertIn('user="999"', at_render)
+        self.assertIn('qq="999"', at_render)
         self.assertIn('name="李四"', at_render)
 
     def test_at_all_segment(self) -> None:
@@ -348,12 +348,12 @@ class BuildTimelineTests(unittest.TestCase):
         ]
         items = Projector.build_timeline(evs, tool_views=[])
         rendered = items[1].render
-        self.assertIn('to="M-EARLIER"', rendered)
+        self.assertIn('to_message_id="M-EARLIER"', rendered)
         self.assertIn('excerpt="天气怎么样"', rendered)
         # from= 标注被引用消息的作者（u1/100），让 LLM 看清是"u2 引用 u1"，
         # 而非"u1 在发言"。
         self.assertIn('from_name="u1"', rendered)
-        self.assertIn('from_id="100"', rendered)
+        self.assertIn('from_qq="100"', rendered)
         # 外部作者不渲染 from_self（该属性只在被引消息是 bot 自己发的时出现）
         self.assertNotIn("from_self=", rendered)
 
@@ -389,7 +389,7 @@ class BuildTimelineTests(unittest.TestCase):
         ]
         rendered = Projector.build_timeline(evs, tool_views=[])[1].render
         self.assertIn('from_name="群主"', rendered)
-        self.assertIn('from_id="3167291813"', rendered)
+        self.assertIn('from_qq="3167291813"', rendered)
 
     def test_reply_segment_without_excerpt_renders_to_only(self) -> None:
         # 被回复消息在 timeline 窗口外 → 只渲染 to，无 excerpt
@@ -406,11 +406,11 @@ class BuildTimelineTests(unittest.TestCase):
             ),
         ]
         rendered = Projector.build_timeline(evs, tool_views=[])[0].render
-        self.assertIn('to="M-OUTSIDE"', rendered)
+        self.assertIn('to_message_id="M-OUTSIDE"', rendered)
         self.assertNotIn("excerpt=", rendered)
         # 作者也查不到（被回复消息在窗口外）→ 三个作者属性都不渲染
         self.assertNotIn("from_name=", rendered)
-        self.assertNotIn("from_id=", rendered)
+        self.assertNotIn("from_qq=", rendered)
         self.assertNotIn("from_self=", rendered)
 
     def _reply_render_to(self, quoted_segments: list[dict]) -> str:
@@ -724,12 +724,12 @@ class BuildTimelineTests(unittest.TestCase):
             ),
         ]
         r = Projector.build_timeline(evs, tool_views=[])[0].render
-        self.assertIn('<face id="14" name="微笑"/>', r)
+        self.assertIn('<face face_id="14" name="微笑"/>', r)
 
     def test_json_ark_card_renders_structured_fields(self) -> None:
         # ark 卡片（B 站分享 / 小程序 / 公众号文章在 napcat 全走 json 段）：
         # app=应用标识, summary=QQ 外显文案(prompt), title/desc=meta.* 内容,
-        # url=跳转链接（qqdocurl 优先）。此前渲染 <card type="json"/> 等于
+        # url=跳转链接（qqdocurl 优先）。此前渲染 <card format="json"/> 等于
         # 把"别人分享了什么"整个丢掉。
         import json as json_mod
 
@@ -777,7 +777,7 @@ class BuildTimelineTests(unittest.TestCase):
             ),
         ]
         r = Projector.build_timeline(evs, tool_views=[])[0].render
-        self.assertIn('<card type="json"/>', r)
+        self.assertIn('<card format="json"/>', r)
 
     def test_share_segment_renders_card_fields(self) -> None:
         # OneBot 标准 share 段（napcat 不产生，兼容其他实现）；content→desc
@@ -802,7 +802,7 @@ class BuildTimelineTests(unittest.TestCase):
         ]
         r = Projector.build_timeline(evs, tool_views=[])[0].render
         self.assertIn(
-            '<card type="share" title="标题" desc="描述"'
+            '<card format="share" title="标题" desc="描述"'
             ' url="https://s.example/1"/>',
             r,
         )
@@ -849,13 +849,13 @@ class BuildTimelineTests(unittest.TestCase):
             ),
         ]
         rendered = Projector.build_timeline(evs, tool_views=[])[0].render
-        self.assertIn('<face id="1"/>', rendered)
+        self.assertIn('<face face_id="1"/>', rendered)
         self.assertIn("<voice/>", rendered)
         self.assertIn("<video/>", rendered)
-        self.assertIn('<poke target="555"/>', rendered)
-        self.assertIn('<forward id="FW-1"/>', rendered)
-        self.assertIn('<card type="json"/>', rendered)
-        self.assertIn('<misc type="weird_new_segment"/>', rendered)
+        self.assertIn('<poke target_qq="555"/>', rendered)
+        self.assertIn('<forward forward_id="FW-1"/>', rendered)
+        self.assertIn('<card format="json"/>', rendered)
+        self.assertIn('<misc segment_type="weird_new_segment"/>', rendered)
 
     def test_text_with_xml_metachars_is_escaped(self) -> None:
         # 用户消息里的 < > & 不能破坏外层 <message> 结构
@@ -952,9 +952,9 @@ class BuildTimelineTests(unittest.TestCase):
             ),
         ]
         r = Projector.build_timeline(evs, tool_views=[])[-1].render
-        self.assertIn('user="555"', r)
+        self.assertIn('user_qq="555"', r)
         self.assertIn('user_name="张三"', r)
-        self.assertIn('operator="666"', r)
+        self.assertIn('operator_qq="666"', r)
         self.assertIn('operator_name="管理员A"', r)
 
     def test_group_ban_notice_renders_duration_seconds(self) -> None:
@@ -983,6 +983,58 @@ class BuildTimelineTests(unittest.TestCase):
         ]
         r = Projector.build_timeline(evs, tool_views=[])[0].render
         self.assertNotIn("duration_seconds=", r)
+
+    def test_poke_notice_renders_action_and_suffix(self) -> None:
+        # napcat raw_info 提炼的动作文案（mapper 落 payload.action/action_suffix，
+        # 有值才落键）；缺失=普通戳一戳，不渲染属性
+        evs = [
+            _snap(
+                type="external.notice.poke",
+                payload={
+                    "sender_id": 555,
+                    "target_id": 666,
+                    "action": "拍了拍",
+                    "action_suffix": "的头",
+                },
+                user_id=555,
+            ),
+        ]
+        r = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertIn('action="拍了拍"', r)
+        self.assertIn('action_suffix="的头"', r)
+
+    def test_poke_notice_omits_action_when_absent(self) -> None:
+        evs = [
+            _snap(
+                type="external.notice.poke",
+                payload={"sender_id": 555, "target_id": 666},
+                user_id=555,
+            ),
+        ]
+        r = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertNotIn("action=", r)
+        self.assertNotIn("action_suffix=", r)
+
+    def test_napcat_unknown_event_renders_as_system_hint(self) -> None:
+        # EventIngest契约 §8 兜底事件：agent_visible 的 runtime.* 走
+        # _render_runtime 泛化渲染，SystemAgentLoop 能看到协议外报文
+        evs = [
+            _snap(
+                type="runtime.napcat_unknown_event",
+                payload={
+                    "post_type": "notice",
+                    "sub_type": "profile_like",
+                    "raw": {"notice_type": "notify"},
+                },
+                scope="system",
+                group_id=None,
+            ),
+        ]
+        items = Projector.build_timeline(evs, tool_views=[])
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].kind, "system_hint")
+        self.assertIn('kind="napcat_unknown_event"', items[0].render)
+        self.assertIn("profile_like", items[0].render)
 
     def test_group_card_notice_renders_old_and_new(self) -> None:
         # new_card 空串=清空名片，与"缺失=mapper 没拿到"区分，所以空串也渲染
@@ -1021,7 +1073,7 @@ class BuildTimelineTests(unittest.TestCase):
     def test_emoji_like_notice_renders_target_message_and_likes(self) -> None:
         # likes 两种表情形态：emoji_id 是 unicode codepoint（128077→👍）
         # 直接给字符；小整数是 QQ 黄豆 face id → "face:N"（与消息里
-        # <face id=.../> 同一 id 空间）。
+        # <face face_id=.../> 同一 id 空间）。
         evs = [
             _snap(
                 type="external.notice.emoji_like",
@@ -1066,35 +1118,12 @@ class BuildTimelineTests(unittest.TestCase):
         r = Projector.build_timeline(evs, tool_views=[])[0].render
         self.assertIn('honor_type="talkative"', r)
 
-    def test_friend_request_renders_with_event_id_and_hides_flag(self) -> None:
-        # external.request.friend → <request kind="friend" event_id=...>，
-        # event_id 必须暴露（LLM 据此调 respond_to_request），flag 不暴露
-        # （napcat 凭证由工具用 event_id 反查，不经 LLM）。
-        evs = [
-            _snap(
-                type="external.request.friend",
-                payload={
-                    "user_id": 12345,
-                    "comment": "求加好友",
-                    "flag": "FLAG_SECRET_xyz",
-                },
-                scope="system",
-                group_id=None,
-                user_id=12345,
-                event_id="REQ_F1",
-            ),
-        ]
-        items = Projector.build_timeline(evs, tool_views=[])
-        self.assertEqual(len(items), 1)
-        self.assertEqual(items[0].kind, "request")
-        render = items[0].render
-        self.assertIn('kind="friend"', render)
-        self.assertIn('event_id="REQ_F1"', render)
-        self.assertIn('user="12345"', render)
-        self.assertIn('comment="求加好友"', render)
-        self.assertNotIn("FLAG_SECRET", render)
-
-    def test_group_add_request_renders_group_and_kind(self) -> None:
+    def test_group_join_request_renders_with_event_id_and_hides_flag(self) -> None:
+        # 2026-07-03 拆分后唯一会实际渲染的 request：external.request.group.add
+        # （scope=group 进目标群 timeline）→ <request kind="group.add" event_id=...>。
+        # event_id 必须暴露（LLM 据此调 respond_to_group_join_request），flag 不
+        # 暴露（napcat 凭证由工具用 event_id 反查，不经 LLM）。好友申请 / 邀请
+        # 入群现为 runtime_only，投影取数层就被滤掉、不会走到渲染。
         evs = [
             _snap(
                 type="external.request.group.add",
@@ -1103,19 +1132,24 @@ class BuildTimelineTests(unittest.TestCase):
                     "group_id": 67890,
                     "user_id": 222,
                     "comment": "想进群",
-                    "flag": "GFLAG",
+                    "flag": "FLAG_SECRET_xyz",
                 },
-                scope="system",
-                group_id=None,
+                scope="group",
+                group_id=67890,
                 user_id=222,
                 event_id="REQ_G1",
             ),
         ]
-        render = Projector.build_timeline(evs, tool_views=[])[0].render
+        items = Projector.build_timeline(evs, tool_views=[])
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].kind, "request")
+        render = items[0].render
         self.assertIn('kind="group.add"', render)
         self.assertIn('event_id="REQ_G1"', render)
-        self.assertIn('group="67890"', render)
-        self.assertIn('user="222"', render)
+        self.assertIn('group_id="67890"', render)
+        self.assertIn('user_qq="222"', render)
+        self.assertIn('comment="想进群"', render)
+        self.assertNotIn("FLAG_SECRET", render)
 
     def test_task_events_do_not_produce_timeline_rows(self) -> None:
         evs = [
@@ -1150,6 +1184,9 @@ class BuildTimelineTests(unittest.TestCase):
         self.assertIn('status="complete"', items[0].render)
         self.assertIn("<result>", items[0].render)
         self.assertIn("[1, 2]", items[0].render)
+        # tool-call 行必须带发起时刻 time= —— 曾是全 timeline 唯一无时间戳的
+        # 行类型（bot 发言恰好渲染在这里，模型判断"多久前说过"只能靠行序）。
+        self.assertIn('time="', items[0].render)
 
     def test_tool_called_without_result_renders_processing(self) -> None:
         called = _snap(
@@ -1215,6 +1252,7 @@ class BuildTimelineTests(unittest.TestCase):
         rendered = items[0].render
         self.assertIn('kind="tool_batch_completed"', rendered)
         self.assertIn("tool_count", rendered)
+        self.assertIn('time="', rendered)  # system-hint 行同样带时间戳
         self.assertNotIn("01JBATCHULIDNOISE0000000000", rendered)
         self.assertNotIn("tool_batch_id", rendered)
 
@@ -1264,7 +1302,7 @@ class BuildTimelineTests(unittest.TestCase):
 
     def test_reply_to_bot_message_attributes_self(self) -> None:
         # 别人引用 bot 自己的发言 → reply 段 from_self="true"（服务端事实标注，
-        # 不依赖 bot_user_id 在场）+ from_id=self_id；bot 显示名未知，不渲染
+        # 不依赖 bot_user_id 在场）+ from_qq=self_id；bot 显示名未知，不渲染
         # from_name。
         # 发言同步后，bot 自己发言的 message_id + self_id 来自 send_message 工具的
         # tool_called（认出是发言）+ tool_result（result.message_id/self_id）。
@@ -1312,7 +1350,7 @@ class BuildTimelineTests(unittest.TestCase):
         items = Projector.build_timeline(evs, tool_views=[])
         msg = [i for i in items if i.kind == "message"][0].render
         self.assertIn('from_self="true"', msg)
-        self.assertIn('from_id="1005089717"', msg)
+        self.assertIn('from_qq="1005089717"', msg)
         self.assertNotIn("from_name=", msg)  # bot 显示名未知，不渲染
 
     def test_reply_to_bot_message_attributes_self_legacy_reply_name(
@@ -1365,7 +1403,7 @@ class BuildTimelineTests(unittest.TestCase):
         items = Projector.build_timeline(evs, tool_views=[])
         msg = [i for i in items if i.kind == "message"][0].render
         self.assertIn('from_self="true"', msg)
-        self.assertIn('from_id="1005089717"', msg)
+        self.assertIn('from_qq="1005089717"', msg)
         self.assertNotIn("from_name=", msg)  # bot 显示名未知，不渲染
 
     def test_mface_dice_rps_file_markdown_segments(self) -> None:
@@ -1450,7 +1488,9 @@ class BuildTimelineTests(unittest.TestCase):
 
     def test_reply_lifecycle_events_are_filtered_out(self) -> None:
         # 发言已同步：reply_emitted/delivered/failed 不再产生（历史遗留事件也
-        # 只 skip）；decision/idle 同为运营事件不进 timeline。发送结果由
+        # 只 skip）；idle_decision 是纯运营事件不进 timeline。decision_emitted
+        # 2026-07-06 起渲染 <my-thought> 行，但空白/缺失 reasoning 的仍消隐
+        # ——本例 payload={} 无 reasoning，照旧不出行。发送结果由
         # send_message 工具的 <tool-call>（succeeded/failed）表达，没有独立行。
         evs = [
             _snap(type="agent.decision_emitted", payload={}),
@@ -1560,13 +1600,15 @@ class ProjectIntegrationTests(unittest.TestCase):
         self.assertEqual(context.active_tasks, [])
         # bot_user_id 默认 None；未注入时不破坏旧用例
         self.assertIsNone(context.bot_user_id)
-        # 窗口内无历史决策 → 跨拍记忆为空
-        self.assertIsNone(context.last_reasoning)
-        self.assertIsNone(context.last_reasoning_at)
+        # 2026-07-06：跨拍自我记忆改为 timeline 的 <my-thought> 行，
+        # last_reasoning / last_reasoning_at 字段已随 <last-reasoning> 删除
+        self.assertFalse(hasattr(context, "last_reasoning"))
+        self.assertFalse(hasattr(context, "last_reasoning_at"))
 
-    def test_last_reasoning_folds_latest_decision(self) -> None:
-        """模型的跨拍自我记忆（2026-07-02）：取窗口内最近一条
-        agent.decision_emitted 的 reasoning；空 reasoning 的决策跳过。"""
+    def test_decisions_render_as_my_thought_rows(self) -> None:
+        """思考轨迹内联（2026-07-06，待办清单#4）：decision_emitted 渲染
+        <my-thought> 行（含 idle 拍）；空白 reasoning 的决策消隐；旧的
+        fold_last_reasoning / <last-reasoning> 单条折叠已删除。"""
         evs = [
             _snap(
                 type="agent.decision_emitted",
@@ -1580,7 +1622,7 @@ class ProjectIntegrationTests(unittest.TestCase):
             ),
             _snap(
                 type="agent.decision_emitted",
-                payload={"reasoning": "   "},  # 空白 → 跳过，取上一条
+                payload={"reasoning": "   "},  # 空白 → 无内容可看，消隐
                 seconds_offset=3,
             ),
         ]
@@ -1591,14 +1633,13 @@ class ProjectIntegrationTests(unittest.TestCase):
             tick_seq=2,
             now=BASE_TIME + timedelta(seconds=10),
         )
-        self.assertEqual(
-            context.last_reasoning, "第二拍：小徐在贴日志，等他贴完"
-        )
-        self.assertEqual(
-            context.last_reasoning_at, BASE_TIME + timedelta(seconds=2)
-        )
-        # decision_emitted 仍不逐条进 timeline（只折叠最近一条 reasoning）
-        self.assertEqual(context.timeline, [])
+        kinds = [it.kind for it in context.timeline]
+        self.assertEqual(kinds, ["my_thought", "my_thought"])
+        self.assertIn("先观望", context.timeline[0].render)
+        self.assertIn("等他贴完", context.timeline[1].render)
+        self.assertIn('time="', context.timeline[1].render)
+        # 单条折叠接口随 <last-reasoning> 一并删除，防复活
+        self.assertFalse(hasattr(Projector, "fold_last_reasoning"))
 
     def test_task_closed_renders_timeline_row(self) -> None:
         """任务收束的事后记忆（2026-07-02）：done/failed 渲染 <task-closed>
@@ -1642,7 +1683,7 @@ class ProjectIntegrationTests(unittest.TestCase):
         kinds = [it.kind for it in context.timeline]
         self.assertEqual(kinds, ["task_closed", "task_closed"])
         done_row = context.timeline[0].render
-        self.assertIn('id="T1"', done_row)
+        self.assertIn('task_id="T1"', done_row)
         self.assertIn('outcome="done"', done_row)
         self.assertIn("已把天气告诉小徐", done_row)
         failed_row = context.timeline[1].render
@@ -1651,7 +1692,7 @@ class ProjectIntegrationTests(unittest.TestCase):
 
     def test_bot_user_id_propagates_into_decision_context(self) -> None:
         """Projector.project 收到 bot_user_id 时必须透传到 DecisionContext，
-        让 LLMPlanner 渲染 <agent-input bot_user_id="..."> 属性。"""
+        让 LLMPlanner 渲染 <agent-input bot_qq="..."> 属性。"""
         context = Projector.project(
             [],
             scope_key="group:100",
@@ -1891,6 +1932,339 @@ class RecallRenderingNoteTests(unittest.TestCase):
         # 原消息没有被改写或删除；recall 单独成行
         self.assertEqual(kinds, ["message", "notice"])
         self.assertIn('kind="group_recall"', items[1].render)
+        # 必须透出被撤回的 message_id——没有它 LLM 不知道撤的是哪条，
+        # 会继续引用已撤回的内容（xml_format.md §notice 明细属性）。
+        self.assertIn('message_id="1234"', items[1].render)
+
+
+class SendMemeAuthorIndexTests(unittest.TestCase):
+    def test_reply_to_bot_meme_attributes_self(self) -> None:
+        # send_meme 也是"bot 发出一条消息"的工具，result 同样带 message_id +
+        # self_id：别人引用 bot 发的表情包时，_build_author_index 一并认它，
+        # reply 段照标 from_self="true"（表情包工具黑盒设计 §结果契约）。
+        evs = [
+            _snap(
+                type="agent.tool_called",
+                payload={
+                    "tool_call_id": "TC_MEME",
+                    "tool_name": "send_meme",
+                    "arguments": {"image_hash": "ab" * 32},
+                },
+                seconds_offset=0,
+            ),
+            _snap(
+                type="agent.tool_result",
+                payload={
+                    "tool_call_id": "TC_MEME",
+                    "result": {
+                        "message_id": "M-MEME",
+                        "self_id": "1005089717",
+                        "file_hash": "ab" * 32,
+                        "sent": True,
+                    },
+                },
+                seconds_offset=1,
+            ),
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "onebot_message_id": "M-E",
+                    "segments": [
+                        {"type": "reply", "data": {"id": "M-MEME"}},
+                        {"type": "text", "data": {"text": "这表情包好评"}},
+                    ],
+                    "sender": {"nickname": "路人E", "user_id": 555},
+                },
+                user_id=555,
+                seconds_offset=2,
+            ),
+        ]
+        items = Projector.build_timeline(evs, tool_views=[])
+        msg = [i for i in items if i.kind == "message"][0].render
+        self.assertIn('from_self="true"', msg)
+        self.assertIn('from_qq="1005089717"', msg)
+
+
+class SavedMemesAugmentTests(unittest.IsolatedAsyncioTestCase):
+    """收藏夹补全（_augment_with_saved_memes）：查全局 agent_memes（2026-
+    07-06 起全 bot 共享，load_saved_memes 不带 scope 参数）挂到
+    ctx.saved_memes；查询失败降级为原 ctx（绝不崩 tick）；system scope
+    没有聊天面，跳过查询。"""
+
+    def _ctx(self, scope_key: str = "group:100"):
+        from qqbot.services.agent_loop.decision import DecisionContext
+
+        return DecisionContext(
+            scope_key=scope_key,
+            correlation_id="CID",
+            tick_seq=1,
+            now=BASE_TIME,
+        )
+
+    async def test_augment_attaches_memes(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        from qqbot.services.agent_loop.decision import MemeView
+
+        meme = MemeView(
+            file_hash="ab" * 32, description="黑猫瞪眼", saved_at=BASE_TIME
+        )
+        proj = Projector(session_factory=lambda: None)  # type: ignore[arg-type]
+        with patch(
+            "qqbot.services.agent_loop.meme_store.load_saved_memes",
+            new=AsyncMock(return_value=[meme]),
+        ):
+            out = await proj._augment_with_saved_memes(
+                self._ctx(), "group:100"
+            )
+        self.assertEqual(out.saved_memes, [meme])
+
+    async def test_augment_degrades_on_store_error(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        ctx = self._ctx()
+        proj = Projector(session_factory=lambda: None)  # type: ignore[arg-type]
+        with patch(
+            "qqbot.services.agent_loop.meme_store.load_saved_memes",
+            new=AsyncMock(side_effect=RuntimeError("db down")),
+        ):
+            out = await proj._augment_with_saved_memes(ctx, "group:100")
+        self.assertIs(out, ctx)  # 降级：原样返回，不崩 tick
+        self.assertEqual(out.saved_memes, [])
+
+    async def test_system_scope_skips_query(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        ctx = self._ctx(scope_key="system")
+        proj = Projector(session_factory=lambda: None)  # type: ignore[arg-type]
+        loader = AsyncMock(return_value=[])
+        with patch(
+            "qqbot.services.agent_loop.meme_store.load_saved_memes",
+            new=loader,
+        ):
+            out = await proj._augment_with_saved_memes(ctx, "system")
+        self.assertIs(out, ctx)
+        loader.assert_not_awaited()  # system 没有收藏面，不查
+
+
+class UnseenMessagesTests(unittest.TestCase):
+    """第一拍判定（2026-07-06，待办清单#1 群聊拆句观望）。
+
+    fold_unseen_message_ids 以窗口内最后一条 agent.decision_emitted 为
+    水位线：其后到达的 external.message.* 是"没有任何一拍决策看过"的新
+    消息，渲染时标 `unseen="true"`（缺失=已经历过至少一拍）。政策侧见
+    group_chat_rules.md §半句话先等等。
+    """
+
+    def test_message_after_decision_is_unseen(self) -> None:
+        evs = [
+            _snap(
+                type="agent.decision_emitted",
+                payload={"reasoning": "r"},
+                seconds_offset=1,
+            ),
+            _snap(
+                type="external.message.group",
+                event_id="M2",
+                seconds_offset=2,
+            ),
+        ]
+        self.assertEqual(
+            Projector.fold_unseen_message_ids(evs), frozenset({"M2"})
+        )
+
+    def test_message_before_decision_is_seen(self) -> None:
+        evs = [
+            _snap(
+                type="external.message.group",
+                event_id="M1",
+                seconds_offset=1,
+            ),
+            _snap(
+                type="agent.decision_emitted",
+                payload={"reasoning": "r"},
+                seconds_offset=2,
+            ),
+        ]
+        self.assertEqual(Projector.fold_unseen_message_ids(evs), frozenset())
+
+    def test_messages_without_any_decision_all_unseen(self) -> None:
+        # 窗口内从没有过决策 = 该 scope 真正意义上的第一拍
+        evs = [
+            _snap(
+                type="external.message.group",
+                event_id="M1",
+                seconds_offset=1,
+            ),
+            _snap(
+                type="external.message.group",
+                event_id="M2",
+                seconds_offset=2,
+            ),
+        ]
+        self.assertEqual(
+            Projector.fold_unseen_message_ids(evs), frozenset({"M1", "M2"})
+        )
+
+    def test_empty_window_has_no_unseen(self) -> None:
+        self.assertEqual(Projector.fold_unseen_message_ids([]), frozenset())
+
+    def test_non_message_events_never_unseen(self) -> None:
+        # notice / request / runtime hint 不参与——观望语义只对"人还在说话"
+        # 成立；空 reasoning 的决策也照样推进水位线（写没写 reasoning 不影响
+        # "这拍看过消息"的事实）。
+        evs = [
+            _snap(
+                type="agent.decision_emitted",
+                payload={"reasoning": ""},
+                seconds_offset=1,
+            ),
+            _snap(type="external.notice.poke", seconds_offset=2),
+            _snap(type="external.request.group.add", seconds_offset=3),
+            _snap(
+                type="runtime.wait_elapsed",
+                payload={"seconds": 15},
+                seconds_offset=4,
+            ),
+        ]
+        self.assertEqual(Projector.fold_unseen_message_ids(evs), frozenset())
+
+    def test_project_renders_unseen_attr_only_on_new_messages(self) -> None:
+        """端到端：决策前的消息不带 unseen，决策后的消息带 unseen="true"。"""
+        evs = [
+            _snap(
+                type="external.message.group",
+                event_id="M1",
+                payload={
+                    "sender": {"user_id": 222, "nickname": "小徐"},
+                    "onebot_message_id": "101",
+                    "segments": [
+                        {"type": "text", "data": {"text": "我想问一下"}}
+                    ],
+                },
+                seconds_offset=1,
+            ),
+            _snap(
+                type="agent.decision_emitted",
+                payload={"reasoning": "像半句，先等"},
+                seconds_offset=2,
+            ),
+            _snap(
+                type="external.message.group",
+                event_id="M2",
+                payload={
+                    "sender": {"user_id": 222, "nickname": "小徐"},
+                    "onebot_message_id": "102",
+                    "segments": [
+                        {"type": "text", "data": {"text": "关于装机那个事"}}
+                    ],
+                },
+                seconds_offset=3,
+            ),
+        ]
+        context = Projector.project(
+            evs,
+            scope_key="group:999",
+            correlation_id="c",
+            tick_seq=2,
+            now=BASE_TIME + timedelta(seconds=10),
+        )
+        kinds = [it.kind for it in context.timeline]
+        # 2026-07-06 思考轨迹内联后，决策事件本身也渲染 <my-thought> 行
+        self.assertEqual(kinds, ["message", "my_thought", "message"])
+        self.assertNotIn("unseen", context.timeline[0].render)
+        self.assertIn('unseen="true"', context.timeline[2].render)
+
+    def test_build_timeline_without_ids_marks_nothing(self) -> None:
+        # 直调 build_timeline 不传 unseen_message_ids（旧调用/单测）时缺省
+        # 空集——渲染行为与引入该属性前完全一致。
+        evs = [
+            _snap(
+                type="external.message.group",
+                event_id="M1",
+                payload={
+                    "segments": [{"type": "text", "data": {"text": "hi"}}]
+                },
+                seconds_offset=1,
+            ),
+        ]
+        items = Projector.build_timeline(evs, tool_views=[])
+        self.assertNotIn("unseen", items[0].render)
+
+
+class MyThoughtTests(unittest.TestCase):
+    """<my-thought> 行契约（2026-07-06，待办清单#4 思考轨迹内联）。
+
+    decision_emitted（含 idle 拍）渲染为 timeline 的 <my-thought> 行：只保留
+    最近 MAX_THOUGHT_ROWS 条、单条截 MAX_THOUGHT_CHARS 字、正文 XML 转义；
+    project() 裁剪只数非思考行——思考行不挤占消息行预算。
+    """
+
+    @staticmethod
+    def _decision(reasoning: str, offset: float) -> "_EventSnapshot":
+        return _snap(
+            type="agent.decision_emitted",
+            payload={"reasoning": reasoning},
+            event_id=f"D{int(offset * 1000)}",
+            seconds_offset=offset,
+        )
+
+    def test_capped_at_max_thought_rows(self) -> None:
+        evs = [self._decision(f"想法{i}", i) for i in range(1, 14)]  # 13 条
+        items = Projector.build_timeline(evs, tool_views=[])
+        self.assertEqual(len(items), Projector.MAX_THOUGHT_ROWS)
+        # 保留的是最近 K 条（想法4..想法13），时间序不变
+        self.assertIn("想法4", items[0].render)
+        self.assertIn("想法13", items[-1].render)
+
+    def test_truncated_at_max_chars(self) -> None:
+        long_text = "长" * (Projector.MAX_THOUGHT_CHARS + 50)
+        items = Projector.build_timeline(
+            [self._decision(long_text, 1)], tool_views=[]
+        )
+        self.assertIn("…", items[0].render)
+        self.assertNotIn(
+            "长" * (Projector.MAX_THOUGHT_CHARS + 1), items[0].render
+        )
+
+    def test_reasoning_xml_escaped(self) -> None:
+        items = Projector.build_timeline(
+            [self._decision("对比 <b> & 引用", 1)], tool_views=[]
+        )
+        self.assertIn("&lt;b&gt;", items[0].render)
+        self.assertNotIn("<b>", items[0].render)
+
+    def test_thoughts_do_not_consume_message_budget(self) -> None:
+        """project(max_timeline_items=3)：3 条消息预算照满，穿插的思考行
+        顺带保留（4 行总量），而不是把最老一条消息挤出去。"""
+        evs = [
+            _snap(
+                type="external.message.group",
+                event_id=f"M{i}",
+                payload={
+                    "segments": [
+                        {"type": "text", "data": {"text": f"m{i}"}}
+                    ]
+                },
+                seconds_offset=i,
+            )
+            for i in range(1, 6)  # M1..M5
+        ]
+        evs.insert(4, self._decision("穿插的想法", 4.5))  # M4 与 M5 之间
+        context = Projector.project(
+            evs,
+            scope_key="group:999",
+            correlation_id="c",
+            tick_seq=1,
+            now=BASE_TIME + timedelta(seconds=10),
+            max_timeline_items=3,
+        )
+        kinds = [it.kind for it in context.timeline]
+        self.assertEqual(
+            kinds, ["message", "message", "my_thought", "message"]
+        )
+        self.assertIn("m3", context.timeline[0].render)
+        self.assertIn("m5", context.timeline[-1].render)
 
 
 if __name__ == "__main__":

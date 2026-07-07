@@ -118,7 +118,7 @@ class SearchHistoryToolContractTest(unittest.TestCase):
         for item in result["items"]:
             self.assertEqual(item["kind"], "message")
             self.assertIn('sender_name="alice"', item["render"])
-            self.assertIn('sender_id="222"', item["render"])
+            self.assertIn('sender_qq="222"', item["render"])
             self.assertIn("hello world", item["render"])
 
     def test_limit_clamped_to_max(self) -> None:

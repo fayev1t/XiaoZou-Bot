@@ -1,0 +1,140 @@
+"""meme_store —— agent_memes 表（表情包收藏）的写入 / 读取。
+
+定位见 models/agent_meme.py 顶部注释。
+
+**全局共享（2026-07-06 起）**：收藏夹是全 bot 一份、所有聊天 scope 共用——
+这是隔离契约（事件系统设计.md §9.2 第 6 条）明确允许的例外：收藏以公共值
+file_hash 为键、不携带 scope 上下文，与图片文件落盘缓存同类。实现方式是
+scope_key 列固定写 MEME_SCOPE_GLOBAL 哨兵（列保留，表结构不变，主键
+(scope_key, file_hash) 退化为全局一图一条；将来要恢复分域只改本模块）。
+存量分群数据需一次性迁移合并到哨兵 scope，见 表情包工具黑盒设计.md §2。
+
+三个对外接口（全部独立事务、每次新开 session，与 task_store 同风格）：
+
+  get_meme(factory, hash)          单条精确查。send_meme 的权限边界
+                                   （只有收录过的才能发）与 save_meme
+                                   的去重前查都走它。
+  insert_meme(factory, ...)        收录一条。ON CONFLICT DO NOTHING：
+                                   并发重复保存时后到者静默不覆盖，
+                                   返回 False（调用方按 already_saved
+                                   处理），不做任何 UPDATE。
+  load_saved_memes(factory)        取全局收藏夹（created_at 倒序、封顶
+                                   MAX_SAVED_MEMES 条），Projector 渲染
+                                   <saved-memes> 用。
+
+失败语义：本模块**不吞异常** —— DB 失败原样 raise，由调用方决定降级（工具层
+经 BaseTool.run 兜底成 internal_tool_error；投影层 try/except 降级为本 tick 不
+渲染收藏夹），与 load_active_tasks 的约定一致。
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Callable
+
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from qqbot.core.logging import get_logger
+from qqbot.core.time import CHINA_TIMEZONE
+from qqbot.models.agent_meme import AgentMeme
+from qqbot.services.agent_loop.decision import MemeView
+
+logger = get_logger(__name__)
+
+SessionFactory = Callable[[], AsyncSession]
+
+# 全局收藏的哨兵 scope_key：所有读写固定用它，隔离契约 §9.2 第 6 条例外的
+# 显式标注就落在这里。列本身保留（见模块 docstring）。
+MEME_SCOPE_GLOBAL = "global"
+
+# <saved-memes> 渲染上限：收藏夹随时间增长，prompt 只带最近收录的 N 条。
+# 超限的老表情包仍在表里（send_meme 凭 hash 仍可发送），只是不再进 prompt。
+# 全局共享后所有群共用一个池，比分群时代放宽到 100。
+MAX_SAVED_MEMES = 100
+
+
+async def get_meme(
+    session_factory: SessionFactory, file_hash: str
+) -> MemeView | None:
+    """按 file_hash 精确查一条全局收藏；不存在 → None。"""
+    stmt = (
+        select(AgentMeme)
+        .where(AgentMeme.scope_key == MEME_SCOPE_GLOBAL)
+        .where(AgentMeme.file_hash == file_hash)
+    )
+    async with session_factory() as session:
+        result = await session.execute(stmt)
+        row = result.scalars().first()
+    return _row_to_meme_view(row) if row is not None else None
+
+
+async def insert_meme(
+    session_factory: SessionFactory,
+    *,
+    file_hash: str,
+    description: str,
+    context_note: str | None,
+    mime: str,
+    source_event_id: str | None,
+    created_at: datetime,
+) -> bool:
+    """收录一条表情包（进全局收藏夹）。返回 True=新插入，False=已存在
+    （并发重复保存）。
+
+    ON CONFLICT DO NOTHING 而非 upsert：收藏是一次性事实，重复保存不刷新
+    描述/时间（想换描述属于将来的 recaption 特性，不混进收录语义）。
+    """
+    stmt = (
+        pg_insert(AgentMeme)
+        .values(
+            scope_key=MEME_SCOPE_GLOBAL,
+            file_hash=file_hash,
+            description=description,
+            context_note=context_note,
+            mime=mime,
+            source_event_id=source_event_id,
+            created_at=created_at,
+        )
+        .on_conflict_do_nothing(index_elements=["scope_key", "file_hash"])
+    )
+    async with session_factory() as session:
+        result = await session.execute(stmt)
+        await session.commit()
+    return bool(getattr(result, "rowcount", 0))
+
+
+async def load_saved_memes(
+    session_factory: SessionFactory,
+    *,
+    limit: int = MAX_SAVED_MEMES,
+) -> list[MemeView]:
+    """取全局收藏夹，created_at 倒序（最新收录在前）、封顶 limit 条。"""
+    stmt = (
+        select(AgentMeme)
+        .where(AgentMeme.scope_key == MEME_SCOPE_GLOBAL)
+        .order_by(AgentMeme.created_at.desc())
+        .limit(limit)
+    )
+    async with session_factory() as session:
+        result = await session.execute(stmt)
+        rows = list(result.scalars().all())
+    return [_row_to_meme_view(r) for r in rows]
+
+
+def _row_to_meme_view(row: Any) -> MemeView:
+    """AgentMeme ORM row → MemeView（时区 normalize 与 task_store 一致）。"""
+    return MemeView(
+        file_hash=row.file_hash,
+        description=row.description or "",
+        saved_at=_norm_china(row.created_at),
+    )
+
+
+def _norm_china(dt: datetime | None) -> datetime:
+    """asyncpg 把 TIMESTAMPTZ 读回 UTC tzinfo；统一 normalize 到北京时间，
+    与 task_store._norm_china / projection._snapshot_from_row 保持一致。"""
+    if dt is not None and dt.tzinfo is not None:
+        return dt.astimezone(CHINA_TIMEZONE)
+    return dt  # type: ignore[return-value]

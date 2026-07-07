@@ -17,7 +17,7 @@ A light, harmless nudge — use it to playfully get someone's attention, react t
 }
 ```
 
-- `user_id` (required, int) — the QQ number of the member to poke. Read it from a `<message sender_id="USER_ID">` row in the timeline, or from an inline `<at user="USER_ID"/>` segment. Don't invent ids.
+- `user_id` (required, int) — the QQ number of the member to poke. Read it from a `<message sender_qq="USER_QQ">` row in the timeline, or from an inline `<at qq="USER_QQ"/>` segment. Don't invent ids.
 
 The target group is **always the current one** — `group_id` is taken from your scope automatically; you cannot poke someone in another group and there is no `group_id` argument.
 

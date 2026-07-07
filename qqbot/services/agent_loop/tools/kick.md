@@ -18,7 +18,7 @@ Only to remove a genuinely disruptive member — a spammer, an ad/scam bot, or s
 }
 ```
 
-- `user_id` (required, int) — the QQ number of the member to kick. Read it from a `<message sender_id="USER_ID">` row in the timeline, or from an inline `<at user="USER_ID"/>` segment. Don't invent ids.
+- `user_id` (required, int) — the QQ number of the member to kick. Read it from a `<message sender_qq="USER_QQ">` row in the timeline, or from an inline `<at qq="USER_QQ"/>` segment. Don't invent ids.
 - `reject_add_request` (optional, bool, default `false`) — if `true`, also block this user's *future* join requests. Use for persistent ad bots you don't want coming back; leave `false` for ordinary removals.
 
 The target group is **always the current one** — `group_id` is taken from your scope automatically; you cannot kick someone out of another group and there is no `group_id` argument.

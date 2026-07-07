@@ -131,13 +131,34 @@ class ImageRef:
 
 
 @dataclass(frozen=True)
+class MemeView:
+    """一条表情包收藏（agent_memes 读出的视图）。
+
+    Projector 经 meme_store.load_saved_memes 挂到 DecisionContext.saved_memes，
+    llm_planner 渲染成 <saved-memes> 里的一行 <meme hash="..." saved_at="...">
+    描述</meme>。description 由 save_meme 收录时的 caption LLM 调用生成，是
+    send_meme 选图的唯一依据；hash 与 timeline <image hash="..."/> 同一值空间。
+    """
+
+    file_hash: str
+    description: str
+    saved_at: datetime
+
+
+@dataclass(frozen=True)
 class TimelineItem:
     """One renderable row in the LLM context (任务与决策契约 §2.3)."""
 
     event_id: str
     occurred_at: datetime
     kind: Literal[
-        "message", "notice", "tool_call", "system_hint", "request", "task_closed"
+        "message",
+        "notice",
+        "tool_call",
+        "system_hint",
+        "request",
+        "task_closed",
+        "my_thought",
     ]
     render: str
     related_event_ids: list[str] = field(default_factory=list)
@@ -208,6 +229,13 @@ class DecisionContext:
 
     timeline: list[TimelineItem] = field(default_factory=list)
     active_tasks: list[TaskView] = field(default_factory=list)
+
+    # ─── 表情包收藏夹（2026-07-03，save_meme / send_meme 工具）───
+    # 全局共享的 agent_memes（2026-07-06 起全 bot 一份，created_at 倒序、
+    # 封顶 meme_store.MAX_SAVED_MEMES 条），由 Projector.
+    # _augment_with_saved_memes 注入；渲染成 <saved-memes>，send_meme 凭
+    # 其中的 hash 精确发送。空 = 不渲染。
+    saved_memes: list[MemeView] = field(default_factory=list)
     # 2026-07-02 起不再有独立的 pending_tool_results 字段：工具结果只在
     # timeline 的 <tool-call status="complete"> 行呈现一次（单一事实源）。
     # 旧的"待消费工具更新区"实现从未做过消费切割——窗口内所有 complete 每拍
@@ -215,13 +243,14 @@ class DecisionContext:
     # 与 pending 区双重渲染，两处语义必然漂移。ToolResultView 仍保留——它是
     # timeline 渲染 tool-call 行时的折叠视图（fold_tool_results）。
 
-    # ─── 模型的跨拍自我记忆（2026-07-02，模型+prompt 优先哲学）───
-    # 最近一条 agent.decision_emitted 的 reasoning 原文 + 时间。渲染成
-    # <last-reasoning at="...">，让模型每拍都记得"上一拍自己在想什么"——
-    # 此前 decision/idle 事件被投影强消隐，模型每拍失忆，跨拍思维只能靠
-    # note_task_progress（还必须挂 task）。窗口内没有历史决策时为 None。
-    last_reasoning: str | None = None
-    last_reasoning_at: datetime | None = None
+    # ─── 模型的跨拍自我记忆（2026-07-02 增 last_reasoning；2026-07-06 改为
+    # 思考轨迹内联，待办清单#4）───
+    # agent.decision_emitted 不再折叠成独立字段：build_timeline 直接把最近
+    # MAX_THOUGHT_ROWS 条（含 idle 拍、空白 reasoning 跳过）渲染为 timeline
+    # 的 <my-thought> 行，单条截 MAX_THOUGHT_CHARS 字、不挤占消息行预算。
+    # 旧的 last_reasoning / last_reasoning_at 字段与 <last-reasoning> 区块已
+    # 删除——只有 1 拍深的记忆使跨拍链条强度取决于最弱一拍，且与 <my-thought>
+    # 并存会双重渲染最新一条。
 
     # ─── 同 tick 校验重试的反馈（任务与决策契约 §7.1）───
     # 上一次 decide() 输出未通过动作校验时，loop 带着错误描述重试；planner

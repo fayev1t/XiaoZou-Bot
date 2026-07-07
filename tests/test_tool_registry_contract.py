@@ -215,7 +215,9 @@ class ToolRegistryContractTest(unittest.TestCase):
 
 
 class _SystemOnlyTool:
-    name = "respond_to_request"
+    # 虚构的 system-only 工具，纯为驱动 per-scope 可见性机制（真实工具里
+    # scope 限定的例子是群管理类 allowed_scopes=("group",)，机制同一套）。
+    name = "system_probe"
     description = "system only"
     arguments_schema = {"type": "object"}
     allowed_scopes = ("system",)
@@ -236,8 +238,8 @@ class _PlainUsageTool:
 
 
 class ToolScopeVisibilityTest(unittest.TestCase):
-    """allowed_scopes per-scope 可见性（契约 §2.2：respond_to_request 仅
-    SystemAgentLoop 可见，GroupAgentLoop 不知道它存在）。"""
+    """allowed_scopes per-scope 可见性（契约 §2.2：scope 限定的工具只在白名单
+    scope 的 catalog / usage_docs 出现，别的 loop 不知道它存在）。"""
 
     def _reg(self) -> ToolRegistry:
         reg = ToolRegistry()
@@ -248,17 +250,17 @@ class ToolScopeVisibilityTest(unittest.TestCase):
     def test_catalog_no_scope_includes_all(self) -> None:
         # scope=None（旧调用）→ 不过滤，全部可见
         names = {e["name"] for e in self._reg().catalog()}
-        self.assertEqual(names, {"send_message", "respond_to_request"})
+        self.assertEqual(names, {"send_message", "system_probe"})
 
     def test_catalog_system_scope_includes_scoped_tool(self) -> None:
         names = {e["name"] for e in self._reg().catalog("system")}
-        self.assertIn("respond_to_request", names)
+        self.assertIn("system_probe", names)
         self.assertIn("send_message", names)
 
     def test_catalog_group_scope_hides_scoped_tool(self) -> None:
         names = {e["name"] for e in self._reg().catalog("group")}
         self.assertIn("send_message", names)
-        self.assertNotIn("respond_to_request", names)
+        self.assertNotIn("system_probe", names)
 
     def test_usage_docs_group_scope_hides_scoped_tool(self) -> None:
         reg = ToolRegistry()

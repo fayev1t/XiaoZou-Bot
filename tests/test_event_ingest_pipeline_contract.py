@@ -101,6 +101,39 @@ class GroupMessageMapperContractTests(unittest.TestCase):
             partial.payload["segments"], [{"type": "text", "data": {"text": "hello"}}]
         )
 
+    def test_segments_prefer_original_message_over_adapter_stripped(self) -> None:
+        # nonebot v11 适配器分发前会原地改写 event.message（_check_reply 删
+        # reply 段与紧随的 @bot 段、_check_at_me 剥首/尾 @bot 段），
+        # original_message 才是 napcat 真实上报的完整段数组——契约
+        # EventIngest契约.md §3.1。
+        original = [
+            SimpleNamespace(type="reply", data={"id": "8888"}),
+            SimpleNamespace(type="at", data={"qq": "10000"}),
+            SimpleNamespace(type="text", data={"text": " 滚"}),
+        ]
+        stripped = [SimpleNamespace(type="text", data={"text": "滚"})]
+        partial = self.mapper.map(
+            _make_message_event(message=stripped, original_message=original)
+        )
+        self.assertEqual(
+            partial.payload["segments"],
+            [
+                {"type": "reply", "data": {"id": "8888"}},
+                {"type": "at", "data": {"qq": "10000"}},
+                {"type": "text", "data": {"text": " 滚"}},
+            ],
+        )
+
+    def test_segments_fall_back_to_message_when_original_absent_or_empty(
+        self,
+    ) -> None:
+        # 测试 fake / 非 v11 适配器没有 original_message；为空同样回退。
+        expected = [{"type": "text", "data": {"text": "hello"}}]
+        partial = self.mapper.map(_make_message_event())
+        self.assertEqual(partial.payload["segments"], expected)
+        partial = self.mapper.map(_make_message_event(original_message=[]))
+        self.assertEqual(partial.payload["segments"], expected)
+
     def test_anonymous_subtype_routes_to_anonymous_type(self) -> None:
         partial = self.mapper.map(_make_message_event(sub_type="anonymous"))
         self.assertEqual(partial.type, "external.message.group.anonymous")
@@ -250,14 +283,65 @@ class IdempotencyHelpersTests(unittest.TestCase):
             idempotency.for_request(1, "friend", "abc"), "1:request:friend:abc"
         )
 
+    def test_for_unknown(self) -> None:
+        self.assertEqual(
+            idempotency.for_unknown(1, "notice", "profile_like", 100, 9),
+            "1:unknown:notice:profile_like:100:9",
+        )
+        self.assertEqual(
+            idempotency.for_unknown(1, None, None, 100, None),
+            "1:unknown:_:_:100:_",
+        )
+
 
 class IngestPipelineTests(unittest.IsolatedAsyncioTestCase):
-    async def test_unknown_event_returns_unknown(self) -> None:
-        registry = build_default_registry()
-        ingest = EventIngest(registry, session_factory=_unused_session_factory)
-        result = await ingest.ingest(SimpleNamespace(post_type="???"))
+    async def test_unknown_event_persists_runtime_fallback(self) -> None:
+        # 契约 EventIngest契约.md §8：没有 mapper 的事件不丢弃——折成
+        # runtime.napcat_unknown_event（agent_visible, scope=system）落库并
+        # 唤醒 system loop；status 仍为 "unknown"（语义：无 mapper）。
+        recorder = _FakeSessionRecorder(rowcount=1)
+        supervisor = _FakeSupervisor()
+        ingest = EventIngest(
+            build_default_registry(),
+            session_factory=recorder.factory,
+            supervisor=supervisor,
+        )
+        result = await ingest.ingest(_UnknownEvent())
+
         self.assertEqual(result.status, "unknown")
-        self.assertIsNone(result.event)
+        self.assertEqual(result.reason, "no_mapper")
+        ev = result.event
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev.type, "runtime.napcat_unknown_event")
+        self.assertEqual(ev.origin, "runtime")
+        self.assertEqual(ev.scope, "system")
+        self.assertIsNone(ev.group_id)
+        self.assertEqual(ev.visibility, "agent_visible")
+        self.assertEqual(ev.payload["post_type"], "notice")
+        self.assertEqual(ev.payload["sub_type"], "profile_like")
+        # 原报文全量在 payload.raw；raw 列仅 external 写入（事件系统设计 §3）
+        self.assertEqual(ev.payload["raw"], _UnknownEvent.DUMP)
+        self.assertIsNone(ev.raw)
+        self.assertEqual(
+            ev.idempotency_key,
+            "10000:unknown:notice:profile_like:1716700000:222",
+        )
+        self.assertEqual(recorder.executes, 1)
+        self.assertEqual(recorder.commits, 1)
+        self.assertEqual(supervisor.woken, ["system"])
+
+    async def test_unknown_event_duplicate_on_repush(self) -> None:
+        # napcat 重推同一未知报文 → 唯一键兜住，不重复入库、不再唤醒
+        recorder = _FakeSessionRecorder(rowcount=0)
+        supervisor = _FakeSupervisor()
+        ingest = EventIngest(
+            build_default_registry(),
+            session_factory=recorder.factory,
+            supervisor=supervisor,
+        )
+        result = await ingest.ingest(_UnknownEvent())
+        self.assertEqual(result.status, "duplicate")
+        self.assertEqual(supervisor.woken, [])
 
     async def test_ingest_group_message_inserts(self) -> None:
         recorder = _FakeSessionRecorder(rowcount=1)
@@ -322,8 +406,38 @@ class _FakeSessionRecorder:
         return _FakeSession(self._rowcount, self)
 
 
-def _unused_session_factory() -> Any:
-    raise AssertionError("session factory should not be invoked for unknown events")
+class _FakeSupervisor:
+    def __init__(self) -> None:
+        self.woken: list[str] = []
+
+    async def wake(self, scope_key: str) -> None:
+        self.woken.append(scope_key)
+
+
+class _UnknownEvent:
+    """没有 mapper 的 napcat 报文 fake（如 notify.profile_like）。
+
+    带 dict() 以便 dump_event 走 pydantic v1 路径，验证原报文进 payload.raw。
+    """
+
+    post_type = "notice"
+    notice_type = "notify"
+    sub_type = "profile_like"
+    user_id = 222
+    self_id = 10000
+    time = 1716700000
+
+    DUMP = {
+        "post_type": "notice",
+        "notice_type": "notify",
+        "sub_type": "profile_like",
+        "user_id": 222,
+        "self_id": 10000,
+        "time": 1716700000,
+    }
+
+    def dict(self) -> dict:
+        return dict(self.DUMP)
 
 
 if __name__ == "__main__":

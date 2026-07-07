@@ -6,9 +6,12 @@
      能反查到对应 bot 实例
   2. 把事件交给 EventIngest 走 mapper → 媒体副作用 → 入库 → 唤醒 supervisor
      的完整流水线（meta_event.heartbeat 走文件旁路，详见 EventIngest契约 §7）
-  3. 启动期：拉起 LoopSupervisor（含 SystemAgentLoop + ToolWorker）；
+  3. request handler 在入库后调 request_auto_approval：好友申请 / 邀请入群
+     自动同意（不走 LLM）；入群申请（group.add）进目标群 timeline 由
+     GroupAgentLoop 处理，此处不动作
+  4. 启动期：拉起 LoopSupervisor（含 SystemAgentLoop + ToolWorker）；
      关停期：优雅停止
-  4. 任何 handler 异常一律 swallow —— 单条事件失败不能让 napcat 重推爆炸
+  5. 任何 handler 异常一律 swallow —— 单条事件失败不能让 napcat 重推爆炸
 
 priority 取较低值（10）以避免与可能存在的调试 plugin 抢先；block=True
 确保事件不再被任何残留 matcher 处理。
@@ -17,8 +20,6 @@ priority 取较低值（10）以避免与可能存在的调试 plugin 抢先；b
 """
 
 from __future__ import annotations
-
-from pathlib import Path
 
 from nonebot import get_driver, on_message, on_metaevent, on_notice, on_request
 from nonebot.adapters import Bot, Event
@@ -35,51 +36,16 @@ from qqbot.services.agent_loop.bot_role_sweep import (
     reflect_bot_role_from_meta,
     reflect_bot_role_from_notice,
 )
+from qqbot.services.agent_loop.meme_caption import caption_image
 from qqbot.services.agent_loop.tools import build_default_registry as build_tool_registry
-from qqbot.services.event_ingest import EventIngest
+from qqbot.services.event_ingest import EventIngest, IngestResult
 from qqbot.services.event_ingest.mappers import build_default_registry
+from qqbot.services.request_auto_approval import maybe_auto_approve
 
 logger = get_logger(__name__)
 
 _ingest: EventIngest | None = None
 _supervisor: LoopSupervisor | None = None
-
-# qqbot/ 没有 __init__.py（namespace package），所以 `qqbot.__file__` 是
-# None，不能用来定位 persona。改用本文件的相对路径，persona 与其他 prompt
-# 段共置于 services/agent_loop/prompts/：
-#   qqbot/plugins/v2_main.py → parent.parent = qqbot/
-#   → services/agent_loop/prompts/persona.md
-_PERSONA_PATH = (
-    Path(__file__).resolve().parent.parent
-    / "services"
-    / "agent_loop"
-    / "prompts"
-    / "persona.md"
-)
-
-
-def _load_persona_text() -> str | None:
-    """从 services/agent_loop/prompts/persona.md 读主人设。文件缺失 / 为空
-    返回 None，LLMPlanner 会退化为纯决策协议 prompt（不报错，便于排障）。"""
-    try:
-        if not _PERSONA_PATH.exists():
-            logger.warning(
-                "[v2_main] persona.md not found at {}, running without persona",
-                _PERSONA_PATH,
-            )
-            return None
-        text = _PERSONA_PATH.read_text(encoding="utf-8").strip()
-        if not text:
-            logger.warning("[v2_main] persona.md is empty, running without persona")
-            return None
-        return text
-    except Exception as exc:
-        logger.warning(
-            "[v2_main] failed to read persona.md ({}), running without persona",
-            exc,
-        )
-        return None
-
 
 def _get_supervisor() -> LoopSupervisor:
     global _supervisor
@@ -88,20 +54,23 @@ def _get_supervisor() -> LoopSupervisor:
         # 工具无构造依赖：session_factory / scope_key 等系统依赖由 ToolWorker
         # 在 run() context 里统一注入（见 ToolWorker._process_one）。
         tool_registry = build_tool_registry()
-        persona_text = _load_persona_text()
         # LLMPlanner 对 LLM 不可用 / JSON 解析失败一律 fallback 为 IdleAction，
         # 不会让 supervisor 起不来。tool_registry 同时给 planner（prompt
         # tool_catalog）和 supervisor（ToolWorker 调度查找）共用。
-        # persona_text 进入 SystemPrompt 最前段，立人设；缺文件时退化为
-        # 纯决策协议 prompt（LLMPlanner 自己处理 None）。
+        # system prompt 由 planner 内部的默认 PromptRegistry 装配（identity /
+        # xml_format / group_chat_rules / protocol / tools_usage）；角色卡随
+        # tools/send_message.md 进 tools_usage 段，插件层不再有单独注入链路。
         _supervisor = LoopSupervisor(
             planner=LLMPlanner(
                 tool_registry=tool_registry,
-                persona_text=persona_text,
             ),
             session_factory=AsyncSessionLocal,
             projector=projector,
             tool_registry=tool_registry,
+            # save_meme 的看图写描述回调：经 supervisor → ToolWorker 进工具
+            # run() context（与 session_factory 同一条注入链，工具不自己
+            # import meme_caption，契约测试可塞假 captioner）。
+            caption_image=caption_image,
         )
         # 无需 supervisor→tool 的反向回调接线：系统依赖（session_factory 等）
         # 由 ToolWorker 在 run() 的 context 统一注入，工具侧不持有 supervisor。
@@ -119,7 +88,7 @@ def _get_ingest() -> EventIngest:
     return _ingest
 
 
-async def _ingest_event(event: Event) -> None:
+async def _ingest_event(event: Event) -> IngestResult | None:
     try:
         result = await _get_ingest().ingest(event)
         if result.status == "error":
@@ -130,8 +99,10 @@ async def _ingest_event(event: Event) -> None:
                 getattr(event, "post_type", "?"),
                 getattr(event, "sub_type", "?"),
             )
+        return result
     except Exception as exc:
         logger.warning("[v2_main] ingest swallowed: {}", exc)
+        return None
 
 
 def _remember_bot(bot: Bot) -> None:
@@ -168,7 +139,15 @@ async def _on_notice(bot: Bot, event: Event) -> None:
 @_request_matcher.handle()
 async def _on_request(bot: Bot, event: Event) -> None:
     _remember_bot(bot)
-    await _ingest_event(event)
+    result = await _ingest_event(event)
+    # 好友申请 / 邀请入群：首次入库（inserted）后立即自动同意，不走 LLM；
+    # duplicate / group.add / 其它一律无动作（group.add 进群 timeline 由
+    # GroupAgentLoop 处理）。maybe_auto_approve 自身永不 raise，这层 try 只是
+    # 维持"handler 绝不让 napcat 重推爆炸"的显式兜底。
+    try:
+        await maybe_auto_approve(bot, result, AsyncSessionLocal)
+    except Exception as exc:
+        logger.warning("[v2_main] auto-approve swallowed: {}", exc)
 
 
 @_meta_matcher.handle()

@@ -4,7 +4,7 @@ Contract: 开发文档/v2.0/EventIngest契约.md §2
 
 Pipeline:
   (0) heartbeat short-circuit → write_heartbeat() (§7.1)
-  (1) mapper lookup (§3)
+  (1) mapper lookup (§3)；no mapper → runtime.napcat_unknown_event 兜底落库 (§8)
   (2) PartialSystemEvent
   (3) attach_media_to_payload — image download side effects (§6)
   (4) finalize (event_id, occurred_at, self-correlation)
@@ -22,8 +22,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from qqbot.core.logging import get_logger
 from qqbot.core.time import normalize_china_time
 from qqbot.services.event_ingest.heartbeat import write_heartbeat
+from qqbot.services.event_ingest.idempotency import for_unknown
 from qqbot.services.event_ingest.mapper import MapperRegistry
 from qqbot.services.event_ingest.media import attach_media_to_payload
+from qqbot.services.event_ingest.napcat_helpers import dump_event
 from qqbot.services.event_ingest.persistence import persist_event
 from qqbot.services.event_ingest.system_event import (
     PartialSystemEvent,
@@ -81,7 +83,7 @@ class EventIngest:
                 getattr(event, "post_type", "?"),
                 getattr(event, "sub_type", "?"),
             )
-            return IngestResult(status="unknown", reason="no_mapper")
+            return await self._ingest_unknown(event)
 
         partial: PartialSystemEvent = mapper.map(event)
 
@@ -114,6 +116,59 @@ class EventIngest:
 
         await self._maybe_wake(sys_event)
         return IngestResult(status="inserted", event=sys_event)
+
+    async def _ingest_unknown(self, event: Any) -> IngestResult:
+        """没有 mapper 的事件不丢弃——折成 runtime.napcat_unknown_event 落库。
+
+        契约 EventIngest契约.md §8 / 事件系统设计.md §4.3.2：napcat 协议升级、
+        第三方扩展推来的未识别报文要留痕并让 SystemAgentLoop 看到（投影层对
+        agent_visible 的 runtime.* 泛化渲染成 <system-hint>，无需改动）。
+        origin=runtime——协议外报文是基础设施观察，不是可信业务事件；raw 列
+        按 §3 只给 external 写，原报文全量放 payload.raw。status 仍返回
+        "unknown"（语义是"无 mapper"，供 v2_main 日志区分），但 event 已入库。
+        """
+        post_type = getattr(event, "post_type", None)
+        sub_type = getattr(event, "sub_type", None)
+        partial = PartialSystemEvent(
+            origin="runtime",
+            type="runtime.napcat_unknown_event",
+            scope="system",
+            group_id=None,
+            user_id=getattr(event, "user_id", None),
+            visibility="agent_visible",
+            payload={
+                "post_type": post_type,
+                "sub_type": sub_type,
+                "raw": dump_event(event),
+            },
+            raw=None,
+            idempotency_key=for_unknown(
+                getattr(event, "self_id", 0),
+                post_type,
+                sub_type,
+                int(getattr(event, "time", 0) or 0),
+                getattr(event, "user_id", None),
+            ),
+        )
+        occurred_at = normalize_china_time(getattr(event, "time", None))
+        sys_event = finalize(partial, occurred_at=occurred_at)
+
+        try:
+            async with self._session_factory() as session:
+                inserted = await persist_event(session, sys_event)
+        except Exception as exc:
+            logger.error(
+                "[event_ingest] unknown-event persist failed: post_type={} err={}",
+                post_type,
+                exc,
+            )
+            return IngestResult(status="error", event=sys_event, reason=str(exc))
+
+        if not inserted:
+            return IngestResult(status="duplicate", event=sys_event)
+
+        await self._maybe_wake(sys_event)
+        return IngestResult(status="unknown", event=sys_event, reason="no_mapper")
 
     async def _maybe_wake(self, event: SystemEvent) -> None:
         if self._supervisor is None:

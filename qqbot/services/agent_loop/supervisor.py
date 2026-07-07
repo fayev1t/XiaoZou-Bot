@@ -26,7 +26,7 @@ runtime.tool_batch_completed 后经 notify_tool_batch_completed **批次级唤�
 from __future__ import annotations
 
 import asyncio
-from typing import Callable
+from typing import Any, Callable
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -50,11 +50,15 @@ class LoopSupervisor:
         session_factory: SessionFactory,
         projector: Projector | None = None,
         tool_registry: ToolRegistry | None = None,
+        caption_image: Any | None = None,
     ) -> None:
         self._planner = planner
         self._session_factory = session_factory
         self._projector = projector
         self._tool_registry = tool_registry
+        # 看图写描述回调（生产 = meme_caption.caption_image，由 v2_main 注入）：
+        # 原样转发给 ToolWorker，进工具 run() context 供 save_meme 用。
+        self._caption_image = caption_image
         self._loops: dict[str, AgentLoop] = {}
         self._lock = asyncio.Lock()
         self._started = False
@@ -97,6 +101,7 @@ class LoopSupervisor:
                 session_factory=self._session_factory,
                 registry=self._tool_registry,
                 supervisor=self,
+                caption_image=self._caption_image,
             )
             self._tool_worker.start()
         # SystemAgentLoop wakes up to handle scope=system events

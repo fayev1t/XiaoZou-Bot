@@ -36,10 +36,12 @@ from qqbot.services.agent_loop.tools.kick import KickTool
 from qqbot.services.agent_loop.tools.leave_group import LeaveGroupTool
 from qqbot.services.agent_loop.tools.poke import PokeTool
 from qqbot.services.agent_loop.tools.recall import RecallTool
-from qqbot.services.agent_loop.tools.respond_to_request import (
-    RespondToRequestTool,
+from qqbot.services.agent_loop.tools.respond_to_group_join_request import (
+    RespondToGroupJoinRequestTool,
 )
+from qqbot.services.agent_loop.tools.save_meme import SaveMemeTool
 from qqbot.services.agent_loop.tools.search_history import SearchHistoryTool
+from qqbot.services.agent_loop.tools.send_meme import SendMemeTool
 from qqbot.services.agent_loop.tools.send_message import SendMessageTool
 from qqbot.services.agent_loop.tools.set_admin import SetAdminTool
 from qqbot.services.agent_loop.tools.set_card import SetCardTool
@@ -54,21 +56,27 @@ from qqbot.services.agent_loop.tools.whole_ban import WholeBanTool
 
 def build_default_registry() -> ToolRegistry:
     # 2026-07-01：应用户要求，暂时只保留最基础的 send_message 工具，其余工具整体下架。
-    # 原因：现有 napcat 动作 / websearch / search_history / respond_to_request 的
-    # 实现「太粗」，先全部停用，待逐个重做后再逐一恢复注册。工具类、sibling .md、
-    # 各自的契约测试都仍留在仓库里——恢复某个工具时，把它对应的
-    # registry.register(...) 行取消注释即可，无需改别处。
+    # 原因：现有 napcat 动作 / websearch / search_history 的实现「太粗」，先全部
+    # 停用，待逐个重做后再逐一恢复注册。工具类、sibling .md、各自的契约测试都仍
+    # 留在仓库里——恢复某个工具时，把它对应的 registry.register(...) 行取消注释
+    # 即可，无需改别处。（respond_to_request 已于 2026-07-03 拆分删除，见下。）
     registry = ToolRegistry()
     # ── 基础能力（当前在用）──
     registry.register(SendMessageTool())
     # wait：模型的时间自主权（自我延迟唤醒），2026-07-02 新增。
     registry.register(WaitTool())
+    # 入群申请审批（2026-07-03 拆分自已删除的 respond_to_request）：group.add
+    # 事件进目标群 timeline，管理员明确授权后由群内 LLM 调它回执；好友申请 /
+    # 邀请入群不经工具，由 plugin 层 request_auto_approval 自动同意。
+    registry.register(RespondToGroupJoinRequestTool())
+    # 表情包收发（2026-07-03 新增）：save_meme 收录 timeline 图片（描述由
+    # 工具内 caption LLM 调用生成，见 meme_caption.py），send_meme 按 hash
+    # 发送收藏——收藏夹经 <saved-memes> 每 tick 注入 prompt。
+    registry.register(SaveMemeTool())
+    registry.register(SendMemeTool())
     # ── 以下工具暂时下架（2026-07-01），重做后逐一恢复 ──
     # registry.register(WebsearchTool())
     # registry.register(SearchHistoryTool())
-    # respond_to_request（同意/拒绝好友·加群·入群邀请）本就未注册：投影渲染与
-    # SystemAgentLoop 处理链路 + scope 归属（群 vs system）待定，见开发日志 2026-06-30。
-    # registry.register(RespondToRequestTool())  # 仅 system scope
     # napcat 动作工具：消息操作
     # registry.register(RecallTool())
     # registry.register(SetEssenceTool())
@@ -110,8 +118,10 @@ __all__ = [
     "LeaveGroupTool",
     "PokeTool",
     "RecallTool",
-    "RespondToRequestTool",
+    "RespondToGroupJoinRequestTool",
+    "SaveMemeTool",
     "SearchHistoryTool",
+    "SendMemeTool",
     "SendMessageTool",
     "SetAdminTool",
     "SetCardTool",

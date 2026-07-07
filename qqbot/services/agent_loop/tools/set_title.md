@@ -20,7 +20,7 @@ Don't hand out titles on your own initiative, to tease someone, or on a non-owne
 }
 ```
 
-- `user_id` (required, int) — the QQ number of the member whose title to set. Read it from a `<message sender_id="USER_ID">` row in the timeline, or from an inline `<at user="USER_ID"/>` segment. Don't invent ids.
+- `user_id` (required, int) — the QQ number of the member whose title to set. Read it from a `<message sender_qq="USER_QQ">` row in the timeline, or from an inline `<at qq="USER_QQ"/>` segment. Don't invent ids.
 - `title` (optional, string, default `""`) — the new special title. An **empty string clears** it. The tool maps this onto napcat's `special_title` field for you; you always pass `title`.
 
 The target group is **always the current one** — `group_id` is taken from your scope automatically; you cannot edit titles in another group and there is no `group_id` argument.

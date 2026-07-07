@@ -125,8 +125,8 @@ class Tool(Protocol):
     # `allowed_scopes` 同样可选：None（默认）= 不限 scope，任何 AgentLoop 都
     # 可见可调；非空序列 = 仅列出的 scope（"system"/"group"/"private"）可见，
     # catalog(scope) 在别的 scope 里隐藏它、工具内 enforce_scope 拒绝硬调（返回
-    # tool_unavailable_in_scope）。这是契约 §2.2「respond_to_request 仅
-    # SystemAgentLoop 可见」的落地点。
+    # tool_unavailable_in_scope）。这是契约 §2.2「scope 限定工具（如群管理类
+    # 仅 GroupAgentLoop 可见）」的落地点。
 
     async def run(self, arguments: dict, **context: Any) -> Any:
         """运行工具，**返回** ToolOutcome（成功或失败）。
@@ -162,7 +162,8 @@ class BaseTool:
     required_permission: PermissionTier = PermissionTier.GUEST
     require_bot_admin: bool = False
     # None = 不限 scope（默认，所有 AgentLoop 可见可调）；非空 tuple 限定
-    # 仅这些 scope 可见（如 respond_to_request = ("system",)，契约 §2.2）。
+    # 仅这些 scope 可见（如 ban / respond_to_group_join_request = ("group",)，
+    # 契约 §2.2）。
     allowed_scopes: tuple[str, ...] | None = None
     # bot 自身在群里的最低角色要求：None=不限；"admin"=须管理员或群主；
     # "owner"=须群主。由 enforce_bot_admin 在工具内判——bot 角色经
@@ -517,10 +518,10 @@ class ToolRegistry:
 
         但 **scope 可见性确实在这里过滤**（与权限不同维度）：传入当前
         AgentLoop 的 scope（"system"/"group"/"private"）时，`allowed_scopes`
-        限定的工具只在白名单 scope 出现。这是契约 §2.2「工具集合按 scope 不同，
-        respond_to_request 仅 SystemAgentLoop 可见」的落地——GroupAgentLoop 的
-        catalog 里根本不出现 respond_to_request，LLM 不知道它存在。scope=None
-        （默认）时不过滤，兼容旧调用。
+        限定的工具只在白名单 scope 出现。这是契约 §2.2「工具集合按 scope 不同」
+        的落地——群专用工具（ban / respond_to_group_join_request …）不出现在
+        SystemAgentLoop 的 catalog 里，LLM 不知道它存在。scope=None（默认）时
+        不过滤，兼容旧调用。
         """
         return [
             {
@@ -541,8 +542,8 @@ class ToolRegistry:
         `## Tool: foo` 标题。
 
         与 catalog() 对称地支持 per-scope 过滤：scope 给定时，allowed_scopes
-        限定的工具的用法文档不进别的 scope 的 prompt（避免 GroupAgentLoop 的
-        system prompt 泄漏 respond_to_request 的存在，反之亦然）。**生产路径已带
+        限定的工具的用法文档不进别的 scope 的 prompt（群专用工具的用法不泄漏进
+        system loop 的 prompt，反之亦然）。**生产路径已带
         scope**：LLMPlanner 把本方法作为 tools_usage section 注入，PromptRegistry
         .render(scope=...) 在每个 tick 按 `context.scope_key` 的 scope 前缀求值
         （与 catalog(scope) 同一把尺子），所以群/‌system 专用工具的用法不再互相

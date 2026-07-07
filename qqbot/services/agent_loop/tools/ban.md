@@ -20,7 +20,7 @@ Don't mute on a whim, over a single tense message, or to "win" an argument. Muti
 }
 ```
 
-- `user_id` (required, int) — the QQ number of the member to mute. Read it from a `<message sender_id="USER_ID">` row in the timeline, or from an inline `<at user="USER_ID"/>` segment. Don't invent ids.
+- `user_id` (required, int) — the QQ number of the member to mute. Read it from a `<message sender_qq="USER_QQ">` row in the timeline, or from an inline `<at qq="USER_QQ"/>` segment. Don't invent ids.
 - `duration` (optional, int, default `1800`) — mute length in **seconds** (1800 = 30 minutes). Pass `0` to **lift** an existing mute. Keep it proportionate: minutes for a brief flood, not days.
 
 The target group is **always the current one** — `group_id` is taken from your scope automatically; you cannot mute someone in another group and there is no `group_id` argument.

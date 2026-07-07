@@ -17,7 +17,7 @@ Use it to take back a message that should no longer be visible: a message you yo
 }
 ```
 
-- `message_id` (required, int) — the `onebot_message_id` of the message to recall. Read it from the `id` attribute of a `<message ... id="MESSAGE_ID">` row in the timeline (that `id` **is** the `onebot_message_id`). Don't invent ids.
+- `message_id` (required, int) — the `onebot_message_id` of the message to recall. Read it from the `message_id` attribute of a `<message ... message_id="MESSAGE_ID">` row in the timeline (same field name as this argument — copy it verbatim). Don't invent ids.
 
 The target message is located by `message_id` alone — there is **no** `group_id` argument. The tool still confirms you are acting inside the current group's scope, but napcat needs only the message id to recall it.
 

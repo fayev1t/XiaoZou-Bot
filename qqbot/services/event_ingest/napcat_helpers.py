@@ -41,3 +41,21 @@ def dump_segments(message: Any) -> list[dict]:
         except Exception:
             out.append({"type": "unknown", "data": {}})
     return out
+
+
+def dump_message_segments(event: Any) -> list[dict]:
+    """消息事件 → 段数组，取适配器改写前的 ``original_message``。
+
+    nonebot 的 OneBot V11 适配器在分发给 matcher 之前会原地改写
+    ``event.message``：``_check_reply`` 把 reply 段解析进 ``event.reply``
+    后**删除该段**（若紧随其后是 @bot 段——客户端引用默认附带——一并
+    删除，并 lstrip 后面的文本），``_check_at_me`` 再剥掉首/尾的 @bot 段。
+    直接 dump ``event.message`` 会让"引用 + @bot"类消息在事件流里退化成
+    裸文本。``event.original_message`` 是改写前的深拷贝，才是 napcat
+    真实上报的完整消息；缺失或为空时（测试 fake、非 v11 适配器）回退
+    ``event.message``。
+    """
+    original = getattr(event, "original_message", None)
+    if original:
+        return dump_segments(original)
+    return dump_segments(getattr(event, "message", None))

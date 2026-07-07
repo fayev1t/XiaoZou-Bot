@@ -99,6 +99,32 @@ class PrivateMessageMapperTests(unittest.TestCase):
         self.assertIn("user_id", p.payload["sender"])
         self.assertIn("nickname", p.payload["sender"])
 
+    def test_segments_prefer_original_message(self) -> None:
+        # 与 GroupMessageMapper 同一契约（EventIngest契约.md §3.1）：
+        # segments 取适配器改写前的 original_message，回退 message。
+        event = _ev(
+            post_type="message",
+            message_type="private",
+            sub_type="friend",
+            message_id=7,
+            user_id=222,
+            raw_message="[CQ:reply,id=42]hi",
+            message=[SimpleNamespace(type="text", data={"text": "hi"})],
+            original_message=[
+                SimpleNamespace(type="reply", data={"id": "42"}),
+                SimpleNamespace(type="text", data={"text": "hi"}),
+            ],
+            sender=SimpleNamespace(user_id=222, nickname="bob"),
+        )
+        p = self.mapper.map(event)
+        self.assertEqual(
+            p.payload["segments"],
+            [
+                {"type": "reply", "data": {"id": "42"}},
+                {"type": "text", "data": {"text": "hi"}},
+            ],
+        )
+
 
 class GroupIncreaseMapperTests(unittest.TestCase):
     def test_partial(self) -> None:
@@ -210,6 +236,44 @@ class PokeMapperTests(unittest.TestCase):
             )
         )
         self.assertEqual(p.scope, "private")
+
+    def test_action_extracted_from_napcat_raw_info(self) -> None:
+        # napcat 扩展 raw_info：type=="nor" 的 txt 依次是动作文案与后缀
+        # （qq/img 段是头像与跳链，无文本语义）。契约：事件系统设计 §4.1。
+        p = PokeMapper().map(
+            _ev(
+                post_type="notice",
+                notice_type="notify",
+                sub_type="poke",
+                group_id=99,
+                user_id=222,
+                target_id=333,
+                raw_info=[
+                    {"type": "qq", "uid": "u_aaa"},
+                    {"type": "img", "src": "http://tianquan.gtimg.cn/x"},
+                    {"type": "nor", "txt": "拍了拍"},
+                    {"type": "qq", "uid": "u_bbb"},
+                    {"type": "nor", "txt": "的头"},
+                ],
+            )
+        )
+        self.assertEqual(p.payload["action"], "拍了拍")
+        self.assertEqual(p.payload["action_suffix"], "的头")
+
+    def test_action_absent_without_raw_info(self) -> None:
+        # 非 napcat 实现没有 raw_info——有值才落键
+        p = PokeMapper().map(
+            _ev(
+                post_type="notice",
+                notice_type="notify",
+                sub_type="poke",
+                group_id=99,
+                user_id=222,
+                target_id=333,
+            )
+        )
+        self.assertNotIn("action", p.payload)
+        self.assertNotIn("action_suffix", p.payload)
 
 
 class LuckyKingMapperTests(unittest.TestCase):
@@ -348,6 +412,8 @@ class BotOfflineMapperTests(unittest.TestCase):
 
 class FriendRequestMapperTests(unittest.TestCase):
     def test_partial(self) -> None:
+        # 2026-07-03 拆分：好友申请不走 LLM（runtime_only 审计落库，plugin 层
+        # 自动同意），scope 仍为 system。
         p = FriendRequestMapper().map(
             _ev(
                 post_type="request",
@@ -359,11 +425,15 @@ class FriendRequestMapperTests(unittest.TestCase):
         )
         self.assertEqual(p.type, "external.request.friend")
         self.assertEqual(p.scope, "system")
+        self.assertEqual(p.visibility, "runtime_only")
+        self.assertEqual(p.payload["flag"], "abc")
         self.assertEqual(p.idempotency_key, "10000:request:friend:abc")
 
 
 class GroupRequestMapperTests(unittest.TestCase):
-    def test_add_subtype(self) -> None:
+    def test_add_subtype_routes_to_group_scope(self) -> None:
+        # 2026-07-03 拆分：入群申请进目标群 timeline（scope=group + group_id 列
+        # + agent_visible），像普通群事件一样唤醒 GroupAgentLoop。
         p = GroupRequestMapper().map(
             _ev(
                 post_type="request",
@@ -376,12 +446,35 @@ class GroupRequestMapperTests(unittest.TestCase):
             )
         )
         self.assertEqual(p.type, "external.request.group.add")
-        self.assertEqual(p.scope, "system")
-        # scope=system 不暴露 group_id 在路由字段，但 payload 保留
-        self.assertIsNone(p.group_id)
+        self.assertEqual(p.scope, "group")
+        self.assertEqual(p.group_id, 99)
+        self.assertEqual(p.visibility, "agent_visible")
+        # 工具反查所需字段全在 payload
         self.assertEqual(p.payload["group_id"], 99)
+        self.assertEqual(p.payload["sub_type"], "add")
+        self.assertEqual(p.payload["flag"], "xyz")
+        self.assertEqual(p.payload["user_id"], 222)
+        self.assertEqual(p.payload["comment"], "join")
 
-    def test_invite_subtype(self) -> None:
+    def test_add_without_group_id_falls_back_to_system_audit(self) -> None:
+        # 理论异常：add 拿不到 group_id → 退 system 审计路径，不造 scope=group
+        # 而 group_id 为空、路由不到任何 loop 的悬空事件。
+        p = GroupRequestMapper().map(
+            _ev(
+                post_type="request",
+                request_type="group",
+                sub_type="add",
+                group_id=None,
+                user_id=222,
+                flag="xyz",
+            )
+        )
+        self.assertEqual(p.scope, "system")
+        self.assertIsNone(p.group_id)
+        self.assertEqual(p.visibility, "runtime_only")
+
+    def test_invite_subtype_is_runtime_only_system(self) -> None:
+        # 邀请入群不走 LLM：system + runtime_only 审计落库，plugin 层自动同意。
         p = GroupRequestMapper().map(
             _ev(
                 post_type="request",
@@ -393,6 +486,27 @@ class GroupRequestMapperTests(unittest.TestCase):
             )
         )
         self.assertEqual(p.type, "external.request.group.invite")
+        self.assertEqual(p.scope, "system")
+        self.assertIsNone(p.group_id)
+        self.assertEqual(p.visibility, "runtime_only")
+        self.assertEqual(p.payload["group_id"], 99)
+
+    def test_unknown_subtype_treated_as_add(self) -> None:
+        # 未知 sub_type 兜底当 add：宁可进群 timeline 要人授权，不掉自动同意通道。
+        p = GroupRequestMapper().map(
+            _ev(
+                post_type="request",
+                request_type="group",
+                sub_type="whatever",
+                group_id=99,
+                user_id=222,
+                flag="uuu",
+            )
+        )
+        self.assertEqual(p.type, "external.request.group.add")
+        self.assertEqual(p.scope, "group")
+        self.assertEqual(p.group_id, 99)
+        self.assertEqual(p.visibility, "agent_visible")
 
 
 class LifecycleMapperTests(unittest.TestCase):

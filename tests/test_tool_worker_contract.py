@@ -519,5 +519,49 @@ class ToolWorkerSelfWakeTest(unittest.TestCase):
         self.assertIsNone(done_unknown.tool_batch_id)
 
 
+class ToolWorkerCaptionInjectionTests(unittest.TestCase):
+    """caption_image 注入链（save_meme 的看图写描述依赖）：构造参数 →
+    run() context，与 session_factory 同链；未配置时注入 None（工具自行
+    降级失败，与 wait 缺 wake_scope 同式）。"""
+
+    class _CtxCapturingTool(_StubTool):
+        def __init__(self, name: str, captured: dict) -> None:
+            super().__init__(name)
+            self._captured = captured
+
+        async def run(self, arguments: dict, **context: Any) -> Any:
+            self._captured.update(context)
+            return {"ok": True}
+
+    def _run_one(self, worker_kwargs: dict) -> dict:
+        captured: dict[str, Any] = {}
+        reg = ToolRegistry()
+        reg.register(self._CtxCapturingTool("save_meme", captured))
+        worker = ToolWorker(
+            session_factory=_factory_for([]), registry=reg, **worker_kwargs
+        )
+        row = _row(
+            payload={
+                "tool_call_id": "TC_CAP",
+                "tool_name": "save_meme",
+                "arguments": {},
+            }
+        )
+        asyncio.run(worker._process_one(row))
+        return captured
+
+    def test_caption_image_forwarded_into_tool_context(self) -> None:
+        async def _fake_caption(data: bytes, mime: str, note: Any) -> str:
+            return "描述"
+
+        captured = self._run_one({"caption_image": _fake_caption})
+        self.assertIs(captured.get("caption_image"), _fake_caption)
+
+    def test_caption_image_defaults_to_none(self) -> None:
+        captured = self._run_one({})
+        self.assertIn("caption_image", captured)
+        self.assertIsNone(captured["caption_image"])
+
+
 if __name__ == "__main__":
     unittest.main()

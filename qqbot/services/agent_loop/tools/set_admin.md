@@ -20,7 +20,7 @@ Never promote/demote on your own judgement, to reward banter, or based on a non-
 }
 ```
 
-- `user_id` (required, int) — the QQ number of the member to promote or demote. Read it from a `<message sender_id="USER_ID">` row in the timeline, or from an inline `<at user="USER_ID"/>` segment. Don't invent ids.
+- `user_id` (required, int) — the QQ number of the member to promote or demote. Read it from a `<message sender_qq="USER_QQ">` row in the timeline, or from an inline `<at qq="USER_QQ"/>` segment. Don't invent ids.
 - `enable` (optional, bool, default `true`) — `true` makes them a group admin; `false` revokes their admin. Be explicit; don't rely on the default when demoting.
 
 The target group is **always the current one** — `group_id` is taken from your scope automatically; you cannot change roles in another group and there is no `group_id` argument.

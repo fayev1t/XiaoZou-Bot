@@ -43,7 +43,7 @@ _USAGE_PROMPT = load_sibling_md(__file__, "send_message.md")
 
 class SendMessageTool(BaseTool):
     """实现 Tool 协议。无构造依赖：scope_key 由 ToolWorker 注入；Bot 实例从
-    bot_registry 取 —— 与 kick / respond_to_request 等同步工具同构。
+    bot_registry 取 —— 与 kick / respond_to_group_join_request 等同步工具同构。
     """
 
     name = "send_message"
@@ -55,8 +55,8 @@ class SendMessageTool(BaseTool):
         "a clearly answerable question went unanswered). Skipping this tool "
         "and emitting `idle` is the correct choice for any tick where no one "
         "is addressing you. The arguments mirror the OneBot V11 send-message "
-        "payload: content (list of segments), target (kind/group_id|user_id "
-        "matching the current scope), and an optional related_msg_hashes. "
+        "payload: content (list of segments) and target "
+        "(kind/group_id|user_id matching the current scope). "
         "Sending is synchronous: a tool-call at status=\"complete\" with a "
         "<result> means the message actually went out (the result carries "
         "its message_id) — it is already said, never re-send it; complete "
@@ -64,6 +64,10 @@ class SendMessageTool(BaseTool):
         "decide whether to retry or drop."
     )
     usage_prompt = _USAGE_PROMPT
+    # 仅 group / private 可见可调：system scope 没有聊天面（target 必须匹配
+    # scope，system 下必然 target_scope_mismatch），同时让用法文档里的角色卡
+    # （Voice 节）随 usage_docs 的 scope 过滤天然不进 system loop 的 prompt。
+    allowed_scopes = ("group", "private")
     # required_permission / required_bot_role 用 BaseTool 默认值（GUEST /
     # 不限 bot 角色）：发言不分群员等级，小奏普通群员也能说话。
     arguments_schema = {
@@ -93,12 +97,6 @@ class SendMessageTool(BaseTool):
                 },
                 "required": ["kind"],
             },
-            "related_msg_hashes": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Optional; informational bookkeeping.",
-                "default": [],
-            },
         },
         "required": ["content", "target"],
     }
@@ -117,6 +115,9 @@ class SendMessageTool(BaseTool):
                 field="scope_key",
                 user_fixable=False,
             )
+
+        if fail := _validate_arguments(arguments):
+            return fail
 
         # §6：content 段白名单 + 结构 + 顺序 + 每段字段前置校验（不把非法段推给
         # 上游碰运气，给 LLM 精确的 segment_index/segment_type 而非一段中文 wording）。
@@ -171,15 +172,14 @@ class SendMessageTool(BaseTool):
         self_id = str(getattr(bot, "self_id", "") or "") or None
         logger.info("[send_message] sent to {} message_id={}", scope_key, message_id)
         # message_id + self_id 供投影 _build_author_index 折出"bot 自己的发言"，
-        # 让别人 <reply to="MSG_ID"> 引用 bot 时能标 from_self="true" + from_id=self_id。
+        # 让别人 <reply to_message_id="..."> 引用 bot 时能标 from_self="true" +
+        # from_qq=self_id。self_id 键名保留（napcat/OneBot 原词，且
+        # bot_role_observed 等多个生产方共用），xml_format.md 注明 = bot_qq。
         return ToolOutcome.success(
             {
                 "message_id": message_id,
                 "self_id": self_id,
                 "target": target,
-                "related_msg_hashes": list(
-                    arguments.get("related_msg_hashes") or []
-                ),
                 "sent": True,
             }
         )
@@ -340,6 +340,23 @@ def _validate_at(data: dict, i: int) -> ToolOutcome | None:
             f"content[{i}].data.qq must be 'all' or a positive QQ id, got {qq!r}",
             segment_index=i,
             segment_type="at",
+        )
+    return None
+
+
+def _validate_arguments(arguments: Any) -> ToolOutcome | None:
+    """顶层参数兼容闸：字段已下架后，明确拒绝继续传旧字段。"""
+    if not isinstance(arguments, dict):
+        return _invalid_args(
+            "bad_field_type",
+            "send_message arguments must be an object",
+            field="arguments",
+        )
+    if "related_image_hashes" in arguments:
+        return _invalid_args(
+            "unsupported_field",
+            "send_message.related_image_hashes is no longer supported",
+            field="related_image_hashes",
         )
     return None
 
