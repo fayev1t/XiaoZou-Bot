@@ -10,6 +10,12 @@
 任何 napcat 动作**。napcat 动作失败（目标不存在等）由 call_action 折成
 upstream_action_failed 返回。全程无 raise。
 
+通用门禁之上还有两道**参数相关**的前置判定（都先于 napcat 动作）：
+- 层级：bot 角色须**严格高于**目标（enforce_actor_outranks_target，目标角色实时
+  查；查不到**不拦**、交 napcat 兜底——避免把"已退群/查询失败"误判成越权）；
+- 自踢防护：user_id 是 bot 自己 → invalid_arguments。set_group_kick 对自身行为
+  未定义（部分实现等价退群），"让 bot 退群"是另一个高危操作，不该由踢人误触发。
+
 OneBot action：set_group_kick(group_id, user_id, reject_add_request)。
 """
 
@@ -46,10 +52,12 @@ class KickTool(BaseTool):
         "Remove (kick) a member from the CURRENT group. Operates on the "
         "current group only — group_id comes from your scope, you cannot kick "
         "from another group. Pass user_id (the QQ number to kick — read it "
-        "from a <message sender_id=\"USER_ID\"> in the timeline) and "
+        "from a <message sender_qq=\"USER_QQ\"> in the timeline) and "
         "optionally reject_add_request=true to also block their future join "
-        "requests. Requires the bot itself to be a group admin; if it isn't, "
-        "the call fails and you'll see the reason next tick."
+        "requests. This is an ADMIN-level action: only act on an explicit "
+        "instruction from a group admin/owner, and set triggered_by_event_id "
+        "to that person's message. The bot itself must be a group admin and "
+        "strictly outrank the target; it cannot kick itself."
     )
     arguments_schema = {
         "type": "object",
@@ -92,6 +100,15 @@ class KickTool(BaseTool):
         bot, fail = get_bot()
         if fail:
             return fail
+        # 自踢防护：LLM 可能把"让 bot 退群"误表达成踢 bot 自己。set_group_kick
+        # 对自身行为未定义（部分实现等价退群），前置拦成确定性 invalid_arguments，
+        # 不打 napcat。self_id 缺失（异常 stub）时 str 比较恒不等 → 不拦。
+        if str(user_id) == str(getattr(bot, "self_id", "")):
+            return ToolOutcome.failure(
+                "invalid_arguments",
+                f"{self.name} cannot target the bot itself "
+                f"(user_id={user_id} is this bot's own account)",
+            )
         # 细粒度层级前置判定：踢不掉 ≥ 自己角色的人（admin 踢不掉群主/另一 admin）。
         # bot 角色实时解析（enforce_bot_admin 已查并缓存，这里复用）、目标角色实时查；
         # 查不到不拦，交 napcat 兜底（见 _onebot_common 注释）。
@@ -110,5 +127,18 @@ class KickTool(BaseTool):
         )
         if fail:
             return fail
-        logger.info("[{}] group={} user={}", self.name, group_id, user_id)
-        return ToolOutcome.success(group_id=group_id, user_id=user_id)
+        logger.info(
+            "[{}] group={} user={} reject_add_request={}",
+            self.name,
+            group_id,
+            user_id,
+            reject,
+        )
+        # 结果回显 reject_add_request：LLM 下一 tick 能确认"有没有顺带拒后续申请"，
+        # 不必回忆自己传了什么参数（与 respond_to_group_join_request 的回显同风格）。
+        return ToolOutcome.success(
+            group_id=group_id,
+            user_id=user_id,
+            reject_add_request=reject,
+            applied=True,
+        )

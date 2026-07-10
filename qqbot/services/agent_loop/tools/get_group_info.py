@@ -8,7 +8,13 @@
 
 权限：查询无副作用，沿用 BaseTool 默认 GUEST。
 
-返回精简后的 group_id/group_name/member_count/max_member_count。
+返回精简后的 group_id/group_name/member_count/max_member_count；平台给了才透传
+的可选字段：group_remark（群备注，group_remark/group_memo 两个候选键）、
+group_create_time（建群时间，epoch → Asia/Shanghai ISO）。NapCat 各版本对这两个
+字段的返回差异大（老版本常给 0/空），缺失/空值不占键——LLM 见键即可信。
+
+no_cache=True：这个工具的意义就是"群**现在**多少人"，调用频率低，实时性优先
+（2026-07-07 重做恢复时从 False 改过来）。
 
 OneBot action：get_group_info(group_id, no_cache)。
 """
@@ -22,6 +28,7 @@ from qqbot.services.agent_loop.prompts import load_sibling_md
 from qqbot.services.agent_loop.tool_registry import BaseTool, ToolOutcome
 from qqbot.services.agent_loop.tools._onebot_common import (
     call_action,
+    epoch_to_iso,
     get_bot,
     require_group_scope,
 )
@@ -40,7 +47,9 @@ class GetGroupInfoTool(BaseTool):
         "Get basic info about the CURRENT group. Operates on the current "
         "group only — group_id comes from your scope, you cannot query "
         "another group. Takes no arguments. Returns group_id, group_name, "
-        "member_count and max_member_count. Read-only, no side effects."
+        "member_count and max_member_count, plus group_remark and "
+        "group_create_time when the platform provides them. Read-only, no "
+        "side effects."
     )
     arguments_schema = {
         "type": "object",
@@ -59,15 +68,23 @@ class GetGroupInfoTool(BaseTool):
         if fail:
             return fail
         info, fail = await call_action(
-            bot, "get_group_info", group_id=group_id, no_cache=False
+            bot, "get_group_info", group_id=group_id, no_cache=True
         )
         if fail:
             return fail
         info = info or {}
-        logger.info("[{}] group={}", self.name, group_id)
-        return ToolOutcome.success({
+        result = {
             "group_id": info.get("group_id", group_id),
             "group_name": info.get("group_name"),
             "member_count": info.get("member_count"),
             "max_member_count": info.get("max_member_count"),
-        })
+        }
+        # 平台相关的可选字段：有值才透传，缺失/空值不占键。
+        remark = info.get("group_remark") or info.get("group_memo")
+        if isinstance(remark, str) and remark.strip():
+            result["group_remark"] = remark.strip()
+        created = epoch_to_iso(info.get("group_create_time"))
+        if created is not None:
+            result["group_create_time"] = created
+        logger.info("[{}] group={}", self.name, group_id)
+        return ToolOutcome.success(result)

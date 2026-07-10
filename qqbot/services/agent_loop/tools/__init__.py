@@ -30,6 +30,9 @@ from qqbot.services.agent_loop.tools.get_group_honor import GetGroupHonorTool
 from qqbot.services.agent_loop.tools.get_group_info import GetGroupInfoTool
 from qqbot.services.agent_loop.tools.get_member_info import GetMemberInfoTool
 from qqbot.services.agent_loop.tools.get_member_list import GetMemberListTool
+from qqbot.services.agent_loop.tools.get_pending_join_requests import (
+    GetPendingJoinRequestsTool,
+)
 from qqbot.services.agent_loop.tools.get_stranger_info import GetStrangerInfoTool
 from qqbot.services.agent_loop.tools.group_notice import GroupNoticeTool
 from qqbot.services.agent_loop.tools.kick import KickTool
@@ -74,6 +77,21 @@ def build_default_registry() -> ToolRegistry:
     # 发送收藏——收藏夹经 <saved-memes> 每 tick 注入 prompt。
     registry.register(SaveMemeTool())
     registry.register(SendMemeTool())
+    # ── 群信息查询（2026-07-07 重做后恢复 / 新增）──
+    # 查询三件套按下架备注的路线重做后恢复：get_group_info（no_cache + 可选
+    # 字段透传）、get_member_list（role 过滤 / include_activity / banned_until）、
+    # get_member_info（时间字段 ISO 化 + banned_until）。
+    registry.register(GetGroupInfoTool())
+    registry.register(GetMemberListTool())
+    registry.register(GetMemberInfoTool())
+    # 待处理入群申请查询（2026-07-07 新增）：纯 napcat get_group_system_msg
+    # 查询、不回查 agent_events；审批仍走 respond_to_group_join_request。
+    registry.register(GetPendingJoinRequestsTool())
+    # ── 群成员管理（2026-07-10 起重做后逐个恢复）──
+    # kick：踢人。通用门禁（发起人 ADMIN 实时核验 + bot 须群管理员）之上，动手前
+    # 实时查目标角色做层级前置判定（bot 须严格高于目标）+ 自踢防护；成功结果回显
+    # reject_add_request / applied。
+    registry.register(KickTool())
     # ── 以下工具暂时下架（2026-07-01），重做后逐一恢复 ──
     # registry.register(WebsearchTool())
     # registry.register(SearchHistoryTool())
@@ -85,7 +103,7 @@ def build_default_registry() -> ToolRegistry:
     # registry.register(PokeTool())
     # registry.register(GroupNoticeTool())
     # napcat 动作工具：群成员管理
-    # registry.register(KickTool())
+    # ——kick 已于 2026-07-10 重做恢复（见上），其余成员管理工具继续停用。
     # registry.register(BanTool())
     # registry.register(SetCardTool())
     # registry.register(SetAdminTool())
@@ -96,9 +114,7 @@ def build_default_registry() -> ToolRegistry:
     # registry.register(SetGroupAvatarTool())
     # registry.register(LeaveGroupTool())
     # napcat 动作工具：查询（GUEST，给 LLM 感知能力）
-    # registry.register(GetMemberInfoTool())
-    # registry.register(GetMemberListTool())
-    # registry.register(GetGroupInfoTool())
+    # ——查询三件套已于 2026-07-07 重做恢复（见上），这两个继续停用。
     # registry.register(GetGroupHonorTool())
     # registry.register(GetStrangerInfoTool())
     return registry
@@ -112,6 +128,7 @@ __all__ = [
     "GetGroupInfoTool",
     "GetMemberInfoTool",
     "GetMemberListTool",
+    "GetPendingJoinRequestsTool",
     "GetStrangerInfoTool",
     "GroupNoticeTool",
     "KickTool",

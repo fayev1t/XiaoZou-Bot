@@ -89,10 +89,13 @@ class KickToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["group_id"], 100)
         self.assertEqual(kwargs["user_id"], 222)
         self.assertTrue(kwargs["reject_add_request"])
-        # 结构化输出：succeeded → result
+        # 结构化输出：succeeded → result（回显 reject_add_request，LLM 下一 tick
+        # 可确认是否顺带拒了后续申请）。
         self.assertTrue(outcome.ok)
         self.assertEqual(outcome.result["group_id"], 100)
         self.assertEqual(outcome.result["user_id"], 222)
+        self.assertIs(outcome.result["reject_add_request"], True)
+        self.assertIs(outcome.result["applied"], True)
 
     async def test_user_id_as_string_coerced(self) -> None:
         bot = _StubBot()
@@ -128,6 +131,19 @@ class KickToolTests(unittest.IsolatedAsyncioTestCase):
         outcome = await KickTool().run({}, scope_key="group:100", **_OK_CTX)
         self.assertFalse(outcome.ok)
         self.assertEqual(outcome.error_kind, "invalid_arguments")
+
+    async def test_cannot_kick_bot_itself(self) -> None:
+        # 自踢防护：user_id 是 bot 自己（_StubBot 默认 self_id="10001"）→ 前置
+        # invalid_arguments，**不发** set_group_kick（"让 bot 退群"不该由踢人误触发）。
+        bot = _StubBot()
+        bot_registry.register(bot)
+        outcome = await KickTool().run(
+            {"user_id": 10001}, scope_key="group:100", **_OK_CTX
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.error_kind, "invalid_arguments")
+        self.assertIn("itself", outcome.error_message)
+        self.assertEqual(len(bot.calls), 0)
 
     async def test_no_bot_available(self) -> None:
         bot_registry.clear()

@@ -2,6 +2,10 @@
 
 照 test_kick_tool_contract.py 的范式。额外重点：napcat 返回的整张成员 list 必须
 按 limit 截断（count 仍报总数），防止撑爆 LLM prompt。
+
+2026-07-07 重做恢复的增强契约：role 过滤在截断**之前**（"列出所有管理员"不被
+limit 吃掉）；include_activity 附带 ISO 化的 join_time/last_sent_time；正被禁言
+（shut_up_timestamp 在未来）的成员附带 banned_until，其余不占键。
 """
 
 from __future__ import annotations
@@ -72,6 +76,8 @@ class GetMemberListToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["group_id"], 100)
         self.assertTrue(outcome.ok)
         self.assertEqual(outcome.result["count"], 3)
+        # 无 role 过滤时 matched == count。
+        self.assertEqual(outcome.result["matched"], 3)
         self.assertEqual(len(outcome.result["members"]), 3)
         self.assertEqual(
             set(outcome.result["members"][0].keys()),
@@ -88,6 +94,77 @@ class GetMemberListToolTests(unittest.IsolatedAsyncioTestCase):
         # count 报总数（不受截断影响），members 被截到 limit。
         self.assertEqual(outcome.result["count"], 10)
         self.assertEqual(len(outcome.result["members"]), 3)
+
+    async def test_role_filter_applies_before_truncation(self) -> None:
+        members = _make_members(8)
+        members.append(
+            {"user_id": 100, "nickname": "管理甲", "card": "", "role": "admin"}
+        )
+        members.append(
+            {"user_id": 101, "nickname": "管理乙", "card": "", "role": "Admin"}
+        )
+        bot_registry.register(_StubBot(members))
+        # limit=1 也必须先过滤再截断：matched 报全部命中数，不被 limit 吃掉。
+        outcome = await GetMemberListTool().run(
+            {"role": "admin", "limit": 1}, scope_key="group:100"
+        )
+        self.assertTrue(outcome.ok)
+        self.assertEqual(outcome.result["count"], 10)
+        self.assertEqual(outcome.result["matched"], 2)  # 大小写不敏感
+        self.assertEqual(len(outcome.result["members"]), 1)
+        self.assertEqual(outcome.result["members"][0]["user_id"], 100)
+
+    async def test_invalid_role_rejected(self) -> None:
+        bot_registry.register(_StubBot(_make_members(1)))
+        outcome = await GetMemberListTool().run(
+            {"role": "boss"}, scope_key="group:100"
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.error_kind, "invalid_arguments")
+
+    async def test_include_activity_adds_iso_times(self) -> None:
+        members = [
+            {
+                "user_id": 1,
+                "nickname": "甲",
+                "card": "",
+                "role": "member",
+                "join_time": 1700000000,
+                "last_sent_time": 0,  # napcat 缺值常给 0 → None
+            }
+        ]
+        bot_registry.register(_StubBot(members))
+        outcome = await GetMemberListTool().run(
+            {"include_activity": True}, scope_key="group:100"
+        )
+        self.assertTrue(outcome.ok)
+        entry = outcome.result["members"][0]
+        self.assertEqual(entry["join_time"], "2023-11-15T06:13:20+08:00")
+        self.assertIsNone(entry["last_sent_time"])
+
+    async def test_banned_member_carries_banned_until(self) -> None:
+        members = [
+            {
+                "user_id": 1,
+                "nickname": "被禁言",
+                "card": "",
+                "role": "member",
+                "shut_up_timestamp": 4102444800,  # 2100-01-01，禁言中
+            },
+            {
+                "user_id": 2,
+                "nickname": "已过期",
+                "card": "",
+                "role": "member",
+                "shut_up_timestamp": 1000,  # 早已过期 → 不占键
+            },
+        ]
+        bot_registry.register(_StubBot(members))
+        outcome = await GetMemberListTool().run({}, scope_key="group:100")
+        self.assertTrue(outcome.ok)
+        banned, expired = outcome.result["members"]
+        self.assertTrue(banned["banned_until"].startswith("2100-01-01"))
+        self.assertNotIn("banned_until", expired)
 
     async def test_limit_as_string_coerced(self) -> None:
         bot = _StubBot(_make_members(10))

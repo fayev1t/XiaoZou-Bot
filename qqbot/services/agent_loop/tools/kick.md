@@ -4,7 +4,7 @@
 
 ## When to use
 
-Only to remove a genuinely disruptive member — a spammer, an ad/scam bot, or someone a group admin explicitly asked you to remove. Kicking is heavy and not reversible (the person is gone, though they can rejoin unless you also reject future requests). For a temporary problem prefer `ban` (mute) instead. Don't kick on a whim, on one tense message, or to "win" an argument.
+Only to remove a genuinely disruptive member — a spammer, an ad/scam bot, or someone a group admin explicitly asked you to remove. Kicking is heavy and not reversible (the person is gone, though they can rejoin unless you also reject future requests). For a temporary problem prefer a mute (`ban`, when it appears in your tool list) instead. Don't kick on a whim, on one tense message, or to "win" an argument.
 
 ## Arguments
 
@@ -23,6 +23,8 @@ Only to remove a genuinely disruptive member — a spammer, an ad/scam bot, or s
 
 The target group is **always the current one** — `group_id` is taken from your scope automatically; you cannot kick someone out of another group and there is no `group_id` argument.
 
+The target must be someone else: the bot cannot kick itself — that call is rejected with `invalid_arguments` before reaching napcat (leaving the group is a different, separate operation).
+
 ## Permissions
 
 - **Triggering user**: this is an ADMIN-level action — a group admin or owner must have asked for it. Set `triggered_by_event_id` on the call to that person's message; if you omit it the caller is treated as GUEST and the kick is refused.
@@ -31,4 +33,4 @@ The target group is **always the current one** — `group_id` is taken from your
 
 ## Result
 
-On success: `{"ok": true, "group_id": <int>, "user_id": <int>}`. On a permission failure (caller not allowed, or the bot isn't admin) or a napcat error you get a `tool_failed` with a human-readable reason — read it, explain or abort, do **not** blindly retry the same call.
+On success: `{"group_id": <int>, "user_id": <int>, "reject_add_request": <bool>, "applied": true}` — `reject_add_request` echoes what was applied, so you can confirm whether future join requests were also blocked. On a permission failure (caller not allowed, bot not admin, or the target's role is equal-or-higher) or a napcat error you get a `tool_failed` with a structured reason — read it, explain or abort, do **not** blindly retry the same call.

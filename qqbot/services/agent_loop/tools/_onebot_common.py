@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from qqbot.core.time import china_now, normalize_china_time
 from qqbot.services.agent_loop import bot_registry
 from qqbot.services.agent_loop.event_writer import parse_scope_key
 from qqbot.services.agent_loop.tool_registry import ToolOutcome
@@ -129,6 +130,27 @@ def coerce_bool(
         "invalid_arguments",
         f"{field} must be a boolean (true/false), got {value!r}",
     )
+
+
+def epoch_to_iso(value: Any, *, future_only: bool = False) -> str | None:
+    """epoch 秒 → Asia/Shanghai 的 ISO 字符串；0 / None / 非法 → None。
+
+    查询类工具（get_member_info / get_group_info / ...）统一用它把 napcat 的裸
+    epoch（join_time / last_sent_time / group_create_time / shut_up_timestamp）
+    转成 LLM 能直接读的本地时间——LLM 对 epoch 的心算换算很不可靠。
+
+    ``future_only=True`` 用于禁言到期一类字段：napcat 在禁言过期后仍留着旧的
+    shut_up_timestamp，只有时间点在未来才代表"正被禁言"，已过期 → None。
+    """
+    try:
+        ts = int(value)
+    except (TypeError, ValueError):
+        return None
+    if ts <= 0:
+        return None
+    if future_only and ts <= int(china_now().timestamp()):
+        return None
+    return normalize_china_time(ts).isoformat()
 
 
 async def call_action(

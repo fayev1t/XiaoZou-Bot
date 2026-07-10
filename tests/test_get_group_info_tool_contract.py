@@ -25,25 +25,31 @@ class _FakeActionFailed(Exception):
 
 class _StubBot:
     def __init__(
-        self, self_id: str = "10001", raise_exc: Exception | None = None
+        self,
+        self_id: str = "10001",
+        raise_exc: Exception | None = None,
+        info: dict | None = None,
     ) -> None:
         self.self_id = self_id
         self.calls: list[tuple[str, dict]] = []
         self._raise = raise_exc
-
-    async def get_group_info(self, **kwargs: Any) -> dict:
-        self.calls.append(("get_group_info", kwargs))
-        if self._raise is not None:
-            raise self._raise
-        # group_memo / group_level 是冗余字段，验证被精简丢弃。
-        return {
+        # group_memo（→ 透传为 group_remark）/ group_create_time（→ ISO）是
+        # 可选透传字段；group_level 是冗余字段，验证被精简丢弃。
+        self._info = info if info is not None else {
             "group_id": 100,
             "group_name": "测试群",
             "member_count": 50,
             "max_member_count": 200,
             "group_memo": "公告",
+            "group_create_time": 1700000000,
             "group_level": 1,
         }
+
+    async def get_group_info(self, **kwargs: Any) -> dict:
+        self.calls.append(("get_group_info", kwargs))
+        if self._raise is not None:
+            raise self._raise
+        return self._info
 
 
 class GetGroupInfoToolTests(unittest.IsolatedAsyncioTestCase):
@@ -61,15 +67,50 @@ class GetGroupInfoToolTests(unittest.IsolatedAsyncioTestCase):
         method, kwargs = bot.calls[0]
         self.assertEqual(method, "get_group_info")
         self.assertEqual(kwargs["group_id"], 100)
-        self.assertFalse(kwargs["no_cache"])
+        # 实时性优先：人数查询不吃缓存（2026-07-07 重做恢复时改为 True）。
+        self.assertTrue(kwargs["no_cache"])
+        self.assertTrue(outcome.ok)
+        self.assertEqual(
+            set(outcome.result.keys()),
+            {
+                "group_id",
+                "group_name",
+                "member_count",
+                "max_member_count",
+                "group_remark",
+                "group_create_time",
+            },
+        )
+        self.assertEqual(outcome.result["group_name"], "测试群")
+        self.assertEqual(outcome.result["member_count"], 50)
+        # group_memo 候选键透传为 group_remark；建群时间转 Asia/Shanghai ISO。
+        self.assertEqual(outcome.result["group_remark"], "公告")
+        self.assertEqual(
+            outcome.result["group_create_time"], "2023-11-15T06:13:20+08:00"
+        )
+        self.assertNotIn("group_memo", outcome.result)
+        self.assertNotIn("group_level", outcome.result)
+
+    async def test_optional_fields_absent_when_platform_omits(self) -> None:
+        # NapCat 老版本常给 0/空——可选字段不占键，LLM 见键即可信。
+        bot_registry.register(
+            _StubBot(
+                info={
+                    "group_id": 100,
+                    "group_name": "测试群",
+                    "member_count": 50,
+                    "max_member_count": 200,
+                    "group_memo": "",
+                    "group_create_time": 0,
+                }
+            )
+        )
+        outcome = await GetGroupInfoTool().run({}, scope_key="group:100")
         self.assertTrue(outcome.ok)
         self.assertEqual(
             set(outcome.result.keys()),
             {"group_id", "group_name", "member_count", "max_member_count"},
         )
-        self.assertEqual(outcome.result["group_name"], "测试群")
-        self.assertEqual(outcome.result["member_count"], 50)
-        self.assertNotIn("group_memo", outcome.result)
 
     async def test_non_group_scope_returns_tool_unavailable(self) -> None:
         bot_registry.register(_StubBot())

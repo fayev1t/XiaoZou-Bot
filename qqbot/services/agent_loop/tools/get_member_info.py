@@ -11,6 +11,13 @@ napcat 动作失败（查不到成员等）由 call_action 折成 upstream_actio
 返回精简后的成员字段（nickname/card/role/level/title/join_time/...），napcat
 原始结果里的冗余字段一律丢弃，避免撑爆 LLM prompt。
 
+2026-07-07 重做恢复时的增强：
+- join_time / last_sent_time 从裸 epoch 转 Asia/Shanghai ISO（LLM 对 epoch 的
+  心算换算很不可靠），0/缺失 → None；
+- 新增 banned_until——shut_up_timestamp 在未来（正被禁言）时给 ISO 到期时间，
+  否则 None（键恒在，单人查询保持键稳定）；
+- no_cache=True——查单人常发生在权限核对/禁言核对前，实时性优先。
+
 OneBot action：get_group_member_info(group_id, user_id, no_cache)。
 """
 
@@ -24,6 +31,7 @@ from qqbot.services.agent_loop.tool_registry import BaseTool, ToolOutcome
 from qqbot.services.agent_loop.tools._onebot_common import (
     call_action,
     coerce_int,
+    epoch_to_iso,
     get_bot,
     require_group_scope,
 )
@@ -44,7 +52,9 @@ class GetMemberInfoTool(BaseTool):
         "another group. Pass user_id (the QQ number — read it from a "
         "<message sender_id=\"USER_ID\"> in the timeline). Returns the "
         "member's nickname, group card, role (owner/admin/member), level, "
-        "title, join_time and last_sent_time. Read-only, no side effects."
+        "title, join_time / last_sent_time (Asia/Shanghai ISO) and "
+        "banned_until (ISO when the member is currently muted, else null). "
+        "Read-only, no side effects."
     )
     arguments_schema = {
         "type": "object",
@@ -77,7 +87,7 @@ class GetMemberInfoTool(BaseTool):
             "get_group_member_info",
             group_id=group_id,
             user_id=user_id,
-            no_cache=False,
+            no_cache=True,
         )
         if fail:
             return fail
@@ -90,6 +100,9 @@ class GetMemberInfoTool(BaseTool):
             "role": info.get("role"),
             "level": info.get("level"),
             "title": info.get("title"),
-            "join_time": info.get("join_time"),
-            "last_sent_time": info.get("last_sent_time"),
+            "join_time": epoch_to_iso(info.get("join_time")),
+            "last_sent_time": epoch_to_iso(info.get("last_sent_time")),
+            "banned_until": epoch_to_iso(
+                info.get("shut_up_timestamp"), future_only=True
+            ),
         })

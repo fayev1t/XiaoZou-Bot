@@ -25,18 +25,17 @@ class _FakeActionFailed(Exception):
 
 class _StubBot:
     def __init__(
-        self, self_id: str = "10001", raise_exc: Exception | None = None
+        self,
+        self_id: str = "10001",
+        raise_exc: Exception | None = None,
+        info: dict | None = None,
     ) -> None:
         self.self_id = self_id
         self.calls: list[tuple[str, dict]] = []
         self._raise = raise_exc
-
-    async def get_group_member_info(self, **kwargs: Any) -> dict:
-        self.calls.append(("get_group_member_info", kwargs))
-        if self._raise is not None:
-            raise self._raise
-        # 故意带上 sex/area 等冗余字段，验证它们被精简丢弃。
-        return {
+        # 故意带上 sex/area 等冗余字段，验证它们被精简丢弃；
+        # shut_up_timestamp 已过期 → banned_until 应为 None。
+        self._info = info if info is not None else {
             "user_id": 222,
             "nickname": "阿狸",
             "card": "群名片",
@@ -45,9 +44,16 @@ class _StubBot:
             "title": "头衔",
             "join_time": 1600000000,
             "last_sent_time": 1700000000,
+            "shut_up_timestamp": 1000,
             "sex": "female",
             "area": "上海",
         }
+
+    async def get_group_member_info(self, **kwargs: Any) -> dict:
+        self.calls.append(("get_group_member_info", kwargs))
+        if self._raise is not None:
+            raise self._raise
+        return self._info
 
 
 class GetMemberInfoToolTests(unittest.IsolatedAsyncioTestCase):
@@ -68,7 +74,8 @@ class GetMemberInfoToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(method, "get_group_member_info")
         self.assertEqual(kwargs["group_id"], 100)
         self.assertEqual(kwargs["user_id"], 222)
-        self.assertFalse(kwargs["no_cache"])
+        # 实时性优先：权限/禁言核对不吃缓存（2026-07-07 重做恢复时改为 True）。
+        self.assertTrue(kwargs["no_cache"])
         self.assertTrue(outcome.ok)
         self.assertEqual(
             set(outcome.result.keys()),
@@ -81,12 +88,40 @@ class GetMemberInfoToolTests(unittest.IsolatedAsyncioTestCase):
                 "title",
                 "join_time",
                 "last_sent_time",
+                "banned_until",
             },
         )
         self.assertEqual(outcome.result["nickname"], "阿狸")
         self.assertEqual(outcome.result["role"], "admin")
+        # 裸 epoch → Asia/Shanghai ISO（LLM 不心算 epoch）。
+        self.assertEqual(outcome.result["join_time"], "2020-09-13T20:26:40+08:00")
+        self.assertEqual(
+            outcome.result["last_sent_time"], "2023-11-15T06:13:20+08:00"
+        )
+        # shut_up_timestamp 已过期 → 不在禁言中 → None（键恒在）。
+        self.assertIsNone(outcome.result["banned_until"])
         self.assertNotIn("sex", outcome.result)
         self.assertNotIn("area", outcome.result)
+
+    async def test_currently_muted_member_has_banned_until(self) -> None:
+        bot_registry.register(
+            _StubBot(
+                info={
+                    "user_id": 333,
+                    "nickname": "被禁言",
+                    "card": "",
+                    "role": "member",
+                    "shut_up_timestamp": 4102444800,  # 2100-01-01，禁言中
+                }
+            )
+        )
+        outcome = await GetMemberInfoTool().run(
+            {"user_id": 333}, scope_key="group:100"
+        )
+        self.assertTrue(outcome.ok)
+        self.assertTrue(outcome.result["banned_until"].startswith("2100-01-01"))
+        # 平台没给的时间字段 → None，不猜。
+        self.assertIsNone(outcome.result["join_time"])
 
     async def test_user_id_as_string_coerced(self) -> None:
         bot = _StubBot()
