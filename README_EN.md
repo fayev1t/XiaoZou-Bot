@@ -14,17 +14,20 @@
 </div>
 
 <p align="center">
-  [简体中文](README.md) | [English](README_EN.md)
+  <a href="README.md">简体中文</a> | <a href="README_EN.md">English</a>
 </p>
 
-## 🤖 Who is she?
+## 🤖 Introduction
 
 <table border="0">
   <tr>
     <td style="border: none; vertical-align: middle;">
-      XiaoZou is a group chat assistant built on <b>VLM (Vision-Language Model) multimodal large models</b>. She is not a simple echo bot that just "receives a message → replies with a message", but an <b>event-driven / task state machine-driven</b> autonomous Agent. She decides on her own when to stay silent, who to @, whether she needs to perform a websearch before replying, and keeps track of how many unfinished tasks she currently has. She maintains her own "todo list" across multiple ticks and judges whether new incoming messages are relevant to her current tasks. 🎭<br><br>
-      Beyond her fun persona, she possesses practical capabilities: <b>native image understanding</b> 📸, <b>websearch</b> 🔍, and full support for OneBot V11 segments. All capabilities are triggered naturally through <b>LLM semantic decisions</b>. ✨<br><br>
-      Heartfelt thanks to <a href="https://github.com/NapNeko/NapCatQQ">NapCatQQ</a> and <a href="https://nonebot.dev/">NoneBot2</a> ❤️
+      <b>XiaoZou-Bot</b> is a QQ group chat AI Agent based on an event loop and decision mechanism (Tick-based Loop).<br><br>
+      Compared to other qqbots, XiaoZou built on the <b>Agent Loop</b> architecture naturally possesses the following characteristics:<br>
+      • <b>Cross-Tick Task Management</b>: Built-in task state machine, naturally supporting persistent tasks.<br>
+      • <b>Autonomous Behavior Decision</b>: When to speak, when to stay silent, whether to use tools are all judged by the model itself, rather than rule-triggered; native QQ capabilities such as @mentions, quotes, memes, and group moderation are all in her toolbox.<br>
+      • <b>Native Multimodality</b>: Images enter the model's view directly just like text, without losing other details.<br><br>
+      Meanwhile, XiaoZou is also built on the <a href="https://github.com/NapNeko/NapCatQQ">NapCatQQ</a> and <a href="https://nonebot.dev/">NoneBot2</a> projects, heartfelt thanks ❤️
     </td>
     <td style="border: none; vertical-align: middle;" width="25%">
       <img src="assets/imgs/xiaozou.png" alt="XiaoZou Character">
@@ -32,80 +35,47 @@
   </tr>
 </table>
 
-## ✨ Key Features of v2.0 Refactor
 
-v2.0 is a complete rewrite based on the ideas of AGENT LOOP/HARNESS. The core change is replacing the "message → reply" request-response model with **Event Streams + Task State Machine + Agent Decision Loop**:
+## ✨ Core Design
 
-| Feature | v1 Old Path | v2 New Path |
-|---|---|---|
-| **Data Engine** | Multiple business tables (users, groups, messages, tool calls) | Single `agent_events` table (Event Sourcing); other views projected on demand |
-| **Trigger Model** | Immediate decision on message receipt → Immediate reply | AgentLoop periodic / event-driven tick; LLM autonomously decides idle / multiple actions within one tick |
-| **Task Concept** | None; each message processed independently | Explicit `active_tasks` state machine (pending → running → done/failed), persisting across ticks |
-| **Images** | Invoke "image tool" then ask secondary question | VLM native multimodality: image bytes sent directly as image_url blocks along with HumanMessage, de-duplicated by hash |
-| **Reply Segments** | Text only | Full OneBot V11 segments: text / at / at-all / reply quote reply / face emoji, taught to the LLM via prompts |
-| **System Prompt** | Hardcoded strings | `PromptRegistry` assembled from multiple sections: identity / xml_format / group_chat_rules / protocol / tools_usage, with each section in an independent `.md` file |
-| **Tools** | Hardcoded registration | `Tool` Protocol + sibling `.md` usage instructions; adding new tools does not touch the planner |
-| **Isolation** | Voluntary separation between groups in business code | Enforced scope isolation (`group:<id>` / `private:<id>` / `system`); LLM cannot fetch data across scopes |
+The project is refactored based on the **Agent Loop / Harness** philosophy, featuring the following core design characteristics:
 
-## 🏗️ Architecture Overview
-
-```
-                ┌──────────────────────────────────────────────────┐
-napcat (QQ)  →  │ EventIngest Pipeline (qqbot/services/event_ingest)│
-                │   mapper → media side effects → idempotency → DB │
-                └────────────────────────┬─────────────────────────┘
-                                         │ writes
-                                         ▼
-                           ┌──────────────────────────┐
-                           │  agent_events (PG, JSONB)│   ←— Single Source of Truth
-                           └──────────┬───────────────┘
-                                      │ reads
-                                      ▼
-        ┌─────────────────────────────────────────────────────────────┐
-        │ LoopSupervisor (qqbot/services/agent_loop)                  │
-        │                                                             │
-        │   per-scope AgentLoop  ─ tick ─►  Projector (fold + project)│
-        │                                       │                     │
-        │                                       ▼                     │
-        │                                  DecisionContext            │
-        │                                  (timeline + active_tasks   │
-        │                                   + pending_tool_results)   │
-        │                                       │                     │
-        │                                       ▼                     │
-        │   PromptRegistry → System  ─►  LLMPlanner (VLM)             │
-        │                                       │                     │
-        │                                       ▼                     │
-        │                                  DecisionOutput              │
-        │                                  (actions[])                │
-        │                                       │                     │
-        │            ┌──────────────────────────┼──────────────┐      │
-        │            ▼                          ▼              ▼      │
-        │      create_task /              call_tool          reply    │
-        │      complete_task /                 │               │      │
-        │      fail_task /                     ▼               ▼      │
-        │      note_task_progress         ToolWorker     ReplySendWorker
-        │                                      │               │      │
-        │                                      └─►  agent_events  ◄──┘│
-        └─────────────────────────────────────────────────────────────┘
-```
-
-## 🧠 Core Capabilities
-
-Based on the unified event stream and **Agent Loop** decision architecture, XiaoZou is able to integrate into the group chat ecosystem as an autonomous agent, possessing the following core capabilities:
-
-- 🔄 **Continuous Context & Task Tracking**: Using incremental state projection based on event streams, she can autonomously track, maintain, and concurrently execute multi-step, long-running tasks in complex group chat scenarios where multiple users frequently interrupt.
-- 🖼️ **Native Multimodal Perception**: Supports multimodal inputs, allowing her to directly read and comprehend images shared in group chats.
-- 🛠️ **Autonomous Tool Invocation & Information Retrieval**: When local knowledge is insufficient, she can autonomously decide to schedule tools like web search or history retrieval to gather real-time context, supporting deep reasoning and decision-making.
-- 💬 **QQ Native Rich Text Interaction**: Deeply integrated with QQ interaction standards, allowing the LLM to autonomously control native interaction capabilities such as @ members, quoting replies, and specific face emojis.
-- 🤫 **Lightweight Silence & Adaptive Wake-up**: Built-in multi-level filtering and reflection mechanisms enable her to automatically identify scenarios that require "no reply" and remain silent, avoiding disrupting group members.
+- **Event Sourcing**: Messages, decisions, tool results, and task changes are all appended as immutable events to the same event stream. The conversation context and task state are folded and projected from this stream. Each event carries a correlation / causation chain, providing a complete, replayable, and traceable record.
+- **LLM-as-Planner**: Each Tick projects the event stream into a decision context (timeline + active tasks) and hands it to the model, which provides a structured action sequence—starting a task, invoking tools, advancing or finalizing tasks, or idling.
+- **Capabilities as Tools**: Abilities like replying, querying, and group moderation are all accessed via a unified `Tool` protocol. Tools come with their own usage instructions and visibility controlled by scope, making it convenient to extend capabilities.
+- **Modular Prompting**: The System Prompt is split into independent sections by responsibility (identity / behavior rules / protocol format / tool usage), so persona changes and rule tuning can be performed independently.
+- **Scope Isolation**: Conversation event streams, contexts, and tool permissions are sandboxed by default with group (`group:<id>`) boundaries, ensuring decision spaces for each group chat do not interfere with each other; meanwhile, public assets like sticker collections are shared across groups under a global scope.
 
 ## 🛠️ Roadmap (TODO)
 
-- [ ] **State Machine-Driven Group Management** — Request processing (accepting friend requests / group invites), assistance with bans and message recalls.
-- [ ] **Voice Tools** — Since VLM native support for audio is less mature than images, a standalone `audio_transcribe` tool will be used (while images stick to native, avoiding reinventing the wheel).
-- [ ] **Group Profiles & Long-term Memory** — Off-peak batch processing to generate user preferences and group slang summaries, writing them back to the event stream.
-- [ ] **CQRS Read Models** — Currently refolds all recent events every tick; plan to add `agent_tasks` and `agent_tool_calls` read tables for direct hot-path queries.
-- [ ] **More PromptRegistry Sections** — Risk control guidelines / runtime reflection / multi-persona A/B testing.
+- [ ] **Complete the Toolset**: Rework and re-enable the temporarily offline web-search and moderation tools (mute, recall, etc.).
+- [ ] **Voice Message Transcribing**: Introduce `audio_transcribe` tool to transcribe audio (while VLM handles images natively) to compensate for VLM's native voice limitations.
+- [ ] **Group Profiles & Long-term Memory**: Off-peak batch analysis to summarize user preferences and group slang/lore, writing them back to the event stream.
+- [ ] **CQRS Read Model Optimization**: Avoid refolding all recent events every tick by adding read tables for direct query path optimization.
+- [ ] **Expand Prompt Registry**: Add risk control guidelines, runtime feedback, and multi-persona hot-swapping sections.
+
+
+## 📸 Screenshots
+
+<div align="center">
+  <table border="0" style="border-collapse: collapse; margin: 20px 0;">
+    <tr>
+      <td align="center" style="padding: 10px; border: none; vertical-align: top;">
+        <img src="assets/imgs/message1.jpg" width="260" style="border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); border: 1px solid #e2e8f0;" />
+        <p style="margin-top: 10px; font-size: 13px; color: #64748b;">1. Launch Task & Start Counting</p>
+      </td>
+      <td align="center" style="padding: 10px; border: none; vertical-align: top;">
+        <img src="assets/imgs/message2.jpg" width="260" style="border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); border: 1px solid #e2e8f0;" />
+        <p style="margin-top: 10px; font-size: 13px; color: #64748b;">2. Concurrent Chat & Task Adjustment</p>
+      </td>
+      <td align="center" style="padding: 10px; border: none; vertical-align: top;">
+        <img src="assets/imgs/message3.jpg" width="260" style="border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); border: 1px solid #e2e8f0;" />
+        <p style="margin-top: 10px; font-size: 13px; color: #64748b;">3. Task Completion & Multimodal Reply</p>
+      </td>
+    </tr>
+  </table>
+</div>
+
 
 ## 🚀 Quick Start
 

@@ -3,7 +3,7 @@
 # 🌟 XiaoZou-Bot (小奏)
 
 <p align="center">
-  <em>「"龙与虎"」</em>
+  <em>「龙与虎」</em>
 </p>
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?style=flat-square&logo=python)
@@ -14,17 +14,20 @@
 </div>
 
 <p align="center">
-  [简体中文](README.md) | [English](README_EN.md)
+  <a href="README.md">简体中文</a> | <a href="README_EN.md">English</a>
 </p>
 
-## 🤖 Who is she？
+## 🤖 项目简介
 
 <table border="0">
   <tr>
     <td style="border: none; vertical-align: middle;">
-      小奏是一个基于 <b>VLM 多模态大模型</b>打造的群聊助手。她不是「收到消息 → 回一条」的简单 echo bot，而是一个 <b>事件驱动 / 任务状态机驱动</b> 的自主 Agent —— 她会自己决定什么时候沉默、什么时候 @ 谁、是否需要先 websearch 再回答、当下手头有几件未完成的事；她会跨多个 tick 维持自己的"待办"，并在新消息进来时判断"这是不是和我手头的任务相关"。 🎭<br><br>
-      除了人设有趣，她也具备实用能力：<b>原生图片理解</b> 📸、<b>websearch</b> 🔍、等 OneBot V11 段全支持。所有能力均通过 <b>LLM 语义化决策</b>自然触发。 ✨<br><br>
-      也由衷致谢 <a href="https://github.com/NapNeko/NapCatQQ">NapCatQQ</a> 与 <a href="https://nonebot.dev/">NoneBot2</a> ❤️
+      <b>XiaoZou-Bot</b> 是一个基于事件循环与决策机制（Tick-based Loop）的 QQ 群聊 AI Agent。<br><br>
+      相较于其他 qqbot，基于 <b>Agent Loop</b> 架构构建的小奏天生具备如下特性：<br>
+      • <b>跨 Tick 任务管理</b>：内置任务状态机，天然支持持久化任务。<br>
+      • <b>真正的自主行为决策</b>：何时开口、何时沉默、要不要动用工具，都由模型自行判断，而非规则触发；@、引用、表情包、群管这些 QQ 原生能力都在她的工具箱里。<br>
+      • <b>原生多模态</b>：图片和文字一样直接进入模型视野，不丢失其他细节。<br><br>
+      同时，小奏也基于 <a href="https://github.com/NapNeko/NapCatQQ">NapCatQQ</a> 和 <a href="https://nonebot.dev/">NoneBot2</a> 两个项目构建，由衷感谢 ❤️
     </td>
     <td style="border: none; vertical-align: middle;" width="25%">
       <img src="assets/imgs/xiaozou.png" alt="XiaoZou Character">
@@ -33,83 +36,44 @@
 </table>
 
 
-## ✨ v2.0 重构亮点
+## ✨ 核心设计
 
-v2.0 是一次基于AGENT LOOP/HARNESS 思想的全面重写，核心变化是把"消息 → 回复"的请求响应模型换成了**事件流 + 任务状态机 + Agent 决策循环**：
+项目基于 **Agent Loop / Harness** 思想重构，核心设计特点如下：
 
-| | v1 旧路径 | v2 新路径 |
-|---|---|---|
-| **数据底座** | 多张业务表（用户、群、消息、工具调用各自一张） | 单一 `agent_events` 表（事件溯源）；其它视图按需投影 |
-| **触发模型** | 收到消息立刻判定 → 立刻回复 | AgentLoop 周期 / 事件驱动 tick；一次 tick 内 LLM 自主决定 idle / 多动作 |
-| **任务概念** | 无；每条消息独立处理 | 显式 `active_tasks` 状态机（pending → running → done/failed），跨 tick 持久存在 |
-| **图片** | 调"识图工具"再二次提问 | VLM 原生多模态：图片 bytes 直接作为 image_url block 随 HumanMessage 发出，hash 去重 |
-| **回复段** | 仅 text | OneBot V11 全段：text / at / at-all / reply 引用回复 / face 黄豆表情，由 prompt 教 LLM 使用 |
-| **System prompt** | 硬编码字符串 | `PromptRegistry` 多 section 拼装：identity / xml_format / group_chat_rules / protocol / tools_usage，每段独立 .md |
-| **工具** | 硬编码注册 | `Tool` Protocol + sibling `.md` 用法说明，新增工具不动 planner |
-| **隔离** | 群间靠业务代码自觉 | 强制 scope 隔离（`group:<id>` / `private:<id>` / `system`），LLM 不能跨 scope 拉数据 |
-
-
-## 🏗️ 架构一览
-
-```
-                ┌──────────────────────────────────────────────────┐
-napcat (QQ)  →  │ EventIngest 流水线（qqbot/services/event_ingest）│
-                │   mapper → 媒体副作用 → idempotency → DB 落库    │
-                └────────────────────────┬─────────────────────────┘
-                                         │ writes
-                                         ▼
-                          ┌──────────────────────────┐
-                          │  agent_events (PG, JSONB)│   ←—  唯一可信源
-                          └──────────┬───────────────┘
-                                     │ reads
-                                     ▼
-        ┌─────────────────────────────────────────────────────────────┐
-        │ LoopSupervisor (qqbot/services/agent_loop)                  │
-        │                                                             │
-        │   per-scope AgentLoop  ─ tick ─►  Projector (折叠 + 投影)   │
-        │                                       │                     │
-        │                                       ▼                     │
-        │                                  DecisionContext            │
-        │                                  (timeline + active_tasks   │
-        │                                   + pending_tool_results)   │
-        │                                       │                     │
-        │                                       ▼                     │
-        │   PromptRegistry → System  ─►  LLMPlanner (VLM)             │
-        │                                       │                     │
-        │                                       ▼                     │
-        │                                  DecisionOutput              │
-        │                                  (actions[])                │
-        │                                       │                     │
-        │            ┌──────────────────────────┼──────────────┐      │
-        │            ▼                          ▼              ▼      │
-        │      create_task /              call_tool          reply    │
-        │      complete_task /                 │               │      │
-        │      fail_task /                     ▼               ▼      │
-        │      note_task_progress         ToolWorker     ReplySendWorker
-        │                                      │               │      │
-        │                                      └─►  agent_events  ◄──┘│
-        └─────────────────────────────────────────────────────────────┘
-```
-
-
-## 🧠 核心能力
-
-基于统一事件流与 **Agent Loop** 决策架构，小奏能够以自主代理（Autonomous Agent）的方式融入群聊生态，具备以下核心能力：
-
-- 🔄 **连续上下文与任务追踪**：采用基于事件流的增量状态投影，在多用户高频插话的复杂群聊场景中，能够自主追踪、维护和并发执行多步长周期任务。
-- 🖼️ **原生多模态感知**：支持多模态输入，能够直接阅读并理解群聊中的图像信息。
-- 🛠️ **自主工具调用与信息检索**：当本地知识不足时，能够自主决策并调度联网搜索、历史记录检索等工具获取实时上下文，支撑深度推理与决策。
-- 💬 **QQ 原生富文本交互**：深度融合 QQ 交互规范，由大模型自主控制 @成员、引用回复、特定黄豆表情等原生互动能力。
-- 🤫 **轻量级静默与自适应唤醒**：内置多级过滤与反思机制，能自动识别"无需回复"的场景并保持静默，避免打乱群成员。
-
+- **事件溯源（Event Sourcing）**：消息、决策、工具结果、任务变更都以不可变事件追加进同一条事件流，会话上下文与任务状态由这条流折叠（fold）投影得到；每个事件携带 correlation / causation 因果链，完整留痕、可回放、可追溯。
+- **决策权归模型（LLM-as-Planner）**：每个 Tick 将事件流投影为决策上下文（timeline + 活跃任务）交给模型，由模型给出结构化的动作序列——开任务、调工具、推进或收尾，或者 idle。
+- **能力即工具**：回复、查询、群管等能力都经统一的 `Tool` 协议接入，工具自带用法说明、按作用域控制可见性；方便能力扩展。
+- **提示词模块化**：System Prompt 按职责拆成独立章节（身份 / 行为规范 / 协议格式 / 工具用法），改人设、调规则可以各自独立进行。
+- **作用域隔离**：会话事件流、上下文及工具权限默认以群组（`group:<id>`）为边界进行沙箱隔离，确保各群聊决策空间互不干扰；同时支持表情包收藏等公共资产在全局作用域下跨群共享。
 
 ## 🛠️ 进化路线 (TODO)
 
-- [ ] **状态机驱动的群管能力** — request 处理（加好友 / 加群同意）、禁言 / 撤回辅助
-- [ ] **语音工具** — 模型对音频原生支持不如图片成熟，单独 `audio_transcribe` 工具（图片走原生不重复造轮子）
-- [ ] **群体画像 / 长期记忆** — 闲时批处理生成用户偏好与群"黑话"摘要，写回事件流
-- [ ] **CQRS 读模型** — 当前每 tick 重 fold 全量近期事件；新增 `agent_tasks` / `agent_tool_calls` 读表，hot path 直查
-- [ ] **更多 PromptRegistry section** — 风控指南 / 运行期反射 / 多人格 A/B
+- [ ] **补全工具体系**：重做并恢复暂时下架的联网搜索与群管工具（禁言、撤回等）。
+- [ ] **语音消息转译**：引入 `audio_transcribe` 工具转译音频，弥补模型对音频原生支持的不足。
+- [ ] **群体画像与长期记忆**：在空闲期批处理分析用户偏好与群内黑话，生成摘要并写回事件流。
+- [ ] **CQRS 读模型优化**：改变目前每 Tick 重新折叠全量近期事件的机制，增加读表以提高直查性能。
+- [ ] **丰富 Prompt 注册表**：新增风控指南、运行时反馈及多重人格热切换等 Section。
+
+## 📸 效果图
+
+<div align="center">
+  <table border="0" style="border-collapse: collapse; margin: 20px 0;">
+    <tr>
+      <td align="center" style="padding: 10px; border: none; vertical-align: top;">
+        <img src="assets/imgs/message1.jpg" width="260" style="border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); border: 1px solid #e2e8f0;" />
+        <p style="margin-top: 10px; font-size: 13px; color: #64748b;">1. 开启任务 & 发起报数</p>
+      </td>
+      <td align="center" style="padding: 10px; border: none; vertical-align: top;">
+        <img src="assets/imgs/message2.jpg" width="260" style="border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); border: 1px solid #e2e8f0;" />
+        <p style="margin-top: 10px; font-size: 13px; color: #64748b;">2. 多轮插话与任务动态调整</p>
+      </td>
+      <td align="center" style="padding: 10px; border: none; vertical-align: top;">
+        <img src="assets/imgs/message3.jpg" width="260" style="border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); border: 1px solid #e2e8f0;" />
+        <p style="margin-top: 10px; font-size: 13px; color: #64748b;">3. 任务结束与自主多模态回复</p>
+      </td>
+    </tr>
+  </table>
+</div>
 
 
 ## 🚀 快速开始
