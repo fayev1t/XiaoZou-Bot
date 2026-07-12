@@ -959,7 +959,8 @@ class JsonParseRetryTests(unittest.TestCase):
 class SavedMemesEnvelopeTests(unittest.TestCase):
     """<saved-memes> 渲染契约（表情包工具黑盒设计 §prompt 注入）：
     有收藏才渲染整段；每条 <meme> 带 hash / saved_at 属性 + 描述正文
-    （XML 转义）；位置在 </active-tasks> 之后、<timeline> 之前。"""
+    （XML 转义）；位置在 </tool-catalog> 之后、<timeline> 之前（2026-07-12
+    信封段序按变化频率升序，见 EnvelopeCacheLayoutTests）。"""
 
     def _envelope_text(self, ctx: DecisionContext) -> str:
         llm = _StubLLM(
@@ -986,7 +987,7 @@ class SavedMemesEnvelopeTests(unittest.TestCase):
             ],
         )
 
-    def test_saved_memes_rendered_between_tasks_and_timeline(self) -> None:
+    def test_saved_memes_rendered_between_catalog_and_timeline(self) -> None:
         text = self._envelope_text(
             self._ctx_with_memes("黑猫瞪眼，配字就这，嘲讽用")
         )
@@ -994,9 +995,9 @@ class SavedMemesEnvelopeTests(unittest.TestCase):
         self.assertIn(f'<meme hash="{"ab" * 32}"', text)
         self.assertIn('saved_at="', text)
         self.assertIn("黑猫瞪眼，配字就这，嘲讽用", text)
-        # 布局：静态参考 → 动态状态 → timeline 尾部（recency bias）
+        # 布局按变化频率升序（前缀缓存契约）：catalog → memes → timeline
         self.assertLess(
-            text.index("</active-tasks>"), text.index("<saved-memes>")
+            text.index("</tool-catalog>"), text.index("<saved-memes>")
         )
         self.assertLess(
             text.index("</saved-memes>"), text.index("<timeline>")
@@ -1011,6 +1012,69 @@ class SavedMemesEnvelopeTests(unittest.TestCase):
         text = self._envelope_text(self._ctx_with_memes("A<B&C"))
         self.assertIn("A&lt;B&amp;C", text)
         self.assertNotIn(">A<B&C<", text)
+
+
+class EnvelopeCacheLayoutTests(unittest.TestCase):
+    """信封段序与前缀稳定性契约（2026-07-12，前缀缓存）。
+
+    OpenAI 系 API 的自动前缀缓存要求前缀**逐字节一致**：每拍必变的 now/tick
+    不得出现在信封头部（否则缓存前缀在 system prompt 末尾就断掉，timeline
+    每拍全价重计费），段序按变化频率升序：tool-catalog → saved-memes →
+    timeline → active-tasks → <current/> → validation-error。改动信封布局
+    前必须先想清对缓存前缀的影响——本类是回归防线。"""
+
+    def _render(self, ctx: DecisionContext) -> str:
+        llm = _StubLLM(
+            response_content='{"actions":[{"type":"idle","reason":"x"}]}'
+        )
+        planner = LLMPlanner(llm_client=llm)
+        asyncio.run(planner.decide(ctx))
+        return llm.invocations[0][1].content[0]["text"]
+
+    def test_agent_input_head_has_no_per_tick_attributes(self) -> None:
+        text = self._render(_ctx())
+        head = text[: text.index(">") + 1]  # <agent-input ...> 开标签
+        self.assertTrue(head.startswith("<agent-input"))
+        self.assertIn('scope="group:100"', head)
+        self.assertNotIn("now=", head)
+        self.assertNotIn("tick=", head)
+
+    def test_current_element_carries_clock_after_tasks(self) -> None:
+        text = self._render(_ctx())
+        self.assertIn("<current now=", text)
+        self.assertIn('tick="1"/>', text)
+        # 段序：timeline → active-tasks → <current/>
+        self.assertLess(
+            text.index("</timeline>"), text.index("<active-tasks>")
+        )
+        self.assertLess(
+            text.index("</active-tasks>"), text.index("<current now=")
+        )
+
+    def test_validation_error_rendered_after_current(self) -> None:
+        from dataclasses import replace
+
+        text = self._render(
+            replace(_ctx(), validation_feedback="attempt 1 rejected: x")
+        )
+        self.assertLess(
+            text.index("<current now="), text.index("<validation-error>")
+        )
+
+    def test_prefix_stable_across_ticks(self) -> None:
+        """同一 timeline、不同 now/tick 的两拍，<current/> 之前的信封文本
+        必须逐字节一致——这是前缀缓存能命中的直接判据。"""
+        from dataclasses import replace
+        from datetime import timedelta
+
+        base = _ctx()
+        text_a = self._render(base)
+        text_b = self._render(
+            replace(base, tick_seq=2, now=base.now + timedelta(seconds=47))
+        )
+        prefix_a = text_a[: text_a.index("<current ")]
+        prefix_b = text_b[: text_b.index("<current ")]
+        self.assertEqual(prefix_a, prefix_b)
 
 
 if __name__ == "__main__":

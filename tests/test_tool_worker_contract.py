@@ -520,7 +520,7 @@ class ToolWorkerSelfWakeTest(unittest.TestCase):
 
 
 class ToolWorkerCaptionInjectionTests(unittest.TestCase):
-    """caption_image 注入链（save_meme 的看图写描述依赖）：构造参数 →
+    """caption_image 注入链（meme 工具看图写描述的依赖）：构造参数 →
     run() context，与 session_factory 同链；未配置时注入 None（工具自行
     降级失败，与 wait 缺 wake_scope 同式）。"""
 
@@ -536,14 +536,14 @@ class ToolWorkerCaptionInjectionTests(unittest.TestCase):
     def _run_one(self, worker_kwargs: dict) -> dict:
         captured: dict[str, Any] = {}
         reg = ToolRegistry()
-        reg.register(self._CtxCapturingTool("save_meme", captured))
+        reg.register(self._CtxCapturingTool("meme", captured))
         worker = ToolWorker(
             session_factory=_factory_for([]), registry=reg, **worker_kwargs
         )
         row = _row(
             payload={
                 "tool_call_id": "TC_CAP",
-                "tool_name": "save_meme",
+                "tool_name": "meme",
                 "arguments": {},
             }
         )

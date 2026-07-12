@@ -136,13 +136,19 @@ class MemeView:
 
     Projector 经 meme_store.load_saved_memes 挂到 DecisionContext.saved_memes，
     llm_planner 渲染成 <saved-memes> 里的一行 <meme hash="..." saved_at="...">
-    描述</meme>。description 由 save_meme 收录时的 caption LLM 调用生成，是
-    send_meme 选图的唯一依据；hash 与 timeline <image hash="..."/> 同一值空间。
+    描述</meme>。description 由收录（meme.save）时的 caption LLM 调用生成，是
+    发送（meme.send）选图的唯一依据；hash 与 timeline <image hash="..."/> 同一
+    值空间。
+
+    context_note 是收录时留档的聊天语境（表情包工具黑盒设计.md §2"留档备将来
+    重生成"）：meme.recaption 不带新语境时沿用它重跑 caption。**不进 prompt**
+    ——<saved-memes> 只渲染 description。
     """
 
     file_hash: str
     description: str
     saved_at: datetime
+    context_note: str | None = None
 
 
 @dataclass(frozen=True)
@@ -230,11 +236,11 @@ class DecisionContext:
     timeline: list[TimelineItem] = field(default_factory=list)
     active_tasks: list[TaskView] = field(default_factory=list)
 
-    # ─── 表情包收藏夹（2026-07-03，save_meme / send_meme 工具）───
+    # ─── 表情包收藏夹（2026-07-03 收发上线；2026-07-12 起为 meme 单工具）───
     # 全局共享的 agent_memes（2026-07-06 起全 bot 一份，created_at 倒序、
     # 封顶 meme_store.MAX_SAVED_MEMES 条），由 Projector.
-    # _augment_with_saved_memes 注入；渲染成 <saved-memes>，send_meme 凭
-    # 其中的 hash 精确发送。空 = 不渲染。
+    # _augment_with_saved_memes 注入；渲染成 <saved-memes>，meme 工具凭
+    # 其中的 hash 精确发送/删除/换描述。空 = 不渲染。
     saved_memes: list[MemeView] = field(default_factory=list)
     # 2026-07-02 起不再有独立的 pending_tool_results 字段：工具结果只在
     # timeline 的 <tool-call status="complete"> 行呈现一次（单一事实源）。

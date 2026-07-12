@@ -1,16 +1,19 @@
-"""agent_memes 表 —— 表情包收藏（save_meme / send_meme 工具的操作状态表）。
+"""agent_memes 表 —— 表情包收藏（meme 工具的操作状态表）。
 
 为什么存在（开发文档/v2.0/30-工具设计/表情包工具黑盒设计.md）：
-  LLM 在聊天里看到值得收藏的图片时，经 save_meme 把它收录为表情包。图片文件
-  本身复用 EventIngest 落盘的 runtime_data/media/img/<hash[:2]>/<hash>
+  LLM 在聊天里看到值得收藏的图片时，经 meme 工具（action=save）把它收录为
+  表情包。图片文件本身复用 EventIngest 落盘的
+  runtime_data/media/img/<hash[:2]>/<hash>
   （EventIngest契约.md §6.1，sha256 内容寻址，**不复制文件**），本表只存一层
-  元数据 —— 其中 description 由 save_meme 内部的 caption LLM 调用看图生成，
-  是 send_meme 选图的唯一依据（投影把收藏夹渲染成 <saved-memes> 每 tick 注入）。
+  元数据 —— 其中 description 由 meme 工具内部的 caption LLM 调用看图生成，
+  是选图（meme.send）的唯一依据（投影把收藏夹渲染成 <saved-memes> 每 tick
+  注入）。
 
 与 append-only 硬规矩的关系：
   agent_events 仍是唯一事件真相源。本表与 agent_delivery_claim 同类，是**可变
-  操作状态表**（不是事件），INSERT 由 save_meme 工具执行；save/send 动作本身
-  已作为 agent.tool_called / tool_result 事件留痕，审计链不依赖本表。
+  操作状态表**（不是事件），INSERT/UPDATE/DELETE 由 meme 工具执行（save /
+  recaption / delete）；各动作本身已作为 agent.tool_called / tool_result 事件
+  留痕，审计链不依赖本表。
 
 共享语义（2026-07-06 起，隔离契约 §9.2 第 6 条例外）：
   收藏夹全 bot 一份、所有聊天 scope 共用 —— 收藏以公共值 file_hash 为键、
@@ -18,12 +21,12 @@
   允许并要求显式标注的例外。实现：scope_key 列固定写 meme_store 的
   MEME_SCOPE_GLOBAL 哨兵（'global'），主键 (scope_key, file_hash) 退化为
   全局一图一条；列保留以便将来恢复分域。历史分群行需一次性迁移合并（见
-  表情包工具黑盒设计.md §2）。跨会话投递不因此放开：send_meme 的发送目标
+  表情包工具黑盒设计.md §2）。跨会话投递不因此放开：meme.send 的发送目标
   仍只从当前 loop 的 scope_key 解析。
 
 媒体文件生命周期约束：
   本表的 file_hash **钉住**对应磁盘文件。当前 runtime_data/media 没有任何清理
-  任务；将来若引入媒体 GC，必须 join 本表排除被收藏的 hash，否则 send_meme
+  任务；将来若引入媒体 GC，必须 join 本表排除被收藏的 hash，否则 meme.send
   读盘失败（media_file_missing）。见 表情包工具黑盒设计.md §媒体生命周期。
 """
 
@@ -41,7 +44,7 @@ class AgentMeme(Base):
     scope_key = Column(Text, primary_key=True)
     file_hash = Column(Text, primary_key=True)
     # caption LLM 生成的中文描述（画面内容/图上文字/情绪/适用场景）。
-    # <saved-memes> 渲染与 send_meme 选图都只看它。
+    # <saved-memes> 渲染与 meme.send 选图都只看它。
     description = Column(Text, nullable=False)
     # 保存时 planner 附带的群聊语境（谁的名场面/本群怎么用）——caption 的输入
     # 之一，原文留档便于将来重生成描述。None = 未提供。

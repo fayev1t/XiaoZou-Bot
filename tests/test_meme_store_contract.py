@@ -6,9 +6,14 @@ Covers（表情包工具黑盒设计.md §存储；2026-07-06 起全局共享）
 - insert_meme：INSERT ... ON CONFLICT (scope_key, file_hash) DO NOTHING；
   rowcount=1 → True（新插入），rowcount=0 → False（已存在，调用方折
   already_saved，**不覆盖**）；values 完整落所有列。
-- get_meme：按 hash 单条精确查 → MemeView；未命中 → None。
+- get_meme：按 hash 单条精确查 → MemeView（含 context_note 留档回读，供
+  meme.recaption 沿用旧语境）；未命中 → None。
 - load_saved_memes：created_at 倒序 + LIMIT（语句面断言）；UTC 时间
   normalize 到北京时间（与 task_store 同约定）。
+- delete_meme（2026-07-12）：DELETE 按哨兵 scope + hash 过滤；rowcount → bool。
+- update_meme_description（2026-07-12）：UPDATE 只动 description /
+  context_note 两列（created_at 等收录事实不动）；rowcount → bool（0 =
+  并发被删，调用方折 unknown_meme）。
 
 不打真实 DB：recording / stub session 捕获语句，postgresql dialect 编译，
 与 test_task_store_contract 同式。
@@ -23,14 +28,16 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from sqlalchemy.dialects import postgresql
-from sqlalchemy.sql.dml import Insert
+from sqlalchemy.sql.dml import Delete, Insert, Update
 
 from qqbot.services.agent_loop.meme_store import (
     MAX_SAVED_MEMES,
     MEME_SCOPE_GLOBAL,
+    delete_meme,
     get_meme,
     insert_meme,
     load_saved_memes,
+    update_meme_description,
 )
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -58,15 +65,16 @@ class _Result:
 
 
 class _StubSession:
-    """execute 捕获语句；select 回固定行、insert 回固定 rowcount。"""
+    """execute 捕获语句；select 回固定行、DML（insert/update/delete）回固定
+    rowcount。"""
 
     def __init__(self, owner: "_StubDB") -> None:
         self._owner = owner
 
     async def execute(self, stmt: Any) -> _Result:
         self._owner.statements.append(stmt)
-        if isinstance(stmt, Insert):
-            return _Result(rowcount=self._owner.insert_rowcount)
+        if isinstance(stmt, (Insert, Update, Delete)):
+            return _Result(rowcount=self._owner.dml_rowcount)
         return _Result(rows=self._owner.select_rows)
 
     async def commit(self) -> None:
@@ -83,10 +91,10 @@ class _StubDB:
     def __init__(
         self,
         select_rows: list[Any] | None = None,
-        insert_rowcount: int = 1,
+        dml_rowcount: int = 1,
     ) -> None:
         self.select_rows = list(select_rows or [])
-        self.insert_rowcount = insert_rowcount
+        self.dml_rowcount = dml_rowcount
         self.statements: list[Any] = []
         self.commits = 0
 
@@ -99,12 +107,14 @@ def _meme_row(
     file_hash: str = HASH_A,
     description: str = "黑猫瞪眼，嘲讽用",
     created_at: datetime | None = None,
+    context_note: str | None = "张三的名场面",
 ) -> SimpleNamespace:
     """伪 AgentMeme ORM row（_row_to_meme_view 只读这些属性）。"""
     return SimpleNamespace(
         file_hash=file_hash,
         description=description,
         created_at=created_at or BASE,
+        context_note=context_note,
     )
 
 
@@ -146,7 +156,7 @@ class InsertMemeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ON CONFLICT (scope_key, file_hash) DO NOTHING", sql)
 
     async def test_insert_conflict_returns_false(self) -> None:
-        db = _StubDB(insert_rowcount=0)
+        db = _StubDB(dml_rowcount=0)
         inserted = await self._insert(db)
         self.assertFalse(inserted)
 
@@ -160,6 +170,8 @@ class GetMemeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(view.file_hash, HASH_A)
         self.assertEqual(view.description, "黑猫瞪眼，嘲讽用")
         self.assertEqual(view.saved_at, BASE)
+        # context_note 留档回读：meme.recaption 未带新语境时沿用它
+        self.assertEqual(view.context_note, "张三的名场面")
 
     async def test_miss_returns_none(self) -> None:
         db = _StubDB(select_rows=[])
@@ -173,6 +185,64 @@ class GetMemeTests(unittest.IsolatedAsyncioTestCase):
         await get_meme(db.factory, HASH_A)
         params = db.statements[0].compile(dialect=postgresql.dialect()).params
         self.assertIn(MEME_SCOPE_GLOBAL, params.values())
+
+
+class DeleteMemeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_delete_filters_global_sentinel_and_hash(self) -> None:
+        db = _StubDB()
+        deleted = await delete_meme(db.factory, HASH_A)
+        self.assertTrue(deleted)
+        self.assertEqual(db.commits, 1)
+        self.assertEqual(len(db.statements), 1)
+        stmt = db.statements[0]
+        self.assertIsInstance(stmt, Delete)
+        params = stmt.compile(dialect=postgresql.dialect()).params
+        # 与 get_meme 同：按哨兵 scope + hash 过滤，不裸删 hash
+        self.assertIn(MEME_SCOPE_GLOBAL, params.values())
+        self.assertIn(HASH_A, params.values())
+
+    async def test_missing_row_returns_false(self) -> None:
+        db = _StubDB(dml_rowcount=0)
+        deleted = await delete_meme(db.factory, HASH_A)
+        self.assertFalse(deleted)
+
+
+class UpdateMemeDescriptionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_update_touches_only_description_and_note(self) -> None:
+        db = _StubDB()
+        updated = await update_meme_description(
+            db.factory,
+            file_hash=HASH_A,
+            description="白猫叹气，摆烂用",
+            context_note="李四的名场面",
+        )
+        self.assertTrue(updated)
+        self.assertEqual(db.commits, 1)
+        stmt = db.statements[0]
+        self.assertIsInstance(stmt, Update)
+        compiled = stmt.compile(dialect=postgresql.dialect())
+        self.assertEqual(compiled.params["description"], "白猫叹气，摆烂用")
+        self.assertEqual(compiled.params["context_note"], "李四的名场面")
+        # 收录事实不动：created_at / mime / source_event_id 不在 SET 列里
+        sql = _sql(stmt)
+        set_clause = sql.split("WHERE")[0]
+        self.assertNotIn("created_at", set_clause)
+        self.assertNotIn("mime", set_clause)
+        self.assertNotIn("source_event_id", set_clause)
+        # 与 get_meme 同：按哨兵 scope + hash 过滤
+        self.assertIn(MEME_SCOPE_GLOBAL, compiled.params.values())
+        self.assertIn(HASH_A, compiled.params.values())
+
+    async def test_missing_row_returns_false(self) -> None:
+        # rowcount=0 = 并发被删，调用方（meme.recaption）折 unknown_meme
+        db = _StubDB(dml_rowcount=0)
+        updated = await update_meme_description(
+            db.factory,
+            file_hash=HASH_A,
+            description="白猫叹气，摆烂用",
+            context_note=None,
+        )
+        self.assertFalse(updated)
 
 
 class LoadSavedMemesTests(unittest.IsolatedAsyncioTestCase):

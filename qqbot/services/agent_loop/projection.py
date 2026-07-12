@@ -117,6 +117,18 @@ class Projector:
     MAX_THOUGHT_ROWS = 10
     MAX_THOUGHT_CHARS = 300
 
+    # ─── 窗口锚定滞回（2026-07-12，前缀缓存契约）───
+    # OpenAI 系 API 的自动前缀缓存要求前缀**逐字节一致**。若裁剪恒取"尾部
+    # 正好 max 条"，活跃群每来一条消息窗口起点就前移一行，timeline 的缓存
+    # 前缀每拍从起点断掉。改为锚定+滞回：起点钉在上一拍的首行（anchor），
+    # 窗口放任增长到 max + SLACK 条才一次性前移回 max 条——起点每 SLACK 条
+    # 新行才跳一次，其间各拍共享整段 timeline 前缀。<my-thought> 的"最近
+    # K 条"选择边界同理滞回（否则每拍新增一条决策，第 K 旧的思考行就从
+    # timeline 中段被抹掉，前缀照断）。锚失效（掉出取数窗 / 重启丢内存态 /
+    # 事件老化出 lookback）时退回朴素裁剪并重新锚定，只多一次缓存 miss。
+    TIMELINE_TRIM_SLACK = 30
+    THOUGHT_ROWS_SLACK = 5
+
     def __init__(
         self,
         session_factory: SessionFactory,
@@ -131,6 +143,11 @@ class Projector:
         # 真正塞给 LLM 的 timeline 在 project() 里再裁到 max_timeline_items 条。
         self._max_items = max_items
         self._max_timeline_items = max_timeline_items
+        # scope_key → 上一拍渲染的 timeline 首行 / 首条 <my-thought> 行的
+        # event_id（窗口锚定滞回，见类常量注释）。纯内存态：重启即空，首拍
+        # 走朴素裁剪重新锚定，代价只是一次缓存 miss，不落库。
+        self._timeline_anchors: dict[str, str] = {}
+        self._thought_anchors: dict[str, str] = {}
 
     async def build_context(
         self,
@@ -142,7 +159,13 @@ class Projector:
         bot_user_id: str | None = None,
     ) -> DecisionContext:
         scope, group_id, _ = parse_scope_key(scope_key)
-        cutoff = now - self._lookback
+        # cutoff 按小时向下取整：24h 窗口边界若随 now 连续滑动，安静 scope 里
+        # 几乎每拍都有旧事件从窗口头部掉出，白白掐断前缀缓存；取整后旧事件按
+        # 小时批量退场。实际 lookback 因此在 [24h, 25h) 浮动，折叠与裁剪不受
+        # 影响（fetch 只是候选池，真正的渲染窗口由 project() 的裁剪决定）。
+        cutoff = (now - self._lookback).replace(
+            minute=0, second=0, microsecond=0
+        )
 
         events = await self._fetch(scope, group_id, cutoff)
         # bot_role 单独一次 SQL 查 —— runtime.bot_role_observed 可能远早于
@@ -159,7 +182,18 @@ class Projector:
             max_timeline_items=self._max_timeline_items,
             bot_user_id=bot_user_id,
             bot_role=bot_role,
+            timeline_anchor=self._timeline_anchors.get(scope_key),
+            thought_anchor=self._thought_anchors.get(scope_key),
         )
+        # 记录本拍窗口锚：timeline 首行 = 下一拍的裁剪起点候选；首条
+        # <my-thought> 行 = 下一拍思考选择的起点候选。无思考行时保留旧锚
+        # （下一拍找不到会自动退朴素选择，无需清理）。
+        if ctx.timeline:
+            self._timeline_anchors[scope_key] = ctx.timeline[0].event_id
+            for item in ctx.timeline:
+                if item.kind == "my_thought":
+                    self._thought_anchors[scope_key] = item.event_id
+                    break
         # 任务持久化补全：fold_tasks 只看 lookback/300 窗口，未完成任务的
         # task_created 被水群挤出窗口后会从 active_tasks 消失（与"任务跨 tick
         # 持久"契约冲突，是 bug）。这里查 agent_tasks 读模型，把"仍 pending/
@@ -168,7 +202,7 @@ class Projector:
         # 窗口折叠结果），绝不让 tick 因补全失败而崩。
         ctx = await self._augment_with_persisted_tasks(ctx, scope_key)
         # 表情包收藏夹注入：查 agent_memes 挂到 ctx.saved_memes，llm_planner
-        # 渲染成 <saved-memes>（send_meme 凭 hash 发送的选图目录）。同样
+        # 渲染成 <saved-memes>（meme 工具凭 hash 操作收藏的选图目录）。同样
         # best-effort 降级——查不到收藏夹只影响本 tick 发不了表情包。
         return await self._augment_with_saved_memes(ctx, scope_key)
 
@@ -200,7 +234,7 @@ class Projector:
 
         收藏夹全 bot 一份、所有聊天 scope 共用（隔离契约 §9.2 第 6 条例外，
         见 meme_store 模块 docstring），查询不带 scope 过滤；scope_key 只用来
-        判断"有没有聊天面"——system scope 没有（save_meme / send_meme 的
+        判断"有没有聊天面"——system scope 没有（meme 工具的
         allowed_scopes 也不含它），跳过查询省一次 SQL。查询失败整段降级
         （本 tick 不渲染 <saved-memes>，模型只是暂时"想不起收藏"），绝不让
         tick 崩。
@@ -316,6 +350,8 @@ class Projector:
         max_timeline_items: int | None = None,
         bot_user_id: str | None = None,
         bot_role: str | None = None,
+        timeline_anchor: str | None = None,
+        thought_anchor: str | None = None,
     ) -> DecisionContext:
         active_tasks = Projector.fold_tasks(events, scope_key=scope_key)
         # tool_views 只喂给 timeline 渲染（<tool-call> 行按两态折叠）；不再
@@ -325,20 +361,18 @@ class Projector:
             events,
             tool_views=tool_views,
             unseen_message_ids=Projector.fold_unseen_message_ids(events),
+            thought_anchor=thought_anchor,
         )
         # 裁到尾部 max_timeline_items 条 —— fetch 上限给得宽是为了 fold 任务/
         # 工具结果时能看到足够长的事件链，但塞给 LLM 的不必那么多。
         # <my-thought> 行不占消息行预算（待办清单#4"不挤占"约定）：从尾部
         # 数满 max 条**非思考行**为止，区间内的思考行顺带保留——它们本身已被
-        # MAX_THOUGHT_ROWS 封顶，不会失控。无思考行时与旧 [-max:] 完全等价。
+        # MAX_THOUGHT_ROWS 封顶，不会失控。timeline_anchor（上一拍窗口首行）
+        # 有效时起点滞回钉住，见 _trim_timeline。
         if max_timeline_items is not None:
-            non_thought = 0
-            for i in range(len(timeline) - 1, -1, -1):
-                if timeline[i].kind != "my_thought":
-                    non_thought += 1
-                    if non_thought >= max_timeline_items:
-                        timeline = timeline[i:]
-                        break
+            timeline = Projector._trim_timeline(
+                timeline, max_timeline_items, timeline_anchor
+            )
         # 如果 caller 没单独传 bot_role（pure project() 测试常常如此），尝试从
         # 事件列表里 fold 一次——支持纯函数测试不需要 DB 也能验证 fold 逻辑。
         if bot_role is None:
@@ -362,6 +396,47 @@ class Projector:
             bot_user_id=bot_user_id,
             bot_role=normalized_role,  # type: ignore[arg-type]
         )
+
+    @staticmethod
+    def _trim_timeline(
+        timeline: list[TimelineItem],
+        max_items: int,
+        anchor: str | None,
+    ) -> list[TimelineItem]:
+        """尾部裁剪 + 窗口锚定滞回（前缀缓存契约，见类常量注释）。
+
+        朴素裁剪 = 从尾部数满 ``max_items`` 条非思考行。给了 ``anchor``
+        （上一拍窗口首行的 event_id）且它仍在窗内、锚起的非思考行数未超
+        ``max_items + TIMELINE_TRIM_SLACK`` 时，起点钉在锚上不动——各拍共享
+        同一窗口起点，timeline 前缀逐字节稳定；超出滞回带或锚已失效（掉出
+        取数窗 / 重启）则退回朴素裁剪，由 caller 重新锚定。
+        """
+        naive = -1
+        non_thought = 0
+        for i in range(len(timeline) - 1, -1, -1):
+            if timeline[i].kind != "my_thought":
+                non_thought += 1
+                if non_thought >= max_items:
+                    naive = i
+                    break
+        if naive <= 0:
+            return timeline  # 不足预算（或起点已是首行），整段保留
+        if anchor:
+            # 锚只可能在朴素起点或更早（窗口只会向前追加）；更新的"锚"说明
+            # 状态异常（如配置变更），忽略之走朴素裁剪。
+            for idx in range(naive + 1):
+                if timeline[idx].event_id != anchor:
+                    continue
+                kept_non_thought = sum(
+                    1 for it in timeline[idx:] if it.kind != "my_thought"
+                )
+                if (
+                    kept_non_thought
+                    <= max_items + Projector.TIMELINE_TRIM_SLACK
+                ):
+                    return timeline[idx:]
+                break  # 超出滞回带：一次性前移回朴素起点
+        return timeline[naive:]
 
     @staticmethod
     def fold_unseen_message_ids(
@@ -537,6 +612,7 @@ class Projector:
         *,
         tool_views: Sequence[ToolResultView],
         unseen_message_ids: frozenset[str] | set[str] = frozenset(),
+        thought_anchor: str | None = None,
     ) -> list[TimelineItem]:
         tool_view_by_id = {tv.tool_call_id: tv for tv in tool_views}
         # 预扫一遍构建 reply 段引用所需的索引（被回复消息摘要 + 用户名映射），
@@ -556,15 +632,31 @@ class Projector:
         # 推 unseen 水位线，跳过会造成"消息在最后一行可见思考之后却没标
         # unseen"的表面矛盾；空白 reasoning 没有内容可看，跳过）。更早的
         # 决策不渲染：思考是辅助记忆，K 之外的旧念头换 token 不划算。
-        thought_ids: set[str] = set()
-        for ev in reversed(events):
-            if len(thought_ids) >= Projector.MAX_THOUGHT_ROWS:
-                break
-            if ev.type != "agent.decision_emitted":
-                continue
-            reasoning = (ev.payload or {}).get("reasoning")
-            if isinstance(reasoning, str) and reasoning.strip():
-                thought_ids.add(ev.event_id)
+        # thought_anchor（上一拍首条思考行）有效时选择起点滞回钉住——否则
+        # 每拍新增一条决策就把第 K 旧的思考行从 timeline 中段抹掉，掐断
+        # 前缀缓存（见类常量注释）；攒满 K + THOUGHT_ROWS_SLACK 条才一次性
+        # 收回最近 K 条。
+        thoughts = [
+            ev
+            for ev in events
+            if ev.type == "agent.decision_emitted"
+            and isinstance((ev.payload or {}).get("reasoning"), str)
+            and str((ev.payload or {}).get("reasoning")).strip()
+        ]
+        selected = thoughts[-Projector.MAX_THOUGHT_ROWS :]
+        if thought_anchor:
+            for j, ev in enumerate(thoughts):
+                if ev.event_id != thought_anchor:
+                    continue
+                anchored = thoughts[j:]
+                if (
+                    len(thoughts) - j
+                    <= Projector.MAX_THOUGHT_ROWS
+                    + Projector.THOUGHT_ROWS_SLACK
+                ):
+                    selected = anchored
+                break  # 超出滞回带：一次性收回最近 K 条
+        thought_ids = {ev.event_id for ev in selected}
 
         items: list[TimelineItem] = []
         for ev in events:
@@ -1665,18 +1757,20 @@ def _build_author_index(
     工具名兼容：发言工具已从 `reply` 改名为 `send_message`（§12.2）；事件表
     append-only，改名前落库的 tool_called 里 tool_name 仍是 `reply`，故这里两个名
     都认，避免改名后一个 lookback 窗口内旧发言丢掉 from_self 标注。
-    `send_meme`（发表情包）同样是"bot 发出一条消息"的工具、result 同样带
-    message_id + self_id，一并认——别人引用 bot 发的表情包时也要 from_self。
+    `meme`（action=send 发表情包）同样是"bot 发出一条消息"的工具、result 同样
+    带 message_id + self_id，一并认——别人引用 bot 发的表情包时也要 from_self；
+    非 send 动作的 result 不带 message_id，下方的 message_id 门自然滤掉。
+    `send_meme` 是 2026-07-12 合并进 meme 前的旧名，同 reply 例保留。
     """
     out: dict[str, _AuthorRef] = {}
     # 先收集发言工具调用的 tool_call_id，用来认出哪些 tool_result 是发言的。
-    # 认 send_message / send_meme（发消息类工具）+ reply（改名前的旧事件，见
-    # docstring 兼容说明）。
+    # 认 send_message / meme（发消息类工具）+ reply / send_meme（改名前的旧
+    # 事件，见 docstring 兼容说明）。
     send_call_ids: set[str] = set()
     for ev in events:
         if ev.type == "agent.tool_called" and (
             (ev.payload or {}).get("tool_name")
-            in ("send_message", "send_meme", "reply")
+            in ("send_message", "meme", "send_meme", "reply")
         ):
             tc_id = (ev.payload or {}).get("tool_call_id")
             if tc_id is not None:

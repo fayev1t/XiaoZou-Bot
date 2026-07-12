@@ -57,7 +57,7 @@ class LoopSupervisor:
         self._projector = projector
         self._tool_registry = tool_registry
         # 看图写描述回调（生产 = meme_caption.caption_image，由 v2_main 注入）：
-        # 原样转发给 ToolWorker，进工具 run() context 供 save_meme 用。
+        # 原样转发给 ToolWorker，进工具 run() context 供 meme 工具用。
         self._caption_image = caption_image
         self._loops: dict[str, AgentLoop] = {}
         self._lock = asyncio.Lock()

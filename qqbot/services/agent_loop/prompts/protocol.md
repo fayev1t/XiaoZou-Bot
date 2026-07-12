@@ -4,7 +4,7 @@ The runtime delivers every fact exactly once (in the timeline), echoes your rece
 
 # Input format
 
-The user turn is a single XML document wrapped in `<agent-input scope="..." now="..." tick="N">`, containing `<tool-catalog>` / `<active-tasks>` / `<timeline>`. The full grammar — every tag, every inline segment, how `<reply>` / `<at>` chains encode conversation lines, what `<truncated/>` / `<processing/>` mean — is documented in §xml_format. Read it once; the rest of this protocol assumes you know the tags. Tool outcomes appear exactly once, as `<tool-call status="complete">` rows inside `<timeline>` — there is no separate results section.
+The user turn is a single XML document wrapped in `<agent-input scope="...">`, containing `<tool-catalog>` / `<timeline>` / `<active-tasks>`, with this tick's clock on a trailing `<current now="..." tick="N"/>` element. The full grammar — every tag, every inline segment, how `<reply>` / `<at>` chains encode conversation lines, what `<truncated/>` / `<processing/>` mean — is documented in §xml_format. Read it once; the rest of this protocol assumes you know the tags. Tool outcomes appear exactly once, as `<tool-call status="complete">` rows inside `<timeline>` — there is no separate results section.
 
 # Core principle — tasks persist, conversation flows around them
 

@@ -9,18 +9,31 @@ scope_key 列固定写 MEME_SCOPE_GLOBAL 哨兵（列保留，表结构不变，
 (scope_key, file_hash) 退化为全局一图一条；将来要恢复分域只改本模块）。
 存量分群数据需一次性迁移合并到哨兵 scope，见 表情包工具黑盒设计.md §2。
 
-三个对外接口（全部独立事务、每次新开 session，与 task_store 同风格）：
+对外接口（全部独立事务、每次新开 session，与 task_store 同风格）：
 
-  get_meme(factory, hash)          单条精确查。send_meme 的权限边界
-                                   （只有收录过的才能发）与 save_meme
-                                   的去重前查都走它。
+  get_meme(factory, hash)          单条精确查。发送（meme.send）的权限
+                                   边界（只有收录过的才能发）与收录
+                                   （meme.save）的去重前查都走它。
   insert_meme(factory, ...)        收录一条。ON CONFLICT DO NOTHING：
                                    并发重复保存时后到者静默不覆盖，
                                    返回 False（调用方按 already_saved
-                                   处理），不做任何 UPDATE。
+                                   处理），收录语义不做 UPDATE。
   load_saved_memes(factory)        取全局收藏夹（created_at 倒序、封顶
                                    MAX_SAVED_MEMES 条），Projector 渲染
                                    <saved-memes> 用。
+  delete_meme(factory, hash)       移除一条收藏（meme.delete，2026-07-12）。
+                                   只删 agent_memes 元数据，**不动磁盘
+                                   文件**——媒体文件是 EventIngest 的内容
+                                   寻址缓存，归将来的媒体 GC 管（黑盒设计
+                                   §7）。返回 False=本就不存在。
+  update_meme_description(...)     换描述 + 语境留档（meme.recaption，
+                                   2026-07-12）。只动 description /
+                                   context_note 两列，created_at 保持收录
+                                   时间不变。返回 False=该 hash 不存在
+                                   （并发被删）。
+
+本表是**可变操作状态表**（黑盒设计 §2），UPDATE/DELETE 不违反 agent_events
+的 append-only 硬规矩——审计链在 agent.tool_called/tool_result 事件里。
 
 失败语义：本模块**不吞异常** —— DB 失败原样 raise，由调用方决定降级（工具层
 经 BaseTool.run 兜底成 internal_tool_error；投影层 try/except 降级为本 tick 不
@@ -32,7 +45,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Callable
 
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -50,7 +63,7 @@ SessionFactory = Callable[[], AsyncSession]
 MEME_SCOPE_GLOBAL = "global"
 
 # <saved-memes> 渲染上限：收藏夹随时间增长，prompt 只带最近收录的 N 条。
-# 超限的老表情包仍在表里（send_meme 凭 hash 仍可发送），只是不再进 prompt。
+# 超限的老表情包仍在表里（meme.send 凭 hash 仍可发送），只是不再进 prompt。
 # 全局共享后所有群共用一个池，比分群时代放宽到 100。
 MAX_SAVED_MEMES = 100
 
@@ -105,6 +118,52 @@ async def insert_meme(
     return bool(getattr(result, "rowcount", 0))
 
 
+async def delete_meme(
+    session_factory: SessionFactory, file_hash: str
+) -> bool:
+    """移除一条全局收藏。返回 True=删了一条，False=本就不存在（或并发已删）。
+
+    只删 agent_memes 元数据，不碰 runtime_data/media 下的文件——文件是
+    EventIngest 的内容寻址缓存，删除收藏后它只是失去"被收藏钉住"的身份
+    （黑盒设计 §7），归将来的媒体 GC 处置。
+    """
+    stmt = (
+        delete(AgentMeme)
+        .where(AgentMeme.scope_key == MEME_SCOPE_GLOBAL)
+        .where(AgentMeme.file_hash == file_hash)
+    )
+    async with session_factory() as session:
+        result = await session.execute(stmt)
+        await session.commit()
+    return bool(getattr(result, "rowcount", 0))
+
+
+async def update_meme_description(
+    session_factory: SessionFactory,
+    *,
+    file_hash: str,
+    description: str,
+    context_note: str | None,
+) -> bool:
+    """换一条收藏的描述（recaption 落表）。返回 True=更新成功，False=该
+    hash 不存在（并发被删，调用方按 unknown_meme 处理）。
+
+    只动 description + context_note（新语境同步留档，供下次 recaption 沿用）；
+    created_at / mime / source_event_id 保持收录时的值——created_at 语义是
+    "收录时间"而非"最后修改时间"，<saved-memes> 排序不因换描述而跳动。
+    """
+    stmt = (
+        update(AgentMeme)
+        .where(AgentMeme.scope_key == MEME_SCOPE_GLOBAL)
+        .where(AgentMeme.file_hash == file_hash)
+        .values(description=description, context_note=context_note)
+    )
+    async with session_factory() as session:
+        result = await session.execute(stmt)
+        await session.commit()
+    return bool(getattr(result, "rowcount", 0))
+
+
 async def load_saved_memes(
     session_factory: SessionFactory,
     *,
@@ -129,6 +188,7 @@ def _row_to_meme_view(row: Any) -> MemeView:
         file_hash=row.file_hash,
         description=row.description or "",
         saved_at=_norm_china(row.created_at),
+        context_note=row.context_note,
     )
 
 

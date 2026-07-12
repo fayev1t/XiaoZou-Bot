@@ -37,14 +37,13 @@ from qqbot.services.agent_loop.tools.get_stranger_info import GetStrangerInfoToo
 from qqbot.services.agent_loop.tools.group_notice import GroupNoticeTool
 from qqbot.services.agent_loop.tools.kick import KickTool
 from qqbot.services.agent_loop.tools.leave_group import LeaveGroupTool
+from qqbot.services.agent_loop.tools.meme import MemeTool
 from qqbot.services.agent_loop.tools.poke import PokeTool
 from qqbot.services.agent_loop.tools.recall import RecallTool
 from qqbot.services.agent_loop.tools.respond_to_group_join_request import (
     RespondToGroupJoinRequestTool,
 )
-from qqbot.services.agent_loop.tools.save_meme import SaveMemeTool
 from qqbot.services.agent_loop.tools.search_history import SearchHistoryTool
-from qqbot.services.agent_loop.tools.send_meme import SendMemeTool
 from qqbot.services.agent_loop.tools.send_message import SendMessageTool
 from qqbot.services.agent_loop.tools.set_admin import SetAdminTool
 from qqbot.services.agent_loop.tools.set_card import SetCardTool
@@ -72,11 +71,12 @@ def build_default_registry() -> ToolRegistry:
     # 事件进目标群 timeline，管理员明确授权后由群内 LLM 调它回执；好友申请 /
     # 邀请入群不经工具，由 plugin 层 request_auto_approval 自动同意。
     registry.register(RespondToGroupJoinRequestTool())
-    # 表情包收发（2026-07-03 新增）：save_meme 收录 timeline 图片（描述由
-    # 工具内 caption LLM 调用生成，见 meme_caption.py），send_meme 按 hash
-    # 发送收藏——收藏夹经 <saved-memes> 每 tick 注入 prompt。
-    registry.register(SaveMemeTool())
-    registry.register(SendMemeTool())
+    # 表情包一站式工具（2026-07-03 收发上线；2026-07-12 合并为单工具并新增
+    # 收藏管理）：action 分发 save（收录，描述由工具内 caption LLM 调用生成，
+    # 见 meme_caption.py）/ send（按 hash 发送收藏）/ delete（移除收藏，只删
+    # 元数据不动磁盘文件）/ recaption（重新生成描述，模型只能换 context_note）。
+    # 收藏夹经 <saved-memes> 每 tick 注入 prompt。
+    registry.register(MemeTool())
     # ── 群信息查询（2026-07-07 重做后恢复 / 新增）──
     # 查询三件套按下架备注的路线重做后恢复：get_group_info（no_cache + 可选
     # 字段透传）、get_member_list（role 过滤 / include_activity / banned_until）、
@@ -133,12 +133,11 @@ __all__ = [
     "GroupNoticeTool",
     "KickTool",
     "LeaveGroupTool",
+    "MemeTool",
     "PokeTool",
     "RecallTool",
     "RespondToGroupJoinRequestTool",
-    "SaveMemeTool",
     "SearchHistoryTool",
-    "SendMemeTool",
     "SendMessageTool",
     "SetAdminTool",
     "SetCardTool",

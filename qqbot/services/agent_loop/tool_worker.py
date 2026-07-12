@@ -137,7 +137,7 @@ class ToolWorker:
         # 退化为不自驱（旧测试 / 早期骨架兼容）。
         self._supervisor = supervisor
         # 看图写描述回调（async (bytes, mime, note) -> str，生产接
-        # meme_caption.caption_image）：save_meme 收录表情包时用。与
+        # meme_caption.caption_image）：meme 工具收录/换描述时用。与
         # session_factory 同一条注入链进 run() context；None 时工具自行降级
         # 失败（与 wait 缺 wake_scope 同式）。
         self._caption_image = caption_image
@@ -451,7 +451,7 @@ class ToolWorker:
                     # 未注入（旧测试 / 早期骨架）时为 None，工具自行降级失败。
                     wake_scope=getattr(self._supervisor, "wake", None),
                     # 看图写描述回调（async (bytes, mime, note) -> str）——
-                    # save_meme 收录表情包时生成 description；未接线时为
+                    # meme 工具收录/换描述时生成 description；未接线时为
                     # None，工具自行降级失败。
                     caption_image=self._caption_image,
                 )

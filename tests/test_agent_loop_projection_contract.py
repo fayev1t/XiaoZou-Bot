@@ -1938,17 +1938,20 @@ class RecallRenderingNoteTests(unittest.TestCase):
 
 
 class SendMemeAuthorIndexTests(unittest.TestCase):
-    def test_reply_to_bot_meme_attributes_self(self) -> None:
-        # send_meme 也是"bot 发出一条消息"的工具，result 同样带 message_id +
-        # self_id：别人引用 bot 发的表情包时，_build_author_index 一并认它，
-        # reply 段照标 from_self="true"（表情包工具黑盒设计 §结果契约）。
-        evs = [
+    """meme（action=send）也是"bot 发出一条消息"的工具，result 同样带
+    message_id + self_id：别人引用 bot 发的表情包时，_build_author_index
+    一并认它，reply 段照标 from_self="true"（表情包工具黑盒设计 §投影集成）。
+    2026-07-12 合并前的旧工具名 send_meme 落在 append-only 事件表里，同
+    reply 例保留兼容。"""
+
+    def _meme_send_events(self, tool_name: str) -> list:
+        return [
             _snap(
                 type="agent.tool_called",
                 payload={
                     "tool_call_id": "TC_MEME",
-                    "tool_name": "send_meme",
-                    "arguments": {"image_hash": "ab" * 32},
+                    "tool_name": tool_name,
+                    "arguments": {"action": "send", "image_hash": "ab" * 32},
                 },
                 seconds_offset=0,
             ),
@@ -1957,6 +1960,7 @@ class SendMemeAuthorIndexTests(unittest.TestCase):
                 payload={
                     "tool_call_id": "TC_MEME",
                     "result": {
+                        "action": "send",
                         "message_id": "M-MEME",
                         "self_id": "1005089717",
                         "file_hash": "ab" * 32,
@@ -1979,6 +1983,17 @@ class SendMemeAuthorIndexTests(unittest.TestCase):
                 seconds_offset=2,
             ),
         ]
+
+    def test_reply_to_bot_meme_attributes_self(self) -> None:
+        evs = self._meme_send_events("meme")
+        items = Projector.build_timeline(evs, tool_views=[])
+        msg = [i for i in items if i.kind == "message"][0].render
+        self.assertIn('from_self="true"', msg)
+        self.assertIn('from_qq="1005089717"', msg)
+
+    def test_legacy_send_meme_name_still_attributes_self(self) -> None:
+        # 改名前一个 lookback 窗口内的旧发言不能丢 from_self 标注。
+        evs = self._meme_send_events("send_meme")
         items = Projector.build_timeline(evs, tool_views=[])
         msg = [i for i in items if i.kind == "message"][0].render
         self.assertIn('from_self="true"', msg)
@@ -2265,6 +2280,107 @@ class MyThoughtTests(unittest.TestCase):
         )
         self.assertIn("m3", context.timeline[0].render)
         self.assertIn("m5", context.timeline[-1].render)
+
+
+class WindowAnchorHysteresisTests(unittest.TestCase):
+    """窗口锚定滞回契约（2026-07-12，前缀缓存）。
+
+    timeline 裁剪起点与 <my-thought> 选择边界都钉在上一拍的锚（event_id）上，
+    直到超出滞回带（TIMELINE_TRIM_SLACK / THOUGHT_ROWS_SLACK）才一次性前移
+    ——保证连续各拍的 timeline 前缀逐字节稳定。锚由 build_context 从上一拍
+    结果的首行取出、下一拍以入参喂回（project 仍是纯函数）。
+    """
+
+    @staticmethod
+    def _msg(i: int) -> "_EventSnapshot":
+        return _snap(
+            type="external.message.group.normal",
+            event_id=f"M{i:03d}",
+            payload={
+                "segments": [{"type": "text", "data": {"text": f"m{i}"}}],
+                "sender": {"nickname": "u", "user_id": 1},
+            },
+            seconds_offset=i,
+        )
+
+    @staticmethod
+    def _decision(i: int) -> "_EventSnapshot":
+        return _snap(
+            type="agent.decision_emitted",
+            event_id=f"D{i:03d}",
+            payload={"reasoning": f"想法{i}"},
+            seconds_offset=i,
+        )
+
+    def _project(self, evs, *, max_items=5, anchor=None):
+        return Projector.project(
+            evs,
+            scope_key="group:999",
+            correlation_id="c",
+            tick_seq=1,
+            now=BASE_TIME + timedelta(seconds=999),
+            max_timeline_items=max_items,
+            timeline_anchor=anchor,
+        )
+
+    def test_anchor_pins_window_start_within_slack(self) -> None:
+        """上一拍首行仍在滞回带内 → 起点钉住不动，窗口随新消息增长。"""
+        evs = [self._msg(i) for i in range(20)]
+        first = self._project(evs)  # 朴素裁剪：M015..M019
+        anchor = first.timeline[0].event_id
+        self.assertEqual(anchor, "M015")
+        # 下一拍：新来 3 条消息，带锚投影
+        evs2 = evs + [self._msg(i) for i in range(20, 23)]
+        second = self._project(evs2, anchor=anchor)
+        self.assertEqual(second.timeline[0].event_id, "M015")  # 起点未移
+        self.assertEqual(len(second.timeline), 8)  # 5 + 3，窗口增长
+        # 前缀稳定判据：上一拍的渲染序列是下一拍的严格前缀
+        self.assertEqual(
+            [it.render for it in first.timeline],
+            [it.render for it in second.timeline[: len(first.timeline)]],
+        )
+
+    def test_anchor_exceeding_slack_recuts_to_max(self) -> None:
+        """锚起的非思考行数超过 max + TIMELINE_TRIM_SLACK → 一次性收回尾部
+        max 条并重新锚定。"""
+        evs = [self._msg(i) for i in range(20)]
+        anchor = self._project(evs).timeline[0].event_id  # M015
+        grown = evs + [
+            self._msg(i)
+            for i in range(20, 20 + Projector.TIMELINE_TRIM_SLACK + 1)
+        ]  # 锚起 5 + 31 条 > 5 + 30
+        ctx = self._project(grown, anchor=anchor)
+        self.assertEqual(len(ctx.timeline), 5)
+        self.assertEqual(ctx.timeline[0].event_id, "M046")
+
+    def test_missing_anchor_falls_back_to_naive_trim(self) -> None:
+        """锚掉出取数窗（或重启丢内存态）→ 退回朴素裁剪，不崩不空。"""
+        evs = [self._msg(i) for i in range(20)]
+        ctx = self._project(evs, anchor="M_GONE")
+        self.assertEqual(len(ctx.timeline), 5)
+        self.assertEqual(ctx.timeline[0].event_id, "M015")
+
+    def test_thought_anchor_pins_selection_within_slack(self) -> None:
+        """思考选择边界钉在锚上：新增决策不再把第 K 旧的思考行挤出窗口。"""
+        evs = [self._decision(i) for i in range(1, 14)]  # 13 条，朴素取 D004 起
+        items = Projector.build_timeline(evs, tool_views=[])
+        self.assertEqual(items[0].event_id, "D004")
+        # 下一拍：新增 2 条决策，带锚选择 → D004 仍在，行数 12
+        evs2 = evs + [self._decision(i) for i in range(14, 16)]
+        items2 = Projector.build_timeline(
+            evs2, tool_views=[], thought_anchor="D004"
+        )
+        self.assertEqual(items2[0].event_id, "D004")
+        self.assertEqual(len(items2), 12)
+
+    def test_thought_anchor_exceeding_slack_recuts_to_last_k(self) -> None:
+        evs = [self._decision(i) for i in range(1, 21)]  # 20 条
+        # 从 D001 起 20 条 > MAX_THOUGHT_ROWS + THOUGHT_ROWS_SLACK (15)
+        items = Projector.build_timeline(
+            evs, tool_views=[], thought_anchor="D001"
+        )
+        self.assertEqual(len(items), Projector.MAX_THOUGHT_ROWS)
+        self.assertEqual(items[0].event_id, "D011")
 
 
 if __name__ == "__main__":

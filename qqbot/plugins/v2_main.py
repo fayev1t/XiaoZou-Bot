@@ -67,7 +67,7 @@ def _get_supervisor() -> LoopSupervisor:
             session_factory=AsyncSessionLocal,
             projector=projector,
             tool_registry=tool_registry,
-            # save_meme 的看图写描述回调：经 supervisor → ToolWorker 进工具
+            # meme 工具的看图写描述回调：经 supervisor → ToolWorker 进工具
             # run() context（与 session_factory 同一条注入链，工具不自己
             # import meme_caption，契约测试可塞假 captioner）。
             caption_image=caption_image,

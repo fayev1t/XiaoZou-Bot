@@ -1,4 +1,4 @@
-"""save_meme / send_meme 共享的小工具（与 _onebot_common 同定位）。
+"""meme 工具的公共小件（与 _onebot_common 同定位）。
 
 - **hash 校验**：image_hash 必须是 64 位十六进制 sha256（LLM 从 timeline 的
   <image hash="..."/> 或 <saved-memes> 的 <meme hash="..."/> 原样抄来），大小写

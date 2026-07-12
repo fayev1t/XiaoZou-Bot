@@ -294,15 +294,20 @@ def _render_input_xml(
 ) -> str:
     """拼装喂给 LLM 的 XML 信封。
 
-    结构（顺序刻意从静态参考 → 动态状态 → 时间线尾部，让 timeline 紧贴
-    LLM 输出位置，吃满 recency bias）：
+    结构（顺序按**变化频率升序**排列——前缀缓存契约，2026-07-12）：
 
-      <agent-input scope="..." now="..." tick="N" bot_qq="..." bot_role="...">
+      <agent-input scope="..." bot_qq="..." bot_role="...">
         <tool-catalog>
           <tool name="..." description="...">
             <arguments-schema>{json schema 文本}</arguments-schema>
           </tool>
         </tool-catalog>
+        <saved-memes>
+          <meme hash="..." saved_at="...">描述</meme>
+        </saved-memes>                                  (有收藏才出)
+        <timeline>
+          {item.render \n item.render ...}
+        </timeline>
         <active-tasks>
           <task task_id="..." state="..." description="...">
             <related-tools>tool1,tool2</related-tools>
@@ -313,22 +318,27 @@ def _render_input_xml(
             </progress-notes>
           </task>
         </active-tasks>
-        <saved-memes>
-          <meme hash="..." saved_at="...">描述</meme>
-        </saved-memes>                                  (有收藏才出)
+        <current now="..." tick="N"/>
         <validation-error>attempt N rejected: ...</validation-error>       (仅校验重试)
-        <timeline>
-          {item.render \n item.render ...}
-        </timeline>
       </agent-input>
+
+    缓存契约（2026-07-12）：OpenAI 系 API 的自动前缀缓存要求前缀**逐字节
+    一致**。now=/tick= 每拍必变，曾是 <agent-input> 的头属性，把可缓存前缀
+    掐断在 system prompt 末尾——tool-catalog（部署内静态）和 timeline（追加
+    为主，窗口起点锚定见 projection）每拍全价重计费。现按变化频率排序：
+    头属性只留 scope/bot_qq/bot_role（稳定/极少变）；active-tasks 任务活跃期
+    逐拍变（pending_tool_call_ids 随工具收口增删），排到 timeline 之后；
+    每拍必变的 now/tick 沉为尾部 <current/>；validation-error 只在同 tick
+    校验重试出现（契约 §7.1），放最尾——同拍重试可复用直到 <current/> 的
+    前缀，且作为最后一行对模型最显著。timeline 仍然紧邻输出位置（其后只有
+    寥寥数行），recency bias 不受影响。
 
     工具结果只在 <timeline> 的 <tool-call status="complete"> 行呈现一次
     （2026-07-02 删除了 <pending-tool-results> 区——同一调用双重渲染、且无
     消费切割地每拍重复出现，是模型复读的直接诱饵）。模型的跨拍自我记忆
     2026-07-06 起也在 timeline 内——最近 K 条 decision_emitted 渲染为
     <my-thought> 行（投影层负责，见 projection.build_timeline；独立的
-    <last-reasoning> 区块已删除）。<validation-error> 只在同 tick 校验重试
-    的调用里出现（契约 §7.1）。
+    <last-reasoning> 区块已删除）。
     """
     parts: list[str] = []
     # bot_qq 可选（值来自 context.bot_user_id）：未注入（启动初期 bot_registry
@@ -349,18 +359,11 @@ def _render_input_xml(
     role_attr = (
         f' bot_role="{_esc_attr(context.bot_role)}"' if context.bot_role else ""
     )
-    # 时区契约：所有暴露给 LLM 的时间都是北京时间（与数据库写入侧 china_now()
-    # 一致）。caller 传错时区时 astimezone() 兜底，naive datetime 走 fromtz
-    # 假设它就是北京时间。
-    now = context.now
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=CHINA_TIMEZONE)
-    else:
-        now = now.astimezone(CHINA_TIMEZONE)
+    # 头属性只留稳定字段（scope 恒定 / bot_qq 启动后恒定 / bot_role 极少变）
+    # ——每拍必变的 now/tick 在尾部 <current/>，见本函数 docstring 的缓存契约。
     parts.append(
-        f'<agent-input scope="{_esc_attr(context.scope_key)}" '
-        f'now="{_esc_attr(now.isoformat())}" '
-        f'tick="{context.tick_seq}"{bot_attr}{role_attr}>'
+        f'<agent-input scope="{_esc_attr(context.scope_key)}"'
+        f"{bot_attr}{role_attr}>"
     )
 
     parts.append("<tool-catalog>")
@@ -387,12 +390,7 @@ def _render_input_xml(
         )
     parts.append("</tool-catalog>")
 
-    parts.append("<active-tasks>")
-    for task in context.active_tasks:
-        parts.append(_render_task_xml(task))
-    parts.append("</active-tasks>")
-
-    # ─── 表情包收藏夹（有才渲染）：send_meme 凭 hash 精确发送的选图目录。
+    # ─── 表情包收藏夹（有才渲染）：meme 工具凭 hash 精确操作收藏的选图目录。
     # 空收藏整段省略——不给模型一个空 <saved-memes> 去好奇。───
     saved_memes = getattr(context, "saved_memes", None) or []
     if saved_memes:
@@ -408,6 +406,34 @@ def _render_input_xml(
             )
         parts.append("</saved-memes>")
 
+    parts.append("<timeline>")
+    # 每条 item.render 单独占一行，纯字符串拼接已足够；不再 JSON 包装。
+    for item in context.timeline:
+        parts.append(item.render)
+    parts.append("</timeline>")
+
+    # active-tasks 在 timeline 之后：任务活跃期它逐拍变（pending_tool_call_ids
+    # 随工具收口增删），放前面会在多工具工作流里逐拍掐断 timeline 的缓存前缀；
+    # 放这里还让"当前承诺"紧邻决策位置，显著性只增不减。
+    parts.append("<active-tasks>")
+    for task in context.active_tasks:
+        parts.append(_render_task_xml(task))
+    parts.append("</active-tasks>")
+
+    # ─── 每拍必变的时钟字段，沉底（缓存契约见本函数 docstring）───
+    # 时区契约：所有暴露给 LLM 的时间都是北京时间（与数据库写入侧 china_now()
+    # 一致）。caller 传错时区时 astimezone() 兜底，naive datetime 假设它就是
+    # 北京时间。
+    now = context.now
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=CHINA_TIMEZONE)
+    else:
+        now = now.astimezone(CHINA_TIMEZONE)
+    parts.append(
+        f'<current now="{_esc_attr(now.isoformat())}" '
+        f'tick="{context.tick_seq}"/>'
+    )
+
     # ─── 同 tick 校验重试反馈（仅重试调用渲染，契约 §7.1）───
     validation_feedback = getattr(context, "validation_feedback", None)
     if validation_feedback:
@@ -415,12 +441,6 @@ def _render_input_xml(
             "<validation-error>"
             f"{_esc_text(validation_feedback)}</validation-error>"
         )
-
-    parts.append("<timeline>")
-    # 每条 item.render 单独占一行，纯字符串拼接已足够；不再 JSON 包装。
-    for item in context.timeline:
-        parts.append(item.render)
-    parts.append("</timeline>")
 
     parts.append("</agent-input>")
     return "\n".join(parts)

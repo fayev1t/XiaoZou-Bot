@@ -1,19 +1,20 @@
-"""表情包收录时的看图写描述（save_meme 的内部 LLM 调用）。
+"""表情包收录/换描述时的看图写描述（meme 工具 save/recaption 的内部 LLM 调用）。
 
-save_meme 不让 planner 在动作 JSON 里顺手写收藏描述：决策 tick 的主职是决策，
+meme 工具不让 planner 在动作 JSON 里顺手写收藏描述：决策 tick 的主职是决策，
 顺手写的一句话密度和稳定性都不够。这里用专用 prompt 单独调一次多模态 LLM：
 输入 = 图片 bytes（+ planner 可选提供的群聊语境 context_note——纯看图写不出
 "这是谁的名场面/本群怎么用"），输出 = 一段密度优先的中文描述，落进
-agent_memes.description；之后 <saved-memes> 渲染与 send_meme 选图都只看它。
+agent_memes.description；之后 <saved-memes> 渲染与 meme.send 选图都只看它。
 
 注入方式：caption_image 由 v2_main 传给 LoopSupervisor → ToolWorker，在
-run() context 里以 ``caption_image`` 键到达 save_meme —— 工具不直接 import
+run() context 里以 ``caption_image`` 键到达 meme 工具 —— 工具不直接 import
 本模块，契约测试塞假 captioner 即可全离线跑（与 session_factory 的注入/伪造
 方式一致）。
 
 失败语义：LLM 未配置 / 调用异常 / 空输出一律 **raise CaptionError**，由
-save_meme 折成 ToolOutcome.failure("caption_failed", retryable=True)——收录的
-核心产出就是描述，生成失败宁可整体失败让 LLM 下拍重试，不落无描述的残记录。
+meme 工具折成 ToolOutcome.failure("caption_failed", retryable=True)——收录的
+核心产出就是描述，生成失败宁可整体失败让 LLM 下拍重试，不落无描述的残记录
+（recaption 场景则保留旧描述不动）。
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ logger = get_logger(__name__)
 MAX_DESCRIPTION_CHARS = 300
 
 # 看图写描述的专用 prompt：只描述、不寒暄、限长。描述要同时可"检索"（画面/
-# 文字）与可"使用"（情绪/场景）——send_meme 选图时模型只看这段文本。
+# 文字）与可"使用"（情绪/场景）——meme.send 选图时模型只看这段文本。
 # 收藏夹是全 bot 共享的（meme_store 全局收藏），描述会出现在收录时所在会话
 # 之外的聊天里，因此要求自包含：附注里只有特定群才懂的背景要概括成通用场景，
 # 不写死"本群/群友名"这类离开原群就失效的指代。
