@@ -42,6 +42,7 @@ from qqbot.services.agent_loop.decision import (
     ImageRef,
     NoteTaskProgressAction,
 )
+from qqbot.services.agent_loop.image_utils import normalize_image_for_llm
 from qqbot.services.agent_loop.projection import (
     _esc_attr,
     _esc_text,
@@ -494,7 +495,8 @@ def _build_image_blocks(context: DecisionContext) -> list[dict]:
     时定位不到对应像素）。label 用 ↓ 箭头明示"指向下一块"，hash 是
     universal binder。
 
-    读盘失败的图（文件已被清理 / 权限异常）跳过 label + 图 —— text 里
+    GIF 在编码前取首帧转 PNG，兼容只接受 JPG/PNG/WebP/ICO 的 VLM 网关。
+    读盘或转换失败的图跳过 label + 图 —— text 里
     的 `<image hash="..."/>` 占位还在，LLM 知道存在但看不到，避免整
     tick 失败。
     """
@@ -519,8 +521,17 @@ def _build_image_blocks(context: DecisionContext) -> list[dict]:
                 ref.local_path,
             )
             continue
+        try:
+            data, mime = normalize_image_for_llm(data, ref.mime or "image/png")
+        except Exception as exc:
+            logger.warning(
+                "[llm_planner] image conversion failed: {} hash={} path={}",
+                exc,
+                ref.file_hash,
+                ref.local_path,
+            )
+            continue
         b64 = base64.b64encode(data).decode("ascii")
-        mime = ref.mime or "image/png"
         blocks.append(
             {"type": "text", "text": f"↓ image hash={ref.file_hash}"}
         )

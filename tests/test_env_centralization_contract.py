@@ -11,11 +11,12 @@ class EnvCentralizationContractTests(unittest.TestCase):
         return (ROOT / relative_path).read_text(encoding="utf-8")
 
     def test_service_compose_layout_is_repo_baseline(self) -> None:
+        # searxng / crawl4ai 已随 websearch 工具 Tavily 化下线（2026-07-18），
+        # 不再是基线的一部分；其 compose 目录暂留仓库仅为部署侧执行
+        # `docker compose down`，之后手动删除，这里不再约束其存在。
         for relative_path in (
             "docker/postgres/compose.yml",
             "docker/napcat/compose.yml",
-            "docker/searxng/compose.yml",
-            "docker/crawl4ai/compose.yml",
         ):
             with self.subTest(path=relative_path):
                 self.assertTrue((ROOT / relative_path).exists())
@@ -47,12 +48,16 @@ class EnvCentralizationContractTests(unittest.TestCase):
             "POSTGRES_PASSWORD=your_postgres_password",
             "POSTGRES_DB=mydb",
             "POSTGRES_HOST_PORT=7504",
-            "SEARXNG_BASE_URL=http://your_docker_service_host:7505",
-            "SEARXNG_SECRET=change-this-searxng-secret",
-            "CRAWL4AI_BASE_URL=http://your_docker_service_host:7506",
+            "WEBSEARCH_PROVIDER=exa",
+            "TAVILY_API_KEY=",
         ):
             with self.subTest(key=key):
                 self.assertIn(key, env_example)
+
+        # websearch 的 SearXNG + Crawl4AI 容器方案已下线（2026-07-18 Tavily
+        # 化），env 模板不应再出现两者的配置（防回潮，同 sqlite 断言风格）。
+        self.assertNotIn("SEARXNG", env_example)
+        self.assertNotIn("CRAWL4AI", env_example)
 
     def test_napcat_compose_keeps_current_hardcoded_ports_and_permissions(self) -> None:
         compose_text = self.read_text("docker/napcat/compose.yml")
@@ -96,43 +101,6 @@ class EnvCentralizationContractTests(unittest.TestCase):
         self.assertIn("network_mode: bridge", compose_text)
         self.assertNotIn("\nnetworks:\n", compose_text)
         self.assertNotIn("qqbot-postgres-network", compose_text)
-
-    def test_searxng_compose_keeps_current_hardcoded_contract(self) -> None:
-        compose_text = self.read_text("docker/searxng/compose.yml")
-
-        self.assertNotIn("env_file:", compose_text)
-        self.assertNotIn("version:", compose_text)
-        self.assertIn("image: searxng/searxng:latest", compose_text)
-        self.assertIn("container_name: searxng_qqbot", compose_text)
-        self.assertIn("restart: unless-stopped", compose_text)
-        self.assertIn("SEARXNG_BASE_URL: http://127.0.0.1:7505", compose_text)
-        # secret 当前以硬编码 placeholder 形式写入 compose（部署侧自行替换）；
-        # ${SEARXNG_SECRET:-...} 形式的 env-var 注入是历史设想。
-        self.assertIn("SEARXNG_SECRET: change-this-searxng-secret", compose_text)
-        self.assertIn('SEARXNG_LIMITER: "false"', compose_text)
-        self.assertIn('SEARXNG_PUBLIC_INSTANCE: "false"', compose_text)
-        self.assertIn('"7505:8080"', compose_text)
-        self.assertIn('"./config:/etc/searxng"', compose_text)
-        self.assertIn('"./cache:/var/cache/searxng"', compose_text)
-        self.assertNotIn("searxng-config:", compose_text)
-        self.assertNotIn("searxng-cache:", compose_text)
-        self.assertIn("network_mode: bridge", compose_text)
-        self.assertNotIn("\nnetworks:\n", compose_text)
-        self.assertNotIn("qqbot-searxng-network", compose_text)
-
-    def test_crawl4ai_compose_exposes_http_service_contract(self) -> None:
-        compose_text = self.read_text("docker/crawl4ai/compose.yml")
-
-        self.assertIn("image: unclecode/crawl4ai:0.8.6", compose_text)
-        self.assertIn("container_name: crawl4ai_qqbot", compose_text)
-        self.assertIn("restart: unless-stopped", compose_text)
-        self.assertIn('"7506:11235"', compose_text)
-        self.assertIn('shm_size: "2g"', compose_text)
-        self.assertIn("TZ: Asia/Shanghai", compose_text)
-        self.assertIn("network_mode: bridge", compose_text)
-        self.assertNotIn("version:", compose_text)
-        self.assertNotIn("\nnetworks:\n", compose_text)
-        self.assertNotIn("qqbot-crawl4ai-network", compose_text)
 
 
 if __name__ == "__main__":

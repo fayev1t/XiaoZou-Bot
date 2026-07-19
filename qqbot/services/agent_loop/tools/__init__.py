@@ -52,6 +52,7 @@ from qqbot.services.agent_loop.tools.set_group_avatar import SetGroupAvatarTool
 from qqbot.services.agent_loop.tools.set_group_name import SetGroupNameTool
 from qqbot.services.agent_loop.tools.set_title import SetTitleTool
 from qqbot.services.agent_loop.tools.wait import WaitTool
+from qqbot.services.agent_loop.tools.webfetch import WebfetchTool
 from qqbot.services.agent_loop.tools.websearch import WebsearchTool
 from qqbot.services.agent_loop.tools.whole_ban import WholeBanTool
 
@@ -92,8 +93,13 @@ def build_default_registry() -> ToolRegistry:
     # 实时查目标角色做层级前置判定（bot 须严格高于目标）+ 自踢防护；成功结果回显
     # reject_add_request / applied。
     registry.register(KickTool())
+    # ── 网页搜索 / 抓取（2026-07-18 重做后恢复 / 新增）──
+    # websearch：后端从自部署 SearXNG + Crawl4AI 容器切换为 Tavily API
+    # （env TAVILY_API_KEY），正文降级链 raw_content → 进程内抓取；webfetch
+    # 同日新增，读取指定 URL 正文，两者共用 _web_common 抓取层。
+    registry.register(WebsearchTool())
+    registry.register(WebfetchTool())
     # ── 以下工具暂时下架（2026-07-01），重做后逐一恢复 ──
-    # registry.register(WebsearchTool())
     # registry.register(SearchHistoryTool())
     # napcat 动作工具：消息操作
     # registry.register(RecallTool())
@@ -146,6 +152,7 @@ __all__ = [
     "SetGroupNameTool",
     "SetTitleTool",
     "WaitTool",
+    "WebfetchTool",
     "WebsearchTool",
     "WholeBanTool",
 ]

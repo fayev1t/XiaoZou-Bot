@@ -639,6 +639,57 @@ class LLMPlannerContractTest(unittest.TestCase):
                 f"image at index {i} not preceded by a hash label: {prev!r}",
             )
 
+    def test_multimodal_gif_is_converted_to_png(self) -> None:
+        """GIF 取首帧转 PNG 再发给 VLM，避免严格网关拒绝整次请求。"""
+        import base64
+        import tempfile
+        from pathlib import Path
+
+        # 1x1 transparent GIF89a.
+        gif_bytes = base64.b64decode(
+            "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "animated-gif"
+            path.write_bytes(gif_bytes)
+            ctx = DecisionContext(
+                scope_key="group:100",
+                correlation_id="CID",
+                tick_seq=1,
+                now=china_now(),
+                timeline=[
+                    TimelineItem(
+                        event_id="E1",
+                        occurred_at=china_now(),
+                        kind="message",
+                        render='<message><image hash="gif-hash"/></message>',
+                        images=[
+                            ImageRef(
+                                file_hash="gif-hash",
+                                local_path=str(path),
+                                mime="image/gif",
+                            )
+                        ],
+                    )
+                ],
+            )
+
+            llm = _StubLLM(
+                response_content='{"actions":[{"type":"idle","reason":"x"}]}'
+            )
+            planner = LLMPlanner(llm_client=llm)
+            asyncio.run(planner.decide(ctx))
+
+        human_content = llm.invocations[0][1].content
+        image_blocks = [
+            block for block in human_content if block.get("type") == "image_url"
+        ]
+        self.assertEqual(len(image_blocks), 1)
+        data_url = image_blocks[0]["image_url"]["url"]
+        self.assertTrue(data_url.startswith("data:image/png;base64,"))
+        png_bytes = base64.b64decode(data_url.split(",", 1)[1])
+        self.assertTrue(png_bytes.startswith(b"\x89PNG\r\n\x1a\n"))
+
     def test_multimodal_skips_missing_file(self) -> None:
         """落盘文件被清理 / 路径不存在 → 跳过该图，整 tick 仍然成功。
         text 里的 <image hash="..."/> 占位还在，LLM 知道图存在过。"""

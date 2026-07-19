@@ -20,6 +20,7 @@ dependencies = [
     "langchain>=0.1.0",
     "langchain-openai>=0.0.5",
     "loguru>=0.7.0",
+    "Pillow>=10.0.0",
 ]
 
 [project.optional-dependencies]

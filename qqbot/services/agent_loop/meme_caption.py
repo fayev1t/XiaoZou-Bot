@@ -24,6 +24,7 @@ from typing import Any
 
 from qqbot.core.llm import create_llm
 from qqbot.core.logging import get_logger
+from qqbot.services.agent_loop.image_utils import normalize_image_for_llm
 
 logger = get_logger(__name__)
 
@@ -60,6 +61,13 @@ async def caption_image(
     与 llm_planner 同一个 create_llm 入口（同一份 LLM_* env 配置、天然多模态），
     每次调用新建客户端 —— 收藏是低频动作，不值得为它维护单例。
     """
+    try:
+        image_bytes, mime = normalize_image_for_llm(image_bytes, mime or "image/png")
+    except Exception as exc:
+        raise CaptionError(
+            f"caption image conversion failed: {type(exc).__name__}: {exc}"
+        ) from exc
+
     llm = await create_llm(temperature=_CAPTION_TEMPERATURE)
     if llm is None:
         raise CaptionError("caption LLM not configured (LLM_API_KEY / LLM_MODEL)")

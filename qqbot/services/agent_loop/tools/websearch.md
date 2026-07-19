@@ -14,12 +14,12 @@ Do **NOT** call websearch for:
 ## Arguments
 
 - `query` (required): plain natural-language keywords. Be specific; cut filler words. Use the language the source material is written in (e.g., Chinese keywords for Chinese sites).
-- `fetch_top_n` (optional, default 0, max 5): ask the upstream to also fetch and return full body text for the top N hits. Costly — only set this when snippets are clearly insufficient (e.g. you need a quote, a number from inside an article). Leave at 0 for "I just need URLs and one-liner summaries".
+- `fetch_top_n` (optional, default 0, max 5): also return full body text for the top N hits. Costly — only set this when snippets are clearly insufficient (e.g. you need a quote, a number from inside an article). Leave at 0 for "I just need URLs and one-liner summaries".
 - `max_results` (optional, default 10, max 20): upper bound on hits returned.
 
 ## Result interpretation
 
-Each item has `title`, `url`, `snippet`, optionally `fetched_text` (if `fetch_top_n` covered it) and `fetch_error`. `warnings` at the top level captures partial-failure notes from SearXNG / Crawl4AI — surface those to the user only if relevant.
+Each item has `title`, `url`, `snippet`, optionally `fetched_text` (if `fetch_top_n` covered it) and `fetch_error` (body unavailable for that hit — don't retry it, work with the snippet). To read ONE specific URL you already have (from chat or from an earlier search), use the `webfetch` tool instead of searching again.
 
 ## After the call
 
