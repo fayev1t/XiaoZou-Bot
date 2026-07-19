@@ -169,6 +169,9 @@ class BaseTool:
     # "owner"=须群主。由 enforce_bot_admin 在工具内判——bot 角色经
     # _effective_bot_role **实时**查 napcat（查不到才回退 context.bot_role 快照）。
     required_bot_role: str | None = None
+    # ToolWorker terminal 后的 Planner 唤醒策略。普通工具恒唤醒；reply 这类
+    # “成功只落中间状态”的工具可设 on_failure，避免成功后自激活空拍。
+    wake_policy: str = "always"
 
     async def run(self, arguments: dict, **context: Any) -> "ToolOutcome":
         """工具统一出口：**无论成功还是失败都返回 ToolOutcome，永不 raise**。

@@ -77,18 +77,23 @@ class V2MainPluginContractTests(unittest.TestCase):
         self.assertIn("swallowed", self.plugin_text)
 
     def test_plugin_has_no_persona_plumbing(self) -> None:
-        # 2026-07-02 起决策层无人格：prompts/persona.md 删除，角色卡并入
-        # tools/send_message.md（Voice 节），随 tools_usage 段按 scope 进
-        # prompt；v2_main 的 persona 读取/注入链路一并移除。
+        # 2026-07-02 起决策层无人格：prompts/persona.md 删除，v2_main 的
+        # persona 读取/注入链路一并移除。角色卡历经 tools/send_message.md
+        # Voice 节，2026-07-19 随 ReplyTask 换轨迁至 prompts/voice.md，仅由
+        # Replyer 组稿时加载——Planner 五段 prompt 不含它。
         persona_path = (
             ROOT / "qqbot" / "services" / "agent_loop" / "prompts" / "persona.md"
         )
         self.assertFalse(persona_path.exists())
         self.assertNotIn("persona", self.plugin_text)
-        # 机器身份段（identity.md）与角色卡的新居所必须存在且非空
+        # 机器身份段（identity.md）与角色卡的现居所必须存在且非空
         prompts_dir = ROOT / "qqbot" / "services" / "agent_loop" / "prompts"
         identity_text = (prompts_dir / "identity.md").read_text(encoding="utf-8")
         self.assertIn("decision engine", identity_text)
+        voice_md = (prompts_dir / "voice.md").read_text(encoding="utf-8")
+        self.assertIn("小奏", voice_md)
+        self.assertIn("那个特殊的人", voice_md)
+        # 旧居所不得残留人格正文（防两处副本漂移）
         send_message_md = (
             ROOT
             / "qqbot"
@@ -97,8 +102,7 @@ class V2MainPluginContractTests(unittest.TestCase):
             / "tools"
             / "send_message.md"
         ).read_text(encoding="utf-8")
-        self.assertIn("小奏", send_message_md)
-        self.assertIn("那个特殊的人", send_message_md)
+        self.assertNotIn("你叫小奏", send_message_md)
 
     def test_request_handler_wires_auto_approval(self) -> None:
         # 2026-07-03 拆分：request handler 在 ingest 返回后调自动审批（好友申请 /

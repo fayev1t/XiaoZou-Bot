@@ -310,8 +310,13 @@ class LoopSupervisorContractTests(unittest.IsolatedAsyncioTestCase):
         )
         await sup.start()
         await sup.stop()
+        # start() 期间任务读模型回填（task_store.backfill_recent）本身就会
+        # 发一条 SELECT——本用例的断言对象是"stop 后 wake 不再产生任何新
+        # 语句"，故取 stop 后的基线数比对，而非要求 captured 全程为空。
+        baseline = len(captured)
         await sup.wake("group:1")
-        self.assertEqual(captured, [])
+        await asyncio.sleep(0.02)
+        self.assertEqual(len(captured), baseline)
 
 
 class FakeIdlePlannerTests(unittest.IsolatedAsyncioTestCase):

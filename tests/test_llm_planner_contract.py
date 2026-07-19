@@ -16,9 +16,18 @@ so no network/langchain runtime is required.
 from __future__ import annotations
 
 import asyncio
+import os
 import unittest
 from types import SimpleNamespace
 from typing import Any
+
+
+def setUpModule() -> None:
+    # Prompt 快照与本文件无关；显式钉死关闭——否则服务器 .env 开着
+    # PROMPT_SNAPSHOT_ENABLED=true 时，这里每个 decide() 用例都会把测试
+    # 请求写进真实快照目录。快照自身的契约测试自管 env，见
+    # test_prompt_snapshot_contract.py。
+    os.environ["PROMPT_SNAPSHOT_ENABLED"] = "false"
 
 from qqbot.core.time import china_now
 from qqbot.services.agent_loop import (
@@ -73,25 +82,23 @@ class LLMPlannerContractTest(unittest.TestCase):
         self.assertEqual(out.actions[0].reason, "nothing happening")
 
     def test_reply_now_parsed_as_call_tool(self) -> None:
-        """Reply 不再是独立 action：LLM 必须用 call_tool tool_name=send_message 发言。
+        """Reply 不是独立 action：Planner 用 call_tool 落语义 reply_task。
         裸 {"type":"reply"} 会走入 _parse_action 的"未知 type"分支 → IdleAction(bad_action)。
         这条断言把"发言是普通工具"的契约钉死。"""
         body = (
             '{"reasoning":"hi","actions":[{"type":"call_tool",'
-            '"tool_name":"send_message",'
-            '"arguments":{"content":[{"type":"text","data":{"text":"hi"}}],'
-            '"target":{"kind":"group","group_id":100}}}]}'
+            '"tool_name":"reply",'
+            '"arguments":{"action":"upsert","targets":[{"message_id":"M1",'
+            '"points":["回答问题"]}],"gist":{"intent":"答复"},'
+            '"hold_seconds":8}}]}'
         )
         llm = _StubLLM(response_content=body)
         planner = LLMPlanner(llm_client=llm)
         out = asyncio.run(planner.decide(_ctx()))
         self.assertEqual(len(out.actions), 1)
         self.assertIsInstance(out.actions[0], CallToolAction)
-        self.assertEqual(out.actions[0].tool_name, "send_message")
-        self.assertEqual(
-            out.actions[0].arguments["target"],
-            {"kind": "group", "group_id": 100},
-        )
+        self.assertEqual(out.actions[0].tool_name, "reply")
+        self.assertEqual(out.actions[0].arguments["hold_seconds"], 8)
 
     def test_bare_reply_type_falls_back_to_idle(self) -> None:
         """旧 {"type":"reply"} 已弃用；planner 把它当作未知 action 处理。"""
@@ -205,25 +212,24 @@ class LLMPlannerContractTest(unittest.TestCase):
         )
 
     def test_no_persona_section_registered(self) -> None:
-        """默认装配不再有独立 persona 段——人格只存在于 send_message 的
-        用法文档（tools/send_message.md 的 Voice 节），随 tools_usage 进 prompt。"""
+        """Planner 无 persona 段；角色卡只由独立 Replyer 消费。"""
         llm = _StubLLM(response_content='{"actions":[{"type":"idle","reason":"x"}]}')
         planner = LLMPlanner(llm_client=llm)
         names = planner._prompt_registry.section_names()
         self.assertIn("identity", names)
         self.assertNotIn("persona", names)
 
-    def test_persona_card_scoped_to_send_message_usage_doc(self) -> None:
-        """角色卡随 send_message 的 allowed_scopes=("group","private") 走 scope
-        过滤：group 的 tools_usage 含小奏卡，system loop 的完全不含。"""
+    def test_reply_usage_scoped_without_persona_card(self) -> None:
+        """Planner 看 reply_task 机械契约，但不再携带最终措辞角色卡。"""
         from qqbot.services.agent_loop.tools import build_default_registry
 
         reg = build_default_registry()
         group_docs = reg.usage_docs("group")
-        self.assertIn("## Tool: send_message", group_docs)
-        self.assertIn("小奏", group_docs)
+        self.assertIn("## Tool: reply", group_docs)
+        self.assertNotIn("## Tool: send_message", group_docs)
+        self.assertNotIn("小奏", group_docs)
         system_docs = reg.usage_docs("system")
-        self.assertNotIn("## Tool: send_message", system_docs)
+        self.assertNotIn("## Tool: reply", system_docs)
         self.assertNotIn("小奏", system_docs)
 
     def test_group_chat_rules_skipped_in_system_scope(self) -> None:
@@ -233,8 +239,8 @@ class LLMPlannerContractTest(unittest.TestCase):
         planner = LLMPlanner(llm_client=llm)
         rendered_group = planner._prompt_registry.render(scope="group")
         rendered_system = planner._prompt_registry.render(scope="system")
-        self.assertIn("什么时候调用 send_message", rendered_group)
-        self.assertNotIn("什么时候调用 send_message", rendered_system)
+        self.assertIn("什么时候调用 reply", rendered_group)
+        self.assertNotIn("什么时候调用 reply", rendered_system)
         # 协议与身份段两个 scope 都在
         self.assertIn("decision engine", rendered_system)
         self.assertIn("tasks persist, conversation flows around them", rendered_system)
@@ -302,7 +308,7 @@ class LLMPlannerContractTest(unittest.TestCase):
         content = llm.invocations[0][0].content
 
         # 文档头
-        self.assertIn("什么时候调用 send_message", content)
+        self.assertIn("什么时候调用 reply", content)
         # 关键锚点：正反两张理由清单 + addressee 判别 + idle 常态
         self.assertIn("构成发言理由", content)
         self.assertIn("不构成发言理由", content)
@@ -310,14 +316,12 @@ class LLMPlannerContractTest(unittest.TestCase):
         self.assertIn("`idle` 是常态结果", content)
         # 行为约束里仍要涉及备选决策
         self.assertIn("note_task_progress", content)
-        # 复读禁令（2026-07-01 批次语义）：已 complete 的 send_message = 已说
-        # 出，绝不再发。protocol 与 group_chat_rules 两处都要教。
-        self.assertIn("别复读自己", content)
+        # reply 结果只是 pending，my-reply 才是已发送事实。
+        self.assertIn("Actual sent history exists only in `<my-reply>`", content)
         self.assertIn("One tick, one tool batch", content)
 
     def test_system_prompt_explicitly_forbids_bare_text_as_reply(self) -> None:
-        """system prompt 必须明确：想让群里看到的话只能放进 send_message 工具，
-        不能塞进 reasoning / task 字段假装已经回复。"""
+        """Planner 只能落语义意图，最终可见措辞属于 Replyer。"""
         llm = _StubLLM(
             response_content='{"actions":[{"type":"idle","reason":"x"}]}'
         )
@@ -325,17 +329,14 @@ class LLMPlannerContractTest(unittest.TestCase):
         asyncio.run(planner.decide(_ctx()))
         content = llm.invocations[0][0].content
 
-        self.assertIn(
-            'it must live inside `call_tool(tool_name="send_message").arguments.content`',
-            content,
-        )
-        self.assertIn("没调 `send_message` 就等于你还没说", content)
+        self.assertIn("Planner records semantic authorization", content)
+        self.assertIn("Only successful children of `<my-reply>`", content)
 
     def test_default_prompt_section_order(self) -> None:
         """五段必须按 order 升序拼接：
         identity < xml_format < group_chat_rules < protocol < tools_usage。
         LLM 按"你是什么→怎么读输入→什么时候需要发言→怎么决定→工具"递进读。
-        人设不再是独立段（角色卡在 tools/send_message.md 里随 tools_usage 出现）。"""
+        人设不在 Planner prompt 中，由 Replyer 独立加载。"""
         from qqbot.services.agent_loop.tool_registry import ToolRegistry
 
         class _StubTool:
@@ -363,7 +364,7 @@ class LLMPlannerContractTest(unittest.TestCase):
         idx_identity = content.index("decision engine")
         idx_xml = content.index("reading the `<agent-input>` envelope")
         idx_protocol = content.index("tasks persist, conversation flows around them")
-        idx_group = content.index("什么时候调用 send_message")
+        idx_group = content.index("什么时候调用 reply")
         idx_tools = content.index("STUB-TOOL-ORDER-MARKER")
 
         self.assertLess(idx_identity, idx_xml)
@@ -372,9 +373,7 @@ class LLMPlannerContractTest(unittest.TestCase):
         self.assertLess(idx_protocol, idx_tools)
 
     def test_reply_tool_usage_doc_renders_via_tool_registry(self) -> None:
-        """SendMessageTool.usage_prompt（tools/send_message.md）必须随
-        ToolRegistry.usage_docs 进 system prompt 的 tools_usage 段；send_message
-        现在和 websearch / search_history 同构。"""
+        """ReplyTool.usage_prompt 必须随 registry 进入 Planner prompt。"""
         from qqbot.services.agent_loop.tools import build_default_registry
 
         # 工具无构造依赖；usage_docs 只读 usage_prompt，不触发任何运行期依赖
@@ -388,13 +387,10 @@ class LLMPlannerContractTest(unittest.TestCase):
         content = llm.invocations[0][0].content
 
         # 按工具名分段的标题
-        self.assertIn("## Tool: send_message", content)
-        # send_message.md 标志性段落
-        self.assertIn("your one and only way to speak", content)
-        # OneBot V11 段示例关键字面
-        self.assertIn('"type": "at"', content)
-        # @ 全体成员的 qq:"all" 约定
-        self.assertIn('"all"', content)
+        self.assertIn("## Tool: reply", content)
+        self.assertIn("short-lived `reply_task`", content)
+        self.assertIn("successful tool result means **pending**, not sent", content)
+        self.assertNotIn("## Tool: send_message", content)
 
     def test_system_prompt_includes_tool_usage_docs(self) -> None:
         """Tool 的 sibling .md 必须按工具名分段注入 system prompt，
@@ -1065,13 +1061,58 @@ class SavedMemesEnvelopeTests(unittest.TestCase):
         self.assertNotIn(">A<B&C<", text)
 
 
+class PendingReplyEnvelopeTests(unittest.TestCase):
+    def test_pending_reply_renders_after_tasks_before_current(self) -> None:
+        """缓存契约（2026-07-19 修正）：pending-reply 是全信封最易变的业务段
+        （每次合稿 revision/flush_at 都变、创建/flush 时整段出现消失），且只
+        存在于拍频最高的维持窗口内——必须排在 timeline/active-tasks 之后、
+        <current/> 之前，否则维持窗口期间每拍掐断 timeline 的缓存前缀。"""
+        from datetime import timedelta
+
+        from qqbot.services.agent_loop.decision import PendingReplyView
+
+        now = china_now()
+        ctx = DecisionContext(
+            scope_key="group:100",
+            correlation_id="CID",
+            tick_seq=2,
+            now=now,
+            pending_reply=PendingReplyView(
+                reply_task_id="R1",
+                revision=2,
+                state="open",
+                created_at=now,
+                flush_at=now + timedelta(seconds=8),
+                hard_deadline=now + timedelta(seconds=90),
+                mode="compose",
+                targets=[{"message_id": "M1", "points": ["回答"]}],
+                gist={"intent": "解释清楚", "avoid": ["别编"]},
+            ),
+        )
+        llm = _StubLLM(
+            response_content='{"actions":[{"type":"idle","reason":"x"}]}'
+        )
+        planner = LLMPlanner(llm_client=llm)
+        asyncio.run(planner.decide(ctx))
+        text = llm.invocations[0][1].content[0]["text"]
+        self.assertIn('<pending-reply reply_task_id="R1" revision="2"', text)
+        self.assertIn("解释清楚", text)
+        self.assertLess(
+            text.index("</active-tasks>"), text.index("<pending-reply")
+        )
+        self.assertLess(
+            text.index("<pending-reply"), text.index("<current now=")
+        )
+
+
 class EnvelopeCacheLayoutTests(unittest.TestCase):
     """信封段序与前缀稳定性契约（2026-07-12，前缀缓存）。
 
     OpenAI 系 API 的自动前缀缓存要求前缀**逐字节一致**：每拍必变的 now/tick
     不得出现在信封头部（否则缓存前缀在 system prompt 末尾就断掉，timeline
     每拍全价重计费），段序按变化频率升序：tool-catalog → saved-memes →
-    timeline → active-tasks → <current/> → validation-error。改动信封布局
+    timeline → active-tasks → pending-reply（有草稿才出，2026-07-19）→
+    <current/> → validation-error。改动信封布局
     前必须先想清对缓存前缀的影响——本类是回归防线。"""
 
     def _render(self, ctx: DecisionContext) -> str:

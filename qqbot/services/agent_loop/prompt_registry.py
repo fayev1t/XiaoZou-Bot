@@ -6,8 +6,8 @@ v2 系统里需要往 LLM 的 system prompt 注入的内容会越来越多：
 
   - 机器身份（identity.md：决策引擎操作一个 QQ 账号）
   - 决策协议（protocol.md，原 _SYSTEM_PROMPT）
-  - 参与规则（group_chat_rules.md：什么时候有理由调 send_message）
-  - 每个 tool 的用法说明（tools/<name>.md；小奏角色卡在 send_message.md 里）
+  - 参与规则（group_chat_rules.md：什么时候有理由落 reply_task）
+  - 每个 tool 的用法说明（tools/<name>.md；角色卡由独立 Replyer 消费）
   - 未来还会有 task 模板、风控指南、运行期反射……
 
 把这些散在 llm_planner 里硬拼会越来越乱。PromptRegistry 提供一个最小内核：
@@ -34,6 +34,19 @@ import inspect
 from dataclasses import dataclass
 from typing import Callable, Union
 
+
+@dataclass(frozen=True)
+class RenderedSection:
+    """render_sections() 的单段产物：段名 + 求值后的正文（已 strip）。
+
+    给 Prompt 快照（prompt_snapshot.py，待办 #11）统计"system prompt 每段
+    占多少"用——快照层自己算 chars / sha256，registry 只负责把段名和正文
+    成对交出去，保持零依赖。
+    """
+
+    name: str
+    text: str
+
 # source 可以是纯字符串、无参 ``() -> str``、或接受一个 scope 位置参的
 # ``(scope) -> str``（如 ToolRegistry.usage_docs）。render(scope=...) 会按 arity
 # 自动决定是否把 scope 传进去——见 _resolve_source。
@@ -47,7 +60,10 @@ class _Section:
     source: PromptSource
 
 
-_SECTION_SEP = "\n\n---\n\n"
+# 段间分隔符。公开导出：llm_planner 用 render_sections() 拿逐段结果后需要
+# 用同一分隔符拼回完整 system prompt（与 render() 逐字节一致）。
+SECTION_SEP = "\n\n---\n\n"
+_SECTION_SEP = SECTION_SEP
 
 
 class PromptRegistry:
@@ -94,12 +110,25 @@ class PromptRegistry:
         callable 抛异常时该段静默丢弃 —— 启动期 prompt 不应阻断整个 tick，丢失的内容
         由日志暴露即可。
         """
+        return _SECTION_SEP.join(
+            sec.text for sec in self.render_sections(scope=scope)
+        )
+
+    def render_sections(
+        self, *, scope: str | None = None
+    ) -> list[RenderedSection]:
+        """与 render() 同一求值过程，但保留段边界返回逐段结果。
+
+        供 Prompt 快照统计每段体积（待办 #11）。语义与 render() 严格一致：
+        同一 order 升序、同一 scope 传递规则、空段与抛异常段同样丢弃——
+        ``render()`` 就是本方法的 join，两者永不发散。
+        """
         from qqbot.core.logging import get_logger
 
         logger = get_logger(__name__)
 
         ordered = sorted(self._sections.values(), key=lambda s: (s.order, s.name))
-        parts: list[str] = []
+        rendered: list[RenderedSection] = []
         for sec in ordered:
             try:
                 text = _resolve_source(sec.source, scope)
@@ -113,8 +142,8 @@ class PromptRegistry:
             stripped = str(text).strip()
             if not stripped:
                 continue
-            parts.append(stripped)
-        return _SECTION_SEP.join(parts)
+            rendered.append(RenderedSection(name=sec.name, text=stripped))
+        return rendered
 
     def section_names(self) -> list[str]:
         """按 render 顺序返回 section 名，主要给单测 / debug 用。"""

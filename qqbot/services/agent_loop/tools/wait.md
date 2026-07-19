@@ -6,12 +6,12 @@ Schedules a wake-up for yourself after `seconds` seconds. Use it whenever the ri
 
 ## When to call
 
-- Someone is clearly mid-thought (typing a multi-part message, pasting content piece by piece) — wait instead of answering an incomplete utterance.
 - You committed to a follow-up — schedule it instead of only saying it.
 - A running task deserves a later look and no tool result will wake you by itself.
 
 ## When NOT to call
 
+- To wait for someone to finish a multi-part message before answering — that is the `reply` tool's job, not wait's: create the reply_task with a short hold and merge new points into it (merging is what postpones the flush). wait plays no part in replying.
 - To poll a tool that already wakes you when its batch completes — that wake is automatic.
 - To "stay alive": don't schedule recurring waits with nothing to do. One wait, one purpose.
 - Don't stack multiple overlapping waits for the same purpose; the extra wake-ups are noise.

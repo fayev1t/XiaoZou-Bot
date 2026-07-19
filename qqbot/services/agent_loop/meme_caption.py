@@ -20,11 +20,19 @@ meme 工具折成 ToolOutcome.failure("caption_failed", retryable=True)——收
 from __future__ import annotations
 
 import base64
+import hashlib
+import time
 from typing import Any
 
 from qqbot.core.llm import create_llm
 from qqbot.core.logging import get_logger
 from qqbot.services.agent_loop.image_utils import normalize_image_for_llm
+from qqbot.services.agent_loop.prompt_snapshot import (
+    PromptSnapshot,
+    extract_usage,
+    should_snapshot,
+    write_snapshot,
+)
 
 logger = get_logger(__name__)
 
@@ -89,13 +97,47 @@ async def caption_image(
             },
         ]
     )
+    # Prompt 快照（待办 #11）：辅助 LLM 调用同样留观测记录。图片只记
+    # hash/mime/字节数（脱敏契约：base64 永不落盘）；scope_key=None——
+    # 收藏夹是全 bot 共享的，caption 不属于任何单一 scope。
+    snapshot: PromptSnapshot | None = None
+    if should_snapshot(None):
+        snapshot = PromptSnapshot(
+            kind="meme_caption",
+            model=getattr(llm, "model_name", None)
+            or getattr(llm, "model", None),
+            user_text=prompt,
+            images=[
+                {
+                    "hash": hashlib.sha256(image_bytes).hexdigest(),
+                    "mime": mime or "image/png",
+                    "bytes": len(image_bytes),
+                }
+            ],
+        )
+    started = time.monotonic()
     try:
         raw = await llm.ainvoke([message])
     except Exception as exc:
+        if snapshot is not None:
+            snapshot.add_attempt(
+                latency_ms=int((time.monotonic() - started) * 1000),
+                error=f"{type(exc).__name__}: {exc}"[:300],
+            )
+            snapshot.outcome = "call_error"
+            write_snapshot(snapshot)
         raise CaptionError(
             f"caption LLM call failed: {type(exc).__name__}: {exc}"
         ) from exc
     text = _extract_text(raw).strip()
+    if snapshot is not None:
+        snapshot.add_attempt(
+            latency_ms=int((time.monotonic() - started) * 1000),
+            response_text=text,
+            usage=extract_usage(raw),
+        )
+        snapshot.outcome = "ok" if text else "empty_response"
+        write_snapshot(snapshot)
     if not text:
         raise CaptionError("caption LLM returned empty text")
     return text[:MAX_DESCRIPTION_CHARS]

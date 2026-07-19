@@ -4,6 +4,11 @@
 （外部事件 / 批次收口），模型无法表达"我 10 分钟后再来看看"或"等这个人把话
 说完再回"。本工具把"何时思考"的部分决定权交还模型。
 
+职责收窄（2026-07-19，ReplyTask 换轨）："等他把话说完再回"的回复防抖已整体
+移交 reply 工具的维持窗口（合稿即顺延，见 group_chat_rules §分条消息并入
+reply_task）；wait 只保留自我提醒 / 延迟执行其它动作的用途，description 与
+wait.md 不得再引导用它等分条消息。
+
 执行语义（**绝不在工具内 sleep**——ToolWorker 串行跑工具，长眠会卡死整个
 派发通道）：execute() 只登记一个 asyncio 定时器就立刻返回成功（带 wake_at）。
 到点后回调先写 ``runtime.wait_elapsed``（agent_visible，携带模型当时留下的
@@ -47,10 +52,12 @@ class WaitTool(BaseTool):
     name = "wait"
     description = (
         "Schedule a wake-up for yourself after N seconds. Use this when the "
-        "right move is to check back later instead of acting now — e.g. "
-        "someone is typing a multi-part message, you promised to follow up "
-        "in a few minutes, or a running task deserves a later look. When the "
-        "timer fires you get a new tick whose timeline carries "
+        "right move is to check back later instead of acting now — e.g. you "
+        "promised to follow up in a few minutes, or a running task deserves "
+        "a later look. NOT for holding a reply while someone finishes a "
+        "multi-part message — that is the reply tool's hold window (merge "
+        "the reply_task to postpone its flush). When the timer fires you "
+        "get a new tick whose timeline carries "
         '<system-hint kind="wait_elapsed"> echoing your note. The timer is '
         "in-memory: a process restart drops it (your wait tool-call stays "
         "visible in the timeline, so you can tell and re-schedule)."

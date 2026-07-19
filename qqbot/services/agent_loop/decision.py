@@ -49,7 +49,7 @@ class CallToolAction:
     `triggered_by_event_id` 是 LLM 显式声明"是哪条事件让我调这个工具"。对
     敏感工具（required_permission > GUEST）**工具内** enforce_permission 据此
     **实时**解析触发用户的当前群角色 → tier 做权限校验；缺失时视作 GUEST，敏感
-    工具自然失败。非敏感工具（send_message / websearch）可省略，仅作 audit 用。AgentLoop
+    工具自然失败。非敏感工具（reply / websearch）可省略，仅作 audit 用。AgentLoop
     自己不解析 tier、不做任何权限判定——只把这个 anchor 原样注入
     tool_called.payload 交给工具；CallToolAction 缺省且 task 上挂了
     triggered_by_event_id 时，由 AgentLoop fall back 到 task 的 anchor 补全因果链。
@@ -92,7 +92,7 @@ class NoteTaskProgressAction:
 # Union of every action type the loop translates. Order matters only for
 # isinstance dispatch readability, not semantics.
 #
-# 注意：发言不在这里 —— v2 中"发言"是 send_message 工具的 CallToolAction，
+# 注意：发言不在这里 —— v2 中 Planner 通过 reply 工具落 reply_task，
 # 不再是一类独立的 Action。这是为了让 LLM 把"要不要说话"当成一次工具调
 # 用决策，与调 websearch / search_history 同构，避免被旧 ReplyAction 诱
 # 导成"群里每条消息都要选择回 vs idle"的二分法。
@@ -136,9 +136,9 @@ class MemeView:
 
     Projector 经 meme_store.load_saved_memes 挂到 DecisionContext.saved_memes，
     llm_planner 渲染成 <saved-memes> 里的一行 <meme hash="..." saved_at="...">
-    描述</meme>。description 由收录（meme.save）时的 caption LLM 调用生成，是
-    发送（meme.send）选图的唯一依据；hash 与 timeline <image hash="..."/> 同一
-    值空间。
+    描述</meme>。description 由收录（meme.save）时的 caption LLM 调用生成，
+    是 Replyer 在 flush 时选图的唯一依据；hash 与 timeline
+    <image hash="..."/> 同一值空间。
 
     context_note 是收录时留档的聊天语境（表情包工具黑盒设计.md §2"留档备将来
     重生成"）：meme.recaption 不带新语境时沿用它重跑 caption。**不进 prompt**
@@ -149,6 +149,23 @@ class MemeView:
     description: str
     saved_at: datetime
     context_note: str | None = None
+
+
+@dataclass(frozen=True)
+class PendingReplyView:
+    """当前 scope 唯一一份短生命周期待发回复。"""
+
+    reply_task_id: str
+    revision: int
+    state: str
+    created_at: datetime
+    flush_at: datetime
+    hard_deadline: datetime
+    mode: str
+    targets: list[dict] = field(default_factory=list)
+    gist: dict = field(default_factory=dict)
+    verbatim_messages: list[dict] = field(default_factory=list)
+    latest_event_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -165,6 +182,7 @@ class TimelineItem:
         "request",
         "task_closed",
         "my_thought",
+        "my_reply",
     ]
     render: str
     related_event_ids: list[str] = field(default_factory=list)
@@ -235,12 +253,13 @@ class DecisionContext:
 
     timeline: list[TimelineItem] = field(default_factory=list)
     active_tasks: list[TaskView] = field(default_factory=list)
+    pending_reply: PendingReplyView | None = None
 
-    # ─── 表情包收藏夹（2026-07-03 收发上线；2026-07-12 起为 meme 单工具）───
+    # ─── 表情包收藏夹（meme 管收藏；Replyer 在 flush 时决定是否发送）───
     # 全局共享的 agent_memes（2026-07-06 起全 bot 一份，created_at 倒序、
     # 封顶 meme_store.MAX_SAVED_MEMES 条），由 Projector.
     # _augment_with_saved_memes 注入；渲染成 <saved-memes>，meme 工具凭
-    # 其中的 hash 精确发送/删除/换描述。空 = 不渲染。
+    # 其中的 hash 精确删除/换描述，并供 Replyer 选图。空 = 不渲染。
     saved_memes: list[MemeView] = field(default_factory=list)
     # 2026-07-02 起不再有独立的 pending_tool_results 字段：工具结果只在
     # timeline 的 <tool-call status="complete"> 行呈现一次（单一事实源）。

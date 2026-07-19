@@ -1,7 +1,7 @@
 """ToolWorker — 消费 agent.tool_called 调用 ToolRegistry 并写 agent.tool_result/failed。
 
-push+pull dispatcher 设计（详见 2026-05-26 设计讨论；曾经的 reply 异步投递
-worker 已随 send_message 同步化而删除，本 worker 是唯一的异步工具派发者）：
+push+pull dispatcher 设计（详见 2026-05-26 设计讨论）：本 worker 派发
+Planner 工具；reply_task 的最终发送由独立 ReplyExecutor 负责。
 
   1. 启动时 wake_event 预 set，第一次循环 catchup 扫描遗留 pending
   2. 平时阻塞在 asyncio.Event 上
@@ -14,7 +14,7 @@ worker 已随 send_message 同步化而删除，本 worker 是唯一的异步工
      全部 terminal 且条数 ≥ batch_size"——收口了才写一条
      runtime.tool_batch_completed 标记事件，再经
      supervisor.notify_tool_batch_completed 解闩 + 唤醒该 scope **一次**。
-     不再是"每 drain 一轮就按 scope wake"（那会让先完成的 send_message 提前
+     不再是"每 drain 一轮就按 scope wake"（那会让先完成的工具提前
      唤醒下一拍，慢工具还没回来，模型容易复读）。无批次标记的遗留
      tool_called（升级前落库的）维持旧行为：drain 后按 scope 直接 wake。
 
@@ -94,7 +94,17 @@ _BATCH_STATUS_QUERY = text(
                 WHERE d.causation_id = r.event_id
                   AND d.type IN ('agent.tool_result', 'agent.tool_failed')
             )
-        ) AS terminal
+        ) AS terminal,
+        COUNT(*) FILTER (
+            WHERE r.payload->>'tool_name' <> 'reply'
+        ) AS non_reply,
+        COUNT(*) FILTER (
+            WHERE EXISTS (
+                SELECT 1 FROM agent_events d
+                WHERE d.causation_id = r.event_id
+                  AND d.type = 'agent.tool_failed'
+            )
+        ) AS failed
     FROM agent_events r
     WHERE r.type = 'agent.tool_called'
       AND r.payload->>'tool_batch_id' = :tool_batch_id
@@ -121,6 +131,7 @@ class _ProcessedCall:
     tool_batch_size: int | None
     terminal_event_id: str
     correlation_id: str
+    wake_requested: bool = True
 
 
 class ToolWorker:
@@ -206,6 +217,7 @@ class ToolWorker:
         # (scope_key, tool_batch_id) → 本轮该批次最后一条 _ProcessedCall（其
         # terminal_event_id 作 completion 事件的 causation 锚）。
         touched_batches: dict[tuple[str, str], _ProcessedCall] = {}
+        batch_should_wake: dict[tuple[str, str], bool] = {}
         # 无批次标记（升级前落库）的遗留 tool_called 涉及的 scope。
         legacy_scopes: set[str] = set()
         for row in rows:
@@ -222,8 +234,12 @@ class ToolWorker:
                 continue
             completed += 1
             if done.tool_batch_id:
-                touched_batches[(done.scope_key, done.tool_batch_id)] = done
-            else:
+                key = (done.scope_key, done.tool_batch_id)
+                touched_batches[key] = done
+                batch_should_wake[key] = batch_should_wake.get(key, False) or getattr(
+                    done, "wake_requested", True
+                )
+            elif done.wake_requested:
                 legacy_scopes.add(done.scope_key)
 
         # 遗留（无批次标记）：维持旧的"drain 后按 scope 直接唤醒"。若该 scope
@@ -249,7 +265,12 @@ class ToolWorker:
         # "唤醒到达时完成事件必已在事件流里"。
         for (scope_key, batch_id), last in touched_batches.items():
             try:
-                await self._maybe_close_batch(scope_key, batch_id, last)
+                await self._maybe_close_batch(
+                    scope_key,
+                    batch_id,
+                    last,
+                    should_wake=batch_should_wake.get((scope_key, batch_id), True),
+                )
             except Exception as exc:
                 logger.exception(
                     "[tool_worker] batch close check failed: scope={} "
@@ -262,7 +283,12 @@ class ToolWorker:
         return len(rows)
 
     async def _maybe_close_batch(
-        self, scope_key: str, tool_batch_id: str, last: _ProcessedCall
+        self,
+        scope_key: str,
+        tool_batch_id: str,
+        last: _ProcessedCall,
+        *,
+        should_wake: bool = True,
     ) -> None:
         """判定批次是否收口；是则写 completion 标记事件并通知 supervisor。"""
         async with self._session_factory() as session:
@@ -272,6 +298,13 @@ class ToolWorker:
             row = result.mappings().first()
         called = int(row["called"] or 0) if row else 0
         terminal = int(row["terminal"] or 0) if row else 0
+        if row is not None:
+            # “不唤醒”只允许真正的 reply-only 全成功批次。多实例/分轮处理
+            # 时，当前 drain 可能只碰到最后一条 reply，必须从整批 DB 事实
+            # 恢复是否还含普通工具或失败，不能只看本轮 touched calls。
+            non_reply = int(row.get("non_reply") or 0)
+            failed = int(row.get("failed") or 0)
+            should_wake = should_wake or non_reply > 0 or failed > 0
         if called == 0:
             # 理论不可达（本轮刚处理过该批次的行），防御分支
             return
@@ -309,7 +342,7 @@ class ToolWorker:
                     "tool_batch_size": expected,
                 },
             )
-        if self._supervisor is None:
+        if self._supervisor is None or not should_wake:
             return
         notify = getattr(
             self._supervisor, "notify_tool_batch_completed", None
@@ -369,13 +402,16 @@ class ToolWorker:
         scope_key = _scope_key_from_row(scope, group_id, user_id)
         tool = self._registry.get(tool_name)
 
-        def _processed(terminal_event_id: str) -> _ProcessedCall:
+        def _processed(
+            terminal_event_id: str, *, wake_requested: bool = True
+        ) -> _ProcessedCall:
             return _ProcessedCall(
                 scope_key=scope_key,
                 tool_batch_id=tool_batch_id,
                 tool_batch_size=tool_batch_size,
                 terminal_event_id=terminal_event_id,
                 correlation_id=correlation_id,
+                wake_requested=wake_requested,
             )
 
         if tool is None:
@@ -454,6 +490,9 @@ class ToolWorker:
                     # meme 工具收录/换描述时生成 description；未接线时为
                     # None，工具自行降级失败。
                     caption_image=self._caption_image,
+                    notify_reply_task=getattr(
+                        self._supervisor, "notify_reply_task", None
+                    ),
                 )
             except Exception as exc:
                 logger.exception("[tool_worker] {} crashed: {}", tool_name, exc)
@@ -503,7 +542,14 @@ class ToolWorker:
                     payload=fail_payload,
                 )
             terminal_written = True
-            return _processed(terminal_id)
+            wake_policy = getattr(tool, "wake_policy", "always")
+            if wake_policy == "never":
+                wake_requested = False
+            elif wake_policy == "on_failure":
+                wake_requested = not outcome.ok
+            else:
+                wake_requested = True
+            return _processed(terminal_id, wake_requested=wake_requested)
         finally:
             if claimed_here and not terminal_written:
                 self._schedule_retry(float(DEFAULT_LEASE_SECONDS))

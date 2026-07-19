@@ -1,5 +1,4 @@
-"""Contract tests for MemeTool（表情包一站式工具，action=save/send/delete/
-recaption）。
+"""Contract tests for MemeTool（表情包收藏工具，action=save/delete/recaption）。
 
 2026-07-12 起 save_meme / send_meme（2026-07-03）与当晚拆分先行的
 delete_meme / recaption_meme 合并为单工具 `meme`；本文件整合原四份工具契约
@@ -7,7 +6,7 @@ delete_meme / recaption_meme 合并为单工具 `meme`；本文件整合原四�
 test_recaption_meme_tool_contract.py，均已删除）。
 
 设计结论（表情包工具黑盒设计.md）：
-- 工具面：action 必填且限 save/send/delete/recaption（非法 →
+- 工具面：action 必填且限 save/delete/recaption（非法 →
   invalid_arguments reason_code=bad_action）；image_hash 四动作共用（大小写
   归一小写，非法 → bad_image_hash）；context_note 仅 save/recaption 消费，
   给其它动作 → context_note_not_applicable，非字符串 → context_note_not_str；
@@ -23,12 +22,8 @@ test_recaption_meme_tool_contract.py，均已删除）。
   承担（逐张走单张流程、逐项回执 results）；≥1 张成功 → success（batch:
   true + 三计数），无一成功 → batch_save_failed（retryable=任一项
   retryable）；单 string 输入结果形态不变（不包 batch 壳）。
-- send：**收藏是发送的权限边界**（未收录 → unknown_meme 拒发）；无 target
-  参数，目标从 scope_key 解析（group → send_group_msg，private →
-  send_private_msg）；base64:// 内联单图；上游 ok 但无 message_id →
-  upstream_action_failed(missing_message_id)；成功 result 带 message_id +
-  self_id（投影 _build_author_index 折 from_self 依赖它）；收藏在、文件没了
-  → media_file_missing。
+- send 已从 meme 工具面移除；最终是否发 meme、发哪张及排序由 reply_task
+  到点后的 Replyer 决定。
 - delete：未收录 → unknown_meme 不发 DELETE；命中 → 删元数据并回执被删条目
   描述（确认话术点名绑定对象）；并发删除（rowcount=0）结果状态一致照常
   success。
@@ -37,12 +32,11 @@ test_recaption_meme_tool_contract.py，均已删除）。
   UPDATE rowcount=0（并发被删）→ unknown_meme。
 
 全程无 raise；不打真实 DB / LLM / 磁盘目录 / napcat（fake session 捕获语句、
-假 captioner、tempdir + patch MEDIA_IMG_DIR、stub Bot 进 bot_registry）。
+假 captioner、tempdir + patch MEDIA_IMG_DIR）。
 """
 
 from __future__ import annotations
 
-import base64
 import tempfile
 import unittest
 from datetime import datetime
@@ -55,7 +49,6 @@ from zoneinfo import ZoneInfo
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.sql.dml import Delete, Insert, Update
 
-from qqbot.services.agent_loop import bot_registry
 from qqbot.services.agent_loop.tools.meme import MAX_SAVE_BATCH, MemeTool
 
 HASH_A = "ab" * 32
@@ -147,48 +140,6 @@ class _FakeSession:
         return None
 
 
-class _FakeActionFailed(Exception):
-    """模拟 nonebot ActionFailed：完整响应挂在 .info。"""
-
-    def __init__(self, retcode: int, wording: str) -> None:
-        super().__init__(f"ActionFailed: retcode={retcode}")
-        self.info = {
-            "status": "failed",
-            "retcode": retcode,
-            "message": "",
-            "wording": wording,
-            "stream": "normal-action",
-        }
-
-
-class _StubBot:
-    def __init__(
-        self,
-        self_id: str = "10001",
-        message_id: int | None = 12345,
-        raise_exc: Exception | None = None,
-    ) -> None:
-        self.self_id = self_id
-        self._message_id = message_id
-        self._raise = raise_exc
-        self.calls: list[tuple[str, dict]] = []
-
-    def _result(self) -> dict:
-        return {"message_id": self._message_id} if self._message_id is not None else {}
-
-    async def send_group_msg(self, **kwargs: Any) -> dict:
-        self.calls.append(("send_group_msg", kwargs))
-        if self._raise is not None:
-            raise self._raise
-        return self._result()
-
-    async def send_private_msg(self, **kwargs: Any) -> dict:
-        self.calls.append(("send_private_msg", kwargs))
-        if self._raise is not None:
-            raise self._raise
-        return self._result()
-
-
 def _meme_row(
     description: str = "黑猫瞪眼，嘲讽用",
     context_note: str | None = "张三的名场面",
@@ -222,11 +173,9 @@ def _failing_captioner(exc: Exception):
 
 
 class _MemeToolTestBase(unittest.IsolatedAsyncioTestCase):
-    """公共脚手架：临时 media 目录 + bot_registry 清理 + context 构造。"""
+    """公共脚手架：临时 media 目录 + context 构造。"""
 
     def setUp(self) -> None:
-        bot_registry.clear()
-        self.addCleanup(bot_registry.clear)
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.media_root = Path(self._tmp.name)
@@ -273,7 +222,7 @@ class ActionDispatchTests(_MemeToolTestBase):
 
     async def test_bad_hash_invalid_arguments_for_every_action(self) -> None:
         db = _FakeMemeDB()
-        for action in ("save", "send", "delete", "recaption"):
+        for action in ("save", "delete", "recaption"):
             for bad in ("xyz", "ab" * 31, "", None, 123):
                 outcome = await MemeTool().run(
                     {"action": action, "image_hash": bad}, **self._context(db)
@@ -285,9 +234,9 @@ class ActionDispatchTests(_MemeToolTestBase):
                 )
         self.assertEqual(db.statements, [])
 
-    async def test_context_note_rejected_for_send_and_delete(self) -> None:
+    async def test_context_note_rejected_for_delete(self) -> None:
         db = _FakeMemeDB()
-        for action in ("send", "delete"):
+        for action in ("delete",):
             outcome = await MemeTool().run(
                 {
                     "action": action,
@@ -317,7 +266,7 @@ class ActionDispatchTests(_MemeToolTestBase):
 
     async def test_system_scope_rejected(self) -> None:
         db = _FakeMemeDB()
-        for action in ("save", "send", "delete", "recaption"):
+        for action in ("save", "delete", "recaption"):
             outcome = await MemeTool().run(
                 {"action": action, "image_hash": HASH_A},
                 **self._context(db, scope_key="system"),
@@ -327,7 +276,7 @@ class ActionDispatchTests(_MemeToolTestBase):
 
     async def test_missing_session_factory_is_internal_tool_error(self) -> None:
         db = _FakeMemeDB()
-        for action in ("save", "send", "delete", "recaption"):
+        for action in ("save", "delete", "recaption"):
             ctx = self._context(db)
             ctx["session_factory"] = None
             outcome = await MemeTool().run(
@@ -335,6 +284,16 @@ class ActionDispatchTests(_MemeToolTestBase):
             )
             self.assertFalse(outcome.ok)
             self.assertEqual(outcome.error_kind, "internal_tool_error")
+
+    async def test_send_action_is_removed(self) -> None:
+        db = _FakeMemeDB()
+        outcome = await MemeTool().run(
+            {"action": "send", "image_hash": HASH_A}, **self._context(db)
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.error_kind, "invalid_arguments")
+        self.assertEqual(outcome.extra.get("reason_code"), "bad_action")
+        self.assertEqual(db.statements, [])
 
 
 class SaveActionTests(_MemeToolTestBase):
@@ -623,7 +582,7 @@ class BatchSaveActionTests(_MemeToolTestBase):
 
     async def test_array_rejected_for_other_actions(self) -> None:
         db = _FakeMemeDB()
-        for action in ("send", "delete", "recaption"):
+        for action in ("delete", "recaption"):
             outcome = await MemeTool().run(
                 {"action": action, "image_hash": [HASH_A]},
                 **self._context(db),
@@ -648,116 +607,6 @@ class BatchSaveActionTests(_MemeToolTestBase):
         self.assertNotIn("batch", outcome.result)
         self.assertNotIn("results", outcome.result)
         self.assertTrue(outcome.result["saved"])
-
-
-class SendActionTests(_MemeToolTestBase):
-    # ── happy path ──
-
-    async def test_group_send_base64_image_segment(self) -> None:
-        self._write_media()
-        bot = _StubBot(message_id=999)
-        bot_registry.register(bot)
-        db = _FakeMemeDB(select_results=[[_meme_row()]])
-        outcome = await MemeTool().run(
-            {"action": "send", "image_hash": HASH_A}, **self._context(db)
-        )
-        self.assertTrue(outcome.ok)
-        self.assertEqual(outcome.result["action"], "send")
-        self.assertEqual(outcome.result["message_id"], 999)
-        self.assertEqual(outcome.result["self_id"], "10001")
-        self.assertEqual(outcome.result["file_hash"], HASH_A)
-        self.assertTrue(outcome.result["sent"])
-        # 调用面：send_group_msg + 单个 image 段 + base64:// 可还原原始 bytes
-        self.assertEqual(len(bot.calls), 1)
-        method, kwargs = bot.calls[0]
-        self.assertEqual(method, "send_group_msg")
-        self.assertEqual(kwargs["group_id"], 100)
-        message = kwargs["message"]
-        self.assertEqual(len(message), 1)
-        self.assertEqual(message[0]["type"], "image")
-        file_value = message[0]["data"]["file"]
-        self.assertTrue(file_value.startswith("base64://"))
-        self.assertEqual(
-            base64.b64decode(file_value[len("base64://"):]), PNG_BYTES
-        )
-
-    async def test_private_send_routes_by_scope(self) -> None:
-        self._write_media()
-        bot = _StubBot()
-        bot_registry.register(bot)
-        db = _FakeMemeDB(select_results=[[_meme_row()]])
-        outcome = await MemeTool().run(
-            {"action": "send", "image_hash": HASH_A},
-            **self._context(db, scope_key="private:555"),
-        )
-        self.assertTrue(outcome.ok)
-        method, kwargs = bot.calls[0]
-        self.assertEqual(method, "send_private_msg")
-        self.assertEqual(kwargs["user_id"], 555)
-
-    # ── 收藏边界 ──
-
-    async def test_unsaved_hash_is_unknown_meme_and_no_send(self) -> None:
-        # 磁盘上有这张图（bot 见过），但全局收藏夹里没收录过 → 拒发。
-        self._write_media()
-        bot = _StubBot()
-        bot_registry.register(bot)
-        db = _FakeMemeDB(select_results=[[]])
-        outcome = await MemeTool().run(
-            {"action": "send", "image_hash": HASH_A}, **self._context(db)
-        )
-        self.assertFalse(outcome.ok)
-        self.assertEqual(outcome.error_kind, "unknown_meme")
-        self.assertEqual(bot.calls, [])
-
-    async def test_saved_but_file_gone_is_media_file_missing(self) -> None:
-        bot = _StubBot()
-        bot_registry.register(bot)
-        db = _FakeMemeDB(select_results=[[_meme_row()]])  # 收藏在，文件不写
-        outcome = await MemeTool().run(
-            {"action": "send", "image_hash": HASH_A}, **self._context(db)
-        )
-        self.assertFalse(outcome.ok)
-        self.assertEqual(outcome.error_kind, "media_file_missing")
-        self.assertEqual(bot.calls, [])
-
-    # ── 发送失败面 ──
-
-    async def test_missing_message_id_is_upstream_failure(self) -> None:
-        self._write_media()
-        bot_registry.register(_StubBot(message_id=None))
-        db = _FakeMemeDB(select_results=[[_meme_row()]])
-        outcome = await MemeTool().run(
-            {"action": "send", "image_hash": HASH_A}, **self._context(db)
-        )
-        self.assertFalse(outcome.ok)
-        self.assertEqual(outcome.error_kind, "upstream_action_failed")
-        self.assertEqual(
-            outcome.extra.get("reason_code"), "missing_message_id"
-        )
-
-    async def test_action_failed_folds_upstream_failure(self) -> None:
-        self._write_media()
-        bot_registry.register(
-            _StubBot(raise_exc=_FakeActionFailed(100, "被禁言"))
-        )
-        db = _FakeMemeDB(select_results=[[_meme_row()]])
-        outcome = await MemeTool().run(
-            {"action": "send", "image_hash": HASH_A}, **self._context(db)
-        )
-        self.assertFalse(outcome.ok)
-        self.assertEqual(outcome.error_kind, "upstream_action_failed")
-        self.assertEqual(outcome.extra.get("retcode"), 100)
-        self.assertIn("被禁言", outcome.error_message or "")
-
-    async def test_no_bot_available(self) -> None:
-        self._write_media()
-        db = _FakeMemeDB(select_results=[[_meme_row()]])
-        outcome = await MemeTool().run(
-            {"action": "send", "image_hash": HASH_A}, **self._context(db)
-        )
-        self.assertFalse(outcome.ok)
-        self.assertEqual(outcome.error_kind, "no_bot_available")
 
 
 class DeleteActionTests(_MemeToolTestBase):

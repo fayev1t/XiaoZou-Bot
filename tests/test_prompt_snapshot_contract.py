@@ -1,0 +1,440 @@
+"""Prompt 快照契约测试（待办 #11 可观测性基线）。
+
+覆盖：
+- 开关 / scope 白名单：关闭不落盘；私聊 scope 默认不落盘；无 scope 的辅助
+  调用放行
+- 快照 schema：元信息（scope/tick/correlation/model/outcome）、分段统计
+  （name/chars/sha256）、attempts（latency/usage/响应原文/error）、
+  整体 sha256 与正文一致
+- 脱敏硬保证：内联 base64 data URL 抹掉、已配置密钥值抹掉、图片只落
+  hash/mime/bytes 元信息
+- 保留清理：文件数超 PROMPT_SNAPSHOT_KEEP 删最旧
+- usage 归一化：usage_metadata / response_metadata.token_usage 两条来源
+- LLMPlanner 集成：decide() 各 return 路径（解析成功 / JSON 重试放弃 /
+  调用异常）都落一份快照且不改变决策行为
+- meme_caption 集成：辅助调用落 kind=meme_caption 快照，base64 不落盘
+
+所有用例显式设置 PROMPT_SNAPSHOT_* 环境变量（os.environ 优先于 .env 文件，
+见 core/settings.get_env_value）——不依赖"默认值"，服务器 .env 里开没开
+采集都不影响测试结果，也绝不写真实快照目录。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+from unittest import mock
+
+from qqbot.core.time import china_now
+from qqbot.services.agent_loop.decision import DecisionContext
+from qqbot.services.agent_loop.llm_planner import LLMPlanner
+from qqbot.services.agent_loop.prompt_snapshot import (
+    SNAPSHOT_SCHEMA_VERSION,
+    PromptSnapshot,
+    extract_usage,
+    should_snapshot,
+    write_snapshot,
+)
+
+_ENV_KEYS = (
+    "PROMPT_SNAPSHOT_ENABLED",
+    "PROMPT_SNAPSHOT_DIR",
+    "PROMPT_SNAPSHOT_KEEP",
+    "PROMPT_SNAPSHOT_SCOPES",
+)
+
+
+class _SnapshotEnvTestCase(unittest.TestCase):
+    """临时目录 + 显式 env 的公共基座；tearDown 恢复原 env。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.snapshot_dir = Path(self._tmp.name)
+        self._saved_env = {k: os.environ.get(k) for k in _ENV_KEYS}
+        os.environ["PROMPT_SNAPSHOT_ENABLED"] = "true"
+        os.environ["PROMPT_SNAPSHOT_DIR"] = str(self.snapshot_dir)
+        os.environ["PROMPT_SNAPSHOT_KEEP"] = "50"
+        os.environ["PROMPT_SNAPSHOT_SCOPES"] = "group,system"
+
+    def tearDown(self) -> None:
+        for key, value in self._saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def files(self) -> list[Path]:
+        return sorted(self.snapshot_dir.glob("*.json"))
+
+    def read_single(self) -> dict[str, Any]:
+        files = self.files()
+        self.assertEqual(len(files), 1, f"expected 1 snapshot, got {files}")
+        return json.loads(files[0].read_text(encoding="utf-8"))
+
+
+def _snapshot(**overrides: Any) -> PromptSnapshot:
+    base: dict[str, Any] = {
+        "kind": "planner",
+        "scope_key": "group:100",
+        "tick_seq": 7,
+        "correlation_id": "CID-1",
+        "model": "gpt-test",
+        "system_prompt": "SYSTEM BODY",
+        "user_text": "<agent-input>USER BODY</agent-input>",
+        "sections": [{"name": "identity", "chars": 11, "sha256": "x" * 64}],
+        "images": [{"hash": "h" * 64, "mime": "image/png", "bytes": 123}],
+        "outcome": "parsed",
+    }
+    base.update(overrides)
+    return PromptSnapshot(**base)
+
+
+class GatingTests(_SnapshotEnvTestCase):
+    def test_disabled_writes_nothing(self) -> None:
+        os.environ["PROMPT_SNAPSHOT_ENABLED"] = "false"
+        self.assertFalse(should_snapshot("group:100"))
+        self.assertIsNone(write_snapshot(_snapshot()))
+        self.assertEqual(self.files(), [])
+
+    def test_private_scope_blocked_by_default_whitelist(self) -> None:
+        self.assertFalse(should_snapshot("private:42"))
+        self.assertIsNone(write_snapshot(_snapshot(scope_key="private:42")))
+        self.assertEqual(self.files(), [])
+
+    def test_none_scope_allowed_for_aux_calls(self) -> None:
+        # 辅助调用（meme_caption）无 scope：白名单不拦
+        self.assertTrue(should_snapshot(None))
+
+    def test_write_snapshot_rechecks_gate_itself(self) -> None:
+        # 即便调用方忘了预判，write_snapshot 自己也复核（配置说不落就不落）
+        os.environ["PROMPT_SNAPSHOT_SCOPES"] = "system"
+        self.assertIsNone(write_snapshot(_snapshot(scope_key="group:100")))
+        self.assertEqual(self.files(), [])
+
+
+class SchemaTests(_SnapshotEnvTestCase):
+    def test_written_payload_fields(self) -> None:
+        snap = _snapshot()
+        snap.add_attempt(
+            latency_ms=812,
+            response_text='{"actions":[]}',
+            usage={"prompt_tokens": 10, "completion_tokens": 2},
+        )
+        path = write_snapshot(snap)
+        self.assertIsNotNone(path)
+        data = self.read_single()
+
+        self.assertEqual(data["schema"], SNAPSHOT_SCHEMA_VERSION)
+        self.assertEqual(data["kind"], "planner")
+        self.assertEqual(data["scope_key"], "group:100")
+        self.assertEqual(data["tick_seq"], 7)
+        self.assertEqual(data["correlation_id"], "CID-1")
+        self.assertEqual(data["model"], "gpt-test")
+        self.assertEqual(data["outcome"], "parsed")
+        self.assertFalse(data["validation_retry"])
+        # 正文 + 与正文一致的体积/哈希
+        self.assertEqual(data["system_prompt"], "SYSTEM BODY")
+        self.assertEqual(data["system_prompt_chars"], len("SYSTEM BODY"))
+        self.assertEqual(
+            data["system_prompt_sha256"],
+            hashlib.sha256(b"SYSTEM BODY").hexdigest(),
+        )
+        self.assertEqual(data["user_text_chars"], len(data["user_text"]))
+        # 分段统计与图片元信息原样透传
+        self.assertEqual(data["sections"][0]["name"], "identity")
+        self.assertEqual(data["images"][0]["mime"], "image/png")
+        # attempts
+        self.assertEqual(len(data["attempts"]), 1)
+        attempt = data["attempts"][0]
+        self.assertEqual(attempt["latency_ms"], 812)
+        self.assertEqual(attempt["response_text"], '{"actions":[]}')
+        self.assertEqual(attempt["response_chars"], len('{"actions":[]}'))
+        self.assertEqual(attempt["usage"]["prompt_tokens"], 10)
+        self.assertIsNone(attempt["error"])
+
+    def test_filename_carries_kind_scope_tick(self) -> None:
+        write_snapshot(_snapshot())
+        name = self.files()[0].name
+        self.assertIn("planner", name)
+        self.assertIn("group-100", name)  # scope 冒号已 sanitize
+        self.assertIn("tick7", name)
+
+
+class RedactionTests(_SnapshotEnvTestCase):
+    def test_inline_base64_data_url_scrubbed(self) -> None:
+        payload = "A" * 200
+        text = f'<image src="data:image/png;base64,{payload}"/> tail'
+        write_snapshot(_snapshot(user_text=text))
+        data = self.read_single()
+        self.assertNotIn(payload, json.dumps(data))
+        self.assertIn("data:<base64-redacted>", data["user_text"])
+        self.assertIn("tail", data["user_text"])
+
+    def test_secret_env_value_scrubbed(self) -> None:
+        saved = os.environ.get("LLM_API_KEY")
+        os.environ["LLM_API_KEY"] = "sk-super-secret-key-12345"
+        try:
+            write_snapshot(
+                _snapshot(
+                    system_prompt="key is sk-super-secret-key-12345 here",
+                    user_text="also sk-super-secret-key-12345",
+                )
+            )
+            raw = self.files()[0].read_text(encoding="utf-8")
+            self.assertNotIn("sk-super-secret-key-12345", raw)
+            self.assertIn("[REDACTED:LLM_API_KEY]", raw)
+        finally:
+            if saved is None:
+                os.environ.pop("LLM_API_KEY", None)
+            else:
+                os.environ["LLM_API_KEY"] = saved
+
+
+class RetentionTests(_SnapshotEnvTestCase):
+    def test_oldest_files_deleted_beyond_keep(self) -> None:
+        os.environ["PROMPT_SNAPSHOT_KEEP"] = "3"
+        for tick in range(1, 6):
+            write_snapshot(_snapshot(tick_seq=tick))
+        files = self.files()
+        self.assertEqual(len(files), 3)
+        names = "".join(f.name for f in files)
+        # 最旧的 tick1/tick2 已清理，最新三份保留
+        for expected in ("tick3", "tick4", "tick5"):
+            self.assertIn(expected, names)
+        self.assertNotIn("tick1", names)
+        self.assertNotIn("tick2", names)
+
+
+class ExtractUsageTests(unittest.TestCase):
+    def test_from_usage_metadata(self) -> None:
+        raw = SimpleNamespace(
+            usage_metadata={
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "total_tokens": 120,
+                "input_token_details": {"cache_read": 64},
+            }
+        )
+        self.assertEqual(
+            extract_usage(raw),
+            {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "total_tokens": 120,
+                "cache_read_tokens": 64,
+            },
+        )
+
+    def test_from_response_metadata_token_usage(self) -> None:
+        raw = SimpleNamespace(
+            usage_metadata=None,
+            response_metadata={
+                "token_usage": {
+                    "prompt_tokens": 7,
+                    "completion_tokens": 2,
+                    "total_tokens": 9,
+                    "prompt_tokens_details": {"cached_tokens": 4},
+                }
+            },
+        )
+        self.assertEqual(
+            extract_usage(raw),
+            {
+                "prompt_tokens": 7,
+                "completion_tokens": 2,
+                "total_tokens": 9,
+                "cache_read_tokens": 4,
+            },
+        )
+
+    def test_stub_without_usage_returns_none(self) -> None:
+        self.assertIsNone(extract_usage(SimpleNamespace(content="x")))
+
+
+class _StubLLM:
+    def __init__(
+        self,
+        response_content: str = "",
+        raise_exc: Exception | None = None,
+        usage_metadata: dict | None = None,
+    ) -> None:
+        self.response_content = response_content
+        self.raise_exc = raise_exc
+        self.usage_metadata = usage_metadata
+        self.model_name = "stub-model"
+
+    async def ainvoke(self, messages: Any) -> Any:
+        if self.raise_exc:
+            raise self.raise_exc
+        return SimpleNamespace(
+            content=self.response_content,
+            usage_metadata=self.usage_metadata,
+        )
+
+
+def _ctx(scope_key: str = "group:100") -> DecisionContext:
+    return DecisionContext(
+        scope_key=scope_key,
+        correlation_id="CID-9",
+        tick_seq=3,
+        now=china_now(),
+    )
+
+
+class PlannerSnapshotIntegrationTests(_SnapshotEnvTestCase):
+    def test_successful_decide_writes_planner_snapshot(self) -> None:
+        llm = _StubLLM(
+            response_content='{"actions":[{"type":"idle","reason":"r"}]}',
+            usage_metadata={
+                "input_tokens": 11,
+                "output_tokens": 3,
+                "total_tokens": 14,
+            },
+        )
+        planner = LLMPlanner(llm_client=llm)
+        asyncio.run(planner.decide(_ctx()))
+
+        data = self.read_single()
+        self.assertEqual(data["kind"], "planner")
+        self.assertEqual(data["scope_key"], "group:100")
+        self.assertEqual(data["tick_seq"], 3)
+        self.assertEqual(data["correlation_id"], "CID-9")
+        self.assertEqual(data["model"], "stub-model")
+        self.assertEqual(data["outcome"], "parsed")
+        # system prompt 分段统计（默认装配的 .md 段，group scope 至少含
+        # identity / xml_format / group_chat_rules / protocol）
+        section_names = [s["name"] for s in data["sections"]]
+        self.assertIn("identity", section_names)
+        self.assertIn("group_chat_rules", section_names)
+        for sec in data["sections"]:
+            self.assertGreater(sec["chars"], 0)
+            self.assertEqual(len(sec["sha256"]), 64)
+        # user XML 原文在快照里
+        self.assertIn("<agent-input", data["user_text"])
+        # attempts：latency + usage + 响应原文
+        self.assertEqual(len(data["attempts"]), 1)
+        attempt = data["attempts"][0]
+        self.assertIsInstance(attempt["latency_ms"], int)
+        self.assertEqual(attempt["usage"]["total_tokens"], 14)
+        self.assertIn('"idle"', attempt["response_text"])
+
+    def test_json_retry_giveup_records_all_attempts(self) -> None:
+        llm = _StubLLM(response_content="NOT JSON AT ALL")
+        planner = LLMPlanner(llm_client=llm)
+        out = asyncio.run(planner.decide(_ctx()))
+        # 行为不变：三次仍解析失败 → idle fallback
+        self.assertEqual(out.actions[0].reason, "llm_json_error:JSONDecodeError")
+
+        data = self.read_single()
+        self.assertEqual(data["outcome"], "json_error_giveup")
+        self.assertEqual(len(data["attempts"]), 3)
+        for attempt in data["attempts"]:
+            self.assertIn("json_error", attempt["error"])
+
+    def test_llm_call_error_records_call_error_outcome(self) -> None:
+        llm = _StubLLM(raise_exc=RuntimeError("boom"))
+        planner = LLMPlanner(llm_client=llm)
+        out = asyncio.run(planner.decide(_ctx()))
+        self.assertEqual(out.actions[0].reason, "llm_call_error:RuntimeError")
+
+        data = self.read_single()
+        self.assertEqual(data["outcome"], "call_error")
+        self.assertEqual(len(data["attempts"]), 1)
+        self.assertIn("RuntimeError", data["attempts"][0]["error"])
+
+    def test_disabled_snapshot_leaves_decide_untouched(self) -> None:
+        os.environ["PROMPT_SNAPSHOT_ENABLED"] = "false"
+        llm = _StubLLM(
+            response_content='{"actions":[{"type":"idle","reason":"r"}]}'
+        )
+        planner = LLMPlanner(llm_client=llm)
+        out = asyncio.run(planner.decide(_ctx()))
+        self.assertEqual(out.actions[0].reason, "r")
+        self.assertEqual(self.files(), [])
+
+    def test_private_scope_not_written(self) -> None:
+        llm = _StubLLM(
+            response_content='{"actions":[{"type":"idle","reason":"r"}]}'
+        )
+        planner = LLMPlanner(llm_client=llm)
+        asyncio.run(planner.decide(_ctx(scope_key="private:55")))
+        self.assertEqual(self.files(), [])
+
+    def test_validation_retry_flag_recorded(self) -> None:
+        from dataclasses import replace
+
+        llm = _StubLLM(
+            response_content='{"actions":[{"type":"idle","reason":"r"}]}'
+        )
+        planner = LLMPlanner(llm_client=llm)
+        ctx = replace(_ctx(), validation_feedback="attempt 1 rejected: x")
+        asyncio.run(planner.decide(ctx))
+        data = self.read_single()
+        self.assertTrue(data["validation_retry"])
+
+
+class MemeCaptionSnapshotIntegrationTests(_SnapshotEnvTestCase):
+    def test_caption_call_writes_snapshot_without_base64(self) -> None:
+        from qqbot.services.agent_loop.meme_caption import caption_image
+
+        llm = _StubLLM(response_content="一张测试用表情包描述")
+
+        async def fake_create_llm(temperature: float | None = None) -> Any:
+            return llm
+
+        with mock.patch(
+            "qqbot.services.agent_loop.meme_caption.create_llm",
+            fake_create_llm,
+        ):
+            text = asyncio.run(
+                caption_image(b"\x89PNG-fake-bytes", "image/png", "群里语境")
+            )
+        self.assertEqual(text, "一张测试用表情包描述")
+
+        data = self.read_single()
+        self.assertEqual(data["kind"], "meme_caption")
+        self.assertIsNone(data["scope_key"])
+        self.assertEqual(data["outcome"], "ok")
+        self.assertIn("收藏者附注", data["user_text"])
+        # 图片只落元信息：hash 是原始 bytes 的 sha256，无任何 base64
+        image = data["images"][0]
+        self.assertEqual(
+            image["hash"], hashlib.sha256(b"\x89PNG-fake-bytes").hexdigest()
+        )
+        self.assertEqual(image["bytes"], len(b"\x89PNG-fake-bytes"))
+        raw = self.files()[0].read_text(encoding="utf-8")
+        self.assertNotIn("base64,", raw)
+
+    def test_caption_failure_still_snapshots_then_raises(self) -> None:
+        from qqbot.services.agent_loop.meme_caption import (
+            CaptionError,
+            caption_image,
+        )
+
+        llm = _StubLLM(raise_exc=RuntimeError("gateway down"))
+
+        async def fake_create_llm(temperature: float | None = None) -> Any:
+            return llm
+
+        with mock.patch(
+            "qqbot.services.agent_loop.meme_caption.create_llm",
+            fake_create_llm,
+        ):
+            with self.assertRaises(CaptionError):
+                asyncio.run(caption_image(b"\x89PNG-fake-bytes", "image/png"))
+
+        data = self.read_single()
+        self.assertEqual(data["outcome"], "call_error")
+        self.assertIn("RuntimeError", data["attempts"][0]["error"])
+
+
+if __name__ == "__main__":
+    unittest.main()

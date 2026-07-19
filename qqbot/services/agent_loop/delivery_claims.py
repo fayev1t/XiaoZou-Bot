@@ -4,6 +4,8 @@
 - `try_claim`：只关心"有没有抢到"的轻量布尔接口
 - `claim_delivery`：在抢不到时额外返回"建议多久后再试"，供 worker 给自己补
   一个 lease-expiry retry wake
+- `try_claim_once_strict`：聊天发送专用的永久、fail-closed one-shot claim
+- `has_delivery_claim`：启动恢复时查协调表，覆盖 claim/event 间崩溃缝隙
 
 定位与语义见 models/agent_delivery_claim.py 顶部注释。
 
@@ -88,6 +90,69 @@ async def try_claim(
         include_retry_after=False,
     )
     return result.claimed
+
+
+async def try_claim_once_strict(
+    session_factory: SessionFactory,
+    event_id: str,
+    kind: str,
+) -> bool:
+    """永久 one-shot claim，用于不可安全重试的聊天发送。
+
+    与工具投递的 lease/fail-open 不同：冲突永不接管，数据库异常 fail-closed。
+    NapCat 没有幂等键，宁可把中断批次标 uncertain，也不能在租约过期后复发。
+    """
+    now = china_now()
+    lease_until = now + timedelta(days=36500)
+    try:
+        async with session_factory() as session:
+            stmt = (
+                pg_insert(AgentDeliveryClaim)
+                .values(
+                    event_id=event_id,
+                    kind=kind,
+                    claimed_at=now,
+                    lease_until=lease_until,
+                )
+                .on_conflict_do_nothing(index_elements=["event_id"])
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+            return (result.rowcount or 0) > 0
+    except Exception as exc:
+        logger.warning(
+            "[delivery_claims] strict claim({}, {}) failed closed: {}",
+            event_id,
+            kind,
+            exc,
+        )
+        return False
+
+
+async def has_delivery_claim(
+    session_factory: SessionFactory,
+    event_id: str,
+    kind: str,
+) -> bool:
+    """查询协调表里的既有 claim，覆盖 claim 已提交、事件尚未写入的崩溃缝隙。"""
+    try:
+        async with session_factory() as session:
+            stmt = (
+                select(AgentDeliveryClaim.event_id)
+                .where(AgentDeliveryClaim.event_id == event_id)
+                .where(AgentDeliveryClaim.kind == kind)
+                .limit(1)
+            )
+            result = await session.execute(stmt)
+            return result.scalar_one_or_none() is not None
+    except Exception as exc:
+        logger.warning(
+            "[delivery_claims] inspect claim({}, {}) failed: {}",
+            event_id,
+            kind,
+            exc,
+        )
+        return False
 
 
 async def _claim_once(

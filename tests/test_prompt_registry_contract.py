@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import unittest
 
-from qqbot.services.agent_loop.prompt_registry import PromptRegistry
+from qqbot.services.agent_loop.prompt_registry import (
+    SECTION_SEP,
+    PromptRegistry,
+)
 
 
 class PromptRegistryOrderingTests(unittest.TestCase):
@@ -96,6 +99,32 @@ class PromptRegistryOrderingTests(unittest.TestCase):
         self.assertIn("NOARG", out)
         self.assertIn("USAGE[group]", out)
         self.assertEqual(seen, ["group"])  # scope 确实传进去了
+
+    def test_render_sections_matches_render(self) -> None:
+        # render_sections 是 render 的分段视图（Prompt 快照统计每段体积用）：
+        # 同序、同过滤、join(SECTION_SEP) 后与 render() 逐字节一致。
+        reg = PromptRegistry()
+        reg.register("b", 10, "BODY-B")
+        reg.register("a", 0, "BODY-A")
+        reg.register("blank", 5, "   ")  # 空段照旧丢弃
+
+        def boom() -> str:
+            raise RuntimeError("intentional")
+
+        reg.register("boom", 7, boom)  # 异常段照旧丢弃
+
+        sections = reg.render_sections()
+        self.assertEqual([s.name for s in sections], ["a", "b"])
+        self.assertEqual([s.text for s in sections], ["BODY-A", "BODY-B"])
+        self.assertEqual(
+            SECTION_SEP.join(s.text for s in sections), reg.render()
+        )
+
+    def test_render_sections_passes_scope(self) -> None:
+        reg = PromptRegistry()
+        reg.register("usage", 0, lambda scope=None: f"U[{scope}]")
+        sections = reg.render_sections(scope="group")
+        self.assertEqual(sections[0].text, "U[group]")
 
     def test_render_default_scope_none_backward_compatible(self) -> None:
         # 不传 scope（旧调用 / 单测）→ scope-aware source 收到 None（= 不过滤）；

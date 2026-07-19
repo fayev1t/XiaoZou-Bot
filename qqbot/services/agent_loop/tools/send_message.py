@@ -102,11 +102,14 @@ class SendMessageTool(BaseTool):
     }
 
     async def execute(self, arguments: dict, **context: Any) -> ToolOutcome:
-        # GUEST + 不限 scope：enforce_access 实为 no-op，但统一保留首行调用，
-        # 以后给 send_message 加门禁（如禁言期不准发言）时不必记得补。全程无 raise。
+        # GUEST + allowed_scopes=("group","private")：enforce_access 的 scope
+        # 闸门在此拦下 system loop 硬调与 scope_key 缺失（折
+        # tool_unavailable_in_scope）。全程无 raise。
         if fail := await self.enforce_access(context):
             return fail
 
+        # 防御层：allowed_scopes 非空时 scope_key 缺失已被上面的 scope 闸门
+        # 拦下，此检查仅在将来放开 allowed_scopes 时兜底。
         scope_key = context.get("scope_key")
         if not scope_key or not isinstance(scope_key, str):
             return _invalid_args(

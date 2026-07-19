@@ -1937,6 +1937,115 @@ class RecallRenderingNoteTests(unittest.TestCase):
         self.assertIn('message_id="1234"', items[1].render)
 
 
+class ReplyFlushedProjectionTests(unittest.TestCase):
+    def test_successful_reply_tool_row_folds_away_until_flushed(self) -> None:
+        called = _snap(
+            type="agent.tool_called",
+            event_id="TC_EVENT",
+            payload={
+                "tool_call_id": "TC_REPLY",
+                "tool_name": "reply",
+                "arguments": {
+                    "action": "upsert",
+                    "gist": {"intent": "回答"},
+                },
+            },
+        )
+        result = _snap(
+            type="agent.tool_result",
+            payload={
+                "tool_call_id": "TC_REPLY",
+                "result": {
+                    "reply_task_id": "R1",
+                    "revision": 1,
+                    "state": "open",
+                },
+            },
+            seconds_offset=1,
+        )
+        views = Projector.fold_tool_results([called, result])
+        self.assertEqual(
+            Projector.build_timeline([called, result], tool_views=views), []
+        )
+
+    def test_reply_flushed_renders_exact_items_and_message_ids(self) -> None:
+        flushed = _snap(
+            type="runtime.reply_flushed",
+            event_id="FLUSH",
+            payload={
+                "reply_task_id": "R1",
+                "revision": 1,
+                "status": "sent",
+                "message_ids": [101, 102],
+                "sent_messages": [
+                    {
+                        "index": 0,
+                        "kind": "chat",
+                        "content": [
+                            {"type": "text", "data": {"text": "第一句"}}
+                        ],
+                        "status": "sent",
+                        "message_id": 101,
+                        "self_id": "10001",
+                    },
+                    {
+                        "index": 1,
+                        "kind": "meme",
+                        "image_hash": "ab" * 32,
+                        "status": "sent",
+                        "message_id": 102,
+                        "self_id": "10001",
+                    },
+                ],
+            },
+        )
+        items = Projector.build_timeline([flushed], tool_views=[])
+        self.assertEqual([item.kind for item in items], ["my_reply"])
+        rendered = items[0].render
+        self.assertIn('<my-reply reply_task_id="R1" status="sent"', rendered)
+        self.assertIn('message_id="101"', rendered)
+        self.assertIn("第一句", rendered)
+        self.assertIn('message_id="102"', rendered)
+        self.assertIn(f'hash="{"ab" * 32}"', rendered)
+
+    def test_reply_to_flushed_message_is_marked_from_self(self) -> None:
+        flushed = _snap(
+            type="runtime.reply_flushed",
+            payload={
+                "reply_task_id": "R1",
+                "status": "sent",
+                "sent_messages": [
+                    {
+                        "kind": "chat",
+                        "content": [
+                            {"type": "text", "data": {"text": "说过的话"}}
+                        ],
+                        "status": "sent",
+                        "message_id": "M-BOT",
+                        "self_id": "10001",
+                    }
+                ],
+            },
+        )
+        incoming = _snap(
+            type="external.message.group.normal",
+            payload={
+                "onebot_message_id": "M-IN",
+                "segments": [
+                    {"type": "reply", "data": {"id": "M-BOT"}},
+                    {"type": "text", "data": {"text": "知道了"}},
+                ],
+                "sender": {"nickname": "路人", "user_id": 2},
+            },
+            user_id=2,
+            seconds_offset=1,
+        )
+        items = Projector.build_timeline([flushed, incoming], tool_views=[])
+        message = [item for item in items if item.kind == "message"][0]
+        self.assertIn('from_self="true"', message.render)
+        self.assertIn('from_qq="10001"', message.render)
+
+
 class SendMemeAuthorIndexTests(unittest.TestCase):
     """meme（action=send）也是"bot 发出一条消息"的工具，result 同样带
     message_id + self_id：别人引用 bot 发的表情包时，_build_author_index

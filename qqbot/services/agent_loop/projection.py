@@ -204,7 +204,30 @@ class Projector:
         # 表情包收藏夹注入：查 agent_memes 挂到 ctx.saved_memes，llm_planner
         # 渲染成 <saved-memes>（meme 工具凭 hash 操作收藏的选图目录）。同样
         # best-effort 降级——查不到收藏夹只影响本 tick 发不了表情包。
-        return await self._augment_with_saved_memes(ctx, scope_key)
+        ctx = await self._augment_with_saved_memes(ctx, scope_key)
+        return await self._augment_with_pending_reply(ctx, scope_key)
+
+    async def _augment_with_pending_reply(
+        self, ctx: DecisionContext, scope_key: str
+    ) -> DecisionContext:
+        if not scope_key.startswith(("group:", "private:")):
+            return ctx
+        try:
+            from dataclasses import replace
+
+            from qqbot.services.agent_loop.reply_task import load_open_reply_task
+
+            task = await load_open_reply_task(self._session_factory, scope_key)
+            return replace(
+                ctx, pending_reply=task.to_view() if task is not None else None
+            )
+        except Exception as exc:
+            logger.warning(
+                "[projection] load pending reply failed for {}: {}",
+                scope_key,
+                exc,
+            )
+            return ctx
 
     async def _augment_with_persisted_tasks(
         self, ctx: DecisionContext, scope_key: str
@@ -682,6 +705,12 @@ class Projector:
             if ev.type in ("agent.tool_result", "agent.tool_failed"):
                 # rendered alongside the matching tool_called row
                 continue
+            if ev.type in (
+                "agent.reply_task_upserted",
+                "agent.reply_task_cancelled",
+            ):
+                # 折叠为 DecisionContext.pending_reply，避免与内容区双重渲染。
+                continue
             if ev.type == "agent.decision_emitted":
                 # 思考轨迹内联（待办清单#4）：最近 K 条渲染 <my-thought> 行
                 # ——模型跨拍看得到自己一路在想什么，链条强度不再取决于
@@ -703,18 +732,26 @@ class Projector:
                 "agent.reply_failed",
                 "agent.idle_decision",
             ):
-                # 发言现已**同步**：发送结果直接体现在 send_message 工具的
-                # <tool-call>（complete + <result> 带 message_id / complete +
-                # <error> 带原因，由 _render_tool_call 渲染），不再有独立的
-                # reply_emitted/delivered/
-                # failed 事件。这里保留对历史遗留事件的 skip（迁移期旧库可能还有
-                # 这三类），新代码不再产生它们。idle_decision 是纯运营事件（当拍
+                # reply_emitted/delivered/failed 是历史链路；现役发送事实为
+                # runtime.reply_flushed。这里继续跳过旧库遗留事件。idle_decision
+                # 是纯运营事件（当拍
                 # 的 reasoning 已在 decision_emitted 上渲染 <my-thought>），仍消隐。
                 continue
 
             if ev.type == "agent.tool_called":
                 tc_id = ev.payload.get("tool_call_id")
                 tv = tool_view_by_id.get(tc_id)
+                # 新 reply 工具成功只落 ReplyTask，成功行折叠进 <pending-reply>；
+                # processing/失败仍保留，历史旧 reply result 带 message_id，不误消隐。
+                if (
+                    ev.payload.get("tool_name") == "reply"
+                    and tv is not None
+                    and tv.status == "complete"
+                    and tv.error_kind is None
+                    and isinstance(tv.result, dict)
+                    and tv.result.get("reply_task_id")
+                ):
+                    continue
                 items.append(
                     TimelineItem(
                         event_id=ev.event_id,
@@ -757,6 +794,15 @@ class Projector:
                         occurred_at=ev.occurred_at,
                         kind="request",
                         render=Projector._render_request(ev),
+                    )
+                )
+            elif ev.type == "runtime.reply_flushed":
+                items.append(
+                    TimelineItem(
+                        event_id=ev.event_id,
+                        occurred_at=ev.occurred_at,
+                        kind="my_reply",
+                        render=Projector._render_reply_flushed(ev),
                     )
                 )
             elif ev.type.startswith("runtime.") and ev.visibility == "agent_visible":
@@ -1013,6 +1059,41 @@ class Projector:
             f'time="{_esc_attr(time_str)}">'
             f"{_esc_text(payload_json)}</system-hint>"
         )
+
+    @staticmethod
+    def _render_reply_flushed(ev: _EventSnapshot) -> str:
+        payload = ev.payload or {}
+        attrs = [
+            f'reply_task_id="{_esc_attr(str(payload.get("reply_task_id") or ""))}"',
+            f'status="{_esc_attr(str(payload.get("status") or "unknown"))}"',
+            f'time="{_esc_attr(ev.occurred_at.isoformat(timespec="seconds"))}"',
+        ]
+        parts = [f"<my-reply {' '.join(attrs)}>"]
+        for item in payload.get("sent_messages") or []:
+            if not isinstance(item, dict):
+                continue
+            status = _esc_attr(str(item.get("status") or "unknown"))
+            mid = item.get("message_id")
+            mid_attr = (
+                f' message_id="{_esc_attr(str(mid))}"' if mid is not None else ""
+            )
+            if item.get("kind") == "meme":
+                image_hash = _esc_attr(str(item.get("image_hash") or ""))
+                parts.append(
+                    f'<sent-meme status="{status}"{mid_attr} hash="{image_hash}"/>'
+                )
+            else:
+                body, _ = _render_segments(
+                    item.get("content") or [], {}, {}, {}
+                )
+                parts.append(
+                    f'<sent-message status="{status}"{mid_attr}>{body}</sent-message>'
+                )
+        reason = payload.get("reason")
+        if reason:
+            parts.append(f"<reason>{_esc_text(str(reason))}</reason>")
+        parts.append("</my-reply>")
+        return "".join(parts)
 
 
 # ─── XML escape + JSON helpers ───
@@ -1748,24 +1829,16 @@ def _build_author_index(
     覆盖两类来源：
     - 外部消息：作者 = sender 的 card/nickname + user_id。别人引用某人时，
       LLM 据此判断被引用的是谁（含群主自己）——而不是误以为那人在发言。
-    - bot 自己同步发出的消息：``is_self=True``，message_id + self_id 取自
-      send_message 工具的 tool_result（send_message 已是**同步**工具、直接返回
-      napcat 的 message_id，不再有 reply_delivered 事件）。别人引用 bot 时渲染
-      `from_self="true"`（且 from_qq 命中 bot_qq），LLM 无需比对也能判定
-      "被引用的是我自己"。
+    - bot 自己现役发出的消息：``is_self=True``，message_id + self_id 取自
+      runtime.reply_flushed 的成功 sent item。别人引用 bot 时渲染
+      `from_self="true"`（且 from_qq 命中 bot_qq）。
 
-    工具名兼容：发言工具已从 `reply` 改名为 `send_message`（§12.2）；事件表
-    append-only，改名前落库的 tool_called 里 tool_name 仍是 `reply`，故这里两个名
-    都认，避免改名后一个 lookback 窗口内旧发言丢掉 from_self 标注。
-    `meme`（action=send 发表情包）同样是"bot 发出一条消息"的工具、result 同样
-    带 message_id + self_id，一并认——别人引用 bot 发的表情包时也要 from_self；
-    非 send 动作的 result 不带 message_id，下方的 message_id 门自然滤掉。
-    `send_meme` 是 2026-07-12 合并进 meme 前的旧名，同 reply 例保留。
+    工具结果分支只作 append-only 历史兼容：旧 reply/send_message 与旧
+    meme.send/send_meme 的 tool_result 仍可恢复 from_self；现役 reply tool_result
+    不含 message_id，会被下方门槛自然滤掉。
     """
     out: dict[str, _AuthorRef] = {}
-    # 先收集发言工具调用的 tool_call_id，用来认出哪些 tool_result 是发言的。
-    # 认 send_message / meme（发消息类工具）+ reply / send_meme（改名前的旧
-    # 事件，见 docstring 兼容说明）。
+    # 收集历史发言工具调用 id；现役发送直接从 reply_flushed 分支进入。
     send_call_ids: set[str] = set()
     for ev in events:
         if ev.type == "agent.tool_called" and (
@@ -1776,6 +1849,19 @@ def _build_author_index(
             if tc_id is not None:
                 send_call_ids.add(str(tc_id))
     for ev in events:
+        if ev.type == "runtime.reply_flushed":
+            for item in (ev.payload or {}).get("sent_messages") or []:
+                if not isinstance(item, dict) or item.get("status") != "sent":
+                    continue
+                mid = item.get("message_id")
+                if mid is None:
+                    continue
+                self_id = item.get("self_id")
+                out[str(mid)] = _AuthorRef(
+                    name=None,
+                    user_id=str(self_id) if self_id else None,
+                    is_self=True,
+                )
         # bot 自己同步发出的消息：从其 tool_result 取 message_id + self_id。
         if ev.type == "agent.tool_result":
             payload = ev.payload or {}

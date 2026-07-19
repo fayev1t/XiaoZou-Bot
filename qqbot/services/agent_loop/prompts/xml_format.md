@@ -1,5 +1,31 @@
 # Input format — reading the `<agent-input>` envelope
 
+> **ReplyTask truth override.** `reply` tool success means a pending draft,
+> never speech. `<pending-reply>` is the current unsent task. Actual past
+> utterances are rendered as `<my-reply>` with exact sent text/meme and
+> message_id. `send_message` is not a current tool.
+
+### `<pending-reply>` — current unsent reply task
+
+```xml
+<pending-reply reply_task_id="..." revision="2" flush_at="..." hard_deadline="..." mode="compose">{"targets":[],"gist":{...}}</pending-reply>
+```
+
+Merge new semantic points with this id/revision; merge is what postpones it.
+Do not re-upsert merely because another tick occurred.
+
+### `<my-reply>` — messages actually sent
+
+```xml
+<my-reply reply_task_id="..." status="sent" time="...">
+  <sent-message status="sent" message_id="123">actual text</sent-message>
+  <sent-meme status="sent" message_id="124" hash="..."/>
+</my-reply>
+```
+
+Only successful children count as things already said. Read `partial`,
+`failed`, `empty`, and `uncertain` literally; never blindly resend uncertain.
+
 Every tick you receive a single XML document wrapped in `<agent-input scope="...">`. This document is your sole observation of the world. Read it by **tag**, not by string scanning — the tag nesting carries who-said-what-to-whom relationships that flat prose would lose. The current wall-clock time and tick counter arrive on the `<current now="..." tick="N"/>` element near the end of the document.
 
 Attribute naming conventions, used consistently across every tag:
@@ -82,8 +108,8 @@ Attribute meanings on `<agent-input>` (identity, stable across ticks) and `<curr
 
 - The memes you previously saved via the `meme` tool (`action="save"`), newest first, capped. Absent section = nothing saved yet.
 - The body is a system-generated description of the image: what it shows, text on it, mood, usage scenario. **This description is all you get for choosing** — the pixels are not attached.
-- `hash=` is the exact `image_hash` value for the `meme` tool's send/delete/recaption actions — copy it verbatim, all 64 chars. It lives in the same id space as `<image hash="..."/>` in the timeline (both are the image file's sha256), so a hash returned by a save result can be sent immediately even before it shows up here.
-- This section is a reference catalog, never a prompt to act: having memes is not a reason to send one.
+- `hash=` is the exact `image_hash` value for `meme` delete/recaption; copy it verbatim, all 64 chars. It lives in the same id space as `<image hash="..."/>` in the timeline. Replyer also receives this catalog and may select at most one hash at flush time.
+- This section is a reference catalog, never a prompt to act. Planner must not choose a send hash; if a meme-like emotional beat is intended, express that in the reply gist and leave the final choice to Replyer.
 
 ## `<validation-error>` — same-tick retry feedback (rare)
 
@@ -98,6 +124,7 @@ Operationally: start reading from the bottom few rows. The bottom is the freshes
 ```xml
 <timeline>
   <message ...>...</message>
+  <my-reply ...>...</my-reply>
   <tool-call ...>...</tool-call>
   <my-thought ...>...</my-thought>
   <notice ...>...</notice>
@@ -107,7 +134,8 @@ Operationally: start reading from the bottom few rows. The bottom is the freshes
 </timeline>
 ```
 
-(Your own past replies are not a separate row type — they appear as `<tool-call name="send_message">`, since replying is a tool call. See that section below.)
+Your own delivered replies are separate `<my-reply>` rows. A `reply` tool-call
+only mutates `<pending-reply>` and is never itself visible speech.
 
 ### `<message>` — an incoming user message
 
@@ -129,7 +157,10 @@ Every attribute is single-purpose (no composite values to parse apart); absent =
 
 The body is text plus **inline segment tags** (see §Inline segments).
 
-> **Where are YOUR own past replies?** There is no separate `<agent-reply>` row. Because replying is a tool call, everything you've said shows up as `<tool-call name="send_message">` (see the next section). When new `<message>` events follow one of your send_message tool-calls, they are usually reactions to what you said — not independent topics. And when someone quote-replies you, their `<message>` carries `<reply ... from_self="true"/>` (see §Inline segments) — that is how you recognise a reply directed at you.
+> **Where are YOUR own past replies?** Read `<my-reply>` rows. Each successful
+> child contains exactly what reached QQ plus its message id. Incoming messages
+> immediately after one are usually reactions; explicit quote replies also carry
+> `<reply ... from_self="true"/>`.
 
 ### `<tool-call>` — a tool invocation and its outcome
 
@@ -149,22 +180,24 @@ The body is text plus **inline segment tags** (see §Inline segments).
   <processing/>
 </tool-call>
 
-<tool-call name="send_message" status="complete" time="2026-05-28T14:30:42+08:00">
-  <args>{"content":[{"type":"text","data":{"text":"哼,带伞啦笨蛋"}}],"target":{"kind":"group","group_id":100}}</args>
-  <result>{"message_id":8813,"self_id":"10001","sent":true}</result>
+<tool-call name="reply" status="complete" time="2026-05-28T14:30:42+08:00">
+  <args>{"action":"upsert","targets":[{"message_id":"MSG_100","points":["提醒带伞"]}],"gist":{"intent":"回答天气问题"},"hold_seconds":8}</args>
+  <result>{"reply_task_id":"R1","revision":1,"state":"open","flush_at":"..."}</result>
 </tool-call>
 ```
 
 - `status` ∈ {`processing`, `complete`}. It answers exactly one question: **is this call finished?** Whether a finished call *worked* is the child element — `<result>` = success, `<error>` = failure.
-- `time=` is when YOU dispatched the call. For a `send_message` row that is effectively when you spoke — compare it against `now=` and the surrounding `<message time=>` stamps to judge how long ago you last said something.
+- `time=` is when YOU dispatched the call. It is never proof that a chat message was delivered; delivery time lives on `<my-reply>`.
 - These rows are the **only** place tool outcomes appear — there is no separate results section. **Scan the recent completed `<tool-call>` rows BEFORE issuing a new `call_tool`** — the answer you need may already be sitting there; don't re-run a search whose result is already in the timeline.
 - `<processing/>` means the call was dispatched but has not finished. **Do not redial.** You'll see it when something woke you while your own batch is still running (e.g. a new message arrived mid-search), or after an interrupted batch (a restart). Either way the outcome is coming — handle what woke you, or idle and wait for the batch-completion wake.
-- With a `<result>`, the body is a JSON string. If it ends with `<truncated/>`, the original was longer than 6144 characters and the tail was cut. In a `send_message` result, `self_id` is your own QQ id — the same value as `bot_qq`.
+- With a `<result>`, the body is a JSON string. If it ends with `<truncated/>`, the original was longer than 6144 characters and the tail was cut. A successful `reply` result means pending state only and deliberately has no `message_id`.
 - With an `<error>`, it carries `kind=` plus **structured attributes** describing exactly what went wrong — read them, don't just eyeball the prose body. `permission_denied_user_tier` → `required_tier=` / `actual_tier=`; `permission_denied_bot_role` → `required_bot_role=` / `actual_bot_role=`; `tool_unavailable_in_scope` → `allowed_scopes=` / `actual_scope=`; `target_scope_mismatch` → `expected_scope=` / `actual_target_kind=` / `actual_target_id=`; `invalid_arguments` → `reason_code=` / `segment_index=` / `segment_type=` (which segment/field was bad); `upstream_action_failed` (napcat refused) → `retcode=` / `action=` / `upstream_wording=`, with QQ's human-readable reason in the body. For an `<error>`, decide whether to retry (different args), fail the task, or proceed without it — full handling rules live in §protocol permissions.
 
-> **`<tool-call name="send_message">` is YOU speaking — read it as your own utterance, not an internal action.**
-> Because sending a message is itself a tool call, your own past words appear here and **only** here (there is no separate `<agent-reply>` row). The `content` array inside `<args>` is **exactly what you said into the chat**; `status="complete"` with a `<result>` means it went out. So a complete send_message with a `<result>` means **"I have already said this"** — it is history, not an open item. Never re-send or re-word that content because a new tick started, because the task is still running, or because new unrelated messages arrived. Say something again ONLY if someone explicitly asks you to repeat it.
-> If the `send_message` tool-call completed with an `<error>` (e.g. `permission_denied_*`, `target_scope_mismatch`), your message did **not** go out — fix the cause and you may send it. When someone later quote-replies what you said, you'll recognise it because their `<message>` carries `<reply ... from_self="true"/>`.
+> **`<tool-call name="reply">` is content-area bookkeeping, not speech.** A
+> successful create/merge is folded into `<pending-reply>`; cancel removes it.
+> Only `<my-reply>` is the delivery fact. Never infer sent wording from Planner's
+> gist, and never recreate a successful `<my-reply>` merely because a task is
+> still open.
 
 ### `<my-thought>` — your own reasoning from a past tick
 
@@ -208,9 +241,9 @@ Kind-specific detail attributes (absent = not reported):
 - `group_card` → `old_card` / `new_card` — the group nickname before/after the change. `new_card=""` (empty) means the card was **cleared**, which is different from the attribute being absent (unknown).
 - `group_upload` → `file_name` / `file_size_bytes` — what was uploaded.
 - `poke` → `action` / `action_suffix` — the poke's flavor text, reading `action` + target + `action_suffix` (e.g. `action="拍了拍"` `action_suffix="的头"` = 拍了拍…的头). Absent = a plain 戳一戳 or unknown.
-- `emoji_like` → `message_id` — the message that received the reaction (matches a `<message message_id="...">` above; if it's one your send_message produced, someone reacted to YOU); `likes` — the reactions as comma-joined `表情×人数` entries, where 表情 is either a literal emoji character (`👍`) or `face:N` (a QQ-native emoticon id, same id space as `<face face_id="N"/>`).
+- `emoji_like` → `message_id` — the message that received the reaction (matches a `<message>` or successful `<my-reply>` child above); `likes` — the reactions as comma-joined `表情×人数` entries, where 表情 is either a literal emoji character (`👍`) or `face:N` (a QQ-native emoticon id, same id space as `<face face_id="N"/>`).
 - `essence` → `message_id` — the message that was set / unset as 群精华.
-- `group_recall` / `friend_recall` → `message_id` — the message that was recalled (matches a `<message message_id="...">` earlier in the timeline). That content is withdrawn — don't quote it or keep building on it as if it were still on screen. If the id matches a message_id one of your send_message results returned, it was YOUR message that got recalled.
+- `group_recall` / `friend_recall` → `message_id` — the message that was recalled (matches a `<message>` or successful `<my-reply>` child earlier in the timeline). That content is withdrawn — don't quote it or keep building on it as if it were still on screen.
 - `honor` → `honor_type` — which group honor changed (`talkative` = 龙王, `performer`, `emotion`).
 
 **Full list of `kind` values you may see:**
@@ -263,7 +296,7 @@ How to react: a `<request>` row is a legitimate reason to post **one** short lin
 
 Runtime-emitted guidance. Some hints have advisory severity, others are mandatory (`budget_exceeded` = stop spending, `context_compacted` = old events are gone). Treat their content with the gravity their `kind` implies.
 
-`kind="tool_batch_completed"` marks a **batch boundary**: every tool call you dispatched in one earlier tick has reached its final outcome (`tool_count` of them). All `<tool-call>` rows above this marker from that batch are final — a `send_message` among them **has been said**. The hint itself never calls for action: do not reply to it, and do not re-fire or re-say anything just because the batch closed; act only on what the actual results and any new messages warrant.
+`kind="tool_batch_completed"` marks a **batch boundary**: every tool call you dispatched in one earlier tick has reached its final outcome (`tool_count` of them). A completed `reply` in that batch only confirms pending content; it does not mean anything was said. The hint itself never calls for action: do not reply or re-fire merely because the batch closed.
 
 `kind="wait_elapsed"` means a `wait` you scheduled earlier has fired; `note` is the memo you left yourself. Check the timeline tail before acting on the note — if the situation resolved itself while you waited, `idle` is the correct response.
 
@@ -326,7 +359,7 @@ The same distinction applies when reading third parties: a message about 张三 
 
 ### Messages right after something you said
 
-Your own utterances sit in the stream as `<tool-call name="send_message" status="complete">` rows. Messages arriving shortly after one of yours are, by default, reactions to it even with no `<reply>` and no `<at>` — thanks, follow-up questions, pushback. Two qualifications:
+Your own utterances sit in the stream as `<my-reply>` rows. Messages arriving shortly after one are, by default, reactions to it even with no `<reply>` and no `<at>` — thanks, follow-up questions, pushback. Two qualifications:
 
 - The default weakens with distance: once other threads take over or time passes, an untagged message is no longer presumed to be at you.
 - A reaction is not an obligation to answer: an acknowledgment-tier response usually closes the exchange, and answering it re-opens a finished conversation.

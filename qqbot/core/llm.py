@@ -57,6 +57,16 @@ async def create_llm(temperature: float | None = None) -> "LLM | None":
     }
     if config.llm_provider == "openai":
         llm_kwargs["streaming"] = True
+        # 流式响应默认不带 usage；stream_usage=True 让最后一个 chunk 携带
+        # token 用量（Prompt 快照 / 观测基线依赖它，待办 #11）。老版本
+        # langchain_openai 没有该字段——按字段表探测，不支持就不传，
+        # 行为退化为快照里 usage=null，不影响调用。
+        fields = (
+            getattr(ChatOpenAI, "model_fields", None)
+            or getattr(ChatOpenAI, "__fields__", {})
+        )
+        if "stream_usage" in fields:
+            llm_kwargs["stream_usage"] = True
     if config.llm_max_tokens is not None:
         llm_kwargs["max_tokens"] = config.llm_max_tokens
 

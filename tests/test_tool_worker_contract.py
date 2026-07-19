@@ -461,6 +461,33 @@ class ToolWorkerSelfWakeTest(unittest.TestCase):
         self.assertEqual(processed, 1)
         self.assertIn("agent.tool_result", _types(store))
 
+    def test_legacy_successful_reply_does_not_wake_supervisor(self) -> None:
+        reg = ToolRegistry()
+        tool = _StubTool("reply", return_value={"reply_task_id": "R1"})
+        tool.wake_policy = "on_failure"
+        reg.register(tool)
+        supervisor = _StubSupervisor()
+        rows = [
+            _row(
+                event_id="E_REPLY",
+                payload={
+                    "tool_call_id": "TC_REPLY",
+                    "tool_name": "reply",
+                    "arguments": {},
+                },
+            )
+        ]
+        worker = ToolWorker(
+            session_factory=_drain_factory([], rows),
+            registry=reg,
+            supervisor=supervisor,
+        )
+
+        processed = asyncio.run(worker._drain_once())
+
+        self.assertEqual(processed, 1)
+        self.assertEqual(supervisor.woke, [])
+
     def test_process_one_returns_processed_call(self) -> None:
         """会落终态事件的分支需返回 _ProcessedCall（scope + 批次线索 +
         terminal 事件 id），供 drain 层做遗留唤醒 / 批次收口判定。"""
@@ -517,6 +544,32 @@ class ToolWorkerSelfWakeTest(unittest.TestCase):
         assert done_unknown is not None
         self.assertEqual(done_unknown.scope_key, "private:42")
         self.assertIsNone(done_unknown.tool_batch_id)
+
+    def test_successful_reply_style_tool_does_not_request_planner_wake(self) -> None:
+        """落稿成功只等 ReplyExecutor；不能因 tool_result 自激活下一拍。"""
+        reg = ToolRegistry()
+        tool = _StubTool("reply", return_value={"reply_task_id": "R1"})
+        tool.wake_policy = "on_failure"
+        reg.register(tool)
+        worker = ToolWorker(
+            session_factory=_factory_for([]),
+            registry=reg,
+        )
+        done = asyncio.run(
+            worker._process_one(
+                _row(
+                    payload={
+                        "tool_call_id": "TC_REPLY",
+                        "tool_name": "reply",
+                        "tool_batch_id": "B_REPLY",
+                        "tool_batch_size": 1,
+                    }
+                )
+            )
+        )
+        self.assertIsNotNone(done)
+        assert done is not None
+        self.assertFalse(done.wake_requested)
 
 
 class ToolWorkerCaptionInjectionTests(unittest.TestCase):

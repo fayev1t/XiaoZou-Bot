@@ -40,11 +40,11 @@ from qqbot.services.agent_loop.tools.leave_group import LeaveGroupTool
 from qqbot.services.agent_loop.tools.meme import MemeTool
 from qqbot.services.agent_loop.tools.poke import PokeTool
 from qqbot.services.agent_loop.tools.recall import RecallTool
+from qqbot.services.agent_loop.tools.reply import ReplyTool
 from qqbot.services.agent_loop.tools.respond_to_group_join_request import (
     RespondToGroupJoinRequestTool,
 )
 from qqbot.services.agent_loop.tools.search_history import SearchHistoryTool
-from qqbot.services.agent_loop.tools.send_message import SendMessageTool
 from qqbot.services.agent_loop.tools.set_admin import SetAdminTool
 from qqbot.services.agent_loop.tools.set_card import SetCardTool
 from qqbot.services.agent_loop.tools.set_essence import SetEssenceTool
@@ -58,25 +58,22 @@ from qqbot.services.agent_loop.tools.whole_ban import WholeBanTool
 
 
 def build_default_registry() -> ToolRegistry:
-    # 2026-07-01：应用户要求，暂时只保留最基础的 send_message 工具，其余工具整体下架。
+    # 2026-07-19：reply 已取代 send_message，落 reply_task 后由独立执行器发送。
     # 原因：现有 napcat 动作 / websearch / search_history 的实现「太粗」，先全部
     # 停用，待逐个重做后再逐一恢复注册。工具类、sibling .md、各自的契约测试都仍
     # 留在仓库里——恢复某个工具时，把它对应的 registry.register(...) 行取消注释
     # 即可，无需改别处。（respond_to_request 已于 2026-07-03 拆分删除，见下。）
     registry = ToolRegistry()
     # ── 基础能力（当前在用）──
-    registry.register(SendMessageTool())
+    registry.register(ReplyTool())
     # wait：模型的时间自主权（自我延迟唤醒），2026-07-02 新增。
     registry.register(WaitTool())
     # 入群申请审批（2026-07-03 拆分自已删除的 respond_to_request）：group.add
     # 事件进目标群 timeline，管理员明确授权后由群内 LLM 调它回执；好友申请 /
     # 邀请入群不经工具，由 plugin 层 request_auto_approval 自动同意。
     registry.register(RespondToGroupJoinRequestTool())
-    # 表情包一站式工具（2026-07-03 收发上线；2026-07-12 合并为单工具并新增
-    # 收藏管理）：action 分发 save（收录，描述由工具内 caption LLM 调用生成，
-    # 见 meme_caption.py）/ send（按 hash 发送收藏）/ delete（移除收藏，只删
-    # 元数据不动磁盘文件）/ recaption（重新生成描述，模型只能换 context_note）。
-    # 收藏夹经 <saved-memes> 每 tick 注入 prompt。
+    # 表情包收藏管理：save（描述由 caption LLM 生成）/ delete / recaption。
+    # 发送入口已并入 reply_task；Replyer 从 <saved-memes> 决定 0..1 张。
     registry.register(MemeTool())
     # ── 群信息查询（2026-07-07 重做后恢复 / 新增）──
     # 查询三件套按下架备注的路线重做后恢复：get_group_info（no_cache + 可选
@@ -144,7 +141,7 @@ __all__ = [
     "RecallTool",
     "RespondToGroupJoinRequestTool",
     "SearchHistoryTool",
-    "SendMessageTool",
+    "ReplyTool",
     "SetAdminTool",
     "SetCardTool",
     "SetEssenceTool",

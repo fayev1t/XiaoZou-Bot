@@ -1,9 +1,13 @@
 """Freeze the v2 `agent_events` single-table schema and ULID generator.
 
-Contract source: 开发文档/v2.0/事件系统设计.md §3
-Ingest contract:  开发文档/v2.0/EventIngest契约.md §4.1
+Contract source: 开发文档/v2.0/20-横切契约/事件系统设计.md §3
+Ingest contract:  开发文档/v2.0/20-横切契约/EventIngest契约.md §4.1
 
 Static string assertions only; safe to run without a live database.
+
+文档路径基准：`开发文档/` 在**项目根的上一级**（顶层工作区，与 `qqbot/`
+同级——见顶层 CLAUDE.md ③），且契约文档在 2026-07-02 目录重组后位于
+`20-横切契约/` 子目录。
 """
 
 from __future__ import annotations
@@ -12,6 +16,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+DOCS_CONTRACTS = ROOT.parent / "开发文档" / "v2.0" / "20-横切契约"
 
 
 class AgentEventsSchemaContractTests(unittest.TestCase):
@@ -26,12 +31,12 @@ class AgentEventsSchemaContractTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.ids_text = (ROOT / "qqbot" / "core" / "ids.py").read_text(encoding="utf-8")
-        self.design_text = (
-            ROOT / "开发文档" / "v2.0" / "事件系统设计.md"
-        ).read_text(encoding="utf-8")
-        self.ingest_text = (
-            ROOT / "开发文档" / "v2.0" / "EventIngest契约.md"
-        ).read_text(encoding="utf-8")
+        self.design_text = (DOCS_CONTRACTS / "事件系统设计.md").read_text(
+            encoding="utf-8"
+        )
+        self.ingest_text = (DOCS_CONTRACTS / "EventIngest契约.md").read_text(
+            encoding="utf-8"
+        )
 
     def test_tablename_matches_contract(self) -> None:
         self.assertIn('__tablename__ = "agent_events"', self.model_text)
@@ -144,12 +149,12 @@ class ContractDocsCrossReferenceTests(unittest.TestCase):
     """Sanity: the design docs that describe this schema still mention it."""
 
     def setUp(self) -> None:
-        self.design_text = (
-            ROOT / "开发文档" / "v2.0" / "事件系统设计.md"
-        ).read_text(encoding="utf-8")
-        self.ingest_text = (
-            ROOT / "开发文档" / "v2.0" / "EventIngest契约.md"
-        ).read_text(encoding="utf-8")
+        self.design_text = (DOCS_CONTRACTS / "事件系统设计.md").read_text(
+            encoding="utf-8"
+        )
+        self.ingest_text = (DOCS_CONTRACTS / "EventIngest契约.md").read_text(
+            encoding="utf-8"
+        )
 
     def test_design_mentions_table_and_idempotency_key(self) -> None:
         self.assertIn("agent_events", self.design_text)

@@ -50,6 +50,12 @@ class EnvCentralizationContractTests(unittest.TestCase):
             "POSTGRES_HOST_PORT=7504",
             "WEBSEARCH_PROVIDER=exa",
             "TAVILY_API_KEY=",
+            # Prompt 快照（待办 #11）：模板默认开启采集（代码默认关闭，
+            # 由部署侧显式决定）
+            "PROMPT_SNAPSHOT_ENABLED=true",
+            "PROMPT_SNAPSHOT_DIR=./runtime_data/prompt_snapshots",
+            "PROMPT_SNAPSHOT_KEEP=200",
+            "PROMPT_SNAPSHOT_SCOPES=group,system",
         ):
             with self.subTest(key=key):
                 self.assertIn(key, env_example)

@@ -35,6 +35,8 @@ from qqbot.services.agent_loop import bot_registry
 from qqbot.services.agent_loop.decision import Planner
 from qqbot.services.agent_loop.loop import AgentLoop
 from qqbot.services.agent_loop.projection import Projector
+from qqbot.services.agent_loop.reply_executor import ReplyExecutor
+from qqbot.services.agent_loop.replyer import Replyer
 from qqbot.services.agent_loop.tool_registry import ToolRegistry
 from qqbot.services.agent_loop.tool_worker import ToolWorker
 
@@ -51,6 +53,7 @@ class LoopSupervisor:
         projector: Projector | None = None,
         tool_registry: ToolRegistry | None = None,
         caption_image: Any | None = None,
+        replyer: Replyer | None = None,
     ) -> None:
         self._planner = planner
         self._session_factory = session_factory
@@ -59,11 +62,13 @@ class LoopSupervisor:
         # 看图写描述回调（生产 = meme_caption.caption_image，由 v2_main 注入）：
         # 原样转发给 ToolWorker，进工具 run() context 供 meme 工具用。
         self._caption_image = caption_image
+        self._replyer = replyer
         self._loops: dict[str, AgentLoop] = {}
         self._lock = asyncio.Lock()
         self._started = False
         self._stopped = False
         self._tool_worker: ToolWorker | None = None
+        self._reply_executor: ReplyExecutor | None = None
 
     @property
     def started(self) -> bool:
@@ -95,8 +100,26 @@ class LoopSupervisor:
         # 自己注入进去让 worker 在**整批工具收口后**（写完 runtime.
         # tool_batch_completed）经 notify_tool_batch_completed 批次级唤醒对应
         # scope 的 AgentLoop——不再是每 drain 一轮就按 scope wake 一次。
-        # send_message 已是同步工具，不再需要 ReplySendWorker。
+        # ReplyExecutor 独立负责 reply_task 的到点组稿与发送。
         if self._tool_registry is not None:
+            if self._projector is not None:
+                self._reply_executor = ReplyExecutor(
+                    session_factory=self._session_factory,
+                    projector=self._projector,
+                    wake_scope=self.wake,
+                    replyer=self._replyer,
+                )
+                # rescan 与上面的任务回填同属恢复性动作，best-effort：失败只
+                # 损失"重挂定时器 / 补 uncertain / overdue hint"，模型侧仍有
+                # <pending-reply> 证据链可自愈（合稿即重新挂表），不挡启动。
+                try:
+                    await self._reply_executor.start()
+                except Exception as exc:
+                    logger.warning(
+                        "[supervisor] reply executor rescan failed "
+                        "(continuing): {}",
+                        exc,
+                    )
             self._tool_worker = ToolWorker(
                 session_factory=self._session_factory,
                 registry=self._tool_registry,
@@ -127,6 +150,9 @@ class LoopSupervisor:
                 logger.warning("[supervisor] tool_worker.stop failed: {}", exc)
             finally:
                 self._tool_worker = None
+        if self._reply_executor is not None:
+            await self._reply_executor.stop()
+            self._reply_executor = None
         logger.info("[supervisor] stopped, {} loops drained", len(loops))
 
     async def wake(self, scope_key: str) -> None:
@@ -147,6 +173,19 @@ class LoopSupervisor:
         tool_registry 时是 no-op。"""
         if self._tool_worker is not None:
             self._tool_worker.notify()
+
+    async def notify_reply_task(
+        self,
+        scope_key: str,
+        reply_task_id: str,
+        revision: int,
+        flush_at: Any,
+        event_id: str,
+    ) -> None:
+        if self._reply_executor is not None:
+            await self._reply_executor.notify(
+                scope_key, reply_task_id, revision, flush_at, event_id
+            )
 
     async def notify_tool_batch_completed(
         self, scope_key: str, tool_batch_id: str

@@ -6,8 +6,8 @@
 System prompt 不再硬编码 —— 完全交给 PromptRegistry 组装。默认 registry
 （build_default_prompt_registry）注册五段：identity / xml_format /
 group_chat_rules / protocol / tools usage。人格不再是独立段：决策层（规划、
-任务、工具选择、reasoning）无人格，角色卡随 tools/send_message.md 进
-tools_usage 段——人格只作用于 send_message 的 content 文本。需要迭代协议、
+任务、工具选择、reasoning）无人格，角色卡只由 Replyer 在最终组稿时加载，
+不进入 Planner 的 tools_usage 段。需要迭代协议、
 参与规则或工具说明时直接改对应 .md 即可，不需要碰 planner。
 
 错误兜底：LLM 不可用 / 接口报错 / JSON 不可解析 / schema 不符
@@ -24,6 +24,7 @@ import asyncio
 import base64
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -48,7 +49,17 @@ from qqbot.services.agent_loop.projection import (
     _esc_text,
     _safe_json,
 )
-from qqbot.services.agent_loop.prompt_registry import PromptRegistry
+from qqbot.services.agent_loop.prompt_registry import (
+    SECTION_SEP,
+    PromptRegistry,
+)
+from qqbot.services.agent_loop.prompt_snapshot import (
+    PromptSnapshot,
+    extract_usage,
+    section_stats,
+    should_snapshot,
+    write_snapshot,
+)
 from qqbot.services.agent_loop.tool_registry import ToolRegistry
 
 logger = get_logger(__name__)
@@ -57,16 +68,14 @@ logger = get_logger(__name__)
 # 默认 prompt section order 约定（PromptRegistry 文档 §register）：
 #   0   identity           机器身份：决策引擎操作一个 QQ 账号（无人格层）
 #   50  xml_format         输入 XML 信封语法与读法
-#   100 group_chat_rules   参与规则（什么时候有理由调 send_message）
+#   100 group_chat_rules   参与规则（什么时候有理由落 reply_task）
 #   150 protocol           决策协议（任务状态机、JSON 输出规则）
-#   300 tools_usage        每个工具的 sibling .md 汇总（含 send_message 工具）
+#   300 tools_usage        每个已注册工具的 sibling .md 汇总
 #
 # 逻辑递进：你是什么 → 你怎么读输入 → 什么时候需要发言 → 你怎么决定 →
 # 你能调什么工具
 #
-# 人格（小奏角色卡）不设独立段：它只作用于 send_message 的 content 文本，
-# 所以直接写在 tools/send_message.md 的 Voice 节里，随 tools_usage 按 scope
-# 过滤进 prompt——send_message 限 group/private，system loop 因此天然无人设。
+# 人格（小奏角色卡）不进 Planner；Replyer 在最终组稿时单独加载。
 SECTION_IDENTITY = "identity"
 SECTION_XML_FORMAT = "xml_format"
 SECTION_PROTOCOL = "protocol"
@@ -81,8 +90,8 @@ def build_default_prompt_registry(
 
     各段从对应 .md 文件懒加载，缺失即静默跳过（PromptRegistry render 会
     忽略空 section）。tools_usage 在 render 时才遍历 ToolRegistry，新增 /
-    下架工具立即生效，无需重启 planner。send_message 工具的 sibling .md（含
-    小奏角色卡）也走 tools_usage 渲染。
+    下架工具立即生效，无需重启 planner。reply 的机械用法走 tools_usage；
+    小奏角色卡只由 Replyer 消费。
     """
     from qqbot.services.agent_loop import prompts as prompts_pkg
     from qqbot.services.agent_loop.prompts import load_sibling_md
@@ -142,7 +151,7 @@ class LLMPlanner:
         self._tool_registry = tool_registry
         # prompt_registry 优先：调用方明确传入就用它；否则按 tool_registry
         # 装配默认 registry（identity/xml_format/group_chat_rules/protocol/
-        # tools_usage 五段；角色卡在 send_message 的用法文档里）。
+        # tools_usage 五段；角色卡只属于 Replyer）。
         if prompt_registry is None:
             prompt_registry = build_default_prompt_registry(
                 tool_registry=tool_registry
@@ -159,9 +168,11 @@ class LLMPlanner:
             )
 
         try:
-            messages = _build_messages(
+            messages, snapshot = _build_messages(
                 context, self._tool_registry, self._prompt_registry
             )
+            if snapshot is not None:
+                snapshot.model = _llm_model_name(llm)
             _log_request(context, messages)
         except Exception as exc:
             logger.warning("[llm_planner] build messages failed: {}", exc)
@@ -177,63 +188,92 @@ class LLMPlanner:
         # 输出不是合法 JSON 时，把模型原始输出 + 解析错误追加回对话再问一次，
         # 让模型自己修——一次格式抖动不再没收整拍的响应权。传输层异常（网络/
         # 超时）不重试：可能很慢，维持原 llm_call_error 回退等下一次唤醒。
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
-            try:
-                raw = await llm.ainvoke(messages)
-                text = _extract_text(raw)
-                _log_response(context, text)
-            except Exception as exc:
-                logger.warning("[llm_planner] LLM call failed: {}", exc)
-                return DecisionOutput(
-                    actions=[
-                        IdleAction(
-                            reason=f"llm_call_error:{type(exc).__name__}"
+        #
+        # Prompt 快照（待办 #11）：每次往返记录 latency / usage / 响应原文，
+        # 任何 return 路径（含异常回退）都由 finally 统一落盘——观测层绝不
+        # 改变决策行为，写失败在 write_snapshot 内部吞掉。
+        try:
+            max_attempts = 3
+            for attempt in range(1, max_attempts + 1):
+                started = time.monotonic()
+                try:
+                    raw = await llm.ainvoke(messages)
+                    text = _extract_text(raw)
+                    _log_response(context, text)
+                except Exception as exc:
+                    logger.warning("[llm_planner] LLM call failed: {}", exc)
+                    if snapshot is not None:
+                        snapshot.add_attempt(
+                            latency_ms=_elapsed_ms(started),
+                            error=f"{type(exc).__name__}: {exc}"[:300],
                         )
-                    ],
-                    reasoning=str(exc)[:200],
-                )
-            try:
-                parsed = _parse_json(text)
-            except Exception as exc:
-                logger.warning(
-                    "[llm_planner] JSON parse failed (attempt {}/{}): {} raw={!r}",
-                    attempt,
-                    max_attempts,
-                    exc,
-                    text[:200],
-                )
-                if attempt >= max_attempts:
+                        snapshot.outcome = "call_error"
                     return DecisionOutput(
                         actions=[
                             IdleAction(
-                                reason=f"llm_json_error:{type(exc).__name__}"
+                                reason=f"llm_call_error:{type(exc).__name__}"
                             )
                         ],
-                        reasoning=(
-                            f"unparseable after {max_attempts} attempts: "
-                            f"{text[:120]}"
-                        ),
+                        reasoning=str(exc)[:200],
                     )
-                from langchain_core.messages import AIMessage, HumanMessage
-
-                messages = list(messages) + [
-                    AIMessage(content=text),
-                    HumanMessage(
-                        content=(
-                            "Your previous response could not be parsed as "
-                            f"the required JSON ({type(exc).__name__}: {exc}). "
-                            "Re-emit your COMPLETE decision as ONE valid JSON "
-                            "object only — no prose, no markdown fences."
+                if snapshot is not None:
+                    snapshot.add_attempt(
+                        latency_ms=_elapsed_ms(started),
+                        response_text=text,
+                        usage=extract_usage(raw),
+                    )
+                try:
+                    parsed = _parse_json(text)
+                except Exception as exc:
+                    logger.warning(
+                        "[llm_planner] JSON parse failed (attempt {}/{}): {} raw={!r}",
+                        attempt,
+                        max_attempts,
+                        exc,
+                        text[:200],
+                    )
+                    if snapshot is not None and snapshot.attempts:
+                        snapshot.attempts[-1].error = (
+                            f"json_error:{type(exc).__name__}"
                         )
-                    ),
-                ]
-                continue
-            return _parse_decision_output(parsed)
-        # for 循环内必 return；此处只为类型完备
-        return DecisionOutput(
-            actions=[IdleAction(reason="llm_json_error:exhausted")],
-        )
+                    if attempt >= max_attempts:
+                        if snapshot is not None:
+                            snapshot.outcome = "json_error_giveup"
+                        return DecisionOutput(
+                            actions=[
+                                IdleAction(
+                                    reason=f"llm_json_error:{type(exc).__name__}"
+                                )
+                            ],
+                            reasoning=(
+                                f"unparseable after {max_attempts} attempts: "
+                                f"{text[:120]}"
+                            ),
+                        )
+                    from langchain_core.messages import AIMessage, HumanMessage
+
+                    messages = list(messages) + [
+                        AIMessage(content=text),
+                        HumanMessage(
+                            content=(
+                                "Your previous response could not be parsed as "
+                                f"the required JSON ({type(exc).__name__}: {exc}). "
+                                "Re-emit your COMPLETE decision as ONE valid JSON "
+                                "object only — no prose, no markdown fences."
+                            )
+                        ),
+                    ]
+                    continue
+                if snapshot is not None:
+                    snapshot.outcome = "parsed"
+                return _parse_decision_output(parsed)
+            # for 循环内必 return；此处只为类型完备
+            return DecisionOutput(
+                actions=[IdleAction(reason="llm_json_error:exhausted")],
+            )
+        finally:
+            if snapshot is not None:
+                write_snapshot(snapshot)
 
     async def _ensure_llm(self) -> Any:
         if self._llm is not None:
@@ -248,16 +288,17 @@ def _build_messages(
     context: DecisionContext,
     tool_registry: ToolRegistry | None,
     prompt_registry: PromptRegistry,
-) -> list[Any]:
-    """构造 chat 输入。langchain_core.messages 在 langchain_openai 已是必依赖。
+) -> tuple[list[Any], PromptSnapshot | None]:
+    """构造 chat 输入 + 可选的 Prompt 快照（快照关闭 / scope 不在白名单时为
+    None）。langchain_core.messages 在 langchain_openai 已是必依赖。
 
     System prompt 完全由 PromptRegistry.render() 输出 —— 默认装配里包含
     identity / xml_format / group_chat_rules / protocol / tools_usage 五段，
     每段在自己的 .md 文件里独立维护。
 
     HumanMessage 的 text block 用 XML 信封而非 JSON 拼装：timeline 里每条
-    item 的 render 字段本身就是 `<message ...>` / `<tool-call ...>`（发言也是
-    send_message 工具的 tool-call）/ `<notice ...>` 等独立标签，所以外层再用 `<agent-input>` /
+    item 的 render 字段本身就是 `<message ...>` / `<tool-call ...>` /
+    `<my-reply ...>` / `<notice ...>` 等独立标签，所以外层再用 `<agent-input>` /
     `<timeline>` 标签嵌套时上下引用关系（reply、at、tool_call ↔ result）
     依然连贯，而不会被 JSON 字符串转义压平成扁平的字段表。
 
@@ -274,20 +315,39 @@ def _build_messages(
     # 到 system loop、system 专用工具的说明会泄漏到群 loop，徒增提示噪音与误判
     # （§2.2；catalog 与 usage 同一把 scope 尺子）。
     scope = context.scope_key.split(":", 1)[0]
-    system_content = prompt_registry.render(scope=scope)
+    # render_sections + SECTION_SEP join 与 render() 逐字节一致（registry 内
+    # render() 就是这么实现的）——多要一份分段统计给快照，不重复求值。
+    sections = prompt_registry.render_sections(scope=scope)
+    system_content = SECTION_SEP.join(sec.text for sec in sections)
     tool_catalog = (
         tool_registry.catalog(scope) if tool_registry is not None else []
     )
     xml_text = _render_input_xml(context, tool_catalog)
 
     text_block = {"type": "text", "text": xml_text}
-    image_blocks = _build_image_blocks(context)
+    image_blocks, image_meta = _build_image_blocks(context)
     human_content: list[dict] = [text_block, *image_blocks]
+
+    snapshot: PromptSnapshot | None = None
+    if should_snapshot(context.scope_key):
+        snapshot = PromptSnapshot(
+            kind="planner",
+            scope_key=context.scope_key,
+            tick_seq=context.tick_seq,
+            correlation_id=context.correlation_id,
+            system_prompt=system_content,
+            user_text=xml_text,
+            sections=section_stats(sections),
+            images=image_meta,
+            validation_retry=bool(
+                getattr(context, "validation_feedback", None)
+            ),
+        )
 
     return [
         SystemMessage(content=system_content),
         HumanMessage(content=human_content),
-    ]
+    ], snapshot
 
 
 def _render_input_xml(
@@ -319,6 +379,7 @@ def _render_input_xml(
             </progress-notes>
           </task>
         </active-tasks>
+        <pending-reply reply_task_id="..." revision="N" ...>{targets/gist}</pending-reply>  (有未发草稿才出)
         <current now="..." tick="N"/>
         <validation-error>attempt N rejected: ...</validation-error>       (仅校验重试)
       </agent-input>
@@ -329,7 +390,9 @@ def _render_input_xml(
     为主，窗口起点锚定见 projection）每拍全价重计费。现按变化频率排序：
     头属性只留 scope/bot_qq/bot_role（稳定/极少变）；active-tasks 任务活跃期
     逐拍变（pending_tool_call_ids 随工具收口增删），排到 timeline 之后；
-    每拍必变的 now/tick 沉为尾部 <current/>；validation-error 只在同 tick
+    pending-reply（2026-07-19）每次合稿必变、创建/flush 时整段出现消失，且
+    只存在于拍频最高的维持窗口内，排在 active-tasks 之后；每拍必变的
+    now/tick 沉为尾部 <current/>；validation-error 只在同 tick
     校验重试出现（契约 §7.1），放最尾——同拍重试可复用直到 <current/> 的
     前缀，且作为最后一行对模型最显著。timeline 仍然紧邻输出位置（其后只有
     寥寥数行），recency bias 不受影响。
@@ -421,6 +484,16 @@ def _render_input_xml(
         parts.append(_render_task_xml(task))
     parts.append("</active-tasks>")
 
+    # pending-reply 在 active-tasks 之后、<current/> 之前：它是全信封变化最
+    # 频繁的业务段（每次合稿 revision/flush_at 都变，创建/flush 时整段出现
+    # 消失），且只存在于维持窗口的数秒内——恰是拍频最高的时段。放 timeline
+    # 之前会逐拍掐断 timeline 的缓存前缀（前缀缓存契约：段序按变化频率
+    # 升序）；放这里前缀可稳定复用到 </active-tasks>，"待发承诺"也仍紧邻
+    # 决策位置。
+    pending_reply = getattr(context, "pending_reply", None)
+    if pending_reply is not None:
+        parts.append(_render_pending_reply_xml(pending_reply))
+
     # ─── 每拍必变的时钟字段，沉底（缓存契约见本函数 docstring）───
     # 时区契约：所有暴露给 LLM 的时间都是北京时间（与数据库写入侧 china_now()
     # 一致）。caller 传错时区时 astimezone() 兜底，naive datetime 假设它就是
@@ -484,9 +557,30 @@ def _render_task_xml(task: Any) -> str:
     )
 
 
-def _build_image_blocks(context: DecisionContext) -> list[dict]:
+def _render_pending_reply_xml(reply: Any) -> str:
+    body = _safe_json(
+        {
+            "targets": reply.targets,
+            "gist": reply.gist,
+            "mode": reply.mode,
+        }
+    )
+    return (
+        f'<pending-reply reply_task_id="{_esc_attr(reply.reply_task_id)}" '
+        f'revision="{reply.revision}" flush_at="{_esc_attr(reply.flush_at.isoformat())}" '
+        f'hard_deadline="{_esc_attr(reply.hard_deadline.isoformat())}" '
+        f'mode="{_esc_attr(reply.mode)}">{_esc_text(body)}</pending-reply>'
+    )
+
+
+def _build_image_blocks(
+    context: DecisionContext,
+) -> tuple[list[dict], list[dict]]:
     """汇总 timeline 中所有 ImageRef，按 hash 去重后读盘 + base64，
-    返回 OpenAI 兼容的 content blocks。
+    返回 (OpenAI 兼容的 content blocks, 快照用图片元信息)。
+
+    元信息只有 {hash, mime, bytes}（编码前字节数）——Prompt 快照的脱敏契约
+    要求像素数据永不落盘，快照层拿到的从源头就不含 base64。
 
     每张图前面**挂一个文本 label `↓ image hash=<sha256>`**，让 LLM 能把
     XML timeline 里出现的 `<image hash="XXX"/>` 占位符和实际图像 bytes
@@ -510,6 +604,7 @@ def _build_image_blocks(context: DecisionContext) -> list[dict]:
             ordered.append(ref)
 
     blocks: list[dict] = []
+    meta: list[dict] = []
     for ref in ordered:
         try:
             data = Path(ref.local_path).read_bytes()
@@ -541,7 +636,24 @@ def _build_image_blocks(context: DecisionContext) -> list[dict]:
                 "image_url": {"url": f"data:{mime};base64,{b64}"},
             }
         )
-    return blocks
+        meta.append(
+            {"hash": ref.file_hash, "mime": mime, "bytes": len(data)}
+        )
+    return blocks, meta
+
+
+def _elapsed_ms(started_monotonic: float) -> int:
+    return int((time.monotonic() - started_monotonic) * 1000)
+
+
+def _llm_model_name(llm: Any) -> str | None:
+    """best-effort 取模型名（ChatOpenAI 是 model_name；stub / 其它实现取不到
+    就 None——快照记 null，不猜）。"""
+    for attr in ("model_name", "model"):
+        value = getattr(llm, attr, None)
+        if isinstance(value, str) and value:
+            return value
+    return None
 
 
 def _log_request(context: DecisionContext, messages: list[Any]) -> None:
@@ -690,7 +802,7 @@ def _parse_action(raw: Any) -> Action | None:
                 triggered_by_event_id=raw.get("triggered_by_event_id") or None,
             )
         # NOTE: t == "reply" 已弃用——发言现在是工具，走
-        # {"type":"call_tool","tool_name":"send_message","arguments":{...}}。
+        # {"type":"call_tool","tool_name":"reply","arguments":{...}}。
         if t == "complete_task":
             return CompleteTaskAction(
                 task_id=str(raw.get("task_id", "")),

@@ -336,7 +336,11 @@ class SendMessageToolValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.error_kind, "invalid_arguments")
         self.assertEqual(outcome.extra["reason_code"], "duplicate_reply_segment")
 
-    async def test_missing_scope_key_invalid_arguments(self) -> None:
+    async def test_missing_scope_key_unavailable_in_scope(self) -> None:
+        """send_message 有 allowed_scopes=("group","private")：scope_key 缺失时
+        enforce_access 的 scope 闸门（execute 第一行）先于 execute 内的
+        invalid_arguments 防御检查命中——当前 scope 解析为 None、不在白名单，
+        折 tool_unavailable_in_scope（契约 §7.2 错误表，确定性失败）。"""
         bot_registry.register(_StubBot())
         outcome = await SendMessageTool().run(
             {
@@ -344,7 +348,7 @@ class SendMessageToolValidationTests(unittest.IsolatedAsyncioTestCase):
                 "target": {"kind": "group", "group_id": 100},
             },
         )
-        self.assertEqual(outcome.error_kind, "invalid_arguments")
+        self.assertEqual(outcome.error_kind, "tool_unavailable_in_scope")
 
     async def test_no_bot_available(self) -> None:
         bot_registry.clear()
