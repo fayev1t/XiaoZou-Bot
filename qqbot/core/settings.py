@@ -94,3 +94,17 @@ def get_env_value(key: str) -> str | None:
         return None
 
     return raw_value.strip().strip('"').strip("'")
+
+
+def get_model_providers_path() -> Path:
+    """LLM 路由配置文件路径（多服务商注册表 + 按模型名路由）。
+
+    env ``MODEL_PROVIDERS_PATH`` 可覆写；默认 ``<项目根>/config/model_providers.json``。
+    真实文件含各服务商 api_key，已被 .gitignore 排除；模板见
+    ``config/model_providers.example.json``，格式契约见
+    `开发文档/v2.0/20-横切契约/LLM路由契约.md`。
+    """
+    raw = get_env_value("MODEL_PROVIDERS_PATH")
+    if raw:
+        return Path(raw).expanduser()
+    return _REPO_ROOT / "config" / "model_providers.json"

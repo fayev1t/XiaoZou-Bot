@@ -280,7 +280,7 @@ class LLMPlanner:
             return self._llm
         async with self._init_lock:
             if self._llm is None:
-                self._llm = await create_llm()
+                self._llm = await create_llm(role="planner")
             return self._llm
 
 

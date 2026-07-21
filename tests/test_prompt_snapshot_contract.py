@@ -197,6 +197,51 @@ class RedactionTests(_SnapshotEnvTestCase):
             else:
                 os.environ["LLM_API_KEY"] = saved
 
+    def test_model_providers_file_every_api_key_scrubbed(self) -> None:
+        """config/model_providers.json（多服务商注册表）里的每把 api_key 都必须被抹掉。"""
+        config = {
+            "providers": [
+                {
+                    "name": "deepseek",
+                    "base_url": "https://api.deepseek.com/v1",
+                    "api_key": "sk-provider-one-secret-111",
+                    "models": ["deepseek-chat"],
+                },
+                {
+                    "name": "relay",
+                    "base_url": "https://relay.example.com/v1",
+                    "api_key": "sk-provider-two-secret-222",
+                    "models": ["gpt-4o"],
+                },
+            ]
+        }
+        # 放独立子目录：快照目录的 *.json 计数不能被配置文件污染
+        config_dir = Path(self._tmp.name) / "cfg"
+        config_dir.mkdir()
+        config_path = config_dir / "model_providers.json"
+        config_path.write_text(
+            json.dumps(config, ensure_ascii=False), encoding="utf-8"
+        )
+        saved = os.environ.get("MODEL_PROVIDERS_PATH")
+        os.environ["MODEL_PROVIDERS_PATH"] = str(config_path)
+        try:
+            write_snapshot(
+                _snapshot(
+                    system_prompt="leak sk-provider-one-secret-111",
+                    user_text="leak sk-provider-two-secret-222",
+                )
+            )
+            raw = self.files()[0].read_text(encoding="utf-8")
+            self.assertNotIn("sk-provider-one-secret-111", raw)
+            self.assertNotIn("sk-provider-two-secret-222", raw)
+            self.assertIn("[REDACTED:MODEL_PROVIDERS:deepseek]", raw)
+            self.assertIn("[REDACTED:MODEL_PROVIDERS:relay]", raw)
+        finally:
+            if saved is None:
+                os.environ.pop("MODEL_PROVIDERS_PATH", None)
+            else:
+                os.environ["MODEL_PROVIDERS_PATH"] = saved
+
 
 class RetentionTests(_SnapshotEnvTestCase):
     def test_oldest_files_deleted_beyond_keep(self) -> None:
@@ -387,7 +432,9 @@ class MemeCaptionSnapshotIntegrationTests(_SnapshotEnvTestCase):
 
         llm = _StubLLM(response_content="一张测试用表情包描述")
 
-        async def fake_create_llm(temperature: float | None = None) -> Any:
+        async def fake_create_llm(
+            temperature: float | None = None, **_kwargs: Any
+        ) -> Any:
             return llm
 
         with mock.patch(
@@ -421,7 +468,9 @@ class MemeCaptionSnapshotIntegrationTests(_SnapshotEnvTestCase):
 
         llm = _StubLLM(raise_exc=RuntimeError("gateway down"))
 
-        async def fake_create_llm(temperature: float | None = None) -> Any:
+        async def fake_create_llm(
+            temperature: float | None = None, **_kwargs: Any
+        ) -> Any:
             return llm
 
         with mock.patch(

@@ -38,7 +38,9 @@ class Replyer:
         context: DecisionContext,
         memes: list[MemeView],
     ) -> dict:
-        llm = self._llm or await create_llm(temperature=REPLYER_TEMPERATURE)
+        llm = self._llm or await create_llm(
+            temperature=REPLYER_TEMPERATURE, role="replyer"
+        )
         if llm is None:
             raise ReplyerError("replyer LLM is not configured")
         system_prompt = _build_system_prompt()

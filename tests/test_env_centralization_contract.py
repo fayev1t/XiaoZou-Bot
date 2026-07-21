@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 
@@ -56,6 +57,9 @@ class EnvCentralizationContractTests(unittest.TestCase):
             "PROMPT_SNAPSHOT_DIR=./runtime_data/prompt_snapshots",
             "PROMPT_SNAPSHOT_KEEP=200",
             "PROMPT_SNAPSHOT_SCOPES=group,system",
+            # 多服务商 LLM 路由：注册表在 config/model_providers.json（可选特性，默认单
+            # 服务商扁平形态），模板只保留路径覆写键的注释示例
+            "# MODEL_PROVIDERS_PATH=",
         ):
             with self.subTest(key=key):
                 self.assertIn(key, env_example)
@@ -64,6 +68,19 @@ class EnvCentralizationContractTests(unittest.TestCase):
         # 化），env 模板不应再出现两者的配置（防回潮，同 sqlite 断言风格）。
         self.assertNotIn("SEARXNG", env_example)
         self.assertNotIn("CRAWL4AI", env_example)
+
+    def test_model_providers_template_exists_and_real_file_gitignored(self) -> None:
+        """多服务商 LLM 注册表走 config/model_providers.json：模板必须存在且是合法
+        JSON（providers/roles/settings 三段），真实文件含 api_key 必须被
+        .gitignore 排除。"""
+        template = ROOT / "config" / "model_providers.example.json"
+        self.assertTrue(template.exists())
+        data = json.loads(template.read_text(encoding="utf-8"))
+        for section in ("providers", "roles", "settings"):
+            with self.subTest(section=section):
+                self.assertIn(section, data)
+
+        self.assertIn("config/model_providers.json", self.read_text(".gitignore"))
 
     def test_napcat_compose_keeps_current_hardcoded_ports_and_permissions(self) -> None:
         compose_text = self.read_text("docker/napcat/compose.yml")

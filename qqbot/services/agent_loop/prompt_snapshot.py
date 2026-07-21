@@ -12,7 +12,9 @@ token、模型回了什么"。快照是**纯观测产物**：
   1. **图片 base64 永不落盘**——调用方只传 (hash, mime, bytes 数) 元信息；
      文本字段再兜底扫一遍 data URL 正则替换（防未来某处把 base64 拼进文本）。
   2. **密钥永不落盘**——LLM_API_KEY / TAVILY_API_KEY / ONEBOT_ACCESS_TOKEN /
-     DATABASE_URL 的实际值若出现在任何存储文本中，替换为 [REDACTED:<KEY>]。
+     DATABASE_URL 的实际值若出现在任何存储文本中，替换为 [REDACTED:<KEY>]；
+     config/model_providers.json（多服务商注册表）里的**每一把** api_key 同样替换，
+     标注为 [REDACTED:MODEL_PROVIDERS:<服务商名>]。
   3. **scope 白名单**——默认只落 group / system 两类 scope 的快照；私聊
      scope（将来若实例化 private loop）默认不落盘，显式配置才开。
 
@@ -35,8 +37,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from qqbot.core.llm_routing import collect_api_keys
 from qqbot.core.logging import get_logger
-from qqbot.core.settings import get_env_value
+from qqbot.core.settings import get_env_value, get_model_providers_path
 from qqbot.core.time import china_now
 
 logger = get_logger(__name__)
@@ -295,7 +298,7 @@ def _to_payload(snapshot: PromptSnapshot) -> dict[str, Any]:
 
 
 def _scrub_text(text: str) -> str:
-    """脱敏：内联 base64 data URL + 已配置密钥值。"""
+    """脱敏：内联 base64 data URL + 已配置密钥值（含多服务商每把 key）。"""
     scrubbed = _DATA_URL_RE.sub("data:<base64-redacted>", text)
     for key in _SECRET_ENV_KEYS:
         try:
@@ -304,6 +307,23 @@ def _scrub_text(text: str) -> str:
             continue
         if value and len(value) >= _MIN_SECRET_LEN and value in scrubbed:
             scrubbed = scrubbed.replace(value, f"[REDACTED:{key}]")
+    # config/model_providers.json（多服务商注册表）里的 api_key 逐把替换；读文件与
+    # collect_api_keys 均永不 raise，配置烂掉也不能反噬脱敏环节。
+    try:
+        config_path = get_model_providers_path()
+        raw_config = (
+            config_path.read_text(encoding="utf-8")
+            if config_path.exists()
+            else None
+        )
+    except Exception:
+        raw_config = None
+    if raw_config:
+        for provider_name, secret in collect_api_keys(raw_config):
+            if len(secret) >= _MIN_SECRET_LEN and secret in scrubbed:
+                scrubbed = scrubbed.replace(
+                    secret, f"[REDACTED:MODEL_PROVIDERS:{provider_name}]"
+                )
     return scrubbed
 
 

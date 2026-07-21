@@ -3,6 +3,9 @@
 .env.*
 !.env.example
 
+# LLM 路由配置（含各服务商 api_key，模板见 config/model_providers.example.json）
+config/model_providers.json
+
 # Virtual environments
 .venv/
 venv/

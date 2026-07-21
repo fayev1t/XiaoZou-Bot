@@ -238,9 +238,13 @@ async def _amain(args: argparse.Namespace) -> int:
     from qqbot.core.llm import create_llm
     from qqbot.core.time import china_now
 
-    llm = await create_llm()
+    # 回放的是 planner 用例，走与 planner 相同的路由，保证模型行为可比。
+    llm = await create_llm(role="planner")
     if llm is None:
-        print("LLM 未配置（LLM_API_KEY / LLM_MODEL）", file=sys.stderr)  # noqa: T201
+        print(  # noqa: T201
+            "LLM 未配置（LLM_API_KEY / LLM_MODEL 或 config/model_providers.json）",
+            file=sys.stderr,
+        )
         return 1
 
     out_dir = Path(args.out_dir) / china_now().strftime("%Y%m%dT%H%M%S")
