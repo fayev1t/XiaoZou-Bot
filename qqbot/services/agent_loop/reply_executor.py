@@ -261,8 +261,12 @@ class ReplyExecutor:
                 exc,
             )
             return
-        if status != "sent":
-            await self._wake_for_attention(task.scope_key)
+        # 2026-07-22 起无论 status 都唤醒（含 sent）：flush 才是新架构里"话已
+        # 说完"的时刻，这次唤醒对应 send_message 时代批次收口唤醒的锚点搬迁。
+        # final 先落库、唤醒在后，醒来的拍必能看到 <my-reply>；要不要续说由
+        # 模型按 prompt 判断（多段任务续发下一段，无事则 idle）——程序不替
+        # 模型决定何时思考（模型+prompt 优先，同 loop.py 批次门闩拆除注记）。
+        await self._wake_for_attention(task.scope_key)
 
     async def _wake_for_attention(self, scope_key: str) -> None:
         """最终事件已经写定后 best-effort 唤醒；失败不得制造第二条 final。"""

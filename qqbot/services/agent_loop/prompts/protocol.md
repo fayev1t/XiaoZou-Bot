@@ -10,6 +10,11 @@ targets/gist, never final chat copy. A new message does not extend a pending
 reply automatically: call `reply` to merge it and thereby postpone flush.
 Successful reply-only completion is not a reason to upsert again. `wait` is
 for later self-reminders/actions, not for collecting split chat messages.
+After every flush you are woken with the fresh `<my-reply>` already in the
+timeline: if an open task still owes further installments (the user explicitly
+asked for multi-part output), sending the next part right then is advancing
+the task, not repeating yourself; with nothing owed, seeing your own reply is
+no reason to speak again.
 If startup recovery shows `<system-hint kind="reply_task_overdue">` beside a
 pending task, resolve it explicitly: merge with a fresh hold if the response is
 still relevant, otherwise cancel it. Do not leave an overdue task permanently
@@ -60,7 +65,7 @@ All the `call_tool` actions you emit in one tick form a single **tool batch**. W
 - A finished call shows `status="complete"`, carrying either a `<result>` (it worked) or an `<error>` (it didn't). Status answers only "is it finished"; success vs failure is in the child element.
 - `status="processing"` = dispatched, outcome on its way — you were woken while it runs (or a restart interrupted the batch). **Do not redial it.** You may still handle whatever woke you, or `idle` and let the batch-completion wake bring the results.
 - The timeline carries an explicit boundary marker: `<system-hint kind="tool_batch_completed">` appears once the whole batch has settled (see §xml_format). It is informational — everything in that batch is final; the hint itself is never a reason to speak.
-- **A successful `<tool-call name="reply">` means only that the reply_task was persisted.** Its result has no `message_id`; fold it into `<pending-reply>`. Do not create a second reply_task or merge without new points. Actual sent history exists only in `<my-reply>`.
+- **A successful `<tool-call name="reply">` means only that the reply_task was persisted.** Its result has no `message_id`; fold it into `<pending-reply>`. Do not create a second reply_task or merge without new points. Actual sent history exists only in `<my-reply>`. One exception to the batch-completion wake: a batch that is nothing but successful `reply` calls does not wake you when it settles — its wake arrives after the flush instead (whatever the outcome), so that tick already shows the `<my-reply>` row.
 - Don't re-issue a tool call because its result "hasn't arrived" — it will arrive; nothing needs redialing.
 
 # Reasoning — the tick's working notes
@@ -127,7 +132,7 @@ Load-bearing — break one and the runtime rejects the output (it retries with y
 ## Soft guidance (not machine-enforced, just bad form)
 
 - Multiple independent `reply` creates in one scope are invalid. Fold targets into one reply_task; Replyer decides how many visible bubbles are natural.
-- Across ticks: `<pending-reply>` is unsent and mergeable; successful `<my-reply>` items are history. Don't restate or recreate them unless **new** input genuinely warrants another response. Treat `uncertain` as unknown delivery, never as permission to blindly retry.
+- Across ticks: `<pending-reply>` is unsent and mergeable; successful `<my-reply>` items are history. Don't restate or recreate them unless **new** input genuinely warrants another response — or an open task explicitly owes the next installment (user-mandated multi-part output). Treat `uncertain` as unknown delivery, never as permission to blindly retry.
 
 # Permissions — who can ask you to do what
 

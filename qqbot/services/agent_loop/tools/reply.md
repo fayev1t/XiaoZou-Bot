@@ -15,6 +15,13 @@ The Replyer later decides wording, number/order of messages, quote/@ segments,
 and whether/which saved meme to use. `mode="verbatim"` carries exact validated
 OneBot `content` messages and bypasses the Replyer; it cannot be merged.
 
+One flush emits at most 4 bubbles (at most one of them a meme). Output the
+user explicitly wants in more parts than one flush can carry is a cross-tick
+task: keep that task open, authorize only the current installment in this
+reply_task, and on the wake that follows each flush (the `<my-reply>` row is
+already in the timeline) upsert the next installment — without waiting to be
+prompted — until the task completes.
+
 Never treat `<tool-call name="reply"><result>...</result>` as speech. When an
 open task needs no change, do not upsert it again merely because another tick
 started.

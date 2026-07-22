@@ -73,7 +73,7 @@ class ReplyExecutorContractTests(unittest.TestCase):
             replyer=replyer,  # type: ignore[arg-type]
         )
 
-    def test_compose_task_calls_replyer_once_and_success_does_not_wake(self) -> None:
+    def test_compose_task_calls_replyer_once_and_success_wakes_once(self) -> None:
         replyer = _Replyer()
         wake = AsyncMock()
         executor = self._executor(replyer, wake)
@@ -100,7 +100,8 @@ class ReplyExecutorContractTests(unittest.TestCase):
         kwargs = executor._write_flushed.await_args.kwargs  # type: ignore[attr-defined]
         self.assertEqual(kwargs["status"], "sent")
         self.assertEqual(kwargs["sent_messages"], [receipt])
-        wake.assert_not_awaited()
+        # 2026-07-22 起 flush 成功同样唤醒一次（final 先落库、唤醒在后）。
+        wake.assert_awaited_once_with("group:100")
 
     def test_verbatim_bypasses_replyer(self) -> None:
         replyer = _Replyer()
