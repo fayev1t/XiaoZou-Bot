@@ -292,6 +292,74 @@ class ReplyerOutputTests(unittest.TestCase):
             ["chat", "meme", "chat"],
         )
 
+    def test_normalizes_flat_segments_and_code_fence(self) -> None:
+        """Gemini 系模型的真实漂移形态（2026-07-22 线上快照）：输出包 ```json
+        围栏 + 段字段拍平到顶层。解析层无损归一成 OneBot data 包装，执行器
+        preflight 的严格校验保持不变。"""
+        raw = (
+            "```json\n"
+            '{"messages":[{"kind":"chat","content":['
+            '{"type":"reply","id":"1115629605"},'
+            '{"type":"text","text":"在呢，有事就直接说"}]}],"empty_reason":null}\n'
+            "```"
+        )
+        parsed = _parse_output(raw, set())
+        self.assertEqual(
+            parsed["messages"][0]["content"],
+            [
+                {"type": "reply", "data": {"id": "1115629605"}},
+                {"type": "text", "data": {"text": "在呢，有事就直接说"}},
+            ],
+        )
+
+    def test_normalizes_reply_message_id_alias(self) -> None:
+        value = {
+            "messages": [
+                {
+                    "kind": "chat",
+                    "content": [
+                        {"type": "reply", "data": {"message_id": "840063058"}},
+                        {"type": "at", "qq": "10001"},
+                    ],
+                }
+            ],
+            "empty_reason": None,
+        }
+        parsed = _parse_output(json.dumps(value, ensure_ascii=False), set())
+        self.assertEqual(
+            parsed["messages"][0]["content"],
+            [
+                {"type": "reply", "data": {"id": "840063058"}},
+                {"type": "at", "data": {"qq": "10001"}},
+            ],
+        )
+
+    def test_fence_without_closing_line_still_parses(self) -> None:
+        raw = (
+            "```json\n"
+            '{"messages":[{"kind":"chat","content":'
+            '[{"type":"text","data":{"text":"好"}}]}],"empty_reason":null}'
+        )
+        parsed = _parse_output(raw, set())
+        self.assertEqual(
+            parsed["messages"][0]["content"],
+            [{"type": "text", "data": {"text": "好"}}],
+        )
+
+    def test_unrecognized_segment_shapes_pass_through_untouched(self) -> None:
+        """归一只处理已知漂移；其余坏形态原样透传，由执行器严格校验
+        fail loudly，不在解析层静默吞掉。"""
+        content = [
+            {"type": "image", "data": {"file": "x"}},
+            {"type": "text", "data": "hello"},
+        ]
+        value = {
+            "messages": [{"kind": "chat", "content": content}],
+            "empty_reason": None,
+        }
+        parsed = _parse_output(json.dumps(value), set())
+        self.assertEqual(parsed["messages"][0]["content"], content)
+
     def test_rejects_unknown_or_second_meme(self) -> None:
         unknown = {
             "messages": [{"kind": "meme", "image_hash": "cd" * 32}],

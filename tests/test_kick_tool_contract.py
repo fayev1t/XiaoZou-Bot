@@ -275,6 +275,9 @@ class KickToolTests(unittest.IsolatedAsyncioTestCase):
 
     def test_usage_md_loaded(self) -> None:
         self.assertIn("set_group_kick", KickTool.usage_prompt)
+        # 2026-07-22 实测回填：踢后 group_decrease 通知 = 权威完成确认，
+        # usage 必须教模型认这行（operator_qq=自己 → 不当新事件反应）。
+        self.assertIn("group_decrease", KickTool.usage_prompt)
 
 
 if __name__ == "__main__":

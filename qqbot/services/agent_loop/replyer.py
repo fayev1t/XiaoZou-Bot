@@ -127,10 +127,16 @@ def _build_system_prompt() -> str:
         "bubbles, wording, quote/@/face segments, and whether to use at most one "
         "saved meme. Never invent facts or answer a new topic outside targets/gist. "
         "A meme hash must be copied from SAVED_MEMES. Chat content allows only "
-        "text/at/reply/face; reply is optional, at most one, and first. Meme is a "
-        "standalone bubble. Schema: {\"messages\":[{\"kind\":\"chat\",\"content\":"
-        "[...]},{\"kind\":\"meme\",\"image_hash\":\"...\"}],"
-        "\"empty_reason\":null}. No markdown.\n\nVOICE:\n" + voice
+        "text/at/reply/face segments in OneBot v11 shape — every field sits "
+        "inside \"data\": {\"type\":\"text\",\"data\":{\"text\":\"...\"}} / "
+        "{\"type\":\"at\",\"data\":{\"qq\":\"10001\"}} / "
+        "{\"type\":\"reply\",\"data\":{\"id\":\"<message_id>\"}} / "
+        "{\"type\":\"face\",\"data\":{\"id\":\"178\"}}; never flatten fields to "
+        "the segment top level. reply is optional, at most one, and first. Meme "
+        "is a standalone bubble. Schema: {\"messages\":[{\"kind\":\"chat\","
+        "\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"...\"}}]},"
+        "{\"kind\":\"meme\",\"image_hash\":\"...\"}],\"empty_reason\":null}. "
+        "Output raw JSON only — no markdown, no code fences.\n\nVOICE:\n" + voice
     )
 
 
@@ -154,11 +160,56 @@ def _build_user_text(
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _parse_output(text: str, allowed_memes: set[str]) -> dict:
+# LLM 输出边界的段格式归一表：新模型（尤其 Gemini 系，2026-07-22 快照实证）常把
+# OneBot 段拍平成 {"type":"text","text":...} / {"type":"reply","id":...}，或把
+# reply 的 id 写成 message_id。只做这两类无损归一，其余形态原样透传，交执行器
+# preflight 的严格契约校验兜底（fail loudly 语义不变）。
+_FLAT_SEGMENT_KEYS: dict[str, tuple[str, ...]] = {
+    "text": ("text",),
+    "at": ("qq",),
+    "reply": ("id", "message_id"),
+    "face": ("id",),
+}
+
+
+def _normalize_segment(segment: Any) -> Any:
+    if not isinstance(segment, dict):
+        return segment
+    seg_type = segment.get("type")
+    if not isinstance(seg_type, str):
+        return segment
+    flat_keys = _FLAT_SEGMENT_KEYS.get(seg_type)
+    if flat_keys is None:
+        return segment
+    data = segment.get("data")
+    if isinstance(data, dict):
+        data = dict(data)
+    else:
+        data = {key: segment[key] for key in flat_keys if key in segment}
+        if not data:
+            return segment
+    if seg_type == "reply" and "id" not in data and "message_id" in data:
+        data["id"] = data.pop("message_id")
+    return {"type": seg_type, "data": data}
+
+
+def _strip_code_fence(text: str) -> str:
+    """容忍 markdown 围栏（LLM 偶尔无视 "no fences" 指令）。收尾围栏可能缺失
+    或后面跟解说文字：从末尾向前找独立的 ``` 行截断，找不到则保留全文，
+    绝不把正文末行当围栏裁掉。"""
     cleaned = text.strip()
-    if cleaned.startswith("```"):
-        lines = cleaned.splitlines()
-        cleaned = "\n".join(lines[1:-1])
+    if not cleaned.startswith("```"):
+        return cleaned
+    lines = cleaned.splitlines()[1:]
+    for index in range(len(lines) - 1, -1, -1):
+        if lines[index].strip() == "```":
+            lines = lines[:index]
+            break
+    return "\n".join(lines).strip()
+
+
+def _parse_output(text: str, allowed_memes: set[str]) -> dict:
+    cleaned = _strip_code_fence(text)
     value = json.loads(cleaned)
     if not isinstance(value, dict):
         raise ValueError("root must be an object")
@@ -175,7 +226,12 @@ def _parse_output(text: str, allowed_memes: set[str]) -> dict:
             content = message.get("content")
             if not isinstance(content, list):
                 raise ValueError(f"messages[{index}].content must be an array")
-            normalized.append({"kind": "chat", "content": content})
+            normalized.append(
+                {
+                    "kind": "chat",
+                    "content": [_normalize_segment(seg) for seg in content],
+                }
+            )
         elif kind == "meme":
             image_hash = message.get("image_hash")
             if image_hash not in allowed_memes:

@@ -34,3 +34,5 @@ The target must be someone else: the bot cannot kick itself — that call is rej
 ## Result
 
 On success: `{"group_id": <int>, "user_id": <int>, "reject_add_request": <bool>, "applied": true}` — `reject_add_request` echoes what was applied, so you can confirm whether future join requests were also blocked. On a permission failure (caller not allowed, bot not admin, or the target's role is equal-or-higher) or a napcat error you get a `tool_failed` with a structured reason — read it, explain or abort, do **not** blindly retry the same call.
+
+Shortly after a successful kick (about a second), the timeline also gains `<notice kind="group_decrease" sub_type="kick" user_qq="TARGET_QQ" operator_qq="BOT_QQ"/>` — the definitive "they are gone" fact. When `operator_qq` equals your own `bot_qq` (envelope header), that notice is your *own* kick echoing back, not a new incident — don't react to it as news. The general guidance to stay quiet when members leave targets organic departures; confirming completion to the admin who ordered the kick is a normal reply, not "commenting on someone leaving".

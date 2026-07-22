@@ -17,6 +17,12 @@ upstream_action_failed 返回。全程无 raise。
   未定义（部分实现等价退群），"让 bot 退群"是另一个高危操作，不该由踢人误触发。
 
 OneBot action：set_group_kick(group_id, user_id, reject_add_request)。
+实测（2026-07-22，NapCat 4.18.8，api_lab）：成功返回 data=null——忽略返回值即
+正确；~1s 后 napcat 推 notice.group_decrease（sub_type="kick"、operator_id=bot
+自身、user_id=被踢者），经 GroupDecreaseMapper 入库、投影渲染 <notice> 行，
+下一拍模型可见"人已移除"的权威确认。get_group_member_info(no_cache) 返回含
+role 的 dict（fetch_member_role 前提成立）。暂未实测：失败形态 retcode/wording
+目录、reject_add_request 实效、kick_me（api_lab 可随时补测）。
 """
 
 from __future__ import annotations
