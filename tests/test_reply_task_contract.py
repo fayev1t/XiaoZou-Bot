@@ -6,13 +6,17 @@ Replyer 一次输出可含多条文本和至多一张已收藏 meme。
 
 from __future__ import annotations
 
+import asyncio
 import json
+import sys
+import types
 import unittest
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
+from qqbot.services.agent_loop.decision import DecisionContext
 from qqbot.services.agent_loop.reply_task import (
     ReplyTaskState,
     _fold_rows,
@@ -20,6 +24,7 @@ from qqbot.services.agent_loop.reply_task import (
     merge_targets,
 )
 from qqbot.services.agent_loop.replyer import (
+    Replyer,
     _build_system_prompt,
     _parse_output,
 )
@@ -414,6 +419,132 @@ class ReplyerOutputTests(unittest.TestCase):
                 _build_system_prompt()
         finally:
             replyer_mod._VOICE_PATH = original
+
+
+class _CapturingLLM:
+    """记录 ainvoke 收到的 messages，返回最小合法组稿 JSON。"""
+
+    def __init__(self) -> None:
+        self.messages: list | None = None
+
+    async def ainvoke(self, messages: list) -> SimpleNamespace:
+        self.messages = messages
+        return SimpleNamespace(
+            content=json.dumps(
+                {
+                    "messages": [
+                        {
+                            "kind": "chat",
+                            "content": [
+                                {"type": "text", "data": {"text": "好"}}
+                            ],
+                        }
+                    ],
+                    "empty_reason": None,
+                }
+            )
+        )
+
+
+class ReplyerMultimodalTests(unittest.TestCase):
+    """compose 的多模态 content 合同（2026-07-22 Replyer 与 Planner 同等看图）：
+    有图 → content 为 [文本块, *图块] 且文本块即原 JSON payload；无图 →
+    content 保持纯字符串（旧行为）。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # 本地无 langchain 时桩替 message 类；服务器上真模块存在则原样使用。
+        try:
+            import langchain_core.messages  # noqa: F401
+        except Exception:
+            messages_mod = types.ModuleType("langchain_core.messages")
+
+            class _Message:
+                def __init__(self, content: object) -> None:
+                    self.content = content
+
+            messages_mod.SystemMessage = _Message  # type: ignore[attr-defined]
+            messages_mod.HumanMessage = _Message  # type: ignore[attr-defined]
+            root = sys.modules.setdefault(
+                "langchain_core", types.ModuleType("langchain_core")
+            )
+            root.messages = messages_mod  # type: ignore[attr-defined]
+            sys.modules["langchain_core.messages"] = messages_mod
+
+    @staticmethod
+    def _compose_task() -> ReplyTaskState:
+        return ReplyTaskState(
+            reply_task_id="R1",
+            scope_key="group:100",
+            revision=1,
+            state="claimed",
+            created_at=NOW,
+            updated_at=NOW,
+            flush_at=NOW,
+            hard_deadline=NOW + timedelta(seconds=90),
+            mode="compose",
+            targets=[{"message_id": "M1", "points": ["回答"]}],
+            gist={"intent": "解释"},
+            verbatim_messages=[],
+            latest_event_id="E1",
+            source_tool_call_event_id="TC1",
+            correlation_id="CID",
+        )
+
+    def _run_compose(
+        self, blocks: list[dict], meta: list[dict]
+    ) -> _CapturingLLM:
+        llm = _CapturingLLM()
+        context = DecisionContext(
+            scope_key="group:100",
+            correlation_id="CID",
+            tick_seq=0,
+            now=NOW,
+        )
+        with (
+            patch(
+                "qqbot.services.agent_loop.replyer.should_snapshot",
+                return_value=False,
+            ),
+            patch(
+                "qqbot.services.agent_loop.replyer._timeline_image_blocks",
+                return_value=(blocks, meta),
+            ),
+        ):
+            result = asyncio.run(
+                Replyer(llm_client=llm).compose(
+                    self._compose_task(), context, []
+                )
+            )
+        self.assertEqual(result["messages"][0]["kind"], "chat")
+        return llm
+
+    def test_compose_attaches_timeline_image_blocks(self) -> None:
+        blocks = [
+            {"type": "text", "text": f"↓ image hash={HASH_A}"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,QUJD"},
+            },
+        ]
+        llm = self._run_compose(
+            blocks, [{"hash": HASH_A, "mime": "image/png", "bytes": 3}]
+        )
+        assert llm.messages is not None
+        content = llm.messages[1].content
+        self.assertIsInstance(content, list)
+        self.assertEqual(content[0]["type"], "text")
+        payload = json.loads(content[0]["text"])
+        self.assertEqual(payload["reply_task"]["reply_task_id"], "R1")
+        self.assertEqual(content[1:], blocks)
+
+    def test_compose_without_images_keeps_plain_text_content(self) -> None:
+        llm = self._run_compose([], [])
+        assert llm.messages is not None
+        content = llm.messages[1].content
+        self.assertIsInstance(content, str)
+        payload = json.loads(content)
+        self.assertEqual(payload["reply_task"]["reply_task_id"], "R1")
 
 
 if __name__ == "__main__":

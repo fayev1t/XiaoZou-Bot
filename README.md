@@ -22,12 +22,12 @@
 <table border="0">
   <tr>
     <td style="border: none; vertical-align: middle;">
-      <b>XiaoZou-Bot</b> 是一个基于事件循环与决策机制（Tick-based Loop）的 QQ 群聊 AI Agent。<br><br>
-      相较于其他 qqbot，基于 <b>Agent Loop</b> 架构构建的小奏天生具备如下特性：<br>
-      • <b>跨 Tick 任务管理</b>：内置任务状态机，天然支持持久化任务。<br>
-      • <b>真正的自主行为决策</b>：何时开口、何时沉默、要不要动用工具，都由模型自行判断，而非规则触发；@、引用、表情包、群管这些 QQ 原生能力都在她的工具箱里。<br>
-      • <b>原生多模态</b>：图片和文字一样直接进入模型视野，不丢失其他细节。<br><br>
-      同时，小奏也基于 <a href="https://github.com/NapNeko/NapCatQQ">NapCatQQ</a> 和 <a href="https://nonebot.dev/">NoneBot2</a> 两个项目构建，由衷感谢 ❤️
+      <b>XiaoZou-Bot</b> 是一个基于事件循环与自主决策机制（Tick-based Agent Loop）的 QQ 群聊 AI Agent。<br><br>
+      不同于传统被动触发或单轮问答的聊天机器人，小奏采用 <b>Agent Harness</b> 架构，将群聊视为连续演进的认知场域：<br>
+      • <b>跨 Tick 持续任务图谱</b>：内置任务状态机，支持多轮对话下的跨拍任务追踪、自我纠偏与主动推进。<br>
+      • <b>认知与表达双层解耦</b>：高阶规划大脑（LLM Planner）负责态势感知与决策，独立表达层（Replyer）负责情绪化组稿与视觉对位。<br>
+      • <b>事件溯源与完全可观测</b>：全局会话以不可变因果事件流落盘，具备全链路快照审计与因果离线回放能力。<br><br>
+      本项目基于 <a href="https://github.com/NapNeko/NapCatQQ">NapCatQQ</a> 与 <a href="https://nonebot.dev/">NoneBot2</a> 构建，由衷感谢开源社区 ❤️
     </td>
     <td style="border: none; vertical-align: middle;" width="25%">
       <img src="assets/imgs/xiaozou.png" alt="XiaoZou Character">
@@ -36,23 +36,32 @@
 </table>
 
 
-## ✨ 核心设计
+## 🏗️ 核心设计与架构抽象
 
-项目基于 **Agent Loop / Harness** 思想重构，核心设计特点如下：
+项目围绕 **Agent Loop / Harness** 思想构建，具备以下核心架构抽象：
 
-- **事件溯源（Event Sourcing）**：消息、决策、工具结果、任务变更都以不可变事件追加进同一条事件流，会话上下文与任务状态由这条流折叠（fold）投影得到；每个事件携带 correlation / causation 因果链，完整留痕、可回放、可追溯。
-- **决策权归模型（LLM-as-Planner）**：每个 Tick 将事件流投影为决策上下文（timeline + 活跃任务）交给模型，由模型给出结构化的动作序列——开任务、调工具、推进或收尾，或者 idle。
-- **能力即工具**：回复、查询、群管等能力都经统一的 `Tool` 协议接入，工具自带用法说明、按作用域控制可见性；方便能力扩展。
-- **提示词模块化**：System Prompt 按职责拆成独立章节（身份 / 行为规范 / 协议格式 / 工具用法），改人设、调规则可以各自独立进行。
-- **作用域隔离**：会话事件流、上下文及工具权限默认以群组（`group:<id>`）为边界进行沙箱隔离，确保各群聊决策空间互不干扰；同时支持表情包收藏等公共资产在全局作用域下跨群共享。
+- **事件溯源与状态投影（Event Sourcing & State Projection）**  
+  所有入站消息、模型决策、工具结果与任务变更均追加至不可变事件流（`agent_events`）。每个 Tick 将事件流折叠投影为当前决策上下文（Timeline + 活跃任务），全生命周期因果可追踪、可审计、可无损回放。
 
-## 🛠️ 进化路线 (TODO)
+- **认知与表达职责解耦（Planner & Replyer Layering）**  
+  - **高阶决策大脑（LLM-as-Planner）**：专注全局态势感知、对话理解与工具调度，输出结构化 Action（任务管理 / 工具调用 / 自主沉寂）。
+  - **多模态表达与渲染（Replyer Engine）**：把“发信”升级为异步维持与组稿任务（`reply_task`）。具体的语气人设（Voice）、段落排版及视觉多模态校验（VLM）由专属 Replyer 独立完成，使规划大脑免受低阶渲染细节干扰。
 
-- [ ] **补全工具体系**：重做并恢复暂时下架的联网搜索与群管工具（禁言、撤回等）。
-- [ ] **语音消息转译**：引入 `audio_transcribe` 工具转译音频，弥补模型对音频原生支持的不足。
-- [ ] **群体画像与长期记忆**：在空闲期批处理分析用户偏好与群内黑话，生成摘要并写回事件流。
-- [ ] **CQRS 读模型优化**：改变目前每 Tick 重新折叠全量近期事件的机制，增加读表以提高直查性能。
-- [ ] **丰富 Prompt 注册表**：新增风控指南、运行时反馈及多重人格热切换等 Section。
+- **模型基础设施网格（Model Mesh & Resiliency）**  
+  基于角色（Planner / Replyer / Caption）抽象 LLM 路由层，支持按模型名跨服务商负载均衡（随机分摊）、自动故障退避与被动熔断，确保认知循环与具体模型端点脱钩。
+
+- **能力协议与沙箱隔离（Scoped Tools & Sandboxing）**  
+  网络检索（`websearch`/`webfetch`）、群管（`kick`）等能力均通过统一 `Tool` 接口接入。事件流、上下文及工具权限默认按群组（`group:<id>`）沙箱隔离；表情包等公共资产则在全局作用域共享。
+
+- **全栈白盒与可观测性（Full-Stack Observability）**  
+  每个 Tick 决策均支持完整落盘 Prompt/XML 快照（`prompt_snapshot`），可与固定数据集进行离线比对与回归评测（`replay_snapshots`），实现模型调优的数据驱动。
+
+## 🛠️ 进化路线 (Roadmap)
+
+- [ ] **认知演进**：群体画像与长期记忆（空闲期批处理分析群内黑话与用户偏好，写回事件流）。
+- [ ] **表达增强**：语音消息转译（引入 `audio_transcribe` 工具补全音频模态认知）。
+- [ ] **基础设施**：CQRS 读模型优化（增加读表以避免每 Tick 重新折叠全量近期事件）。
+- [ ] **资产治理**：Prompt 注册表扩展（新增运行时反馈、风控指南与多人格热切换）。
 
 ## 📸 效果图
 
@@ -81,19 +90,28 @@
 直接把小奏（1005089717）拉到群里！
 
 
-## 🐢 龟速开始
+## 🐢 慢速开始
 
 ```bash
 # 1. 启动 NapCat & PostgreSQL 容器
 docker compose -f docker/postgres/compose.yml up -d
 docker compose -f docker/napcat/compose.yml up -d
-# 2. 复制配置并运行（必须使用 VLM 多模态模型）
+
+# 2. 初始化配置文件
 cp .env.example .env
+cp config/model_providers.example.json config/model_providers.json
+
+# 3. 安装依赖并启动服务
 pip install -r requirements.txt
 python -m qqbot
 ```
-- **对接 NapCat**：Web 面板添加 WebSocket 客户端指向 `ws://<bot-host>:7500/onebot/v11/ws`。
-- **自定义人设**：编辑 `qqbot/services/agent_loop/tools/send_message.md` 的 Voice 节（角色卡只作用于发言文本；修改后重启进程生效）。
+
+### ⚙️ 配置说明
+
+- **NapCat 协议对接**：在 NapCat Web 面板中添加 WebSocket 客户端，指向 `ws://<bot-host>:7500/onebot/v11/ws`。
+- **模型路由配置 (`config/model_providers.json`)**：填入 API Key，并配置 `planner`（规划）、`replyer`（组稿）与 `caption`（表情包描述）角色的目标模型。
+- **人设语气自定义 (`prompts/voice.md`)**：编辑 `qqbot/services/agent_loop/prompts/voice.md` 调整 Replyer 组稿时的人设卡（重启进程生效）。
+- **API Lab 独立调试**：运行 `python -m qqbot.main_test` 可启动无 DB/无 LLM 的单机协议探针，方便测试 OneBot/NapCat 连通性与底层 API。
 
 
 ## 🍓 交流群
