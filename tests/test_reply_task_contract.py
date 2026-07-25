@@ -1,6 +1,7 @@
 """ReplyTask / Replyer 的核心合同测试。
 
-钉住四个边界：reply 取代 send_message；草稿折叠与最终事实分离；合稿去重；
+钉住四个边界：reply 取代 send_message；草稿折叠与最终事实分离；**授权
+append-only、最新一次获胜**（2026-07-24 待办#19 取代原"合稿去重"）；
 Replyer 一次输出可含多条文本和至多一张已收藏 meme。
 """
 
@@ -17,12 +18,8 @@ from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
 from qqbot.services.agent_loop.decision import DecisionContext
-from qqbot.services.agent_loop.reply_task import (
-    ReplyTaskState,
-    _fold_rows,
-    merge_gist,
-    merge_targets,
-)
+from qqbot.services.agent_loop import reply_task as reply_task_module
+from qqbot.services.agent_loop.reply_task import ReplyTaskState, _fold_rows
 from qqbot.services.agent_loop.replyer import (
     Replyer,
     _build_system_prompt,
@@ -67,7 +64,7 @@ def _upsert_payload(revision: int = 1) -> dict:
         "flush_at": (NOW + timedelta(seconds=10)).isoformat(),
         "hard_deadline": (NOW + timedelta(seconds=90)).isoformat(),
         "mode": "compose",
-        "targets": [{"message_id": "M1", "points": ["回答问题"]}],
+        "targets": [{"message_id": "M1", "context": "李四@我提问"}],
         "gist": {"intent": "解释清楚", "facts": ["事实 A"]},
         "verbatim_messages": [],
     }
@@ -123,7 +120,11 @@ class ReplyToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "action": "upsert",
                     "targets": [
-                        {"message_id": "M1", "points": ["回答问题"]}
+                        {
+                            "message_id": "M1",
+                            "context": "李四@我提问",
+                            "guidance": "直接给结论",
+                        }
                     ],
                     "gist": {"intent": "解释清楚", "facts": ["事实 A"]},
                     "hold_seconds": 8,
@@ -138,25 +139,35 @@ class ReplyToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["flush_at"], (NOW + timedelta(seconds=8)).isoformat())
         notify.assert_awaited_once()
 
-    async def test_merge_extends_but_never_passes_initial_hard_deadline(self) -> None:
-        current = ReplyTaskState(
+    @staticmethod
+    def _open_task(
+        *,
+        mode: str = "compose",
+        flush_offset: int = 40,
+        deadline_offset: int = 60,
+    ) -> ReplyTaskState:
+        return ReplyTaskState(
             reply_task_id="R1",
             scope_key="group:100",
             revision=1,
             state="open",
-            created_at=NOW - timedelta(seconds=85),
+            created_at=NOW - timedelta(seconds=30),
             updated_at=NOW - timedelta(seconds=5),
-            flush_at=NOW + timedelta(seconds=2),
-            hard_deadline=NOW + timedelta(seconds=5),
-            mode="compose",
-            targets=[{"message_id": "M1", "points": ["A"]}],
+            flush_at=NOW + timedelta(seconds=flush_offset),
+            hard_deadline=NOW + timedelta(seconds=deadline_offset),
+            mode=mode,
+            targets=[{"message_id": "M1", "context": "旧判读"}],
             gist={"intent": "答复", "facts": ["F1"]},
             verbatim_messages=[],
             latest_event_id="E1",
             source_tool_call_event_id="TC1",
             correlation_id="CID",
         )
-        notify = AsyncMock(side_effect=RuntimeError("timer unavailable"))
+
+    async def _append(
+        self, arguments: dict, current: ReplyTaskState | None
+    ) -> tuple[object, AsyncMock]:
+        notify = AsyncMock()
         with (
             patch(
                 "qqbot.services.agent_loop.tools.reply.find_upsert_for_tool_call",
@@ -175,25 +186,152 @@ class ReplyToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
                 return_value=NOW,
             ),
         ):
-            outcome = await ReplyTool().run(
-                {
-                    "action": "upsert",
-                    "reply_task_id": "R1",
-                    "expected_revision": 1,
-                    "targets": [
-                        {"message_id": "M1", "points": ["B"]}
-                    ],
-                    "gist": {"facts": ["F2"]},
-                    "hold_seconds": 90,
-                },
-                **self._context(notify),
-            )
+            outcome = await ReplyTool().run(arguments, **self._context(notify))
+        return outcome, append
+
+    async def test_append_needs_no_id_and_does_not_merge_old_content(self) -> None:
+        """append-only（待办#19）：不传 reply_task_id / expected_revision 也
+        能续在同一份稿上，且事件里只留**本次授权原文**——旧 targets/gist 不再
+        被并进来（旧 merge 只增不减，撤不掉写错的 target 与 fact）。"""
+        outcome, append = await self._append(
+            {
+                "action": "upsert",
+                "targets": [{"message_id": "M2", "context": "改成先反问一句"}],
+                "gist": {"facts": ["F2"]},
+                "hold_seconds": 10,
+            },
+            self._open_task(),
+        )
         self.assertTrue(outcome.ok)
         payload = append.await_args.kwargs["payload"]
+        self.assertEqual(payload["reply_task_id"], "R1")
         self.assertEqual(payload["revision"], 2)
+        self.assertEqual(
+            [t["message_id"] for t in payload["targets"]], ["M2"]
+        )
+        self.assertEqual(payload["gist"]["facts"], ["F2"])
+        self.assertNotIn("intent", payload["gist"])
+
+    async def test_newest_hold_wins_and_may_shorten(self) -> None:
+        """最新一次调用的 hold 直接获胜——旧实现的 max() 只能延长，模型
+        发现"他说完了"也收不回来。"""
+        outcome, append = await self._append(
+            {
+                "action": "upsert",
+                "targets": [{"message_id": "M1", "context": "他说完了"}],
+                "hold_seconds": 3,
+            },
+            self._open_task(flush_offset=40),
+        )
+        self.assertTrue(outcome.ok)
+        payload = append.await_args.kwargs["payload"]
+        self.assertEqual(
+            payload["flush_at"], (NOW + timedelta(seconds=3)).isoformat()
+        )
+
+    async def test_hard_deadline_is_inherited_and_caps_the_hold(self) -> None:
+        """hard_deadline 自首次创建起算、不随 append 滑动，且是 flush_at 的
+        硬上界。"""
+        current = self._open_task(flush_offset=2, deadline_offset=5)
+        outcome, append = await self._append(
+            {
+                "action": "upsert",
+                "targets": [{"message_id": "M1", "context": "还在打字"}],
+                "hold_seconds": 90,
+            },
+            current,
+        )
+        self.assertTrue(outcome.ok)
+        payload = append.await_args.kwargs["payload"]
+        self.assertEqual(payload["hard_deadline"], current.hard_deadline.isoformat())
+        self.assertEqual(payload["created_at"], current.created_at.isoformat())
         self.assertEqual(payload["flush_at"], current.hard_deadline.isoformat())
-        self.assertEqual(payload["gist"]["facts"], ["F1", "F2"])
-        self.assertEqual(payload["targets"][0]["points"], ["A", "B"])
+
+    async def test_hold_seconds_is_required_with_no_default(self) -> None:
+        """等多久是每拍现场判断的语义，没有默认值——旧的 default 0 等于把
+        合并窗口整个关掉。"""
+        outcome, append = await self._append(
+            {
+                "action": "upsert",
+                "targets": [{"message_id": "M1", "context": "判读"}],
+            },
+            None,
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.error_kind, "invalid_arguments")
+        self.assertEqual(
+            outcome.extra.get("reason_code"), "missing_hold_seconds"
+        )
+        append.assert_not_awaited()
+
+    async def test_verbatim_draft_is_exclusive(self) -> None:
+        """verbatim 绕过 Replyer 直发，没有"综合多条授权"可言：挂着一份就
+        拒绝后续 upsert，只能先 cancel。"""
+        outcome, append = await self._append(
+            {
+                "action": "upsert",
+                "targets": [{"message_id": "M1", "context": "判读"}],
+                "hold_seconds": 5,
+            },
+            self._open_task(mode="verbatim"),
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.error_kind, "reply_task_locked")
+        append.assert_not_awaited()
+
+
+class ReplyToolTargetSemanticsTests(unittest.IsolatedAsyncioTestCase):
+    """2026-07-22 语义换代：targets 传对话分析（context/guidance），不再传
+    points 要点清单——Replyer 已与 Planner 看同一份 timeline。"""
+
+    def _context(self) -> dict:
+        return {
+            "scope_key": "group:100",
+            "session_factory": object(),
+            "correlation_id": "CID",
+            "tool_call_event_id": "E_TOOL_CALL",
+        }
+
+    async def _run(self, targets: list[dict]) -> object:
+        with patch(
+            "qqbot.services.agent_loop.tools.reply.find_upsert_for_tool_call",
+            new=AsyncMock(return_value=None),
+        ):
+            return await ReplyTool().run(
+                {"action": "upsert", "targets": targets, "hold_seconds": 5},
+                **self._context(),
+            )
+
+    async def test_legacy_points_rejected_with_migration_hint(self) -> None:
+        outcome = await self._run(
+            [{"message_id": "M1", "points": ["回答问题"]}]
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.error_kind, "invalid_arguments")
+        self.assertEqual(
+            outcome.extra.get("reason_code"), "points_replaced_by_context"
+        )
+
+    async def test_target_requires_nonempty_context(self) -> None:
+        outcome = await self._run([{"message_id": "M1"}])
+        self.assertFalse(outcome.ok)
+        self.assertEqual(
+            outcome.extra.get("reason_code"), "bad_target_context"
+        )
+        outcome = await self._run([{"message_id": "M1", "context": "  "}])
+        self.assertFalse(outcome.ok)
+        self.assertEqual(
+            outcome.extra.get("reason_code"), "bad_target_context"
+        )
+
+    async def test_guidance_must_be_string_when_present(self) -> None:
+        outcome = await self._run(
+            [{"message_id": "M1", "context": "判读", "guidance": ["x"]}]
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(
+            outcome.extra.get("reason_code"), "bad_target_guidance"
+        )
 
 
 class ReplyTaskFoldTests(unittest.TestCase):
@@ -253,26 +391,42 @@ class ReplyTaskFoldTests(unittest.TestCase):
         self.assertEqual(state.source_tool_call_event_id, "TC2")
 
 
-class MergeContractTests(unittest.TestCase):
-    def test_targets_merge_by_message_and_dedupe_points(self) -> None:
-        merged = merge_targets(
-            [{"message_id": "M1", "sender_qq": "1", "points": ["A"]}],
-            [
-                {"message_id": "M1", "sender_qq": "1", "points": ["A", "B"]},
-                {"message_id": "M2", "sender_qq": "2", "points": ["C"]},
-            ],
-        )
-        self.assertEqual(merged[0]["points"], ["A", "B"])
-        self.assertEqual(merged[1]["message_id"], "M2")
+class AppendOnlyContractTests(unittest.TestCase):
+    """程序侧不再做任何合并计算（2026-07-24，待办#19）。
 
-    def test_gist_keeps_old_intent_and_merges_fact_lists(self) -> None:
-        merged = merge_gist(
-            {"intent": "旧意图", "facts": ["A"], "avoid": ["X"]},
-            {"facts": ["A", "B"], "avoid": ["Y"]},
+    原 MergeContractTests 钉的是 merge_targets/merge_gist 的并集语义，而那
+    正是"撤不掉已授权的 target / 写错的 fact"的来源。现在每条授权原样入库，
+    谁覆盖谁由 Replyer 按时间顺序判断（最新的是权威），程序只负责调度。
+    """
+
+    def test_merge_helpers_are_gone(self) -> None:
+        self.assertFalse(hasattr(reply_task_module, "merge_targets"))
+        self.assertFalse(hasattr(reply_task_module, "merge_gist"))
+        self.assertFalse(hasattr(reply_task_module, "_dedupe_strings"))
+
+    def test_fold_takes_scheduling_from_latest_upsert_only(self) -> None:
+        """折叠出的 ReplyTaskState 只回答"什么时候发、到哪一步了"：调度字段
+        取最新一条 upsert，内容字段留的是最近一次授权原文，不是合并态。"""
+        first = _event(
+            "E1", "agent.reply_task_upserted", _upsert_payload(), causation_id="TC1"
         )
-        self.assertEqual(merged["intent"], "旧意图")
-        self.assertEqual(merged["facts"], ["A", "B"])
-        self.assertEqual(merged["avoid"], ["X", "Y"])
+        second_payload = _upsert_payload(2)
+        second_payload["targets"] = [{"message_id": "M2", "context": "改主意了"}]
+        second_payload["gist"] = {"intent": "换个角度"}
+        second_payload["flush_at"] = (NOW + timedelta(seconds=3)).isoformat()
+        second = _event(
+            "E2",
+            "agent.reply_task_upserted",
+            second_payload,
+            causation_id="TC2",
+            seconds=1,
+        )
+        state = _fold_rows([first, second])["R1"]
+        self.assertEqual(state.revision, 2)
+        self.assertEqual(state.flush_at, NOW + timedelta(seconds=3))
+        # 最近一次授权原文，不含第一条的 M1 / 事实 A
+        self.assertEqual([t["message_id"] for t in state.targets], ["M2"])
+        self.assertEqual(state.gist, {"intent": "换个角度"})
 
 
 class ReplyerOutputTests(unittest.TestCase):
@@ -448,8 +602,8 @@ class _CapturingLLM:
 
 class ReplyerMultimodalTests(unittest.TestCase):
     """compose 的多模态 content 合同（2026-07-22 Replyer 与 Planner 同等看图）：
-    有图 → content 为 [文本块, *图块] 且文本块即原 JSON payload；无图 →
-    content 保持纯字符串（旧行为）。"""
+    有图 → content 为 [文本块, *图块] 且文本块即 XML 信封（replyer-input）；
+    无图 → content 保持纯字符串。"""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -483,7 +637,7 @@ class ReplyerMultimodalTests(unittest.TestCase):
             flush_at=NOW,
             hard_deadline=NOW + timedelta(seconds=90),
             mode="compose",
-            targets=[{"message_id": "M1", "points": ["回答"]}],
+            targets=[{"message_id": "M1", "context": "李四@我提问"}],
             gist={"intent": "解释"},
             verbatim_messages=[],
             latest_event_id="E1",
@@ -534,8 +688,9 @@ class ReplyerMultimodalTests(unittest.TestCase):
         content = llm.messages[1].content
         self.assertIsInstance(content, list)
         self.assertEqual(content[0]["type"], "text")
-        payload = json.loads(content[0]["text"])
-        self.assertEqual(payload["reply_task"]["reply_task_id"], "R1")
+        text = content[0]["text"]
+        self.assertTrue(text.startswith("<replyer-input "))
+        self.assertIn('reply_task_id="R1"', text)
         self.assertEqual(content[1:], blocks)
 
     def test_compose_without_images_keeps_plain_text_content(self) -> None:
@@ -543,8 +698,8 @@ class ReplyerMultimodalTests(unittest.TestCase):
         assert llm.messages is not None
         content = llm.messages[1].content
         self.assertIsInstance(content, str)
-        payload = json.loads(content)
-        self.assertEqual(payload["reply_task"]["reply_task_id"], "R1")
+        self.assertTrue(content.startswith("<replyer-input "))
+        self.assertIn('reply_task_id="R1"', content)
 
 
 if __name__ == "__main__":

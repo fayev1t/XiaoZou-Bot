@@ -5,9 +5,9 @@
 说完再回"。本工具把"何时思考"的部分决定权交还模型。
 
 职责收窄（2026-07-19，ReplyTask 换轨）："等他把话说完再回"的回复防抖已整体
-移交 reply 工具的维持窗口（合稿即顺延，见 group_chat_rules §分条消息并入
-reply_task）；wait 只保留自我提醒 / 延迟执行其它动作的用途，description 与
-wait.md 不得再引导用它等分条消息。
+移交 reply 工具的维持窗口（局势变化时追加一份完整授权，最新 hold_seconds
+直接替换旧时机；见 group_chat_rules §对方还在说的时候）；wait 只保留自我提醒
+/ 延迟执行其它动作的用途，description 与 wait.md 不得再引导用它等分条消息。
 
 执行语义（**绝不在工具内 sleep**——ToolWorker 串行跑工具，长眠会卡死整个
 派发通道）：execute() 只登记一个 asyncio 定时器就立刻返回成功（带 wake_at）。
@@ -55,9 +55,10 @@ class WaitTool(BaseTool):
         "right move is to check back later instead of acting now — e.g. you "
         "promised to follow up in a few minutes, or a running task deserves "
         "a later look. NOT for holding a reply while someone finishes a "
-        "multi-part message — that is the reply tool's hold window (merge "
-        "the reply_task to postpone its flush). When the timer fires you "
-        "get a new tick whose timeline carries "
+        "multi-part message — that is the reply tool's hold window (call "
+        "reply again with a fresh complete authorization when the picture "
+        "changes; the newest hold_seconds replaces the old wait). When the "
+        "timer fires you get a new tick whose timeline carries "
         '<system-hint kind="wait_elapsed"> echoing your note. The timer is '
         "in-memory: a process restart drops it (your wait tool-call stays "
         "visible in the timeline, so you can tell and re-schedule)."

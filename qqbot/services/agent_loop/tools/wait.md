@@ -11,7 +11,7 @@ Schedules a wake-up for yourself after `seconds` seconds. Use it whenever the ri
 
 ## When NOT to call
 
-- To wait for someone to finish a multi-part message before answering — that is the `reply` tool's job, not wait's: create the reply_task with a short hold and merge new points into it (merging is what postpones the flush). wait plays no part in replying.
+- To wait for someone to finish a multi-part message before answering — that is the `reply` tool's job, not wait's: authorize with a `hold_seconds` that covers the wait, and call `reply` again if the picture changes (the newest hold replaces the old one). wait plays no part in replying.
 - To poll a tool that already wakes you when its batch completes — that wake is automatic.
 - To "stay alive": don't schedule recurring waits with nothing to do. One wait, one purpose.
 - Don't stack multiple overlapping waits for the same purpose; the extra wake-ups are noise.

@@ -108,10 +108,14 @@ class LoopSupervisor:
                     projector=self._projector,
                     wake_scope=self.wake,
                     replyer=self._replyer,
+                    # 与 AgentLoop 同一把 resolver：Replyer 的组稿 context 同样
+                    # 带 bot_qq/bot_role（输入权重与 Planner 对齐，2026-07-22）。
+                    bot_user_id_resolver=_default_bot_user_id_resolver,
                 )
                 # rescan 与上面的任务回填同属恢复性动作，best-effort：失败只
                 # 损失"重挂定时器 / 补 uncertain / overdue hint"，模型侧仍有
-                # <pending-reply> 证据链可自愈（合稿即重新挂表），不挡启动。
+                # timeline 上的 <tool-call name="reply"> 行作证据链可自愈
+                # （再落一次稿即重新挂表），不挡启动。
                 try:
                     await self._reply_executor.start()
                 except Exception as exc:

@@ -47,6 +47,20 @@ def _values(stmt: Any) -> dict:
     return {k: v for k, v in stmt.compile().params.items()}
 
 
+class WaitToolPromptContractTests(unittest.TestCase):
+    def test_description_uses_append_only_reply_semantics(self) -> None:
+        description = WaitTool.description.lower()
+        self.assertNotIn("merge", description)
+        self.assertIn("fresh complete authorization", description)
+        self.assertIn("newest hold_seconds replaces", description)
+
+    def test_usage_prompt_uses_append_only_reply_semantics(self) -> None:
+        usage_prompt = WaitTool.usage_prompt.lower()
+        self.assertNotIn("merge", usage_prompt)
+        self.assertIn("call reply again", usage_prompt)
+        self.assertIn("newest hold replaces", usage_prompt)
+
+
 class WaitToolScheduleTests(unittest.IsolatedAsyncioTestCase):
     def _context(self, timeline: list[Any]) -> dict:
         async def _wake(scope_key: str) -> None:

@@ -167,7 +167,12 @@ class Projector:
             minute=0, second=0, microsecond=0
         )
 
-        events = await self._fetch(scope, group_id, cutoff)
+        # ``now`` 不只是渲染时钟，也是本拍严格的投影快照上界。消息可能在
+        # loop 捕获 now 之后、这条 SELECT 真正执行之前入库；若不设上界，
+        # 它会混进本拍 context，却又排在 occurred_at=now 的
+        # decision_emitted 之后，下一拍看起来像是本拍已经处理过。明确截到
+        # now 后，这类消息留给其自己的 wake/tick 消费。
+        events = await self._fetch(scope, group_id, cutoff, now)
         # bot_role 单独一次 SQL 查 —— runtime.bot_role_observed 可能远早于
         # lookback 窗口（比如启动 sweep 跑过一次就再没变），不应受 cutoff 影响。
         bot_role: str | None = None
@@ -204,30 +209,13 @@ class Projector:
         # 表情包收藏夹注入：查 agent_memes 挂到 ctx.saved_memes，llm_planner
         # 渲染成 <saved-memes>（meme 工具凭 hash 操作收藏的选图目录）。同样
         # best-effort 降级——查不到收藏夹只影响本 tick 发不了表情包。
-        ctx = await self._augment_with_saved_memes(ctx, scope_key)
-        return await self._augment_with_pending_reply(ctx, scope_key)
-
-    async def _augment_with_pending_reply(
-        self, ctx: DecisionContext, scope_key: str
-    ) -> DecisionContext:
-        if not scope_key.startswith(("group:", "private:")):
-            return ctx
-        try:
-            from dataclasses import replace
-
-            from qqbot.services.agent_loop.reply_task import load_open_reply_task
-
-            task = await load_open_reply_task(self._session_factory, scope_key)
-            return replace(
-                ctx, pending_reply=task.to_view() if task is not None else None
-            )
-        except Exception as exc:
-            logger.warning(
-                "[projection] load pending reply failed for {}: {}",
-                scope_key,
-                exc,
-            )
-            return ctx
+        # _augment_with_pending_reply 已于 2026-07-24 删除（待办#19）：它每拍
+        # 多查一次 reply_task 事件、只为渲染 <pending-reply>，而那一段的每个
+        # 字段都被 timeline 上的 <tool-call name="reply"> 行逐字段覆盖
+        # （reply_task_id / revision / flush_at / hard_deadline 在 <result> 里，
+        # mode / targets / gist 在 <args> 里）。reply 成功行不再折叠之后主从
+        # 关系反转，独立状态区没有存在理由，连带省掉这次查询。
+        return ctx
 
     async def _augment_with_persisted_tasks(
         self, ctx: DecisionContext, scope_key: str
@@ -343,16 +331,22 @@ class Projector:
         scope: str,
         group_id: int | None,
         cutoff: datetime,
+        upper_bound: datetime,
     ) -> list[_EventSnapshot]:
         stmt = (
             select(AgentEvent)
             .where(AgentEvent.scope == scope)
             .where(AgentEvent.visibility == "agent_visible")
             .where(AgentEvent.occurred_at >= cutoff)
+            .where(AgentEvent.occurred_at <= upper_bound)
         )
         if scope == "group" and group_id is not None:
             stmt = stmt.where(AgentEvent.group_id == group_id)
-        stmt = stmt.order_by(AgentEvent.occurred_at.desc()).limit(self._max_items)
+        # event_id 是 ULID；同一 occurred_at 下用它做稳定次序，reverse 后仍是
+        # 正向时间序，避免时间戳相同时窗口边缘与行位置随机抖动。
+        stmt = stmt.order_by(
+            AgentEvent.occurred_at.desc(), AgentEvent.event_id.desc()
+        ).limit(self._max_items)
 
         async with self._session_factory() as session:
             result = await session.execute(stmt)
@@ -383,7 +377,6 @@ class Projector:
         timeline = Projector.build_timeline(
             events,
             tool_views=tool_views,
-            unseen_message_ids=Projector.fold_unseen_message_ids(events),
             thought_anchor=thought_anchor,
         )
         # 裁到尾部 max_timeline_items 条 —— fetch 上限给得宽是为了 fold 任务/
@@ -461,36 +454,15 @@ class Projector:
                 break  # 超出滞回带：一次性前移回朴素起点
         return timeline[naive:]
 
-    @staticmethod
-    def fold_unseen_message_ids(
-        events: Sequence[_EventSnapshot],
-    ) -> frozenset[str]:
-        """第一拍判定（2026-07-06，待办清单#1 群聊拆句观望）：找出"还没有
-        任何一拍决策看过"的新外部消息。
-
-        每条消息入库即 wake(scope)，第一拍常在对方话说到一半时开拍。这里以
-        窗口内**最后一条** agent.decision_emitted 为水位线：其后到达的
-        external.message.* 即"未见过"，渲染时标 `unseen="true"`（见
-        _render_message），把"这拍是这些消息的第一拍"变成结构性事实——
-        不靠模型比对 <last-reasoning time=> 自行推断。窗口内从没有过决策时
-        全部消息算未见过（该 scope 真正意义上的第一拍）。政策侧（半句先
-        wait 观望、不叠加闹钟、醒来无新 unseen 即作答）见
-        group_chat_rules.md §半句话先等等。
-
-        planner 抛异常的残拍不写 decision_emitted（loop._tick 直接收尾），
-        不推进水位线——那一拍确实没"看到"消息，语义自洽。bot 自己的发言
-        不会误触发：send_message 走 agent.tool_called，不产生
-        external.message 事件（napcat 的 message_sent 自身消息上报未开启，
-        见 event_ingest/mappers/group_message.py 模块注释）。notice /
-        request / runtime hint 亦不参与——观望语义只对"人还在说话"成立。
-        """
-        unseen: list[str] = []
-        for ev in events:
-            if ev.type == "agent.decision_emitted":
-                unseen.clear()
-            elif ev.type.startswith("external.message."):
-                unseen.append(ev.event_id)
-        return frozenset(unseen)
+    # fold_unseen_message_ids / <message unseen="true"> 已于 2026-07-24 删除
+    # （待办清单#18）。它是"这拍是不是第一次看到这条消息"的二值标签，两个
+    # 问题使它弊大于利：① 锚定——模型只在带标签的消息里找发言理由；② 一次
+    # 性——一条消息只享有一拍的"值得看"，那拍若决定观望就永久降级成历史，
+    # 与"等一等再全面处理"直接冲突。引导发言的职责 2026-07-19 起已交给
+    # reply_task + Replyer，标签的原始动机（待办#1 拆句观望）不再成立。
+    # 现在"我处理到哪儿"完全由 timeline 的时间顺序表达：<my-thought> /
+    # <my-reply> 行之后的消息就是我看过之后才来的——前提是 decision_emitted
+    # 的 occurred_at 回填为本拍投影时刻（见 loop._tick 的同批改动）。
 
     @staticmethod
     def fold_bot_role(
@@ -634,7 +606,6 @@ class Projector:
         events: Sequence[_EventSnapshot],
         *,
         tool_views: Sequence[ToolResultView],
-        unseen_message_ids: frozenset[str] | set[str] = frozenset(),
         thought_anchor: str | None = None,
     ) -> list[TimelineItem]:
         tool_view_by_id = {tv.tool_call_id: tv for tv in tool_views}
@@ -651,10 +622,11 @@ class Projector:
 
         # ─── 思考轨迹内联（2026-07-06，待办清单#4）───
         # 预扫出要渲染成 <my-thought> 行的决策事件：只保留最近
-        # MAX_THOUGHT_ROWS 条、reasoning 非空白的（idle 拍照样渲染——它也
-        # 推 unseen 水位线，跳过会造成"消息在最后一行可见思考之后却没标
-        # unseen"的表面矛盾；空白 reasoning 没有内容可看，跳过）。更早的
-        # 决策不渲染：思考是辅助记忆，K 之外的旧念头换 token 不划算。
+        # MAX_THOUGHT_ROWS 条、reasoning 非空白的（空白 reasoning 没有内容
+        # 可看，跳过）。更早的决策不渲染：思考是辅助记忆，K 之外的旧念头换
+        # token 不划算。2026-07-24 起这些行还兼任"我处理到哪儿"的唯一信号
+        # （unseen 标签已删，待办#18）——decision_emitted 的 occurred_at 回填
+        # 为本拍投影时刻后，行在消息之前=那拍没看到它，之后=看过了。
         # thought_anchor（上一拍首条思考行）有效时选择起点滞回钉住——否则
         # 每拍新增一条决策就把第 K 旧的思考行从 timeline 中段抹掉，掐断
         # 前缀缓存（见类常量注释）；攒满 K + THOUGHT_ROWS_SLACK 条才一次性
@@ -709,7 +681,10 @@ class Projector:
                 "agent.reply_task_upserted",
                 "agent.reply_task_cancelled",
             ):
-                # 折叠为 DecisionContext.pending_reply，避免与内容区双重渲染。
+                # 领域事件消隐：同一次授权已由它的 <tool-call name="reply"> 行
+                # 完整呈现（<args> 授权原文 + <result> 调度事实），再渲染一遍
+                # 就是双重渲染。它们仍是 reply_task 折叠的数据源，只是不进
+                # timeline。
                 continue
             if ev.type == "agent.decision_emitted":
                 # 思考轨迹内联（待办清单#4）：最近 K 条渲染 <my-thought> 行
@@ -741,17 +716,13 @@ class Projector:
             if ev.type == "agent.tool_called":
                 tc_id = ev.payload.get("tool_call_id")
                 tv = tool_view_by_id.get(tc_id)
-                # 新 reply 工具成功只落 ReplyTask，成功行折叠进 <pending-reply>；
-                # processing/失败仍保留，历史旧 reply result 带 message_id，不误消隐。
-                if (
-                    ev.payload.get("tool_name") == "reply"
-                    and tv is not None
-                    and tv.status == "complete"
-                    and tv.error_kind is None
-                    and isinstance(tv.result, dict)
-                    and tv.result.get("reply_task_id")
-                ):
-                    continue
+                # 2026-07-24（待办#19）起 reply 的成功行**不再折叠**：它是
+                # append-only 授权序列的唯一真相源——<args> 是这次授权的原文
+                # （targets/gist/hold_seconds），<result> 是它落成的调度事实
+                # （reply_task_id/revision/flush_at/hard_deadline）。折叠是为
+                # 了避免与 <pending-reply> 双重渲染，而那一段已随本次改动删除，
+                # 主从关系反转：内容留在 timeline，不另立状态区。Replyer 与
+                # Planner 共用同一份 timeline，因此自动都看到完整授权序列。
                 items.append(
                     TimelineItem(
                         event_id=ev.event_id,
@@ -767,7 +738,6 @@ class Projector:
                     excerpt_by_msg_id,
                     name_by_user_id,
                     author_by_msg_id,
-                    unseen=ev.event_id in unseen_message_ids,
                 )
                 items.append(
                     TimelineItem(
@@ -825,8 +795,6 @@ class Projector:
         excerpt_by_msg_id: dict[str, str],
         name_by_user_id: dict[str, str],
         author_by_msg_id: "dict[str, _AuthorRef] | None" = None,
-        *,
-        unseen: bool = False,
     ) -> tuple[str, list[ImageRef]]:
         sender = ev.payload.get("sender") or {}
         name = sender.get("card") or sender.get("nickname")
@@ -884,12 +852,6 @@ class Projector:
         # recall / set_essence 等工具参数同名直抄），与 task_id / event_id 区分。
         if msg_id:
             attrs.append(f'message_id="{_esc_attr(str(msg_id))}"')
-        # unseen="true"：该消息在最后一条 agent.decision_emitted 之后到达，
-        # 还没有任何一拍处理过（fold_unseen_message_ids）。缺失 = 已经历过
-        # 至少一拍。属性总语义"缺失=默认"的又一实例；政策见
-        # group_chat_rules.md §半句话先等等。
-        if unseen:
-            attrs.append('unseen="true"')
         return f"<message {' '.join(attrs)}>{body}</message>", images
 
     @staticmethod
@@ -1281,18 +1243,37 @@ def _render_segments(
                 # （不再拼 "昵称(QQ)" / "我(id)" 复合串，模型无需拆括号）。这是
                 # "别人引用我 ≠ 我在发言"的关键——没有它，LLM 看到被引用内容
                 # 内联在画面里，容易当成对方刚说的话。缺哪个省哪个（=未知）。
+                #
+                # 取值优先级（2026-07-22 出窗引用黑洞修复）：ingest 富化的
+                # segment 顶层 quoted 键 > 投影窗口内索引。quoted 在消息到达
+                # 时由适配器已解析的 event.reply 固化（EventIngest契约 §6.4），
+                # 不随窗口滚动丢失；旧库事件无 quoted，仍靠窗口索引兜底。
+                # 逐字段回退：quoted 缺个别子键时该字段仍可由索引补上。
+                quoted = seg.get("quoted")
+                if not isinstance(quoted, dict):
+                    quoted = {}
                 author = (author_by_msg_id or {}).get(rid)
-                if author:
-                    if author.name:
-                        attrs.append(f'from_name="{_esc_attr(author.name)}"')
-                    if author.user_id:
-                        attrs.append(f'from_qq="{_esc_attr(author.user_id)}"')
-                    # 仅 bot 自己的消息渲染 from_self="true"；外部作者不渲染
-                    # false——"是不是我"的常规判据是 from_qq == bot_qq，
-                    # from_self 出现即铁证（服务端标注，不依赖 bot_qq）。
-                    if author.is_self:
-                        attrs.append('from_self="true"')
-                excerpt = excerpt_by_msg_id.get(rid)
+                from_name = _nonempty_str(quoted.get("sender_name")) or (
+                    author.name if author else None
+                )
+                from_qq = _nonempty_str(quoted.get("sender_qq")) or (
+                    author.user_id if author else None
+                )
+                # 仅确证是 bot 自己的消息渲染 from_self="true"；外部作者不
+                # 渲染 false——"是不是我"的常规判据是 from_qq == bot_qq，
+                # from_self 出现即铁证（服务端标注，不依赖 bot_qq）。
+                from_self = quoted.get("from_self") is True or (
+                    author.is_self if author else False
+                )
+                if from_name:
+                    attrs.append(f'from_name="{_esc_attr(from_name)}"')
+                if from_qq:
+                    attrs.append(f'from_qq="{_esc_attr(from_qq)}"')
+                if from_self:
+                    attrs.append('from_self="true"')
+                excerpt = _gloss_segments(
+                    quoted.get("segments") or []
+                ) or excerpt_by_msg_id.get(rid)
                 if excerpt:
                     attrs.append(f'excerpt="{_esc_attr(excerpt)}"')
                 parts.append(f'<reply {" ".join(attrs)}/>')
@@ -1753,14 +1734,33 @@ def _segment_gloss(seg: dict) -> str | None:
     return f"[{t}]" if t else None
 
 
+def _gloss_segments(segments: Iterable) -> str:
+    """段数组 → 单行摘要（前 40 字，超长加 "…"）。
+
+    逐段取 ``_segment_gloss``：文本段取原文，富媒体段取与消息体渲染同源的
+    语义占位（不是裸类型列表）。空白规整成单空格（摘要是单行属性值，不该
+    带换行）。窗口内 excerpt 索引与 ingest 富化的 quoted.segments 共用这
+    一条渲染路径，保证两个来源的 excerpt 形态逐字节同规格。
+    """
+    parts: list[str] = []
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        gloss = _segment_gloss(seg)
+        if gloss:
+            parts.append(gloss)
+    excerpt = " ".join("".join(parts).split())
+    if len(excerpt) > 40:
+        excerpt = excerpt[:40] + "…"
+    return excerpt
+
+
 def _build_excerpt_index(events: Iterable[_EventSnapshot]) -> dict[str, str]:
     """timeline 内 onebot_message_id → 摘要（前 40 字）。
 
-    用于渲染 reply 段时给 LLM 提供"被回复消息说了啥"的上下文。逐段取
-    ``_segment_gloss``：文本段取原文，富媒体段取与消息体渲染同源的语义占位
-    （不再是旧版 "[image, at]" 这种裸类型列表）。空白规整成单空格（摘要是
-    单行属性值，不该带换行）。命中不到（消息在 lookback 窗口外或被 napcat
-    抛弃了）就只渲染 reply.to_message_id 不带 excerpt。
+    用于渲染 reply 段时给 LLM 提供"被回复消息说了啥"的上下文。命中不到
+    （消息在 lookback 窗口外或被 napcat 抛弃了）时由 reply 段自身的
+    quoted 富化兜底；两头都没有才渲染裸 reply.to_message_id。
     """
     out: dict[str, str] = {}
     for ev in events:
@@ -1769,17 +1769,7 @@ def _build_excerpt_index(events: Iterable[_EventSnapshot]) -> dict[str, str]:
         mid = ev.payload.get("onebot_message_id")
         if not mid:
             continue
-        segs = ev.payload.get("segments") or []
-        parts: list[str] = []
-        for seg in segs:
-            if not isinstance(seg, dict):
-                continue
-            gloss = _segment_gloss(seg)
-            if gloss:
-                parts.append(gloss)
-        excerpt = " ".join("".join(parts).split())
-        if len(excerpt) > 40:
-            excerpt = excerpt[:40] + "…"
+        excerpt = _gloss_segments(ev.payload.get("segments") or [])
         if excerpt:
             out[str(mid)] = excerpt
     return out

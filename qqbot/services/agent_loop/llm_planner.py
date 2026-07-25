@@ -379,7 +379,6 @@ def _render_input_xml(
             </progress-notes>
           </task>
         </active-tasks>
-        <pending-reply reply_task_id="..." revision="N" ...>{targets/gist}</pending-reply>  (有未发草稿才出)
         <current now="..." tick="N"/>
         <validation-error>attempt N rejected: ...</validation-error>       (仅校验重试)
       </agent-input>
@@ -390,9 +389,7 @@ def _render_input_xml(
     为主，窗口起点锚定见 projection）每拍全价重计费。现按变化频率排序：
     头属性只留 scope/bot_qq/bot_role（稳定/极少变）；active-tasks 任务活跃期
     逐拍变（pending_tool_call_ids 随工具收口增删），排到 timeline 之后；
-    pending-reply（2026-07-19）每次合稿必变、创建/flush 时整段出现消失，且
-    只存在于拍频最高的维持窗口内，排在 active-tasks 之后；每拍必变的
-    now/tick 沉为尾部 <current/>；validation-error 只在同 tick
+    每拍必变的 now/tick 沉为尾部 <current/>；validation-error 只在同 tick
     校验重试出现（契约 §7.1），放最尾——同拍重试可复用直到 <current/> 的
     前缀，且作为最后一行对模型最显著。timeline 仍然紧邻输出位置（其后只有
     寥寥数行），recency bias 不受影响。
@@ -484,15 +481,11 @@ def _render_input_xml(
         parts.append(_render_task_xml(task))
     parts.append("</active-tasks>")
 
-    # pending-reply 在 active-tasks 之后、<current/> 之前：它是全信封变化最
-    # 频繁的业务段（每次合稿 revision/flush_at 都变，创建/flush 时整段出现
-    # 消失），且只存在于维持窗口的数秒内——恰是拍频最高的时段。放 timeline
-    # 之前会逐拍掐断 timeline 的缓存前缀（前缀缓存契约：段序按变化频率
-    # 升序）；放这里前缀可稳定复用到 </active-tasks>，"待发承诺"也仍紧邻
-    # 决策位置。
-    pending_reply = getattr(context, "pending_reply", None)
-    if pending_reply is not None:
-        parts.append(_render_pending_reply_xml(pending_reply))
+    # <pending-reply> 段已于 2026-07-24 删除（待办#19）——待发稿的调度事实与
+    # 授权内容都在 timeline 的 <tool-call name="reply"> 行上（<result> / <args>），
+    # 独立状态区属于重复渲染。顺带一个缓存收益：它曾是全信封变化最频繁的业务
+    # 段（每次落稿 revision/flush_at 都变、创建/flush 时整段出现消失），撤掉后
+    # 从 </active-tasks> 到 <current/> 之间不再有抖动源。
 
     # ─── 每拍必变的时钟字段，沉底（缓存契约见本函数 docstring）───
     # 时区契约：所有暴露给 LLM 的时间都是北京时间（与数据库写入侧 china_now()
@@ -554,22 +547,6 @@ def _render_task_xml(task: Any) -> str:
         f'state="{_esc_attr(task.state)}" '
         f'description="{_esc_attr(task.description)}">'
         f"{''.join(inner)}</task>"
-    )
-
-
-def _render_pending_reply_xml(reply: Any) -> str:
-    body = _safe_json(
-        {
-            "targets": reply.targets,
-            "gist": reply.gist,
-            "mode": reply.mode,
-        }
-    )
-    return (
-        f'<pending-reply reply_task_id="{_esc_attr(reply.reply_task_id)}" '
-        f'revision="{reply.revision}" flush_at="{_esc_attr(reply.flush_at.isoformat())}" '
-        f'hard_deadline="{_esc_attr(reply.hard_deadline.isoformat())}" '
-        f'mode="{_esc_attr(reply.mode)}">{_esc_text(body)}</pending-reply>'
     )
 
 

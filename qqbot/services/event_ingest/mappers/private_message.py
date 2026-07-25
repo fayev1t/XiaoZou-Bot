@@ -13,6 +13,7 @@ from qqbot.services.event_ingest import idempotency
 from qqbot.services.event_ingest.napcat_helpers import (
     dump_event,
     dump_message_segments,
+    enrich_reply_segments,
 )
 from qqbot.services.event_ingest.system_event import PartialSystemEvent
 
@@ -39,6 +40,8 @@ class PrivateMessageMapper:
             "segments": dump_message_segments(event),
             "message_sub_type": getattr(event, "sub_type", "friend") or "friend",
         }
+        # 被引消息富化：与 group_message 同源（napcat_helpers 注释详述）。
+        enrich_reply_segments(event, payload["segments"])
         return PartialSystemEvent(
             origin="external",
             type="external.message.private",

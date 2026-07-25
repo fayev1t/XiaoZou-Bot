@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from qqbot.services.agent_loop.projection import Projector, _EventSnapshot
@@ -50,6 +51,57 @@ def _snap(
         causation_id=None,
         payload=payload or {},
     )
+
+
+class _EmptyScalars:
+    def all(self) -> list[Any]:
+        return []
+
+
+class _EmptyResult:
+    def scalars(self) -> _EmptyScalars:
+        return _EmptyScalars()
+
+
+class _RecordingProjectionSession:
+    def __init__(self, statements: list[Any]) -> None:
+        self._statements = statements
+
+    async def execute(self, statement: Any) -> _EmptyResult:
+        self._statements.append(statement)
+        return _EmptyResult()
+
+    async def __aenter__(self) -> "_RecordingProjectionSession":
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        return None
+
+
+class ProjectionSnapshotBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fetch_excludes_events_after_tick_snapshot(self) -> None:
+        statements: list[Any] = []
+
+        def factory() -> _RecordingProjectionSession:
+            return _RecordingProjectionSession(statements)
+
+        projector = Projector(factory)
+        await projector._fetch(
+            "group",
+            999,
+            BASE_TIME - timedelta(hours=24),
+            BASE_TIME,
+        )
+
+        self.assertEqual(len(statements), 1)
+        compiled = statements[0].compile()
+        sql = str(compiled)
+        self.assertIn("agent_events.occurred_at <= ", sql)
+        self.assertIn(BASE_TIME, compiled.params.values())
+        self.assertIn(
+            "agent_events.occurred_at DESC, agent_events.event_id DESC",
+            sql,
+        )
 
 
 class FoldTasksTests(unittest.TestCase):
@@ -412,6 +464,155 @@ class BuildTimelineTests(unittest.TestCase):
         self.assertNotIn("from_name=", rendered)
         self.assertNotIn("from_qq=", rendered)
         self.assertNotIn("from_self=", rendered)
+
+    def test_reply_segment_uses_ingest_quoted_outside_window(self) -> None:
+        # 出窗引用黑洞修复（EventIngest契约 §6.4）：被引消息不在窗口内，但
+        # ingest 富化的 quoted 键在 → from_*/excerpt 照常渲染，不再退化成
+        # 裸 to_message_id。
+        evs = [
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "segments": [
+                        {
+                            "type": "reply",
+                            "data": {"id": "M-ANCIENT"},
+                            "quoted": {
+                                "sender_qq": "100",
+                                "sender_name": "u1",
+                                "from_self": False,
+                                "segments": [
+                                    {
+                                        "type": "text",
+                                        "data": {"text": "天气怎么样"},
+                                    }
+                                ],
+                            },
+                        },
+                        {"type": "text", "data": {"text": "今天有雨"}},
+                    ],
+                    "sender": {"nickname": "u2", "user_id": 200},
+                },
+                user_id=200,
+            ),
+        ]
+        rendered = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertIn('to_message_id="M-ANCIENT"', rendered)
+        self.assertIn('from_name="u1"', rendered)
+        self.assertIn('from_qq="100"', rendered)
+        self.assertIn('excerpt="天气怎么样"', rendered)
+        # quoted.from_self=False 与"外部作者"同语义：不渲染 false。
+        self.assertNotIn("from_self=", rendered)
+
+    def test_reply_segment_quoted_from_self_renders_true(self) -> None:
+        # 引用 bot 自己的老消息（窗口外）：quoted.from_self=True → 服务端
+        # 铁证 from_self="true" 不丢——这是"漏判别人在回我"的根因修复。
+        evs = [
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "segments": [
+                        {
+                            "type": "reply",
+                            "data": {"id": "M-BOT-OLD"},
+                            "quoted": {
+                                "sender_qq": "10001",
+                                "from_self": True,
+                                "segments": [
+                                    {"type": "text", "data": {"text": "带伞~"}}
+                                ],
+                            },
+                        },
+                        {"type": "text", "data": {"text": "谢啦"}},
+                    ],
+                    "sender": {"nickname": "u3", "user_id": 300},
+                },
+                user_id=300,
+            ),
+        ]
+        rendered = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertIn('from_self="true"', rendered)
+        self.assertIn('from_qq="10001"', rendered)
+        self.assertIn('excerpt="带伞~"', rendered)
+
+    def test_reply_segment_quoted_gloss_matches_window_gloss(self) -> None:
+        # quoted.segments 走与窗口内索引同一条 gloss 渲染路径：表情包取
+        # summary 语义占位，不是裸类型名。
+        evs = [
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "segments": [
+                        {
+                            "type": "reply",
+                            "data": {"id": "M-STICKER"},
+                            "quoted": {
+                                "sender_qq": "100",
+                                "segments": [
+                                    {
+                                        "type": "image",
+                                        "data": {
+                                            "sub_type": 1,
+                                            "summary": "[贴贴]",
+                                        },
+                                    }
+                                ],
+                            },
+                        },
+                        {"type": "text", "data": {"text": "哈哈"}},
+                    ],
+                    "sender": {"nickname": "u", "user_id": 1},
+                },
+            ),
+        ]
+        rendered = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertIn('excerpt="[贴贴]"', rendered)
+
+    def test_reply_segment_quoted_fields_fall_back_per_field(self) -> None:
+        # 逐字段回退：quoted 只带 segments（无作者信息）而被引消息在窗口内
+        # → excerpt 用 quoted，from_name/from_qq 仍由窗口索引补上。
+        evs = [
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "onebot_message_id": "M-IN",
+                    "segments": [
+                        {"type": "text", "data": {"text": "旧文案"}}
+                    ],
+                    "sender": {"nickname": "u1", "user_id": 100},
+                },
+                user_id=100,
+                seconds_offset=0,
+            ),
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "segments": [
+                        {
+                            "type": "reply",
+                            "data": {"id": "M-IN"},
+                            "quoted": {
+                                "segments": [
+                                    {
+                                        "type": "text",
+                                        "data": {"text": "接收时刻原文"},
+                                    }
+                                ]
+                            },
+                        },
+                        {"type": "text", "data": {"text": "嗯"}},
+                    ],
+                    "sender": {"nickname": "u2", "user_id": 200},
+                },
+                user_id=200,
+                seconds_offset=1,
+            ),
+        ]
+        rendered = Projector.build_timeline(evs, tool_views=[])[1].render
+        # quoted 的 excerpt 优先（接收时刻的事实快照）。
+        self.assertIn('excerpt="接收时刻原文"', rendered)
+        self.assertIn('from_name="u1"', rendered)
+        self.assertIn('from_qq="100"', rendered)
 
     def _reply_render_to(self, quoted_segments: list[dict]) -> str:
         """helper：构造"一条被回复消息 + 一条 reply 它的消息"，返回后者渲染。"""
@@ -1938,7 +2139,11 @@ class RecallRenderingNoteTests(unittest.TestCase):
 
 
 class ReplyFlushedProjectionTests(unittest.TestCase):
-    def test_successful_reply_tool_row_folds_away_until_flushed(self) -> None:
+    def test_successful_reply_tool_row_is_rendered_as_authorization(self) -> None:
+        """2026-07-24（待办#19）起 reply 成功行**不再折叠**：它是 append-only
+        授权序列的唯一真相源——<args> 是这次授权原文（含 hold_seconds），
+        <result> 是它落成的调度事实。原先折叠是为了不与 <pending-reply> 双重
+        渲染，而那一段已随本次改动删除，主从关系反转。"""
         called = _snap(
             type="agent.tool_called",
             event_id="TC_EVENT",
@@ -1948,6 +2153,7 @@ class ReplyFlushedProjectionTests(unittest.TestCase):
                 "arguments": {
                     "action": "upsert",
                     "gist": {"intent": "回答"},
+                    "hold_seconds": 8,
                 },
             },
         )
@@ -1959,14 +2165,38 @@ class ReplyFlushedProjectionTests(unittest.TestCase):
                     "reply_task_id": "R1",
                     "revision": 1,
                     "state": "open",
+                    "flush_at": "2026-05-28T14:30:08+08:00",
                 },
             },
             seconds_offset=1,
         )
         views = Projector.fold_tool_results([called, result])
-        self.assertEqual(
-            Projector.build_timeline([called, result], tool_views=views), []
-        )
+        items = Projector.build_timeline([called, result], tool_views=views)
+        self.assertEqual([it.kind for it in items], ["tool_call"])
+        render = items[0].render
+        self.assertIn('<tool-call name="reply" status="complete"', render)
+        # 授权原文（<args>）与调度事实（<result>）都在同一行上，模型据此
+        # 判断"我授权了什么、什么时候发"，不需要另一个状态区。
+        self.assertIn("hold_seconds", render)
+        self.assertIn("回答", render)
+        self.assertIn("R1", render)
+        self.assertIn("flush_at", render)
+
+    def test_reply_task_domain_events_stay_hidden(self) -> None:
+        """agent.reply_task_upserted / cancelled 仍消隐：同一次授权已由它的
+        tool-call 行完整呈现，再渲染一遍就是双重渲染。"""
+        evs = [
+            _snap(
+                type="agent.reply_task_upserted",
+                payload={"reply_task_id": "R1", "revision": 1},
+            ),
+            _snap(
+                type="agent.reply_task_cancelled",
+                payload={"reply_task_id": "R1", "revision": 1},
+                seconds_offset=1,
+            ),
+        ]
+        self.assertEqual(Projector.build_timeline(evs, tool_views=[]), [])
 
     def test_reply_flushed_renders_exact_items_and_message_ids(self) -> None:
         flushed = _snap(
@@ -2171,90 +2401,20 @@ class SavedMemesAugmentTests(unittest.IsolatedAsyncioTestCase):
         loader.assert_not_awaited()  # system 没有收藏面，不查
 
 
-class UnseenMessagesTests(unittest.TestCase):
-    """第一拍判定（2026-07-06，待办清单#1 群聊拆句观望）。
+class HandledBoundaryByRowOrderTests(unittest.TestCase):
+    """"我处理到哪儿了"由 timeline 的时间顺序表达（2026-07-24，待办清单#18）。
 
-    fold_unseen_message_ids 以窗口内最后一条 agent.decision_emitted 为
-    水位线：其后到达的 external.message.* 是"没有任何一拍决策看过"的新
-    消息，渲染时标 `unseen="true"`（缺失=已经历过至少一拍）。政策侧见
-    group_chat_rules.md §半句话先等等。
+    原 UnseenMessagesTests 覆盖的 `unseen="true"` 水位线已随本次改动删除：
+    二值标签造成锚定（模型只在带标签的消息里找发言理由），且它是一次性的
+    ——一条消息只享有一拍的"值得看"，那拍若观望就永久降级成历史。替代物
+    是行位置本身：`<my-thought>` / `<my-reply>` 行**之后**的消息 = 那拍没
+    看到它。前提是 decision_emitted 的 occurred_at 回填为本拍投影时刻，
+    护栏在 test_agent_loop_skeleton_contract.py::
+    test_decision_timestamp_is_tick_start_not_write_time。
     """
 
-    def test_message_after_decision_is_unseen(self) -> None:
-        evs = [
-            _snap(
-                type="agent.decision_emitted",
-                payload={"reasoning": "r"},
-                seconds_offset=1,
-            ),
-            _snap(
-                type="external.message.group",
-                event_id="M2",
-                seconds_offset=2,
-            ),
-        ]
-        self.assertEqual(
-            Projector.fold_unseen_message_ids(evs), frozenset({"M2"})
-        )
-
-    def test_message_before_decision_is_seen(self) -> None:
-        evs = [
-            _snap(
-                type="external.message.group",
-                event_id="M1",
-                seconds_offset=1,
-            ),
-            _snap(
-                type="agent.decision_emitted",
-                payload={"reasoning": "r"},
-                seconds_offset=2,
-            ),
-        ]
-        self.assertEqual(Projector.fold_unseen_message_ids(evs), frozenset())
-
-    def test_messages_without_any_decision_all_unseen(self) -> None:
-        # 窗口内从没有过决策 = 该 scope 真正意义上的第一拍
-        evs = [
-            _snap(
-                type="external.message.group",
-                event_id="M1",
-                seconds_offset=1,
-            ),
-            _snap(
-                type="external.message.group",
-                event_id="M2",
-                seconds_offset=2,
-            ),
-        ]
-        self.assertEqual(
-            Projector.fold_unseen_message_ids(evs), frozenset({"M1", "M2"})
-        )
-
-    def test_empty_window_has_no_unseen(self) -> None:
-        self.assertEqual(Projector.fold_unseen_message_ids([]), frozenset())
-
-    def test_non_message_events_never_unseen(self) -> None:
-        # notice / request / runtime hint 不参与——观望语义只对"人还在说话"
-        # 成立；空 reasoning 的决策也照样推进水位线（写没写 reasoning 不影响
-        # "这拍看过消息"的事实）。
-        evs = [
-            _snap(
-                type="agent.decision_emitted",
-                payload={"reasoning": ""},
-                seconds_offset=1,
-            ),
-            _snap(type="external.notice.poke", seconds_offset=2),
-            _snap(type="external.request.group.add", seconds_offset=3),
-            _snap(
-                type="runtime.wait_elapsed",
-                payload={"seconds": 15},
-                seconds_offset=4,
-            ),
-        ]
-        self.assertEqual(Projector.fold_unseen_message_ids(evs), frozenset())
-
-    def test_project_renders_unseen_attr_only_on_new_messages(self) -> None:
-        """端到端：决策前的消息不带 unseen，决策后的消息带 unseen="true"。"""
+    def test_message_never_carries_unseen_attribute(self) -> None:
+        """回归护栏：属性彻底消失，决策前后一视同仁。"""
         evs = [
             _snap(
                 type="external.message.group",
@@ -2293,27 +2453,55 @@ class UnseenMessagesTests(unittest.TestCase):
             tick_seq=2,
             now=BASE_TIME + timedelta(seconds=10),
         )
-        kinds = [it.kind for it in context.timeline]
-        # 2026-07-06 思考轨迹内联后，决策事件本身也渲染 <my-thought> 行
-        self.assertEqual(kinds, ["message", "my_thought", "message"])
-        self.assertNotIn("unseen", context.timeline[0].render)
-        self.assertIn('unseen="true"', context.timeline[2].render)
+        for item in context.timeline:
+            self.assertNotIn("unseen", item.render)
 
-    def test_build_timeline_without_ids_marks_nothing(self) -> None:
-        # 直调 build_timeline 不传 unseen_message_ids（旧调用/单测）时缺省
-        # 空集——渲染行为与引入该属性前完全一致。
+    def test_row_order_places_thought_between_the_two_messages(self) -> None:
+        """行位置就是判据：决策事件夹在两条消息之间时，<my-thought> 行必须
+        落在它们中间——上面的是那拍看过的，下面的是那拍之后才来的。"""
         evs = [
             _snap(
                 type="external.message.group",
                 event_id="M1",
                 payload={
-                    "segments": [{"type": "text", "data": {"text": "hi"}}]
+                    "segments": [{"type": "text", "data": {"text": "我想问一下"}}]
                 },
                 seconds_offset=1,
             ),
+            _snap(
+                type="agent.decision_emitted",
+                payload={"reasoning": "像半句，先等"},
+                seconds_offset=2,
+            ),
+            _snap(
+                type="external.message.group",
+                event_id="M2",
+                payload={
+                    "segments": [
+                        {"type": "text", "data": {"text": "关于装机那个事"}}
+                    ]
+                },
+                seconds_offset=3,
+            ),
         ]
-        items = Projector.build_timeline(evs, tool_views=[])
-        self.assertNotIn("unseen", items[0].render)
+        context = Projector.project(
+            evs,
+            scope_key="group:999",
+            correlation_id="c",
+            tick_seq=2,
+            now=BASE_TIME + timedelta(seconds=10),
+        )
+        self.assertEqual(
+            [it.kind for it in context.timeline],
+            ["message", "my_thought", "message"],
+        )
+        self.assertEqual(
+            [it.event_id for it in context.timeline][::2], ["M1", "M2"]
+        )
+
+    def test_fold_unseen_message_ids_is_gone(self) -> None:
+        """折叠函数本身已删除——防止后续改动无意间把它加回来。"""
+        self.assertFalse(hasattr(Projector, "fold_unseen_message_ids"))
 
 
 class MyThoughtTests(unittest.TestCase):

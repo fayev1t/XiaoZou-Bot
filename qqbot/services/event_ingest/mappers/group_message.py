@@ -25,6 +25,7 @@ from qqbot.services.event_ingest import idempotency
 from qqbot.services.event_ingest.napcat_helpers import (
     dump_event,
     dump_message_segments,
+    enrich_reply_segments,
 )
 from qqbot.services.event_ingest.system_event import PartialSystemEvent
 
@@ -61,6 +62,9 @@ class GroupMessageMapper:
             "segments": dump_message_segments(event),
             "message_sub_type": msg_sub_type,
         }
+        # 被引消息富化：适配器已解析的 event.reply 固化进 reply 段顶层
+        # quoted 键——被引消息滚出投影窗口后 from_*/excerpt 不再丢失。
+        enrich_reply_segments(event, payload["segments"])
         # 可选补充字段——"有才落键"，不给一库 None：
         # - anonymous：OneBot 标准匿名消息对象（napcat 无匿名支持、恒缺失；
         #   标准实现才会给）。含 flag（set_group_anonymous_ban 凭证），只入库

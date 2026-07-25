@@ -1061,33 +1061,23 @@ class SavedMemesEnvelopeTests(unittest.TestCase):
         self.assertNotIn(">A<B&C<", text)
 
 
-class PendingReplyEnvelopeTests(unittest.TestCase):
-    def test_pending_reply_renders_after_tasks_before_current(self) -> None:
-        """缓存契约（2026-07-19 修正）：pending-reply 是全信封最易变的业务段
-        （每次合稿 revision/flush_at 都变、创建/flush 时整段出现消失），且只
-        存在于拍频最高的维持窗口内——必须排在 timeline/active-tasks 之后、
-        <current/> 之前，否则维持窗口期间每拍掐断 timeline 的缓存前缀。"""
-        from datetime import timedelta
+class PendingReplySectionRemovedTests(unittest.TestCase):
+    """`<pending-reply>` 段已于 2026-07-24 删除（待办清单#19）。
 
-        from qqbot.services.agent_loop.decision import PendingReplyView
+    它的每个字段都被 timeline 上的 `<tool-call name="reply">` 行逐字段覆盖
+    （reply_task_id / revision / flush_at / hard_deadline 在 `<result>` 里，
+    mode / targets / gist 在 `<args>` 里）。reply 成功行不再折叠之后，独立
+    状态区就是重复渲染，一并撤掉；顺带撤掉了信封里变化最频繁的那一段
+    （每次落稿都变、创建/flush 时整段出现消失），`</active-tasks>` 到
+    `<current/>` 之间不再有缓存抖动源。
+    """
 
-        now = china_now()
+    def test_envelope_has_no_pending_reply_section(self) -> None:
         ctx = DecisionContext(
             scope_key="group:100",
             correlation_id="CID",
             tick_seq=2,
-            now=now,
-            pending_reply=PendingReplyView(
-                reply_task_id="R1",
-                revision=2,
-                state="open",
-                created_at=now,
-                flush_at=now + timedelta(seconds=8),
-                hard_deadline=now + timedelta(seconds=90),
-                mode="compose",
-                targets=[{"message_id": "M1", "points": ["回答"]}],
-                gist={"intent": "解释清楚", "avoid": ["别编"]},
-            ),
+            now=china_now(),
         )
         llm = _StubLLM(
             response_content='{"actions":[{"type":"idle","reason":"x"}]}'
@@ -1095,13 +1085,16 @@ class PendingReplyEnvelopeTests(unittest.TestCase):
         planner = LLMPlanner(llm_client=llm)
         asyncio.run(planner.decide(ctx))
         text = llm.invocations[0][1].content[0]["text"]
-        self.assertIn('<pending-reply reply_task_id="R1" revision="2"', text)
-        self.assertIn("解释清楚", text)
+        self.assertNotIn("<pending-reply", text)
+        # </active-tasks> 之后直接就是尾部时钟字段
         self.assertLess(
-            text.index("</active-tasks>"), text.index("<pending-reply")
+            text.index("</active-tasks>"), text.index("<current now=")
         )
-        self.assertLess(
-            text.index("<pending-reply"), text.index("<current now=")
+
+    def test_decision_context_has_no_pending_reply_field(self) -> None:
+        """防回潮：字段本身也已删除，不能靠 getattr 兜底悄悄复活。"""
+        self.assertNotIn(
+            "pending_reply", DecisionContext.__dataclass_fields__
         )
 
 
@@ -1111,8 +1104,8 @@ class EnvelopeCacheLayoutTests(unittest.TestCase):
     OpenAI 系 API 的自动前缀缓存要求前缀**逐字节一致**：每拍必变的 now/tick
     不得出现在信封头部（否则缓存前缀在 system prompt 末尾就断掉，timeline
     每拍全价重计费），段序按变化频率升序：tool-catalog → saved-memes →
-    timeline → active-tasks → pending-reply（有草稿才出，2026-07-19）→
-    <current/> → validation-error。改动信封布局
+    timeline → active-tasks → <current/> → validation-error。原
+    pending-reply 段已于 2026-07-24 删除。改动信封布局
     前必须先想清对缓存前缀的影响——本类是回归防线。"""
 
     def _render(self, ctx: DecisionContext) -> str:

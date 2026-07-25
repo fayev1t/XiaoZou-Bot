@@ -59,3 +59,57 @@ def dump_message_segments(event: Any) -> list[dict]:
     if original:
         return dump_segments(original)
     return dump_segments(getattr(event, "message", None))
+
+
+def enrich_reply_segments(event: Any, segments: list[dict]) -> None:
+    """把适配器已解析的被引消息（``event.reply``）固化进首个 reply 段。
+
+    nonebot OneBot V11 适配器收到带 reply 段的消息时，分发前已经调过
+    ``get_msg`` 把被引消息解析成 ``event.reply``（Reply 模型：sender +
+    message + message_id）——被引消息的作者与原文在 ingest 时刻**现成可得，
+    零额外 API 调用**。这里把它写进事件 payload，投影渲染 reply 段时优先
+    消费；被引消息滚出投影窗口后 from_*/excerpt 不再丢失（2026-07-22
+    出窗引用黑洞修复）。
+
+    落键（segment 顶层 ``quoted``，与 media 富化同级；子键"有才落键"）：
+    - ``sender_qq`` / ``sender_name``：被引消息作者的 QQ 号与显示名
+      （card 优先、nickname 兜底）。
+    - ``from_self``：被引消息是否 bot 自己所发（sender_qq == self_id，
+      ingest 时刻的服务端事实；bool，两值都落，渲染层只在 true 时输出）。
+    - ``segments``：被引消息的段数组 dump（供投影生成 excerpt；**不做**
+      媒体下载——media 富化只走 payload 顶层 segments）。
+
+    ``event.reply`` 缺失（适配器 get_msg 失败、被引消息已撤回、非 v11
+    适配器、测试 fake）时不落键，投影退回窗口内索引兜底。OneBot V11 一条
+    消息至多一个 reply 段，固定富化第一个、不按 id 匹配——napcat 的
+    get_msg 返回 id 与段内 id 可能分属 message_id / real_id 两个空间，
+    严格匹配反而把现成的富化白白丢掉。
+    """
+    reply = getattr(event, "reply", None)
+    if reply is None:
+        return
+    target = next(
+        (
+            seg
+            for seg in segments
+            if isinstance(seg, dict) and seg.get("type") == "reply"
+        ),
+        None,
+    )
+    if target is None:
+        return
+    quoted: dict[str, Any] = {}
+    sender = getattr(reply, "sender", None)
+    sender_qq = getattr(sender, "user_id", None) if sender is not None else None
+    if sender_qq is not None and str(sender_qq).strip():
+        quoted["sender_qq"] = str(sender_qq)
+    name = None
+    if sender is not None:
+        name = getattr(sender, "card", None) or getattr(sender, "nickname", None)
+    if name is not None and str(name).strip():
+        quoted["sender_name"] = str(name)
+    self_id = getattr(event, "self_id", None)
+    if sender_qq is not None and self_id is not None and str(self_id).strip():
+        quoted["from_self"] = str(sender_qq) == str(self_id)
+    quoted["segments"] = dump_segments(getattr(reply, "message", None))
+    target["quoted"] = quoted

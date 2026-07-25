@@ -134,6 +134,73 @@ class GroupMessageMapperContractTests(unittest.TestCase):
         partial = self.mapper.map(_make_message_event(original_message=[]))
         self.assertEqual(partial.payload["segments"], expected)
 
+    def test_reply_segment_enriched_from_adapter_resolved_reply(self) -> None:
+        # EventIngest契约.md §6.4：适配器已解析的 event.reply（分发前 get_msg
+        # 的产物）固化进首个 reply 段顶层 quoted 键——被引消息滚出投影窗口后
+        # from_*/excerpt 不再丢失。子键"有才落键"。
+        original = [
+            SimpleNamespace(type="reply", data={"id": "8888"}),
+            SimpleNamespace(type="text", data={"text": "谢啦"}),
+        ]
+        reply = SimpleNamespace(
+            message_id=8888,
+            sender=SimpleNamespace(user_id=333, nickname="carol", card="C姐"),
+            message=[SimpleNamespace(type="text", data={"text": "带伞~"})],
+        )
+        partial = self.mapper.map(
+            _make_message_event(original_message=original, reply=reply)
+        )
+        seg = partial.payload["segments"][0]
+        self.assertEqual(seg["type"], "reply")
+        quoted = seg["quoted"]
+        self.assertEqual(quoted["sender_qq"], "333")
+        # card 优先于 nickname（与投影层作者名取值同序）。
+        self.assertEqual(quoted["sender_name"], "C姐")
+        self.assertIs(quoted["from_self"], False)
+        self.assertEqual(
+            quoted["segments"], [{"type": "text", "data": {"text": "带伞~"}}]
+        )
+        # 富化写在 segment 顶层，不污染 data。
+        self.assertEqual(seg["data"], {"id": "8888"})
+
+    def test_reply_segment_quoting_bot_marks_from_self(self) -> None:
+        # 被引消息是 bot 自己发的（sender.user_id == self_id）→ from_self=True，
+        # 投影层据此渲染 from_self="true"（"别人在回我"的服务端铁证）。
+        original = [SimpleNamespace(type="reply", data={"id": "7777"})]
+        reply = SimpleNamespace(
+            message_id=7777,
+            sender=SimpleNamespace(user_id=10000, nickname="小奏", card=None),
+            message=[SimpleNamespace(type="text", data={"text": "带伞~"})],
+        )
+        partial = self.mapper.map(
+            _make_message_event(original_message=original, reply=reply)
+        )
+        quoted = partial.payload["segments"][0]["quoted"]
+        self.assertIs(quoted["from_self"], True)
+        self.assertEqual(quoted["sender_name"], "小奏")
+
+    def test_reply_segment_without_adapter_reply_stays_bare(self) -> None:
+        # event.reply 缺失（get_msg 失败/被引已撤回/测试 fake）→ 不落 quoted
+        # 键，投影退回窗口内索引兜底（行为与富化前逐字节一致）。
+        original = [
+            SimpleNamespace(type="reply", data={"id": "8888"}),
+            SimpleNamespace(type="text", data={"text": "谢啦"}),
+        ]
+        partial = self.mapper.map(_make_message_event(original_message=original))
+        self.assertNotIn("quoted", partial.payload["segments"][0])
+
+    def test_adapter_reply_without_reply_segment_is_ignored(self) -> None:
+        # 病态输入：event.reply 在但段里没有 reply 段（非 v11 适配器改写
+        # 差异）→ 富化静默跳过，不 raise 不污染其他段。
+        reply = SimpleNamespace(
+            message_id=8888,
+            sender=SimpleNamespace(user_id=333, nickname="carol"),
+            message=[],
+        )
+        partial = self.mapper.map(_make_message_event(reply=reply))
+        for seg in partial.payload["segments"]:
+            self.assertNotIn("quoted", seg)
+
     def test_anonymous_subtype_routes_to_anonymous_type(self) -> None:
         partial = self.mapper.map(_make_message_event(sub_type="anonymous"))
         self.assertEqual(partial.type, "external.message.group.anonymous")

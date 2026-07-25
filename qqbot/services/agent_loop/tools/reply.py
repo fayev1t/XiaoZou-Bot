@@ -1,4 +1,12 @@
-"""reply 工具：向当前 scope 的 ReplyTask 内容区落稿、合稿或撤稿。"""
+"""reply 工具：向当前 scope 追加一条发言授权，或撤掉待发的那份。
+
+2026-07-24（待办#19）起是 **append-only**：每次调用都是完整、自足的一条授权，
+不引用上一次调用、程序也不做任何合并计算。scope 内仍只有一份 open reply_task
+承载"等到什么时候发"，后续调用 append 上去并把 flush_at 换成自己的（最新一次
+直接获胜，能延长也能缩短）。多条授权怎么综合成一段话，交给 flush 时的
+Replyer——它拿到与 Planner 同权重的完整 timeline，每条授权都以
+``<tool-call name="reply">`` 行留在上面。
+"""
 
 from __future__ import annotations
 
@@ -17,9 +25,6 @@ from qqbot.services.agent_loop.reply_task import (
     find_cancel_for_tool_call,
     find_upsert_for_tool_call,
     load_open_reply_task,
-    load_reply_task,
-    merge_gist,
-    merge_targets,
     scope_lock,
 )
 from qqbot.services.agent_loop.tool_registry import BaseTool, ToolOutcome
@@ -35,10 +40,11 @@ class ReplyTool(BaseTool):
     # reply-only 成功批次不应为“草稿已落定”再开一拍；失败仍需让 Planner 看见。
     wake_policy = "on_failure"
     description = (
-        "Create, merge, or cancel the current scope's short-lived reply_task. "
-        "A successful call only stores pending reply intent; it does NOT mean "
-        "anything was sent. Actual speech appears later as <my-reply> after "
-        "runtime.reply_flushed."
+        "Append one self-contained authorization to speak, or cancel the "
+        "pending draft. Each call stands alone — never reference an earlier "
+        "call; the newest hold_seconds wins outright. A successful call only "
+        "stores pending intent; it does NOT mean anything was sent. Actual "
+        "speech appears later as <my-reply> after runtime.reply_flushed."
     )
     usage_prompt = _USAGE_PROMPT
     arguments_schema = {
@@ -47,16 +53,17 @@ class ReplyTool(BaseTool):
             "action": {
                 "type": "string",
                 "enum": ["upsert", "cancel"],
-                "description": "Create/merge a draft, or cancel the open draft.",
+                "description": (
+                    "upsert appends one authorization; cancel withdraws the "
+                    "pending draft entirely."
+                ),
             },
             "reply_task_id": {
                 "type": "string",
-                "description": "Omit on create; copy from pending-reply on merge/cancel.",
-            },
-            "expected_revision": {
-                "type": "integer",
-                "minimum": 1,
-                "description": "Required on merge/cancel; copy the current revision.",
+                "description": (
+                    "cancel only, and optional even there: omit to withdraw "
+                    "whatever draft is pending. Never needed on upsert."
+                ),
             },
             "mode": {
                 "type": "string",
@@ -70,18 +77,35 @@ class ReplyTool(BaseTool):
                     "properties": {
                         "message_id": {"type": ["string", "integer"]},
                         "sender_qq": {"type": ["string", "integer"]},
-                        "points": {
-                            "type": "array",
-                            "items": {"type": "string"},
+                        "context": {
+                            "type": "string",
+                            "description": (
+                                "Conversation analysis for this message: who "
+                                "is talking to whom and what it means in its "
+                                "thread."
+                            ),
+                        },
+                        "guidance": {
+                            "type": "string",
+                            "description": (
+                                "How to respond: angle, approach, boundaries. "
+                                "Not final wording."
+                            ),
                         },
                     },
-                    "required": ["points"],
+                    "required": ["context"],
                     "additionalProperties": False,
                 },
             },
             "gist": {
                 "type": "object",
                 "properties": {
+                    "situation": {
+                        "type": "string",
+                        "description": (
+                            "Map of the room's current conversation threads."
+                        ),
+                    },
                     "intent": {"type": "string"},
                     "facts": {
                         "type": "array",
@@ -99,6 +123,11 @@ class ReplyTool(BaseTool):
                 "type": "integer",
                 "minimum": 0,
                 "maximum": MAX_HOLD_SECONDS,
+                "description": (
+                    "Required on upsert — no default. How long to hold this "
+                    "draft before it is composed and sent. The newest call "
+                    "wins outright: it may shorten as well as extend."
+                ),
             },
             "verbatim_messages": {
                 "type": "array",
@@ -116,8 +145,11 @@ class ReplyTool(BaseTool):
         "additionalProperties": False,
         "allOf": [
             {
-                "if": {"properties": {"action": {"const": "cancel"}}},
-                "then": {"required": ["reply_task_id", "expected_revision"]},
+                "if": {
+                    "properties": {"action": {"const": "upsert"}},
+                    "required": ["action"],
+                },
+                "then": {"required": ["hold_seconds"]},
             },
             {
                 "if": {
@@ -182,7 +214,15 @@ class ReplyTool(BaseTool):
         if existing_payload is not None:
             return ToolOutcome.success(_result_from_payload(existing_payload))
 
-        hold = _coerce_hold(arguments.get("hold_seconds", 0))
+        # hold_seconds 无默认值（2026-07-24，待办#19）：等多久是每次调用都要
+        # 现场判断的语义（"这个人说完了没"），给默认值等于替模型做决定——
+        # 曾经的 default 0 就把合并窗口整个关掉了。
+        if "hold_seconds" not in arguments:
+            return _invalid(
+                "missing_hold_seconds",
+                "hold_seconds is required on upsert; there is no default",
+            )
+        hold = _coerce_hold(arguments.get("hold_seconds"))
         if hold is None:
             return _invalid(
                 "bad_hold_seconds",
@@ -203,53 +243,40 @@ class ReplyTool(BaseTool):
         if fail:
             return fail
 
+        # ─── append-only 授权（2026-07-24，待办#19）───
+        # 每次调用就是一条完整、自足的授权，不引用上一次、不做合并计算：
+        # 模型不再抄 reply_task_id/expected_revision，程序也不再 merge
+        # targets/gist（旧 merge 只增不删，撤不掉写错的 target 与 fact）。
+        # scope 内仍只有一份 open reply_task 承载"等到什么时候发"，后续调用
+        # append 上去、把 flush_at 换成自己的——**最新一次调用直接获胜，能
+        # 延长也能缩短**。内容怎么综合交给 flush 时的 Replyer：它拿的是与
+        # Planner 同权重的完整 timeline，每条授权都以 <tool-call name="reply">
+        # 行留在上面（投影不再折叠 reply 成功行）。
         now = china_now()
-        requested_id = arguments.get("reply_task_id")
         current = await load_open_reply_task(session_factory, scope_key)
-        if requested_id is None:
-            if current is not None:
-                return ToolOutcome.failure(
-                    "reply_task_exists",
-                    "an open reply_task already exists; merge with its id/revision",
-                    reply_task_id=current.reply_task_id,
-                    revision=current.revision,
-                )
+        if current is None:
             task_id = new_event_id()
             revision = 1
             created_at = now
             hard_deadline = now + timedelta(seconds=MAX_HOLD_SECONDS)
-            flush_at = now + timedelta(seconds=hold)
-            merged_targets = targets
-            merged_gist = gist
         else:
-            if not isinstance(requested_id, str) or not requested_id:
-                return _invalid("bad_reply_task_id", "reply_task_id must be a string")
-            if current is None or current.reply_task_id != requested_id:
-                return ToolOutcome.failure(
-                    "reply_task_not_found", "open reply_task was not found"
-                )
-            expected = arguments.get("expected_revision")
-            if expected != current.revision:
-                return ToolOutcome.failure(
-                    "reply_task_revision_conflict",
-                    "expected_revision does not match current revision",
-                    expected_revision=expected,
-                    actual_revision=current.revision,
-                )
+            # verbatim 独占：它绕过 Replyer 直发，没有"综合多条授权"可言。
+            # 撞上就只能先 cancel 再重落。
             if current.mode != "compose" or mode != "compose":
                 return ToolOutcome.failure(
-                    "reply_task_locked", "verbatim reply_task cannot be merged"
+                    "reply_task_locked",
+                    "a verbatim reply_task is exclusive; cancel it first",
+                    reply_task_id=current.reply_task_id,
                 )
             task_id = current.reply_task_id
             revision = current.revision + 1
             created_at = current.created_at
             hard_deadline = current.hard_deadline
-            requested_flush = now + timedelta(seconds=hold)
-            flush_at = min(max(current.flush_at, requested_flush), hard_deadline)
-            merged_targets = merge_targets(current.targets, targets)
-            merged_gist = merge_gist(current.gist, gist)
+        # hard_deadline 自创建时刻起算、不随 append 滑动——它是"再怎么等也
+        # 必须发出去"的硬上界。
+        flush_at = min(now + timedelta(seconds=hold), hard_deadline)
 
-        if mode == "compose" and not merged_targets and not merged_gist.get("intent"):
+        if mode == "compose" and not targets and not gist.get("intent"):
             return _invalid(
                 "empty_reply_task", "compose reply requires targets or gist.intent"
             )
@@ -261,8 +288,8 @@ class ReplyTool(BaseTool):
             flush_at=flush_at,
             hard_deadline=hard_deadline,
             mode=mode,
-            targets=merged_targets,
-            gist=merged_gist,
+            targets=targets,
+            gist=gist,
             verbatim_messages=verbatim,
         )
         event_id = await append_upsert(
@@ -277,8 +304,9 @@ class ReplyTool(BaseTool):
                 await notify(scope_key, task_id, revision, flush_at, event_id)
             except Exception as exc:
                 # 落稿事件已经是完成真值；调度通知失败不能把已成功的工具调用
-                # 反写成失败。后续拍仍能从 <pending-reply> 看见并合并/撤销，
-                # 重启 rescan 也会重挂未来定时器。
+                # 反写成失败。后续拍仍能从 timeline 上自己那条 <tool-call
+                # name="reply"> 行看见并追授权/撤销，重启 rescan 也会重挂未来
+                # 定时器。
                 logger.warning(
                     "[reply] persisted task {} but scheduling failed: {}",
                     task_id,
@@ -306,26 +334,23 @@ class ReplyTool(BaseTool):
                     "state": "cancelled",
                 }
             )
-        task_id = arguments.get("reply_task_id")
-        if not isinstance(task_id, str) or not task_id:
-            return _invalid("bad_reply_task_id", "cancel requires reply_task_id")
-        task = await load_reply_task(session_factory, scope_key, task_id)
-        if task is None:
+        # reply_task_id 可省（2026-07-24，待办#19）：scope 内至多一份 open
+        # reply_task，"撤掉待发的那份"无歧义。给了就必须对得上——防止模型拿
+        # 着一份已经发出去的旧 id 来撤，静默撤错另一份。expected_revision 随
+        # append 语义一并取消：授权是追加的，没有需要 CAS 的合并冲突。
+        requested_id = arguments.get("reply_task_id")
+        if requested_id is not None and (
+            not isinstance(requested_id, str) or not requested_id
+        ):
+            return _invalid("bad_reply_task_id", "reply_task_id must be a string")
+        task = await load_open_reply_task(session_factory, scope_key)
+        if task is None or (
+            requested_id is not None and task.reply_task_id != requested_id
+        ):
             return ToolOutcome.failure(
-                "reply_task_not_found", "reply_task was not found"
+                "reply_task_not_found", "no open reply_task to cancel"
             )
-        if task.state != "open":
-            return ToolOutcome.failure(
-                "reply_task_locked", f"reply_task state is {task.state}"
-            )
-        expected = arguments.get("expected_revision")
-        if expected != task.revision:
-            return ToolOutcome.failure(
-                "reply_task_revision_conflict",
-                "expected_revision does not match current revision",
-                expected_revision=expected,
-                actual_revision=task.revision,
-            )
+        task_id = task.reply_task_id
         await append_cancel(
             session_factory,
             scope_key=scope_key,
@@ -354,19 +379,37 @@ def _coerce_hold(raw: Any) -> int | None:
 
 
 def _validate_targets(raw: Any) -> tuple[list[dict], ToolOutcome | None]:
+    """2026-07-22 语义换代：points（要点清单，"教 Replyer 说什么"）→
+    context + guidance（对话关系分析 + 回法，"教 Replyer 怎么回"）。
+    Replyer 已与 Planner 看同一份 timeline，不需要转述内容；旧 points 形态
+    直接拒绝并给出可读 reason_code，让 Planner 下一拍照错误自纠。"""
     if not isinstance(raw, list):
         return [], _invalid("bad_targets", "targets must be an array")
     out: list[dict] = []
     for index, item in enumerate(raw):
         if not isinstance(item, dict):
             return [], _invalid("bad_target", f"targets[{index}] must be an object")
-        points = item.get("points", [])
-        if not isinstance(points, list) or any(not isinstance(p, str) for p in points):
+        if "points" in item:
             return [], _invalid(
-                "bad_target_points",
-                f"targets[{index}].points must be strings",
+                "points_replaced_by_context",
+                f"targets[{index}].points is retired: describe the "
+                "conversation in `context` and how to respond in `guidance`",
             )
-        normalized = {"points": [p.strip() for p in points if p.strip()]}
+        context_val = item.get("context")
+        if not isinstance(context_val, str) or not context_val.strip():
+            return [], _invalid(
+                "bad_target_context",
+                f"targets[{index}].context must be a non-empty string",
+            )
+        normalized: dict[str, Any] = {"context": context_val.strip()}
+        guidance = item.get("guidance")
+        if guidance is not None and not isinstance(guidance, str):
+            return [], _invalid(
+                "bad_target_guidance",
+                f"targets[{index}].guidance must be a string",
+            )
+        if isinstance(guidance, str) and guidance.strip():
+            normalized["guidance"] = guidance.strip()
         for key in ("message_id", "sender_qq"):
             value = item.get(key)
             if value is not None:
@@ -379,7 +422,7 @@ def _validate_gist(raw: Any) -> tuple[dict, ToolOutcome | None]:
     if not isinstance(raw, dict):
         return {}, _invalid("bad_gist", "gist must be an object")
     out: dict[str, Any] = {}
-    for key in ("intent", "tone"):
+    for key in ("situation", "intent", "tone"):
         value = raw.get(key)
         if value is not None and not isinstance(value, str):
             return {}, _invalid("bad_gist", f"gist.{key} must be a string")

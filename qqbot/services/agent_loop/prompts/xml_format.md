@@ -1,18 +1,30 @@
 # Input format — reading the `<agent-input>` envelope
 
 > **ReplyTask truth override.** `reply` tool success means a pending draft,
-> never speech. `<pending-reply>` is the current unsent task. Actual past
-> utterances are rendered as `<my-reply>` with exact sent text/meme and
-> message_id. `send_message` is not a current tool.
+> never speech. The draft lives in the timeline as `<tool-call name="reply">`
+> rows — there is no separate pending-draft section. Actual past utterances are
+> rendered as `<my-reply>` with exact sent text/meme and message_id.
+> `send_message` is not a current tool.
 
-### `<pending-reply>` — current unsent reply task
+### Reading your own `<tool-call name="reply">` rows
 
-```xml
-<pending-reply reply_task_id="..." revision="2" flush_at="..." hard_deadline="..." mode="compose">{"targets":[],"gist":{...}}</pending-reply>
-```
+Each such row is **one authorization you appended**, not something you said:
 
-Merge new semantic points with this id/revision; merge is what postpones it.
-Do not re-upsert merely because another tick occurred.
+- `<args>` is that authorization verbatim — `targets` / `gist` / `hold_seconds`.
+- `<result>` is what it scheduled — `reply_task_id`, `revision`, `state`,
+  `flush_at`, `hard_deadline`.
+- Rows sharing a `reply_task_id` are the same draft. **The newest one wins**
+  where they disagree; the Replyer reads them in order at flush time.
+
+Whether that draft is still pending: look for a `<my-reply>` with the same
+`reply_task_id` **below** it. Present = it has been sent. Absent = still waiting.
+A `cancel` row means it was withdrawn.
+
+Three quantities you may need, all subtraction of things already on screen:
+
+- how long you have been holding — `<current now>` − the row's `time=`
+- how long until it goes out — `<result>.flush_at` − `<current now>`
+- how long since the person last spoke — `<current now>` − their `<message>` `time=`
 
 ### `<my-reply>` — messages actually sent
 
@@ -135,7 +147,7 @@ Operationally: start reading from the bottom few rows. The bottom is the freshes
 ```
 
 Your own delivered replies are separate `<my-reply>` rows. A `reply` tool-call
-only mutates `<pending-reply>` and is never itself visible speech.
+is a recorded authorization and is never itself visible speech.
 
 ### `<message>` — an incoming user message
 
@@ -153,7 +165,6 @@ Every attribute is single-purpose (no composite values to parse apart); absent =
 - `anonymous="true"` (optional) — this is an **anonymous group message**: `sender_name` is the sender's anonymous alias, NOT a real member identity, and `sender_qq` (if present) is the anonymous pseudo-id — do not treat either as a stable person. Absent = a normal, identified message.
 - `time=` — ISO-8601 timestamp.
 - `message_id=` — the OneBot message id. This is the value you put into `reply.data.id` when quote-replying this message, or into `recall` / `set_essence` / `emoji_like`'s `message_id` argument (same name, copy verbatim).
-- `unseen="true"` (optional) — this message arrived **after your last decision in this scope**: no tick of yours has processed it yet — this tick is your first look. **Absent = the message has already been through at least one of your decisions**, so its presence/absence tells you whether you are reacting to genuinely new input or re-reading handled history. Judgment rules for unseen tail messages that look unfinished: §group_chat_rules (半句话先等等).
 
 The body is text plus **inline segment tags** (see §Inline segments).
 
@@ -181,7 +192,7 @@ The body is text plus **inline segment tags** (see §Inline segments).
 </tool-call>
 
 <tool-call name="reply" status="complete" time="2026-05-28T14:30:42+08:00">
-  <args>{"action":"upsert","targets":[{"message_id":"MSG_100","points":["提醒带伞"]}],"gist":{"intent":"回答天气问题"},"hold_seconds":8}</args>
+  <args>{"action":"upsert","targets":[{"message_id":"MSG_100","context":"李四@我问明天天气","guidance":"给结论并提醒带伞"}],"gist":{"intent":"回答天气问题"},"hold_seconds":8}</args>
   <result>{"reply_task_id":"R1","revision":1,"state":"open","flush_at":"..."}</result>
 </tool-call>
 ```
@@ -193,11 +204,11 @@ The body is text plus **inline segment tags** (see §Inline segments).
 - With a `<result>`, the body is a JSON string. If it ends with `<truncated/>`, the original was longer than 6144 characters and the tail was cut. A successful `reply` result means pending state only and deliberately has no `message_id`.
 - With an `<error>`, it carries `kind=` plus **structured attributes** describing exactly what went wrong — read them, don't just eyeball the prose body. `permission_denied_user_tier` → `required_tier=` / `actual_tier=`; `permission_denied_bot_role` → `required_bot_role=` / `actual_bot_role=`; `tool_unavailable_in_scope` → `allowed_scopes=` / `actual_scope=`; `target_scope_mismatch` → `expected_scope=` / `actual_target_kind=` / `actual_target_id=`; `invalid_arguments` → `reason_code=` / `segment_index=` / `segment_type=` (which segment/field was bad); `upstream_action_failed` (napcat refused) → `retcode=` / `action=` / `upstream_wording=`, with QQ's human-readable reason in the body. For an `<error>`, decide whether to retry (different args), fail the task, or proceed without it — full handling rules live in §protocol permissions.
 
-> **`<tool-call name="reply">` is content-area bookkeeping, not speech.** A
-> successful create/merge is folded into `<pending-reply>`; cancel removes it.
-> Only `<my-reply>` is the delivery fact. Never infer sent wording from Planner's
-> gist, and never recreate a successful `<my-reply>` merely because a task is
-> still open.
+> **`<tool-call name="reply">` is an authorization, not speech.** Several of
+> them can stack on one draft — the newest wins where they disagree, and nothing
+> is merged for you. Only `<my-reply>` is the delivery fact. Never infer sent
+> wording from your own gist, and never re-authorize a draft that already has
+> its `<my-reply>` merely because a task is still open.
 
 ### `<my-thought>` — your own reasoning from a past tick
 
@@ -207,7 +218,9 @@ The body is text plus **inline segment tags** (see §Inline segments).
 
 - The body is **your own `reasoning` from a past decision** in this scope, in place on the time axis — you can see what you were thinking between any two messages, including ticks where you chose `idle`. Only the most recent few thoughts are shown, each truncated; older ones drop off.
 - It is memory, not instruction: the situation may have moved on since that thought. Never treat it as something a user said, and never quote its text into chat.
-- **A thought is not an action.** If a thought says you would do something and no matching `<tool-call>` row follows it, that thing **never happened** — no message was sent, no tool ran. Decide it fresh now: do it, schedule it (`wait` / a task), or drop it explicitly. Conversely, a `<message>` row that sits **after** your latest `<my-thought>` is input no decision of yours has processed yet (it will also carry `unseen="true"`).
+- **`time=` is when that tick started looking**, not when the wording came out — it is the moment that tick took its snapshot of the timeline. This is what makes row order mean something: **anything below a `<my-thought>` row arrived after that tick had already looked, so that decision could not have seen it.** Rows above it were in view.
+- **This position rule is your only "have I handled it yet" signal.** A `<message>` sitting below your latest `<my-thought>` (and below your latest `<my-reply>`) is input no decision of yours has processed — you are reacting to genuinely new material. One sitting above them is handled history you are re-reading.
+- **A thought is not an action.** If a thought says you would do something and no matching `<tool-call>` row follows it, that thing **never happened** — no message was sent, no tool ran. Decide it fresh now: do it, schedule it (`wait` / a task), or drop it explicitly.
 - Draft wording inside an old thought is not a queued message. Don't send it just because it reads ready — the reason to speak must come from the current timeline tail, per §group_chat_rules.
 
 ### `<task-closed>` — a task you already finished
@@ -310,7 +323,7 @@ Bodies are a mix of plain text (XML-escaped) and these inline tags:
 |-----|---------|-------|
 | `<at qq="USER_QQ" name="昵称"/>` | @ a specific user | `qq=` is the target's QQ id — the same value (and the same field name) you'd put into an outgoing `at` segment's `data.qq`. **Compare `qq=` to `bot_qq` to know if it's @-ing YOU.** |
 | `<at-all/>` | @ everyone in the group | Cannot be combined with a specific `qq=`. |
-| `<reply to_message_id="MSG_ID" from_name="昵称" from_qq="QQ" from_self="true" excerpt="前 40 字"/>` | The sender is **quote-replying** the message MSG_ID | **`from_name` / `from_qq` / `from_self` describe who wrote the QUOTED message — NOT the sender of this one.** This is the single most-misread tag: the quoted content belongs to the `from_*` author, while the new text after the tag belongs to the `<message sender_name=... sender_qq=...>`. Deciding "is this reply aimed at me": `from_self="true"` present → the quoted message is YOURS, they are replying **to you** (this marker is set server-side and works even when `bot_qq` is missing); otherwise compare `from_qq` to `bot_qq` — equal means you, anything else means that other person. `from_self` only ever appears as `"true"`; on quotes of other people's messages it is simply absent. `from_name` may be absent when the author's display name is unknown (in particular on your own quoted messages — `from_self` + `from_qq` still identify them). `excerpt` is a ≤40-char digest of the quoted message: plain text as-is; rich content as semantic glosses matching what the original message showed (a sticker's meaning like `[贴贴]`, a share card's caption like `[QQ小程序]哔哩哔哩`, `[文件]报表.xlsx`, `[语音]`, …) — so a reply to a sticker/card tells you *what* was replied to, not just that "an image existed". All `from_*` / `excerpt=` absent = the quoted message scrolled out of the window; you can't tell who is being quoted — fall back to `search_history` or, when unsure, stay cautious. |
+| `<reply to_message_id="MSG_ID" from_name="昵称" from_qq="QQ" from_self="true" excerpt="前 40 字"/>` | The sender is **quote-replying** the message MSG_ID | **`from_name` / `from_qq` / `from_self` describe who wrote the QUOTED message — NOT the sender of this one.** This is the single most-misread tag: the quoted content belongs to the `from_*` author, while the new text after the tag belongs to the `<message sender_name=... sender_qq=...>`. Deciding "is this reply aimed at me": `from_self="true"` present → the quoted message is YOURS, they are replying **to you** (this marker is set server-side and works even when `bot_qq` is missing); otherwise compare `from_qq` to `bot_qq` — equal means you, anything else means that other person. `from_self` only ever appears as `"true"`; on quotes of other people's messages it is simply absent. `from_name` may be absent when the author's display name is unknown (in particular on your own quoted messages — `from_self` + `from_qq` still identify them). `excerpt` is a ≤40-char digest of the quoted message: plain text as-is; rich content as semantic glosses matching what the original message showed (a sticker's meaning like `[贴贴]`, a share card's caption like `[QQ小程序]哔哩哔哩`, `[文件]报表.xlsx`, `[语音]`, …) — so a reply to a sticker/card tells you *what* was replied to, not just that "an image existed". `from_*` / `excerpt=` are resolved when the message **arrives** (the runtime fetches the quoted message from the platform at receive time), so they survive even when the quoted message is far older than the visible window. All of them absent = even the platform could not resolve the quote (recalled / extremely old, or an event stored before this enrichment existed); you can't tell who is being quoted — fall back to `search_history` or, when unsure, stay cautious. |
 | `<image kind="photo\|sticker" summary="[动画表情]" hash="sha256"/>` | An image | All three attributes are optional; **absent always means "unknown", never "no"**. `kind="photo"` = a real picture (photo / screenshot) — its content may matter, look at the pixels. `kind="sticker"` = a meme / sticker sent as an emotional reaction (includes market stickers) — read it as tone, don't analyze it like a photo. `summary` = QQ's own display gloss (e.g. `[动画表情]`, or a market-sticker name like `[赞]`); when no pixels are attached, `summary` is all you know about the content. `hash`: if the image was downloaded, the actual pixels are attached **after** the XML envelope as multimodal blocks, each preceded by a text label `↓ image hash=<sha256>` — match it back by hash. A placeholder with no matching label below = download failed; you know it exists but cannot view it. |
 | `<face face_id="N" name="[微笑]"/>` | A QQ-native emoticon (黄豆表情) | `name` is the emoticon's meaning — read the emotion from it. `face_id` is QQ's internal face id (same id space as `face:N` inside notice `likes=`, and the value an outgoing `face` segment's `data.id` takes). `name` absent = meaning unknown; do not guess from the bare id. |
 | `<mface summary="[释义]"/>` | A market / animated sticker (商城·魔法表情) | Only produced by non-napcat backends — napcat delivers market stickers as `<image kind="sticker" summary="...">` instead. `summary` is the sticker's meaning; treat it as tone. |
@@ -338,7 +351,7 @@ For each fresh `<message>` in `<timeline>`, decide who it is addressed to using 
 2. **Explicit `<reply>` quote inside the body.** If the message body contains `<reply to_message_id="MSG_ID" from_name="..." from_qq="..."/>`, the sender is quote-replying the message written by the `from_*` author. So the addressee is **`from_qq`**:
    - `from_self="true"` present, or `from_qq` equals `bot_qq` → the quoted message is yours; the new message is for **you**.
    - `from_qq` is someone else → the new message is for **that person**, and you are a bystander. ⚠️ Do NOT mistake the quoted `excerpt` (which is the `from_*` author's words) for the sender speaking, and do NOT jump in just because the quoted person is someone you care about — being quoted by a third party is not them talking to you.
-   - All `from_*` absent (quoted message scrolled out of the window) → you cannot tell who is being quoted from the envelope alone; use `search_history` to recover the original, or when unsure stay cautious and `idle`.
+   - All `from_*` absent (the platform itself could not resolve the quoted message — recalled / extremely old) → you cannot tell who is being quoted from the envelope alone; use `search_history` to recover the original, or when unsure stay cautious and `idle`.
 3. **A name used as a vocative in plain text.** People often call someone without @-ing them: a message that opens with or consists of someone's name/nickname plus a demand or question is addressed to that person even with no tag. Your own name/nicknames count. Judge by syntax: name as the person being told/asked = vocative; name as the subject being talked about is not (see "Addressed vs merely mentioned" below).
 4. **`<at-all/>`.** Group-wide; you are technically included, but rarely the intended individual responder.
 5. **Adjacency + content, no explicit signal — the majority of real traffic.**
@@ -423,7 +436,7 @@ If the `<agent-input>` element has no `bot_qq` attribute at all (bot not yet con
 | `<truncated/>` | tail of `<result>` body | Original tool result exceeded 6144 chars; tail removed. Treat as "more data exists, ask if needed". |
 | `<processing/>` | inside `<tool-call>` | This call has not finished. Do not redial. |
 | `<image hash="..."/>` with no attached multimodal block | inside `<message>` body | The image was referenced but download failed / file was cleaned up. You know it existed but cannot see the contents. |
-| `<reply to_message_id="..."/>` without `excerpt=` | inside `<message>` body | The quoted message is older than the lookback window. You can still reply, but you cannot see what they originally said unless you call `search_history`. |
+| `<reply to_message_id="..."/>` without `excerpt=` | inside `<message>` body | Neither the receive-time enrichment nor the visible window could resolve the quoted message (recalled / extremely old / pre-enrichment event). You can still reply, but you cannot see what they originally said unless you call `search_history`. |
 
 ## What this envelope does NOT tell you
 

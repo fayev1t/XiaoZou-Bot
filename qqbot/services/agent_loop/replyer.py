@@ -131,25 +131,76 @@ def _load_voice_text() -> str:
 def _build_system_prompt() -> str:
     voice = _load_voice_text()
     return (
-        "You are the final visible-reply composer for a QQ account. You do not "
-        "decide whether to reply and you have no tools. Consume exactly the "
-        "authorized reply_task, use the latest timeline only for context and "
-        "staleness, and output one JSON object only. Timeline images arrive "
-        "as image blocks attached after the JSON payload, each preceded by a "
-        "'↓ image hash=<sha256>' label that binds it to the matching <image "
-        "hash=.../> placeholder in the timeline XML; a placeholder without an "
-        "attached block means that image could not be loaded. "
-        "You decide 0-4 message "
-        "bubbles, wording, quote/@/face segments, and whether to use at most one "
-        "saved meme. Never invent facts or answer a new topic outside targets/gist. "
-        "A meme hash must be copied from SAVED_MEMES. Chat content allows only "
+        "You are the final visible-reply composer for one QQ account. You do "
+        "not decide whether to reply and you have no tools; your entire job is "
+        "turning the authorized reply-task into the account's visible words.\n"
+        "\n"
+        "INPUT — one XML document <replyer-input scope=... bot_qq=... "
+        "bot_role=...>:\n"
+        "- bot_qq is YOUR OWN QQ id this run. An inline <at qq=.../> whose qq "
+        "equals bot_qq is @-ing you; any other qq is @-ing someone else.\n"
+        "- <timeline> is the live conversation feed, oldest first — the same "
+        "feed your planning layer saw. Read the tail first; it is the freshest "
+        "state.\n"
+        "- <message sender_name=... sender_qq=... message_id=... time=...> is "
+        "one incoming chat message. An inline <reply to_message_id=... "
+        "from_name=... from_qq=... from_self=... excerpt=.../> means the "
+        "SENDER is quote-replying an earlier message written by the from_* "
+        "author — from_* and excerpt describe the QUOTED author and their "
+        "words, never the current sender. from_self=\"true\" means the quoted "
+        "message is YOURS (they are replying to you). A quote of someone else "
+        "is that third party being quoted, not them speaking now.\n"
+        "- <my-reply> rows are messages YOU already sent (only children with "
+        "status=\"sent\" count). Never resend them and never re-answer what "
+        "you already answered.\n"
+        "- <my-thought> and <tool-call> rows are your planning layer's "
+        "internal reasoning and tool activity. They are context, never user "
+        "speech: never quote them, never mention their existence in chat.\n"
+        "- <tool-call name=\"reply\"> rows are the authorizations for THIS "
+        "run — see AUTHORIZATION below.\n"
+        "- Timeline images arrive as image blocks attached after the XML "
+        "payload, each preceded by a '↓ image hash=<sha256>' label that binds "
+        "it to the matching <image hash=.../> placeholder; a placeholder "
+        "without an attached block means that image could not be loaded.\n"
+        "\n"
+        "AUTHORIZATION — <reply-task reply_task_id=.../> names the draft you "
+        "are composing. Its authorizations are the <tool-call name=\"reply\"> "
+        "rows in the timeline whose <result> carries that same reply_task_id, "
+        "in time order. There may be several: the planner appends one row per "
+        "tick as the conversation develops, and nothing is merged for you.\n"
+        "- **The newest row is authoritative.** Where rows conflict — a "
+        "different angle, a corrected fact, a target it no longer wants "
+        "answered — follow the latest and let the earlier one go. Earlier rows "
+        "still count for anything the newest does not contradict (an extra "
+        "fact, an additional target).\n"
+        "- Do NOT hedge across a change of mind. Seeing the planner switch "
+        "from A to B is not license to say both; say B.\n"
+        "- Inside one row, <args> holds that authorization: each entry of "
+        "targets[] is one message being answered — copy its message_id into a "
+        "quote segment when quoting; `context` is the planner's read of the "
+        "conversation (who is talking to whom, what this message means in its "
+        "thread); `guidance` is how to respond (angle, approach, boundaries). "
+        "gist.situation maps the room's current threads; gist.intent is the "
+        "overall purpose; gist.facts must stay true exactly; gist.avoid must "
+        "never surface; gist.tone is a light hint.\n"
+        "- targets[] says which thread you are entering, not the only lines "
+        "you may address. Material that arrived on that same thread while the "
+        "draft was held is yours to fold in — you can see it in the timeline "
+        "and the planner could not. Do not wander to an unrelated topic.\n"
+        "Never invent facts. If the moment has passed (already answered, "
+        "conversation moved on), output an empty messages array with "
+        "empty_reason.\n"
+        "\n"
+        "OUTPUT — you decide 0-4 message bubbles, wording, quote/@/face "
+        "segments, and whether to use at most one saved meme. A meme hash "
+        "must be copied from <saved-memes>. Chat content allows only "
         "text/at/reply/face segments in OneBot v11 shape — every field sits "
         "inside \"data\": {\"type\":\"text\",\"data\":{\"text\":\"...\"}} / "
         "{\"type\":\"at\",\"data\":{\"qq\":\"10001\"}} / "
         "{\"type\":\"reply\",\"data\":{\"id\":\"<message_id>\"}} / "
-        "{\"type\":\"face\",\"data\":{\"id\":\"178\"}}; never flatten fields to "
-        "the segment top level. reply is optional, at most one, and first. Meme "
-        "is a standalone bubble. Schema: {\"messages\":[{\"kind\":\"chat\","
+        "{\"type\":\"face\",\"data\":{\"id\":\"178\"}}; never flatten fields "
+        "to the segment top level. reply is optional, at most one, and first. "
+        "Meme is a standalone bubble. Schema: {\"messages\":[{\"kind\":\"chat\","
         "\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"...\"}}]},"
         "{\"kind\":\"meme\",\"image_hash\":\"...\"}],\"empty_reason\":null}. "
         "Output raw JSON only — no markdown, no code fences.\n\nVOICE:\n" + voice
@@ -159,21 +210,57 @@ def _build_system_prompt() -> str:
 def _build_user_text(
     task: ReplyTaskState, context: DecisionContext, memes: list[MemeView]
 ) -> str:
-    payload = {
-        "reply_task": {
-            "reply_task_id": task.reply_task_id,
-            "revision": task.revision,
-            "targets": task.targets,
-            "gist": task.gist,
-        },
-        "timeline": [item.render for item in context.timeline],
-        "saved_memes": [
-            {"image_hash": meme.file_hash, "description": meme.description}
-            for meme in memes
-        ],
-        "now": context.now.isoformat(),
-    }
-    return json.dumps(payload, ensure_ascii=False)
+    """拼 Replyer 的 XML 输入信封（2026-07-22 起与 Planner 同权重）。
+
+    旧版是 json.dumps 整包：timeline 行里的 XML 引号被转义成 ``\\"``，天然
+    比 Planner 看到的难读一档，且不带 bot_qq/bot_role——Replyer 判"谁在对
+    谁说话"的输入低 Planner 一等。现改为与 Planner 同构的 XML 信封：
+    timeline 行原样逐行嵌入，身份属性同名（bot_qq / bot_role，缺失不渲染，
+    语义同 <agent-input>），<reply-task> 锚紧邻文档尾部（最贴近输出位置）。
+    2026-07-24（待办#19）起该锚不再携带 targets/gist——授权是 append-only
+    的序列，原文在 timeline 的 <tool-call name="reply"> 行里，本函数不做任何
+    合并或摘要，综合由模型自己完成。
+    """
+    from qqbot.services.agent_loop.projection import _esc_attr, _esc_text
+
+    parts: list[str] = []
+    bot_attr = (
+        f' bot_qq="{_esc_attr(context.bot_user_id)}"'
+        if context.bot_user_id
+        else ""
+    )
+    role_attr = (
+        f' bot_role="{_esc_attr(context.bot_role)}"'
+        if getattr(context, "bot_role", None)
+        else ""
+    )
+    parts.append(
+        f'<replyer-input scope="{_esc_attr(task.scope_key)}"'
+        f"{bot_attr}{role_attr}>"
+    )
+    if memes:
+        parts.append("<saved-memes>")
+        for meme in memes:
+            parts.append(
+                f'<meme hash="{_esc_attr(meme.file_hash)}">'
+                f"{_esc_text(meme.description)}</meme>"
+            )
+        parts.append("</saved-memes>")
+    parts.append("<timeline>")
+    for item in context.timeline:
+        parts.append(item.render)
+    parts.append("</timeline>")
+    # <reply-task> 2026-07-24（待办#19）起只是**锚**，不带内容：授权序列在
+    # timeline 上那几行 <tool-call name="reply"> 里（<args> 原文），本标签只
+    # 回答"你现在组的是哪一份稿"——timeline 上可能同时有已 flush、被 cancel
+    # 和当前这份的授权行，靠 <result> 里的 reply_task_id 对号入座。verbatim
+    # 直发不经这里（_compose_and_send 里就短路了），故无需带内容。
+    parts.append(
+        f'<reply-task reply_task_id="{_esc_attr(task.reply_task_id)}"/>'
+    )
+    parts.append(f'<current now="{_esc_attr(context.now.isoformat())}"/>')
+    parts.append("</replyer-input>")
+    return "\n".join(parts)
 
 
 def _timeline_image_blocks(

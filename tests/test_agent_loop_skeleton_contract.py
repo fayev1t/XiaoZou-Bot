@@ -141,6 +141,22 @@ class IngestScopeRoutingTests(unittest.TestCase):
         self.assertIsNone(_scope_key_for_wake(self._ev("group", group_id=None)))
 
 
+class _SlowIdlePlanner:
+    """模拟 LLM 往返：decide() 里睡一段可观测的时间再返回 idle。
+
+    用来把"投影时刻"和"决策写入时刻"拉开到断言可分辨的距离。
+    """
+
+    DELAY = 0.15
+
+    async def decide(self, context: Any) -> Any:
+        from qqbot.services.agent_loop import DecisionOutput, IdleAction
+
+        _ = context
+        await asyncio.sleep(self.DELAY)
+        return DecisionOutput(actions=[IdleAction(reason="slow-planner")])
+
+
 class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
     async def test_single_wake_produces_idle_tick_event_chain(self) -> None:
         captured: list[Any] = []
@@ -183,6 +199,48 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
         tick_started_id = _values_of(captured[0]).get("event_id")
         tick_ended_caus = _values_of(captured[3]).get("causation_id")
         self.assertEqual(tick_ended_caus, tick_started_id)
+
+    async def test_decision_timestamp_is_tick_start_not_write_time(self) -> None:
+        """agent.decision_emitted.occurred_at = 本拍**投影时刻**，不是写入时刻
+        （2026-07-24，待办清单#18）。
+
+        投影读于 planner.decide() 之前、事件却写于 LLM 返回之后，而事件流按
+        occurred_at 排序（Projector._fetch）。若取写入时刻，LLM 往返期间到达
+        的消息会排到决策事件**之前**——那些消息根本没进本拍 context，却被读
+        成"这拍已经看过"（人连发的第二句因此被吞），`<my-thought>` 行也会渲染
+        到它们之后。unseen 标签删除后行位置是唯一判据，本条时间戳语义即其
+        地基，故设回归护栏。
+        """
+        captured: list[Any] = []
+        loop = AgentLoop(
+            scope_key="group:12345",
+            planner=_SlowIdlePlanner(),
+            session_factory=_factory_for(captured),
+        )
+        loop.start()
+        loop.wake()
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if len(captured) >= 4:
+                break
+        await loop.stop()
+
+        by_type = {
+            _values_of(stmt).get("type"): _values_of(stmt) for stmt in captured
+        }
+        started = by_type["runtime.tick_started"]["occurred_at"]
+        decision = by_type["agent.decision_emitted"]["occurred_at"]
+        ended = by_type["runtime.tick_ended"]["occurred_at"]
+
+        # tick_started 取默认的写入时刻，写在 now=china_now() 之后；decision
+        # 回填 now，因此必然 <= tick_started。旧行为（取写入时刻）会比它晚
+        # 整整一个 planner 延迟，这条断言即失败。
+        self.assertLessEqual(decision, started)
+        # 反证 planner 确实慢过一拍：tick 收尾比决策时间戳晚至少一个 DELAY，
+        # 说明上面的 <= 不是"planner 快到看不出差别"蒙对的。
+        self.assertGreaterEqual(
+            (ended - decision).total_seconds(), _SlowIdlePlanner.DELAY
+        )
 
     async def test_loop_idle_when_not_waked(self) -> None:
         captured: list[Any] = []

@@ -42,11 +42,15 @@ class ReplyExecutor:
         projector: Any,
         wake_scope: Callable[[str], Awaitable[None]],
         replyer: Replyer | None = None,
+        bot_user_id_resolver: Callable[[], str | None] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._projector = projector
         self._wake_scope = wake_scope
         self._replyer = replyer or Replyer()
+        # 与 AgentLoop 同一把 resolver（supervisor 注入）：组稿 context 也带
+        # bot_qq/bot_role，Replyer 判"谁在对谁说话"的输入不再低 Planner 一等。
+        self._bot_user_id_resolver = bot_user_id_resolver
         self._handles: dict[str, asyncio.TimerHandle] = {}
         self._running: set[asyncio.Task[None]] = set()
         self._stopped = False
@@ -203,11 +207,24 @@ class ReplyExecutor:
         sent_messages: list[dict] = []
         reason: str | None = None
         try:
+            # resolve 失败降级 None（与 loop.py 同款兜底）：Replyer 输入少
+            # bot_qq 属性但仍可组稿，绝不让 flush 因此翻车。
+            bot_user_id: str | None = None
+            if self._bot_user_id_resolver is not None:
+                try:
+                    resolved = self._bot_user_id_resolver()
+                    if resolved:
+                        bot_user_id = str(resolved)
+                except Exception as exc:
+                    logger.warning(
+                        "[reply_executor] bot_user_id_resolver failed: {}", exc
+                    )
             context = await self._projector.build_context(
                 scope_key=task.scope_key,
                 correlation_id=correlation_id,
                 tick_seq=0,
                 now=china_now(),
+                bot_user_id=bot_user_id,
             )
             if context.timeline:
                 cutoff_event_id = context.timeline[-1].event_id
@@ -431,7 +448,7 @@ class ReplyExecutor:
             scope_key=task.scope_key,
             visibility="agent_visible",
             correlation_id=correlation_id,
-            # agent-visible 最终事实直接锚到最后一次落稿/并稿 tool_called；
+            # agent-visible 最终事实直接锚到最后一次授权 tool_called；
             # runtime-only claim 只是去重协调，不应成为模型可见因果链的入口。
             causation_id=task.source_tool_call_event_id or claimed_id,
             payload=payload,

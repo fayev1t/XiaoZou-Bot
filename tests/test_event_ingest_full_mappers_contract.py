@@ -125,6 +125,35 @@ class PrivateMessageMapperTests(unittest.TestCase):
             ],
         )
 
+    def test_reply_segment_enriched_from_adapter_reply(self) -> None:
+        # 与 GroupMessageMapper 共用 enrich_reply_segments（EventIngest契约
+        # §6.4）；私聊侧冒烟：quoted 落键 + from_self 判定。
+        event = _ev(
+            post_type="message",
+            message_type="private",
+            sub_type="friend",
+            message_id=8,
+            user_id=222,
+            raw_message="[CQ:reply,id=42]hi",
+            message=[],
+            original_message=[
+                SimpleNamespace(type="reply", data={"id": "42"}),
+                SimpleNamespace(type="text", data={"text": "hi"}),
+            ],
+            sender=SimpleNamespace(user_id=222, nickname="bob"),
+            reply=SimpleNamespace(
+                message_id=42,
+                sender=SimpleNamespace(user_id=10000, nickname="小奏"),
+                message=[SimpleNamespace(type="text", data={"text": "早"})],
+            ),
+        )
+        quoted = self.mapper.map(event).payload["segments"][0]["quoted"]
+        self.assertEqual(quoted["sender_qq"], "10000")
+        self.assertIs(quoted["from_self"], True)
+        self.assertEqual(
+            quoted["segments"], [{"type": "text", "data": {"text": "早"}}]
+        )
+
 
 class GroupIncreaseMapperTests(unittest.TestCase):
     def test_partial(self) -> None:

@@ -258,6 +258,14 @@ class AgentLoop:
             )
 
         # agent.decision_emitted
+        # occurred_at 显式回填为**本拍投影时刻**（tick 开头的 now），不取默认
+        # 的写入时刻（2026-07-24，待办#18）：投影读于 planner.decide() 之前，
+        # 事件却写于 LLM 返回之后，而事件流按 occurred_at 排序（_fetch）。用
+        # 写入时刻会把 LLM 往返期间到达的消息排到决策事件**之前**——那些消息
+        # 根本没进本拍 context，却因此被读成"这拍已经看过"，人连发的第二句就
+        # 此被吞；<my-thought> 行同样会渲染到它们之后，位置信号跟着一起错。
+        # 决策"发生"于开始思考的时刻，回填后 timeline 的先后关系才与"这拍看到
+        # 了什么"一致。
         decision_id = await write_agent_event(
             self._session_factory,
             event_type="agent.decision_emitted",
@@ -269,6 +277,7 @@ class AgentLoop:
                 "actions": [{"type": a.type} for a in decision.actions],
                 "tick_seq": self._tick_seq,
             },
+            occurred_at=now,
         )
 
         await self._apply_actions(

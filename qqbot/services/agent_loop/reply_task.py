@@ -1,7 +1,14 @@
 """ReplyTask 的 append-only 写入与折叠。
 
-ReplyTask 是 scope 内唯一、最长只存活几十秒的待发内容聚合，不使用读模型表。
-每次 upsert 保存完整快照；cancel/claim/flush 把它推进到非 open 状态。
+ReplyTask 是 scope 内唯一、最长只存活几十秒的待发聚合，不使用读模型表。
+
+2026-07-24（待办#19）起**内容不再合并**：每次 upsert 事件记录的是那一次调用
+自己的授权原文（targets/gist/verbatim_messages），不是与历史的合并态。折叠出
+的 ``ReplyTaskState`` 因此只回答"这份稿什么时候发、发到哪一步了"——调度字段
+（flush_at/hard_deadline/state/revision）取最新一条 upsert，last-write-wins；
+``targets``/``gist`` 字段留的是**最近一次授权原文**，不是有效授权集合。
+完整授权序列在事件流里（也就是 timeline 上那几行 ``<tool-call name="reply">``），
+由 flush 时的 Replyer 自行综合。cancel/claim/flush 把它推进到非 open 状态。
 """
 
 from __future__ import annotations
@@ -16,7 +23,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from qqbot.core.time import CHINA_TIMEZONE, china_now
 from qqbot.models.agent_event import AgentEvent
-from qqbot.services.agent_loop.decision import PendingReplyView
 from qqbot.services.agent_loop.event_writer import parse_scope_key, write_agent_event
 
 SessionFactory = Callable[[], AsyncSession]
@@ -54,21 +60,6 @@ class ReplyTaskState:
     source_tool_call_event_id: str | None
     correlation_id: str | None
 
-    def to_view(self) -> PendingReplyView:
-        return PendingReplyView(
-            reply_task_id=self.reply_task_id,
-            revision=self.revision,
-            state=self.state,
-            created_at=self.created_at,
-            flush_at=self.flush_at,
-            hard_deadline=self.hard_deadline,
-            mode=self.mode,
-            targets=self.targets,
-            gist=self.gist,
-            verbatim_messages=self.verbatim_messages,
-            latest_event_id=self.latest_event_id,
-        )
-
 
 async def load_open_reply_task(
     session_factory: SessionFactory, scope_key: str
@@ -80,12 +71,10 @@ async def load_open_reply_task(
     return max(open_tasks, key=lambda task: task.updated_at)
 
 
-async def load_reply_task(
-    session_factory: SessionFactory,
-    scope_key: str,
-    reply_task_id: str,
-) -> ReplyTaskState | None:
-    return (await _load_scope_tasks(session_factory, scope_key)).get(reply_task_id)
+# load_reply_task(scope_key, reply_task_id) 已于 2026-07-24 删除（待办#19）：
+# 它唯一的调用者是 cancel 的"按 id 精确取任务"路径，而 cancel 现在直接取
+# scope 内那份 open task（至多一份，id 只作可选校验）。按 id 取任意状态的
+# 任务在 append 语义下没有场景——claimed/flushed/cancelled 都不可再改。
 
 
 async def load_open_reply_tasks(
@@ -221,52 +210,12 @@ def build_upsert_payload(
     }
 
 
-def merge_targets(old: list[dict], new: list[dict]) -> list[dict]:
-    out = [dict(item) for item in old]
-    by_key: dict[str, dict] = {}
-    for item in out:
-        key = str(item.get("message_id") or f"@{len(by_key)}")
-        by_key[key] = item
-    for incoming in new:
-        item = dict(incoming)
-        key = str(item.get("message_id") or f"@new:{len(out)}")
-        existing = by_key.get(key)
-        if existing is None:
-            item["points"] = _dedupe_strings(item.get("points") or [])
-            out.append(item)
-            by_key[key] = item
-            continue
-        existing["points"] = _dedupe_strings(
-            [*(existing.get("points") or []), *(item.get("points") or [])]
-        )
-        if item.get("sender_qq"):
-            existing["sender_qq"] = item["sender_qq"]
-    return out
-
-
-def merge_gist(old: dict, new: dict) -> dict:
-    merged = dict(old)
-    for key in ("intent", "tone"):
-        if isinstance(new.get(key), str) and new[key].strip():
-            merged[key] = new[key].strip()
-    for key in ("facts", "avoid"):
-        merged[key] = _dedupe_strings(
-            [*(old.get(key) or []), *(new.get(key) or [])]
-        )
-    return merged
-
-
-def _dedupe_strings(values: list[Any]) -> list[str]:
-    out: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        if not isinstance(value, str):
-            continue
-        text = value.strip()
-        if text and text not in seen:
-            out.append(text)
-            seen.add(text)
-    return out
+# merge_targets / merge_gist / _dedupe_strings 已于 2026-07-24 删除（待办#19）。
+# 它们做的是"把新授权并进旧授权"，而两者都只增不减：merge_targets 无法撤掉
+# 一个已授权的 target，merge_gist 的 facts/avoid 是并集去重、写错的事实撤不
+# 回来，模型只能往 avoid 里塞反向指令去抵消，让 gist 自相矛盾。改成 append-
+# only 之后不存在"合并"这件事——每条授权原样入库，谁覆盖谁由 Replyer 按时间
+# 顺序判断（最新的是权威）。
 
 
 _REPLY_EVENT_TYPES = (

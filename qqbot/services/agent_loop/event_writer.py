@@ -122,7 +122,11 @@ async def write_agent_event(
     correlation_id: str,
     causation_id: str | None,
     payload: dict,
+    occurred_at: datetime | None = None,
 ) -> str:
+    """``occurred_at`` 缺省=写入时刻。只有"事件真正发生的时刻早于写入"的
+    场景才显式传（如 agent.decision_emitted 回填为本拍投影时刻，见
+    loop._tick）——事件流按 occurred_at 排序，用错基准会让时间线错位。"""
     # agent.* 事件按契约 §4.2 全部 visibility=agent_visible
     return await write_internal_event(
         session_factory,
@@ -133,4 +137,5 @@ async def write_agent_event(
         correlation_id=correlation_id,
         causation_id=causation_id,
         payload=payload,
+        occurred_at=occurred_at,
     )
