@@ -35,26 +35,26 @@
   </tr>
 </table>
 
+## 🏗️ 核心设计
 
-## 🏗️ 核心设计与架构抽象
+每个 Tick 的节奏固定：事件落库 → 折叠投影出当前时间线与活跃任务 → Planner 全局决策 → 按 Action 分发（任务管理 / 工具调用 / 组稿回复 / 自主沉寂），工具结果与决策再全部回写事件流，供下一拍观察。围绕这个循环：
 
-项目围绕 **Agent Loop / Harness** 思想构建，具备以下核心架构抽象：
+- **事件溯源（Event Sourcing）**：消息、决策、工具结果、任务变更全部追加进不可变事件流；每个 Tick 通过投影（projection）折叠出当前上下文。全生命周期因果可追踪、可审计、可离线回放。
+- **认知与表达解耦（Planner / Replyer 分层）**：Planner 只做态势感知与决策，输出结构化 Action；"怎么说"交给独立的 Replyer —— 人设语气（voice）、排版、配图与 VLM 多模态校验都由它完成，规划大脑不被渲染细节污染。
+- **模型网格（Model Mesh）**：按角色（planner / replyer / caption）路由 LLM，支持同一模型跨多服务商随机分摊负载、按角色切换 `primary_failover`、故障自动冷却熔断。认知循环与具体模型端点完全脱钩。
+- **群组沙箱（Scoped Sandbox）**：事件流、上下文与工具权限默认按 `group:<id>` 隔离；表情包等公共资产则在全局作用域共享。
 
-- **事件溯源与状态投影（Event Sourcing & State Projection）**  
-  所有入站消息、模型决策、工具结果与任务变更均追加至不可变事件流（`agent_events`）。每个 Tick 将事件流折叠投影为当前决策上下文（Timeline + 活跃任务），全生命周期因果可追踪、可审计、可无损回放。
+## 🧰 能力一览
 
-- **认知与表达职责解耦（Planner & Replyer Layering）**  
-  - **高阶决策大脑（LLM-as-Planner）**：专注全局态势感知、对话理解与工具调度，输出结构化 Action（任务管理 / 工具调用 / 自主沉寂）。
-  - **多模态表达与渲染（Replyer Engine）**：把“发信”升级为异步维持与组稿任务（`reply_task`）。具体的语气人设（Voice）、段落排版及视觉多模态校验（VLM）由专属 Replyer 独立完成，使规划大脑免受低阶渲染细节干扰。
+所有能力经统一 `Tool` 接口接入（`qqbot/services/agent_loop/tools/`，每个工具自带同名 `.md` 说明文档）：
 
-- **模型基础设施网格（Model Mesh & Resiliency）**  
-  基于角色（Planner / Replyer / Caption）抽象 LLM 路由层，支持按模型名跨服务商负载均衡（随机分摊）、自动故障退避与被动熔断，确保认知循环与具体模型端点脱钩。
-
-- **能力协议与沙箱隔离（Scoped Tools & Sandboxing）**  
-  网络检索（`websearch`/`webfetch`）、群管（`kick`）等能力均通过统一 `Tool` 接口接入。事件流、上下文及工具权限默认按群组（`group:<id>`）沙箱隔离；表情包等公共资产则在全局作用域共享。
-
-- **全栈白盒与可观测性（Full-Stack Observability）**  
-  每个 Tick 决策均支持完整落盘 Prompt/XML 快照（`prompt_snapshot`），可与固定数据集进行离线比对与回归评测（`replay_snapshots`），实现模型调优的数据驱动。
+| 分类 | 工具 |
+|---|---|
+| 表达互动 | `reply` `send_message` `poke` `emoji_like` `meme` `recall` |
+| 信息检索 | `websearch` `webfetch` `search_history` `get_group_info` `get_member_info` `get_member_list` `get_group_honor` `get_stranger_info` |
+| 群管操作 | `kick` `ban` `whole_ban` `set_admin` `set_card` `set_title` `set_essence` `group_notice` `set_group_name` `set_group_avatar` `leave_group` |
+| 入群审批 | `get_pending_join_requests` `respond_to_group_join_request` |
+| 节奏控制 | `wait`（自主沉寂，不打扰也是一种决策） |
 
 ## 🛠️ 进化路线 (Roadmap)
 
