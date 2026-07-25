@@ -96,8 +96,15 @@ def build_default_registry() -> ToolRegistry:
     # 同日新增，读取指定 URL 正文，两者共用 _web_common 抓取层。
     registry.register(WebsearchTool())
     registry.register(WebfetchTool())
+    # ── 历史检索（2026-07-23 重做后恢复）──
+    # search_history：timeline 100 条渲染上限之外的按需检索。重做修了两处：
+    # query 过滤改走 pg_trgm word_similarity（`<%` 算子）对 search_text 做模糊
+    # 相似匹配（原 ILIKE 打在 payload->>'raw_message' 上，索引白建、且要求
+    # LLM 猜中原话子串）；private scope 补齐按 user_id 过滤（此前只有 group
+    # 分支按 group_id 过滤，private 分支不设防——因 PrivateAgentLoop 从未
+    # 实例化而未被线上触发）。
+    registry.register(SearchHistoryTool())
     # ── 以下工具暂时下架（2026-07-01），重做后逐一恢复 ──
-    # registry.register(SearchHistoryTool())
     # napcat 动作工具：消息操作
     # registry.register(RecallTool())
     # registry.register(SetEssenceTool())

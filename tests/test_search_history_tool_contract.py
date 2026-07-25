@@ -19,8 +19,13 @@ from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from sqlalchemy.dialects import postgresql
+
 from qqbot.services.agent_loop.projection import _EventSnapshot
-from qqbot.services.agent_loop.tools.search_history import SearchHistoryTool
+from qqbot.services.agent_loop.tools.search_history import (
+    SearchHistoryTool,
+    _build_query_stmt,
+)
 
 
 def _ok(tool: SearchHistoryTool, args: dict, **ctx: Any) -> dict:
@@ -218,6 +223,96 @@ class SearchHistoryToolContractTest(unittest.TestCase):
         asyncio.run(tool.run({}, scope_key="group:42"))
         self.assertEqual(self.captured_query_kwargs["scope"], "group")
         self.assertEqual(self.captured_query_kwargs["group_id"], 42)
+        self.assertIsNone(self.captured_query_kwargs["user_id"])
+
+    def test_private_scope_propagates_user_id_not_group_id(self) -> None:
+        tool = self._make_tool()
+        asyncio.run(tool.run({}, scope_key="private:555"))
+        self.assertEqual(self.captured_query_kwargs["scope"], "private")
+        self.assertIsNone(self.captured_query_kwargs["group_id"])
+        self.assertEqual(self.captured_query_kwargs["user_id"], 555)
+
+
+class SearchHistoryQueryStatementTests(unittest.TestCase):
+    """直接测 _build_query_stmt 拼出来的 SQL 形状（不建真实连接，只编译成串）。
+
+    这层专门盯住两个曾经的真实 bug：query 过滤是否真的打在 search_text
+    这个建了 GIN trgm 索引的列上（而不是重新表达一遍 payload JSONB 路径，
+    导致索引对不上）；private scope 是否真的按 user_id 过滤（而不是像
+    2026-07-23 前那样对所有用户的私聊事件不设防）。
+    """
+
+    def _compile(self, stmt: Any) -> str:
+        return str(
+            stmt.compile(
+                dialect=postgresql.dialect(),
+                compile_kwargs={"literal_binds": True},
+            )
+        )
+
+    def test_query_filter_hits_search_text_via_trgm_operator(self) -> None:
+        stmt = _build_query_stmt(
+            scope="group",
+            group_id=999,
+            user_id=None,
+            anchor_event_id=None,
+            start_dt=None,
+            end_dt=None,
+            query="旅游",
+            limit=20,
+        )
+        compiled = self._compile(stmt)
+        self.assertIn("search_text", compiled)
+        self.assertIn("<%", compiled)
+        self.assertIn("word_similarity", compiled)
+        self.assertNotIn("raw_message", compiled)
+
+    def test_no_query_orders_by_recency(self) -> None:
+        stmt = _build_query_stmt(
+            scope="group",
+            group_id=999,
+            user_id=None,
+            anchor_event_id=None,
+            start_dt=None,
+            end_dt=None,
+            query=None,
+            limit=20,
+        )
+        compiled = self._compile(stmt)
+        self.assertNotIn("word_similarity", compiled)
+        self.assertIn("occurred_at", compiled)
+        self.assertIn("DESC", compiled)
+
+    def test_private_scope_filters_on_user_id_column(self) -> None:
+        stmt = _build_query_stmt(
+            scope="private",
+            group_id=None,
+            user_id=555,
+            anchor_event_id=None,
+            start_dt=None,
+            end_dt=None,
+            query=None,
+            limit=20,
+        )
+        compiled = self._compile(stmt)
+        self.assertIn("user_id", compiled)
+        self.assertIn("555", compiled)
+
+    def test_group_scope_does_not_filter_on_user_id(self) -> None:
+        stmt = _build_query_stmt(
+            scope="group",
+            group_id=999,
+            user_id=12345,
+            anchor_event_id=None,
+            start_dt=None,
+            end_dt=None,
+            query=None,
+            limit=20,
+        )
+        compiled = self._compile(stmt)
+        # group scope 传了 user_id 也不该拼进 WHERE——group 场景下它恒为
+        # None（parse_scope_key 保证），这里只是确认过滤条件按 scope 互斥。
+        self.assertNotIn("user_id", compiled)
 
 
 if __name__ == "__main__":

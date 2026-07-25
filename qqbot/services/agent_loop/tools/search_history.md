@@ -17,7 +17,7 @@ Pick the smallest filter set that gets the job done. Three filter dimensions, al
 - `anchor_event_id` (string): return events strictly OLDER than this event_id. Use when you already know an exact anchor (e.g. from a message id in the timeline).
 - `task_id` (string): if you have a `task_id` but no anchor_event_id, the tool will look up that task's `triggered_by_event_id` and use it as the anchor. Convenient for "what's the context around when I created this task".
 - `start_time` / `end_time` (ISO8601 strings): bound the search to a time window.
-- `query` (string): case-insensitive substring match against message text. Use a short, distinctive keyword — Chinese works fine.
+- `query` (string): fuzzy similarity match against message text (pg_trgm), not an exact substring — a close paraphrase or partial phrase can still hit. Use a short, distinctive keyword or phrase — Chinese works fine, but single characters or long sentences match poorly.
 - `limit` (int, default 20, max 50): result cap.
 
 ## Result format
@@ -26,4 +26,4 @@ Same XML envelope as the normal timeline (`<message ...>`, `<notice ... />`, etc
 
 ## After the call
 
-The result appears on your `<tool-call name="search_history">` timeline row (status="complete") on the next tick. If it answers your current task, proceed to `send_message` / `complete_task`. If it surfaced more questions, you may chain another `search_history` with tightened filters, but avoid loops — three searches without progress means the information probably isn't in the DB.
+The result appears on your `<tool-call name="search_history">` timeline row (status="complete") on the next tick. If it answers your current task, proceed to `reply` / `complete_task`. If it surfaced more questions, you may chain another `search_history` with tightened filters, but avoid loops — three searches without progress means the information probably isn't in the DB.

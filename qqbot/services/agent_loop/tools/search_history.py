@@ -11,7 +11,15 @@
      agent.task_created.payload.triggered_by_event_id 作为锚。查询只看
      anchor 之前发生的事件（ULID 字典序天然=时间序）
   2. 时间窗：start_time / end_time（ISO8601 字符串）
-  3. 关键字：query 在 payload->>'raw_message' 上 ILIKE 子串匹配
+  3. 关键字：query 用 pg_trgm word_similarity（`<%` 算子）对 search_text
+     （STORED GENERATED 列，见 models/agent_event.py）做模糊相似匹配，
+     按相似度倒序取 limit 条，不要求逐字子串命中。2026-07-23 重做前是
+     ILIKE payload->>'raw_message'：既没走已建好的 GIN trgm 索引（表达式
+     对不上索引列，全表扫描），中文口语转述也基本命不中子串。
+
+scope 隔离：group 按 group_id 过滤，private 按 user_id 过滤（parse_scope_key
+解出的三元组按 scope 只用其中一个）。2026-07-23 前 private 分支漏了这道
+过滤，只是当时 PrivateAgentLoop 从未实例化，没被线上触发。
 
 返回结构复用 Projector 渲染器，与正向 timeline 完全同构。
 
@@ -25,7 +33,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import Select, func, literal, select
 
 from qqbot.core.logging import get_logger
 from qqbot.core.time import normalize_china_time
@@ -55,9 +63,10 @@ class SearchHistoryTool(BaseTool):
         "when answering a question requires context older than what you can "
         "see directly. Filters can combine: anchor (anchor_event_id or task_id "
         "to use that task's trigger event as anchor), a time window "
-        "(start_time/end_time ISO8601), and/or a keyword (query — substring "
-        "match against message text). Results are returned in the same XML "
-        "format as the normal timeline."
+        "(start_time/end_time ISO8601), and/or a keyword (query — fuzzy "
+        "similarity match against message text, not exact substring; a "
+        "close paraphrase can still hit). Results are returned in the same "
+        "XML format as the normal timeline."
     )
     usage_prompt = _USAGE_PROMPT
     # required_permission / required_bot_role 用 BaseTool 默认值（GUEST /
@@ -90,7 +99,9 @@ class SearchHistoryTool(BaseTool):
             "query": {
                 "type": "string",
                 "description": (
-                    "Substring to search in message text. Case-insensitive."
+                    "Fuzzy keyword to match against message text (trigram "
+                    "similarity, not exact substring — close paraphrases "
+                    "can still match). Short, distinctive phrases work best."
                 ),
             },
             "limit": {
@@ -119,7 +130,7 @@ class SearchHistoryTool(BaseTool):
         self._session_factory = context.get("session_factory")
 
         try:
-            scope, group_id, _user_id = parse_scope_key(scope_key)
+            scope, group_id, user_id = parse_scope_key(scope_key)
         except ValueError as exc:
             return ToolOutcome.failure(
                 "invalid_arguments", f"invalid scope_key {scope_key!r}: {exc}"
@@ -158,6 +169,7 @@ class SearchHistoryTool(BaseTool):
         rows = await self._query(
             scope=scope,
             group_id=group_id,
+            user_id=user_id,
             anchor_event_id=anchor_event_id,
             start_dt=start_dt,
             end_dt=end_dt,
@@ -212,37 +224,70 @@ class SearchHistoryTool(BaseTool):
         *,
         scope: str,
         group_id: int | None,
+        user_id: int | None,
         anchor_event_id: str | None,
         start_dt: datetime | None,
         end_dt: datetime | None,
         query: str | None,
         limit: int,
     ) -> list[AgentEvent]:
-        stmt = (
-            select(AgentEvent)
-            .where(AgentEvent.scope == scope)
-            .where(AgentEvent.visibility == "agent_visible")
+        stmt = _build_query_stmt(
+            scope=scope,
+            group_id=group_id,
+            user_id=user_id,
+            anchor_event_id=anchor_event_id,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            query=query,
+            limit=limit,
         )
-        if scope == "group" and group_id is not None:
-            stmt = stmt.where(AgentEvent.group_id == group_id)
-        if anchor_event_id:
-            stmt = stmt.where(AgentEvent.event_id < anchor_event_id)
-        if start_dt is not None:
-            stmt = stmt.where(AgentEvent.occurred_at >= start_dt)
-        if end_dt is not None:
-            stmt = stmt.where(AgentEvent.occurred_at <= end_dt)
-        if query:
-            # MVP: 直接 ILIKE 子串匹配 payload->>'raw_message'。步骤 6 上 GIN
-            # trgm 索引后这条查询会自动走索引，无需改 SQL。
-            pattern = f"%{query}%"
-            stmt = stmt.where(AgentEvent.payload["raw_message"].astext.ilike(pattern))
-        stmt = stmt.order_by(AgentEvent.occurred_at.desc()).limit(limit)
-
         async with self._session_factory() as session:
             result = await session.execute(stmt)
             rows = result.scalars().all()
-        # 投影按时间正序，与正向 timeline 一致
-        return list(reversed(rows))
+        # 投影按时间正序，与正向 timeline 一致；query 命中时 DB 侧是按相似度
+        # 排序取的 limit，不能再假设“已经是 occurred_at 倒序”，统一在这重排。
+        return sorted(rows, key=lambda r: r.occurred_at)
+
+
+def _build_query_stmt(
+    *,
+    scope: str,
+    group_id: int | None,
+    user_id: int | None,
+    anchor_event_id: str | None,
+    start_dt: datetime | None,
+    end_dt: datetime | None,
+    query: str | None,
+    limit: int,
+) -> Select:
+    stmt = (
+        select(AgentEvent)
+        .where(AgentEvent.scope == scope)
+        .where(AgentEvent.visibility == "agent_visible")
+    )
+    if scope == "group" and group_id is not None:
+        stmt = stmt.where(AgentEvent.group_id == group_id)
+    if scope == "private" and user_id is not None:
+        stmt = stmt.where(AgentEvent.user_id == user_id)
+    if anchor_event_id:
+        stmt = stmt.where(AgentEvent.event_id < anchor_event_id)
+    if start_dt is not None:
+        stmt = stmt.where(AgentEvent.occurred_at >= start_dt)
+    if end_dt is not None:
+        stmt = stmt.where(AgentEvent.occurred_at <= end_dt)
+    if query:
+        # pg_trgm word_similarity：`<%` 是 gin_trgm_ops 索引真正支持的算子
+        # （走 agent_events_search_trgm_idx），语义是"query 是否与 search_text
+        # 中某个连续片段模糊相似"，阈值由会话级 GUC
+        # pg_trgm.word_similarity_threshold 控制（PG 默认 0.6，要调松紧在
+        # DB 层改，不在这写死）。排序另外显式调 word_similarity() 算分——
+        # ORDER BY 本身不吃索引，索引只加速上面这行 WHERE。
+        similarity = func.word_similarity(query, AgentEvent.search_text)
+        stmt = stmt.where(literal(query).op("<%")(AgentEvent.search_text))
+        stmt = stmt.order_by(similarity.desc())
+    else:
+        stmt = stmt.order_by(AgentEvent.occurred_at.desc())
+    return stmt.limit(limit)
 
 
 def _coerce_str(value: Any) -> str | None:
