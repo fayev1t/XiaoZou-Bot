@@ -50,7 +50,7 @@
 
 | 分类 | 工具 |
 |---|---|
-| 表达互动 | `reply` `send_message` `poke` `emoji_like` `meme` `recall` |
+| 表达互动 | `reply` `send_message` `poke` `emoji_like` `meme_collection` `recall` |
 | 信息检索 | `websearch` `webfetch` `search_history` `get_group_info` `get_member_info` `get_member_list` `get_group_honor` `get_stranger_info` |
 | 群管操作 | `kick` `ban` `whole_ban` `set_admin` `set_card` `set_title` `set_essence` `group_notice` `set_group_name` `set_group_avatar` `leave_group` |
 | 入群审批 | `get_pending_join_requests` `respond_to_group_join_request` |

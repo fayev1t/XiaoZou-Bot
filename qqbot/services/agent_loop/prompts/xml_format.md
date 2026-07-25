@@ -118,10 +118,12 @@ Attribute meanings on `<agent-input>` (identity, stable across ticks) and `<curr
 </saved-memes>
 ```
 
-- The memes you previously saved via the `meme` tool (`action="save"`), newest first, capped. Absent section = nothing saved yet.
-- The body is a system-generated description of the image: what it shows, text on it, mood, usage scenario. **This description is all you get for choosing** — the pixels are not attached.
-- `hash=` is the exact `image_hash` value for `meme` delete/recaption; copy it verbatim, all 64 chars. It lives in the same id space as `<image hash="..."/>` in the timeline. Replyer also receives this catalog and may select at most one hash at flush time.
-- This section is a reference catalog, never a prompt to act. Planner must not choose a send hash; if a meme-like emotional beat is intended, express that in the reply gist and leave the final choice to Replyer.
+- The memes you previously saved via the `meme_collection` tool (`action="save"`), newest first, capped. Absent section = nothing saved yet.
+- The body is a system-generated description of the image: what it shows, text on it, mood, usage scenario. **That description is the only thing the reply composer sees when picking** — the pixels are never attached to it. So a meme whose description is vague or wrong is effectively unusable, however good the picture is; `action="recaption"` is the fix.
+- `hash=` is the exact `image_hash` value for `meme_collection` delete/recaption; copy it verbatim, all 64 chars. It lives in the same id space as `<image hash="..."/>` in the timeline.
+- **You do not choose what gets sent.** The reply composer receives this same catalog at flush time and decides on its own whether the reply carries a meme and which one. Never pick a send hash, and never treat this section as a prompt to act.
+- What you *do* control is the catalog itself, and that is a real lever: the composer can only pick from what is here. An image that scrolls past unsaved is gone for good — if you would plausibly want to answer with it some day, `action="save"` it while it is still in the timeline. Read this section as a running answer to "does the collection cover the beats this group actually hits?"
+- If you want a particular reply to land as a meme rather than as words, say so in plain language in that `reply` call's `gist.tone` or the target's `guidance` (e.g. `"嫌弃但其实在笑，适合配张表情包"`). It is a hint the composer weighs, not an instruction it must obey — which is the intended split: you set the intent, it makes the final call against the latest timeline.
 
 ## `<validation-error>` — same-tick retry feedback (rare)
 

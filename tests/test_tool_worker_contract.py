@@ -589,14 +589,14 @@ class ToolWorkerCaptionInjectionTests(unittest.TestCase):
     def _run_one(self, worker_kwargs: dict) -> dict:
         captured: dict[str, Any] = {}
         reg = ToolRegistry()
-        reg.register(self._CtxCapturingTool("meme", captured))
+        reg.register(self._CtxCapturingTool("meme_collection", captured))
         worker = ToolWorker(
             session_factory=_factory_for([]), registry=reg, **worker_kwargs
         )
         row = _row(
             payload={
                 "tool_call_id": "TC_CAP",
-                "tool_name": "meme",
+                "tool_name": "meme_collection",
                 "arguments": {},
             }
         )

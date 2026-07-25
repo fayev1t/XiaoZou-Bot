@@ -75,7 +75,10 @@ class RegistryBoundaryTests(unittest.TestCase):
         registry = build_default_registry()
         self.assertIn("reply", registry.names())
         self.assertNotIn("send_message", registry.names())
-        meme_schema = registry.get("meme").arguments_schema  # type: ignore[union-attr]
+        # 2026-07-25 改名：`meme` → `meme_collection`（工具面仍无 send 动作）。
+        meme_tool = registry.get("meme_collection")
+        self.assertIsNotNone(meme_tool)
+        meme_schema = meme_tool.arguments_schema  # type: ignore[union-attr]
         self.assertEqual(
             meme_schema["properties"]["action"]["enum"],
             ["save", "delete", "recaption"],

@@ -1,10 +1,16 @@
-"""MemeTool —— 表情包收藏管理：action 分发 save / delete / recaption。
+"""MemeCollectionTool —— 表情包收藏管理：action 分发 save / delete / recaption。
+
+**工具名 2026-07-25 由 `meme` 改为 `meme_collection`**（文件名/类名同步）：旧名
+是注册表里唯一的裸名词，读起来像"表情包能力"，而发送早在 2026-07-19 就移出了
+本工具的参数面——模型（和读代码的人）容易再把它当发图入口。新名点明操作对象
+是**收藏夹**而非"发表情包"这件事，description 首句同步改为"只管收藏、从不发送"。
+旧名不再注册；append-only 事件表里历史 tool_called 行的 `meme` / `send_meme` /
+`save_meme` 原样保留，投影 author index 仍认旧名（见 _build_author_index），
+回溯不受影响。
 
 2026-07-12 起由 save_meme / send_meme 两工具（2026-07-03）+ 当晚先行拆分的
-delete_meme / recaption_meme 合并而来（应用户拍板"能力全集合在一个 meme
-工具中"）：catalog 只暴露一个工具，模型按 `action` 选操作；旧工具名不再
-注册，append-only 事件表里历史 tool_called 行的 `send_meme` 等名字原样保留
-（投影 author index 兼容旧名，见 projection._build_author_index）。
+delete_meme / recaption_meme 合并而来（应用户拍板"能力全集合在一个表情包
+工具中"）：catalog 只暴露一个工具，模型按 `action` 选操作。
 
 三个动作共享同一身份标识：`image_hash`（sha256，与 timeline
 <image hash="..."/>、收藏夹 <meme hash="..."> 同一值空间，LLM 原样照抄）。
@@ -76,7 +82,7 @@ from qqbot.services.agent_loop.tools._meme_common import (
 
 logger = get_logger(__name__)
 
-_USAGE_PROMPT = load_sibling_md(__file__, "meme.md")
+_USAGE_PROMPT = load_sibling_md(__file__, "meme_collection.md")
 
 # context_note 上限：它是 caption 的辅助输入，不是正文；过长说明模型在把
 # 描述塞进 note（描述该由 caption 生成）。
@@ -92,23 +98,26 @@ _NOTE_ACTIONS = ("save", "recaption")
 MAX_SAVE_BATCH = 10
 
 
-class MemeTool(BaseTool):
+class MemeCollectionTool(BaseTool):
     """实现 Tool 协议。发送已并入 reply_task；这里只管理收藏。"""
 
-    name = "meme"
+    name = "meme_collection"
     description = (
-        "Your meme (表情包) collection in one tool; `action` selects the "
-        "operation. 'save' collects an image from this chat into the "
-        "collection (the system looks at the image and writes the "
-        "searchable description — you do not write it; optional "
-        "context_note adds chat context the pixels cannot show; pass an "
-        "ARRAY of up to 10 hashes to save several images at once). 'delete' "
-        "removes a saved meme from the collection. "
-        "'recaption' regenerates a saved meme's description (optional "
-        "context_note steers it). Every action takes image_hash, copied "
-        'VERBATIM: for save from an <image hash="..."/> tag in the '
+        "Your saved-meme (表情包) collection. This tool ONLY curates the "
+        "collection — it never sends anything and there is no send action; "
+        "the reply composer picks at most one meme out of <saved-memes> on "
+        "its own when a reply_task flushes. What you do here decides what it "
+        "will have to choose from. `action` selects the operation. 'save' "
+        "collects an image from this chat into the collection (the system "
+        "looks at the image and writes the searchable description — you do "
+        "not write it; optional context_note adds chat context the pixels "
+        "cannot show; pass an ARRAY of up to 10 hashes to save several "
+        "images at once). 'delete' removes a saved meme from the "
+        "collection. 'recaption' regenerates a saved meme's description "
+        "(optional context_note steers it). Every action takes image_hash, "
+        'copied VERBATIM: for save from an <image hash="..."/> tag in the '
         'timeline; for delete/recaption from a <meme hash="..."> entry in '
-        "<saved-memes>. Meme sending is selected and executed by reply_task."
+        "<saved-memes>."
     )
     usage_prompt = _USAGE_PROMPT
     # 收藏管理挂在聊天 scope 上；system scope 不暴露。

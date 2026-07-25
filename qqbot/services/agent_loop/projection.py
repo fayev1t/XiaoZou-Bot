@@ -1825,7 +1825,9 @@ def _build_author_index(
 
     工具结果分支只作 append-only 历史兼容：旧 reply/send_message 与旧
     meme.send/send_meme 的 tool_result 仍可恢复 from_self；现役 reply tool_result
-    不含 message_id，会被下方门槛自然滤掉。
+    不含 message_id，会被下方门槛自然滤掉。下面名字元组里的 ``meme`` 同样是
+    **历史名**——该工具 2026-07-25 改名 ``meme_collection`` 且早在 2026-07-19
+    就没有 send 动作，新名的 tool_result 永远不带 message_id，故不必加进来。
     """
     out: dict[str, _AuthorRef] = {}
     # 收集历史发言工具调用 id；现役发送直接从 reply_flushed 分支进入。

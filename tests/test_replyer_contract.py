@@ -3,6 +3,9 @@
 旧版 _build_user_text 是 json.dumps 整包——timeline 行内的 XML 引号被转义
 成 \\"，可读性低 Planner 一档，且不带 bot_qq/bot_role。本文件钉住新契约：
 XML 信封、timeline 行原样嵌入、身份属性与 <agent-input> 同名同语义。
+
+2026-07-25 起另钉住 system prompt 的 §MEMES 段与角色卡里的表情包动机段
+（ReplyerMemeGuidanceTests）：发送决策权归 Replyer 之后，判据只能长在这两处。
 """
 
 from __future__ import annotations
@@ -17,7 +20,10 @@ from qqbot.services.agent_loop.decision import (
     TimelineItem,
 )
 from qqbot.services.agent_loop.reply_task import ReplyTaskState
-from qqbot.services.agent_loop.replyer import _build_user_text
+from qqbot.services.agent_loop.replyer import (
+    _build_system_prompt,
+    _build_user_text,
+)
 
 TZ = ZoneInfo("Asia/Shanghai")
 NOW = datetime(2026, 7, 22, 12, 0, tzinfo=TZ)
@@ -121,6 +127,39 @@ class ReplyerUserTextTests(unittest.TestCase):
         self.assertIn("<saved-memes>", with_memes)
         self.assertIn(f'<meme hash="{HASH_A}">', with_memes)
         self.assertIn("黑猫瞪眼，不屑语气", with_memes)
+
+
+class ReplyerMemeGuidanceTests(unittest.TestCase):
+    """system prompt 的 §MEMES 段（2026-07-25 新增）。
+
+    在此之前，"什么时候该发表情包"在任何 prompt 里都没有正文：system prompt
+    只有半句 `whether to use at most one saved meme`，voice.md 一字未提——
+    发送决策权 2026-07-19 归 Replyer 后，判据一直是空的。三处 prompt 的分工见
+    表情包工具黑盒设计 §6.1；本类钉住其中 Replyer 的两处（判据 + 人格动机），
+    Planner 那处由 test_llm_planner / xml_format 侧覆盖。
+    """
+
+    def _prompt(self) -> str:
+        return _build_system_prompt()
+
+    def test_memes_section_states_the_core_judgements(self) -> None:
+        prompt = self._prompt()
+        self.assertIn("MEMES", prompt)
+        # 描述是选图的全部依据 —— 不得脑补描述里没写的细节。
+        self.assertIn("the images are not attached", prompt)
+        # 文字是默认；合适度优先于可用性（宁可不发也不硬凑）。
+        self.assertIn("Words are the default", prompt)
+        self.assertIn("Fit beats availability", prompt)
+        # 连发抑制锚在 timeline 上真实存在的 <sent-meme> 行（投影渲染的标签），
+        # 不是凭空造的信号；写错标签名等于这条判据永远不触发。
+        self.assertIn("<sent-meme>", prompt)
+
+    def test_voice_card_is_folded_in_with_its_meme_section(self) -> None:
+        prompt = self._prompt()
+        # 角色卡整体仍在（voice.md 是唯一权威来源，缺失应 fail loudly）。
+        self.assertIn("小奏", prompt)
+        # 人格层的表情包动机段（voice.md §表情包）也必须随卡片进来。
+        self.assertIn("表情包对你不是装饰", prompt)
 
 
 if __name__ == "__main__":

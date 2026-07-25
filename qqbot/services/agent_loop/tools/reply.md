@@ -97,6 +97,18 @@ timeline already shows. `gist.situation` maps the room's concurrent threads,
 `gist.intent` is the overall purpose, `facts` must remain true, `avoid` must not
 surface, and `tone` is only a light composition hint.
 
+### Steering the form, not picking it
+
+Form — words versus a saved meme, one bubble or three, how blunt it lands — is
+the Replyer's call, decided against the newest timeline. You still get a say:
+write the intent in plain language in `gist.tone` or the target's `guidance`,
+e.g. `"嫌弃但其实在笑，适合配张表情包"`, `"一句话怼回去就行"`, `"这条别耍宝，
+他是认真在问"`. There is no field for choosing a meme and no hash goes in this
+call; what you write is a hint the Replyer weighs, not an order it must follow.
+That is the intended split — steering the beat is yours, landing it is its.
+Whether a fitting meme even exists is upstream of both: only what
+`meme_collection` has already saved can be picked.
+
 One flush emits at most 4 bubbles (at most one of them a meme). Output the user
 explicitly wants in more parts than one flush can carry is a cross-tick task:
 keep that task open, authorize only the current installment, and on the wake

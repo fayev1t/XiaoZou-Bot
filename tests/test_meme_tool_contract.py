@@ -1,9 +1,10 @@
-"""Contract tests for MemeTool（表情包收藏工具，action=save/delete/recaption）。
+"""Contract tests for MemeCollectionTool（表情包收藏工具，action=save/delete/recaption）。
 
 2026-07-12 起 save_meme / send_meme（2026-07-03）与当晚拆分先行的
-delete_meme / recaption_meme 合并为单工具 `meme`；本文件整合原四份工具契约
+delete_meme / recaption_meme 合并为单工具；本文件整合原四份工具契约
 测试（test_save_meme / test_send_meme / test_delete_meme /
-test_recaption_meme_tool_contract.py，均已删除）。
+test_recaption_meme_tool_contract.py，均已删除）。工具名 2026-07-25 由
+`meme` 改为 `meme_collection`（模块/类名同步），见 ToolIdentityTests。
 
 设计结论（表情包工具黑盒设计.md）：
 - 工具面：action 必填且限 save/delete/recaption（非法 →
@@ -49,7 +50,10 @@ from zoneinfo import ZoneInfo
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.sql.dml import Delete, Insert, Update
 
-from qqbot.services.agent_loop.tools.meme import MAX_SAVE_BATCH, MemeTool
+from qqbot.services.agent_loop.tools.meme_collection import (
+    MAX_SAVE_BATCH,
+    MemeCollectionTool,
+)
 
 HASH_A = "ab" * 32
 HASH_B = "cd" * 32
@@ -206,13 +210,48 @@ class _MemeToolTestBase(unittest.IsolatedAsyncioTestCase):
         }
 
 
+class ToolIdentityTests(unittest.TestCase):
+    """工具身份：2026-07-25 改名 `meme` → `meme_collection`，且工具面上
+    不得再出现任何"发送"入口（发送 2026-07-19 起归 Replyer，黑盒设计 §1）。"""
+
+    def test_tool_name_is_meme_collection(self) -> None:
+        self.assertEqual(MemeCollectionTool.name, "meme_collection")
+
+    def test_registered_under_new_name_only(self) -> None:
+        from qqbot.services.agent_loop.tools import build_default_registry
+
+        names = build_default_registry().names()
+        self.assertIn("meme_collection", names)
+        # 旧名不再注册：历史事件里的 tool_name="meme" 只作投影兼容，不是活工具。
+        self.assertNotIn("meme", names)
+
+    def test_no_send_action_anywhere_on_the_tool_surface(self) -> None:
+        schema = MemeCollectionTool.arguments_schema
+        self.assertEqual(
+            schema["properties"]["action"]["enum"],
+            ["save", "delete", "recaption"],
+        )
+        # description 是 catalog 里模型唯一看得到的能力说明：既不能提供发送，
+        # 也要明说自己不发送，否则改名的意义（消除"发图入口"误读）就没了。
+        description = MemeCollectionTool.description
+        self.assertIn("never sends", description)
+        self.assertNotIn("action=send", description)
+
+    def test_usage_prompt_keeps_the_speaking_boundary(self) -> None:
+        usage = MemeCollectionTool.usage_prompt or ""
+        self.assertIn("meme_collection", usage)
+        self.assertIn("never sends", usage)
+        # 倾向表达的唯一合法出口（不加 gist 字段的前提下）必须写在用法文档里。
+        self.assertIn("gist.tone", usage)
+
+
 class ActionDispatchTests(_MemeToolTestBase):
     """工具面：action 校验 / context_note 适用性 / scope / 公共失败。"""
 
     async def test_missing_or_bad_action_is_invalid_arguments(self) -> None:
         db = _FakeMemeDB()
         for bad in (None, "", "post", "SAVE", 42):
-            outcome = await MemeTool().run(
+            outcome = await MemeCollectionTool().run(
                 {"action": bad, "image_hash": HASH_A}, **self._context(db)
             )
             self.assertFalse(outcome.ok)
@@ -224,7 +263,7 @@ class ActionDispatchTests(_MemeToolTestBase):
         db = _FakeMemeDB()
         for action in ("save", "delete", "recaption"):
             for bad in ("xyz", "ab" * 31, "", None, 123):
-                outcome = await MemeTool().run(
+                outcome = await MemeCollectionTool().run(
                     {"action": action, "image_hash": bad}, **self._context(db)
                 )
                 self.assertFalse(outcome.ok)
@@ -237,7 +276,7 @@ class ActionDispatchTests(_MemeToolTestBase):
     async def test_context_note_rejected_for_delete(self) -> None:
         db = _FakeMemeDB()
         for action in ("delete",):
-            outcome = await MemeTool().run(
+            outcome = await MemeCollectionTool().run(
                 {
                     "action": action,
                     "image_hash": HASH_A,
@@ -254,7 +293,7 @@ class ActionDispatchTests(_MemeToolTestBase):
     async def test_context_note_must_be_string(self) -> None:
         db = _FakeMemeDB()
         for action in ("save", "recaption"):
-            outcome = await MemeTool().run(
+            outcome = await MemeCollectionTool().run(
                 {"action": action, "image_hash": HASH_A, "context_note": 42},
                 **self._context(db),
             )
@@ -267,7 +306,7 @@ class ActionDispatchTests(_MemeToolTestBase):
     async def test_system_scope_rejected(self) -> None:
         db = _FakeMemeDB()
         for action in ("save", "delete", "recaption"):
-            outcome = await MemeTool().run(
+            outcome = await MemeCollectionTool().run(
                 {"action": action, "image_hash": HASH_A},
                 **self._context(db, scope_key="system"),
             )
@@ -279,7 +318,7 @@ class ActionDispatchTests(_MemeToolTestBase):
         for action in ("save", "delete", "recaption"):
             ctx = self._context(db)
             ctx["session_factory"] = None
-            outcome = await MemeTool().run(
+            outcome = await MemeCollectionTool().run(
                 {"action": action, "image_hash": HASH_A}, **ctx
             )
             self.assertFalse(outcome.ok)
@@ -287,7 +326,7 @@ class ActionDispatchTests(_MemeToolTestBase):
 
     async def test_send_action_is_removed(self) -> None:
         db = _FakeMemeDB()
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "send", "image_hash": HASH_A}, **self._context(db)
         )
         self.assertFalse(outcome.ok)
@@ -303,7 +342,7 @@ class SaveActionTests(_MemeToolTestBase):
         self._write_media()
         db = _FakeMemeDB(select_results=[[]])  # 前查未命中
         caption, calls = _captioner()
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {
                 "action": "save",
                 "image_hash": HASH_A,
@@ -332,7 +371,7 @@ class SaveActionTests(_MemeToolTestBase):
         self._write_media()
         db = _FakeMemeDB(select_results=[[]])
         caption, _ = _captioner()
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "save", "image_hash": HASH_A.upper()},
             **self._context(db, caption),
         )
@@ -343,7 +382,7 @@ class SaveActionTests(_MemeToolTestBase):
         self._write_media(data=JPEG_BYTES)
         db = _FakeMemeDB(select_results=[[]])
         caption, calls = _captioner()
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "save", "image_hash": HASH_A},
             **self._context(db, caption),
         )
@@ -358,7 +397,7 @@ class SaveActionTests(_MemeToolTestBase):
         self._write_media()
         db = _FakeMemeDB(select_results=[[_meme_row("已有的描述")]])
         caption, calls = _captioner()
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "save", "image_hash": HASH_A},
             **self._context(db, caption),
         )
@@ -376,7 +415,7 @@ class SaveActionTests(_MemeToolTestBase):
             dml_rowcount=0,
         )
         caption, _ = _captioner()
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "save", "image_hash": HASH_A},
             **self._context(db, caption),
         )
@@ -389,7 +428,7 @@ class SaveActionTests(_MemeToolTestBase):
     async def test_file_missing_is_image_not_found(self) -> None:
         db = _FakeMemeDB()
         caption, calls = _captioner()
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "save", "image_hash": HASH_A},
             **self._context(db, caption),
         )
@@ -400,7 +439,7 @@ class SaveActionTests(_MemeToolTestBase):
     async def test_caption_exception_is_caption_failed_no_insert(self) -> None:
         self._write_media()
         db = _FakeMemeDB(select_results=[[]])
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "save", "image_hash": HASH_A},
             **self._context(db, _failing_captioner(RuntimeError("llm down"))),
         )
@@ -413,7 +452,7 @@ class SaveActionTests(_MemeToolTestBase):
         self._write_media()
         db = _FakeMemeDB(select_results=[[]])
         caption, _ = _captioner(description="   ")
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "save", "image_hash": HASH_A},
             **self._context(db, caption),
         )
@@ -424,7 +463,7 @@ class SaveActionTests(_MemeToolTestBase):
     async def test_missing_captioner_is_internal_tool_error(self) -> None:
         self._write_media()
         db = _FakeMemeDB(select_results=[[]])
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "save", "image_hash": HASH_A},
             **self._context(db, None),
         )
@@ -443,7 +482,7 @@ class BatchSaveActionTests(_MemeToolTestBase):
         self._write_media(HASH_B)
         db = _FakeMemeDB(select_results=[[], []])  # 两张前查都未命中
         caption, calls = _captioner()
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "save", "image_hash": [HASH_A, HASH_B]},
             **self._context(db, caption),
         )
@@ -468,7 +507,7 @@ class BatchSaveActionTests(_MemeToolTestBase):
             select_results=[[], [_meme_row(file_hash=HASH_B, description="旧的")]]
         )
         caption, calls = _captioner()
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "save", "image_hash": [HASH_A, HASH_B, HASH_C]},
             **self._context(db, caption),
         )
@@ -487,7 +526,7 @@ class BatchSaveActionTests(_MemeToolTestBase):
         self._write_media(HASH_A)
         db = _FakeMemeDB(select_results=[[]])
         caption, calls = _captioner()
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "save", "image_hash": [HASH_A, HASH_A.upper(), HASH_A]},
             **self._context(db, caption),
         )
@@ -501,7 +540,7 @@ class BatchSaveActionTests(_MemeToolTestBase):
         self._write_media(HASH_B)
         db = _FakeMemeDB(select_results=[[], []])
         caption, calls = _captioner()
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {
                 "action": "save",
                 "image_hash": [HASH_A, HASH_B],
@@ -518,7 +557,7 @@ class BatchSaveActionTests(_MemeToolTestBase):
         # 两张都不在盘上（image_not_found，不可重试）→ 整体失败
         db = _FakeMemeDB()
         caption, _ = _captioner()
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "save", "image_hash": [HASH_A, HASH_B]},
             **self._context(db, caption),
         )
@@ -535,7 +574,7 @@ class BatchSaveActionTests(_MemeToolTestBase):
         # caption 失败是 retryable → 整体 batch_save_failed 也标 retryable
         self._write_media(HASH_A)
         db = _FakeMemeDB(select_results=[[]])
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "save", "image_hash": [HASH_A]},
             **self._context(db, _failing_captioner(RuntimeError("llm down"))),
         )
@@ -548,7 +587,7 @@ class BatchSaveActionTests(_MemeToolTestBase):
 
     async def test_empty_array_rejected(self) -> None:
         db = _FakeMemeDB()
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "save", "image_hash": []}, **self._context(db)
         )
         self.assertFalse(outcome.ok)
@@ -558,7 +597,7 @@ class BatchSaveActionTests(_MemeToolTestBase):
     async def test_over_cap_rejected(self) -> None:
         hashes = [f"{i:02x}" * 32 for i in range(MAX_SAVE_BATCH + 1)]
         db = _FakeMemeDB()
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "save", "image_hash": hashes}, **self._context(db)
         )
         self.assertFalse(outcome.ok)
@@ -569,7 +608,7 @@ class BatchSaveActionTests(_MemeToolTestBase):
         self._write_media(HASH_A)
         db = _FakeMemeDB()
         caption, calls = _captioner()
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "save", "image_hash": [HASH_A, "not-a-hash"]},
             **self._context(db, caption),
         )
@@ -583,7 +622,7 @@ class BatchSaveActionTests(_MemeToolTestBase):
     async def test_array_rejected_for_other_actions(self) -> None:
         db = _FakeMemeDB()
         for action in ("delete", "recaption"):
-            outcome = await MemeTool().run(
+            outcome = await MemeCollectionTool().run(
                 {"action": action, "image_hash": [HASH_A]},
                 **self._context(db),
             )
@@ -599,7 +638,7 @@ class BatchSaveActionTests(_MemeToolTestBase):
         self._write_media(HASH_A)
         db = _FakeMemeDB(select_results=[[]])
         caption, _ = _captioner()
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "save", "image_hash": HASH_A},
             **self._context(db, caption),
         )
@@ -612,7 +651,7 @@ class BatchSaveActionTests(_MemeToolTestBase):
 class DeleteActionTests(_MemeToolTestBase):
     async def test_delete_saved_meme_echoes_description(self) -> None:
         db = _FakeMemeDB(select_results=[[_meme_row()]])
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "delete", "image_hash": HASH_A}, **self._context(db)
         )
         self.assertTrue(outcome.ok)
@@ -626,7 +665,7 @@ class DeleteActionTests(_MemeToolTestBase):
     async def test_delete_race_rowcount_zero_still_success(self) -> None:
         # 前查命中、DELETE 时别的删除先到：结果状态一致，照常回执 deleted
         db = _FakeMemeDB(select_results=[[_meme_row()]], dml_rowcount=0)
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "delete", "image_hash": HASH_A}, **self._context(db)
         )
         self.assertTrue(outcome.ok)
@@ -634,7 +673,7 @@ class DeleteActionTests(_MemeToolTestBase):
 
     async def test_unsaved_hash_is_unknown_meme_without_delete(self) -> None:
         db = _FakeMemeDB(select_results=[[]])
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "delete", "image_hash": HASH_A}, **self._context(db)
         )
         self.assertFalse(outcome.ok)
@@ -649,7 +688,7 @@ class RecaptionActionTests(_MemeToolTestBase):
         self._write_media()
         db = _FakeMemeDB(select_results=[[_meme_row()]])
         caption, calls = _captioner("白猫叹气，配字摆烂，自嘲用")
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {
                 "action": "recaption",
                 "image_hash": HASH_A,
@@ -677,7 +716,7 @@ class RecaptionActionTests(_MemeToolTestBase):
         self._write_media()
         db = _FakeMemeDB(select_results=[[_meme_row(context_note="张三的名场面")]])
         caption, calls = _captioner()
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "recaption", "image_hash": HASH_A},
             **self._context(db, caption),
         )
@@ -690,7 +729,7 @@ class RecaptionActionTests(_MemeToolTestBase):
         self._write_media()
         db = _FakeMemeDB(select_results=[[_meme_row(context_note="张三的名场面")]])
         caption, calls = _captioner()
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "recaption", "image_hash": HASH_A, "context_note": "   "},
             **self._context(db, caption),
         )
@@ -703,7 +742,7 @@ class RecaptionActionTests(_MemeToolTestBase):
         self._write_media()
         db = _FakeMemeDB(select_results=[[]])
         caption, calls = _captioner()
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "recaption", "image_hash": HASH_A},
             **self._context(db, caption),
         )
@@ -716,7 +755,7 @@ class RecaptionActionTests(_MemeToolTestBase):
         # 收藏在、文件没了：违反黑盒设计 §7 钉住约束的防御位
         db = _FakeMemeDB(select_results=[[_meme_row()]])
         caption, calls = _captioner()
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "recaption", "image_hash": HASH_A},
             **self._context(db, caption),
         )
@@ -727,7 +766,7 @@ class RecaptionActionTests(_MemeToolTestBase):
     async def test_caption_exception_keeps_old_description(self) -> None:
         self._write_media()
         db = _FakeMemeDB(select_results=[[_meme_row()]])
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "recaption", "image_hash": HASH_A},
             **self._context(db, _failing_captioner(RuntimeError("llm down"))),
         )
@@ -740,7 +779,7 @@ class RecaptionActionTests(_MemeToolTestBase):
         self._write_media()
         db = _FakeMemeDB(select_results=[[_meme_row()]])
         caption, _ = _captioner(description="   ")
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "recaption", "image_hash": HASH_A},
             **self._context(db, caption),
         )
@@ -753,7 +792,7 @@ class RecaptionActionTests(_MemeToolTestBase):
         self._write_media()
         db = _FakeMemeDB(select_results=[[_meme_row()]], dml_rowcount=0)
         caption, _ = _captioner()
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "recaption", "image_hash": HASH_A},
             **self._context(db, caption),
         )
@@ -763,7 +802,7 @@ class RecaptionActionTests(_MemeToolTestBase):
     async def test_missing_captioner_is_internal_tool_error(self) -> None:
         self._write_media()
         db = _FakeMemeDB(select_results=[[_meme_row()]])
-        outcome = await MemeTool().run(
+        outcome = await MemeCollectionTool().run(
             {"action": "recaption", "image_hash": HASH_A},
             **self._context(db, None),
         )

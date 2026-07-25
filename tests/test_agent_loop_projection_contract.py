@@ -2277,11 +2277,15 @@ class ReplyFlushedProjectionTests(unittest.TestCase):
 
 
 class SendMemeAuthorIndexTests(unittest.TestCase):
-    """meme（action=send）也是"bot 发出一条消息"的工具，result 同样带
-    message_id + self_id：别人引用 bot 发的表情包时，_build_author_index
-    一并认它，reply 段照标 from_self="true"（表情包工具黑盒设计 §投影集成）。
-    2026-07-12 合并前的旧工具名 send_meme 落在 append-only 事件表里，同
-    reply 例保留兼容。"""
+    """**纯历史兼容**：曾经存在的 meme 发送动作（action=send）也是"bot 发出
+    一条消息"的工具，result 同样带 message_id + self_id：别人引用 bot 发的
+    表情包时，_build_author_index 一并认它，reply 段照标 from_self="true"
+    （表情包工具黑盒设计 §投影集成）。
+
+    这里的两个工具名如今都是历史名，append-only 事件表里原样躺着，投影必须
+    继续认：`send_meme` 是 2026-07-12 合并前的独立工具；`meme` 是 2026-07-19
+    移除 send 动作前的合并工具（该工具 2026-07-25 又改名 meme_collection，
+    但新名从不发送、其 tool_result 无 message_id，故不进这个索引）。"""
 
     def _meme_send_events(self, tool_name: str) -> list:
         return [
@@ -2323,7 +2327,9 @@ class SendMemeAuthorIndexTests(unittest.TestCase):
             ),
         ]
 
-    def test_reply_to_bot_meme_attributes_self(self) -> None:
+    def test_legacy_meme_send_name_still_attributes_self(self) -> None:
+        # `meme` = 2026-07-19 移除 send 动作前的工具名（2026-07-25 起该工具
+        # 叫 meme_collection 且不再发送）；旧事件仍须解析出 from_self。
         evs = self._meme_send_events("meme")
         items = Projector.build_timeline(evs, tool_views=[])
         msg = [i for i in items if i.kind == "message"][0].render

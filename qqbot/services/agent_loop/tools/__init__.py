@@ -37,7 +37,7 @@ from qqbot.services.agent_loop.tools.get_stranger_info import GetStrangerInfoToo
 from qqbot.services.agent_loop.tools.group_notice import GroupNoticeTool
 from qqbot.services.agent_loop.tools.kick import KickTool
 from qqbot.services.agent_loop.tools.leave_group import LeaveGroupTool
-from qqbot.services.agent_loop.tools.meme import MemeTool
+from qqbot.services.agent_loop.tools.meme_collection import MemeCollectionTool
 from qqbot.services.agent_loop.tools.poke import PokeTool
 from qqbot.services.agent_loop.tools.recall import RecallTool
 from qqbot.services.agent_loop.tools.reply import ReplyTool
@@ -74,7 +74,10 @@ def build_default_registry() -> ToolRegistry:
     registry.register(RespondToGroupJoinRequestTool())
     # 表情包收藏管理：save（描述由 caption LLM 生成）/ delete / recaption。
     # 发送入口已并入 reply_task；Replyer 从 <saved-memes> 决定 0..1 张。
-    registry.register(MemeTool())
+    # 2026-07-25 由 `meme` 改名 `meme_collection`：裸名词 `meme` 读起来像
+    # "表情包能力"，而发送 2026-07-19 就不在它参数面上了，新名点明操作对象是
+    # 收藏夹本身（历史事件的旧 tool_name 原样保留，投影 author index 仍认）。
+    registry.register(MemeCollectionTool())
     # ── 群信息查询（2026-07-07 重做后恢复 / 新增）──
     # 查询三件套按下架备注的路线重做后恢复：get_group_info（no_cache + 可选
     # 字段透传）、get_member_list（role 过滤 / include_activity / banned_until）、
@@ -143,7 +146,7 @@ __all__ = [
     "GroupNoticeTool",
     "KickTool",
     "LeaveGroupTool",
-    "MemeTool",
+    "MemeCollectionTool",
     "PokeTool",
     "RecallTool",
     "RespondToGroupJoinRequestTool",
