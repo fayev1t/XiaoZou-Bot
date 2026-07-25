@@ -12,9 +12,6 @@ class EnvCentralizationContractTests(unittest.TestCase):
         return (ROOT / relative_path).read_text(encoding="utf-8")
 
     def test_service_compose_layout_is_repo_baseline(self) -> None:
-        # searxng / crawl4ai 已随 websearch 工具 Tavily 化下线（2026-07-18），
-        # 不再是基线的一部分；其 compose 目录暂留仓库仅为部署侧执行
-        # `docker compose down`，之后手动删除，这里不再约束其存在。
         for relative_path in (
             "docker/postgres/compose.yml",
             "docker/napcat/compose.yml",
@@ -24,6 +21,10 @@ class EnvCentralizationContractTests(unittest.TestCase):
 
         self.assertFalse((ROOT / "docker" / "docker-compose.yml").exists())
         self.assertFalse((ROOT / "docker" / "Dockerfile").exists())
+        # searxng / crawl4ai 已随 websearch 工具 Tavily/Exa 化下线
+        # （2026-07-18 下线容器，2026-07-24 删除 compose 目录）——防回潮。
+        self.assertFalse((ROOT / "docker" / "searxng").exists())
+        self.assertFalse((ROOT / "docker" / "crawl4ai").exists())
 
     def test_pyproject_no_longer_depends_on_crawl4ai(self) -> None:
         pyproject_text = self.read_text("pyproject.toml")
