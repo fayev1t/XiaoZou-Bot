@@ -454,6 +454,49 @@ class LoopSupervisorContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(captured), baseline)
 
 
+class MemoryCompactorWiringTests(unittest.IsolatedAsyncioTestCase):
+    """记忆压缩器接线（记忆系统契约 §4.1/§4.2）：开关默认关 = 不构造；
+    打开 = start 挂起等待触顶 + 投影装探针 + stop 收掉；未启用时 notify
+    安全 no-op。"""
+
+    async def test_disabled_by_default_no_compactor(self) -> None:
+        captured: list[Any] = []
+        sup = LoopSupervisor(
+            planner=FakeIdlePlanner(),
+            session_factory=_factory_for(captured),
+        )
+        await sup.start()
+        self.assertIsNone(sup._memory_compactor)
+        sup.notify_compaction("group:1", 250)  # 未启用：安全 no-op
+        await sup.stop()
+
+    async def test_enabled_env_wires_compactor_and_probe(self) -> None:
+        import os
+
+        from qqbot.services.agent_loop.projection import Projector
+
+        old = os.environ.get("MEMORY_COMPACTION_ENABLED")
+        os.environ["MEMORY_COMPACTION_ENABLED"] = "true"
+        try:
+            captured: list[Any] = []
+            projector = Projector(_factory_for(captured))
+            sup = LoopSupervisor(
+                planner=FakeIdlePlanner(),
+                session_factory=_factory_for(captured),
+                projector=projector,
+            )
+            await sup.start()
+            self.assertIsNotNone(sup._memory_compactor)
+            self.assertIsNotNone(projector._uncovered_notifier)
+            await sup.stop()
+            self.assertIsNone(sup._memory_compactor)
+        finally:
+            if old is None:
+                os.environ.pop("MEMORY_COMPACTION_ENABLED", None)
+            else:
+                os.environ["MEMORY_COMPACTION_ENABLED"] = old
+
+
 class FakeIdlePlannerTests(unittest.IsolatedAsyncioTestCase):
     async def test_always_idle(self) -> None:
         from qqbot.services.agent_loop.decision import DecisionContext, IdleAction

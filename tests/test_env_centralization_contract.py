@@ -58,6 +58,12 @@ class EnvCentralizationContractTests(unittest.TestCase):
             "PROMPT_SNAPSHOT_DIR=./runtime_data/prompt_snapshots",
             "PROMPT_SNAPSHOT_KEEP=200",
             "PROMPT_SNAPSHOT_SCOPES=group,system",
+            # 滚动记忆压缩（记忆系统契约 §6）：模板默认关闭，单群灰度后开
+            "MEMORY_COMPACTION_ENABLED=false",
+            "MEMORY_COMPACTION_SCOPES=",
+            "MEMORY_SUMMARY_MAX_CHARS=1200",
+            "MEMORY_COMPACTION_TRIGGER_EVENTS=250",
+            "MEMORY_COMPACTION_KEEP_EVENTS=150",
             # 多服务商 LLM 路由：注册表在 config/model_providers.json（可选特性，默认单
             # 服务商扁平形态），模板只保留路径覆写键的注释示例
             "# MODEL_PROVIDERS_PATH=",
@@ -69,6 +75,10 @@ class EnvCentralizationContractTests(unittest.TestCase):
         # 化），env 模板不应再出现两者的配置（防回潮，同 sqlite 断言风格）。
         self.assertNotIn("SEARXNG", env_example)
         self.assertNotIn("CRAWL4AI", env_example)
+        # 记忆只由实时触顶驱动且一次触顶只做一次 merge：不再保留会引入
+        # 时间门槛或输入分块的旧配置。
+        self.assertNotIn("MEMORY_COMPACTION_MIN_INTERVAL_SECONDS", env_example)
+        self.assertNotIn("MEMORY_COMPACTION_MAX_INPUT_CHARS", env_example)
 
     def test_model_providers_template_exists_and_real_file_gitignored(self) -> None:
         """多服务商 LLM 注册表走 config/model_providers.json：模板必须存在且是合法

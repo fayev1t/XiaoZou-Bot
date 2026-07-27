@@ -69,6 +69,10 @@ class LoopSupervisor:
         self._stopped = False
         self._tool_worker: ToolWorker | None = None
         self._reply_executor: ReplyExecutor | None = None
+        # 滚动记忆压缩器（记忆系统契约 §4）：MEMORY_COMPACTION_ENABLED
+        # 打开时 start() 拉起；类型留 Any——模块惰性导入，避免默认关闭时
+        # 平白拉进 LLM 依赖链。
+        self._memory_compactor: Any | None = None
 
     @property
     def started(self) -> bool:
@@ -131,6 +135,29 @@ class LoopSupervisor:
                 caption_image=self._caption_image,
             )
             self._tool_worker.start()
+        # MemoryCompactor（记忆系统契约 §4）：滚动折叠式场景记忆。开关
+        # 默认关；启用时只挂起 worker 并给投影装推式探针。worker 启动不
+        # 扫描、不 merge；只有 tick 投影报告真正触顶才会唤醒。best-effort：
+        # 记忆压缩失败不能挡启动。
+        try:
+            from qqbot.services.agent_loop.memory_compactor import (
+                MemoryCompactor,
+                memory_compaction_enabled,
+            )
+
+            if memory_compaction_enabled():
+                self._memory_compactor = MemoryCompactor(self._session_factory)
+                self._memory_compactor.start()
+                if self._projector is not None:
+                    self._projector.set_uncovered_notifier(
+                        self.notify_compaction
+                    )
+                logger.info("[supervisor] memory compactor online")
+        except Exception as exc:
+            logger.warning(
+                "[supervisor] memory compactor start failed (continuing): {}",
+                exc,
+            )
         # SystemAgentLoop wakes up to handle scope=system events
         # (request.*, lifecycle, bot_offline, ...).
         await self._ensure("system")
@@ -157,6 +184,15 @@ class LoopSupervisor:
         if self._reply_executor is not None:
             await self._reply_executor.stop()
             self._reply_executor = None
+        if self._memory_compactor is not None:
+            try:
+                await self._memory_compactor.stop()
+            except Exception as exc:
+                logger.warning(
+                    "[supervisor] memory compactor stop failed: {}", exc
+                )
+            finally:
+                self._memory_compactor = None
         logger.info("[supervisor] stopped, {} loops drained", len(loops))
 
     async def wake(self, scope_key: str) -> None:
@@ -177,6 +213,14 @@ class LoopSupervisor:
         tool_registry 时是 no-op。"""
         if self._tool_worker is not None:
             self._tool_worker.notify()
+
+    def notify_compaction(self, scope_key: str, uncovered_events: int) -> None:
+        """转发投影计数；压缩器只接受达到阈值的 scope。
+
+        未启用记忆压缩时 no-op。
+        """
+        if self._memory_compactor is not None:
+            self._memory_compactor.notify(scope_key, uncovered_events)
 
     async def notify_reply_task(
         self,

@@ -101,7 +101,11 @@ async def write_runtime_event(
     correlation_id: str,
     causation_id: str | None,
     payload: dict,
+    occurred_at: datetime | None = None,
 ) -> str:
+    """``occurred_at`` 缺省=写入时刻；只有"事件真正发生的时刻早于写入"的
+    场景才显式回填（如 runtime.context_compacted 回填为覆盖边界 +1ms，
+    见 记忆系统契约 §2.2）。"""
     return await write_internal_event(
         session_factory,
         origin="runtime",
@@ -111,6 +115,7 @@ async def write_runtime_event(
         correlation_id=correlation_id,
         causation_id=causation_id,
         payload=payload,
+        occurred_at=occurred_at,
     )
 
 

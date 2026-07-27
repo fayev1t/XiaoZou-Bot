@@ -4,7 +4,9 @@
       "name": "deepseek",
       "base_url": "https://api.deepseek.com/v1",
       "api_key": "sk-your-deepseek-key",
-      "models": ["deepseek-chat"]
+      "models": [
+        "deepseek-chat"
+      ]
     },
     {
       "name": "relay",
@@ -12,7 +14,12 @@
       "api_key": "sk-your-relay-key",
       "models": [
         "deepseek-chat",
-        { "name": "gpt-4o", "capabilities": ["vision"] }
+        {
+          "name": "gpt-4o",
+          "capabilities": [
+            "vision"
+          ]
+        }
       ]
     }
   ],
@@ -20,6 +27,7 @@
     "planner": "deepseek-chat",
     "replyer": "deepseek-chat",
     "caption": "gpt-4o",
+    "memory": "deepseek-chat",
     "default": "deepseek-chat"
   },
   "settings": {
