@@ -179,7 +179,7 @@ async def load_active_tasks(
 ) -> list[TaskView]:
     """取某 scope 下所有 pending/running 任务，按创建时间升序还原成 TaskView。
 
-    不受 lookback / 条数窗口限制 —— 这正是它能修"未完成任务被水群挤掉"的原因。
+    不受取数条数窗限制 —— 这正是它能修"未完成任务被水群挤掉"的原因。
     """
     stmt = (
         select(AgentTask)

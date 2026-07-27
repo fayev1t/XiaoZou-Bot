@@ -3,7 +3,7 @@
 Contract: 开发文档/v2.0/任务与决策契约.md §2.3, §4.2, §5.1, §5.2
 
 Strategy:
-- Fetch agent_visible events for this scope within a lookback window.
+- Fetch the newest agent_visible events for this scope (count-limited window).
 - Fold `agent.task_*` into TaskView snapshots (active_tasks).
 - Pair `agent.tool_called` with `agent.tool_result | agent.tool_failed`
   into ToolResultView。工具视图只有两态：processing（还没 terminal）/
@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Callable, Iterable, Sequence
 
 from sqlalchemy import select
@@ -124,8 +124,8 @@ class Projector:
     # 窗口放任增长到 max + SLACK 条才一次性前移回 max 条——起点每 SLACK 条
     # 新行才跳一次，其间各拍共享整段 timeline 前缀。<my-thought> 的"最近
     # K 条"选择边界同理滞回（否则每拍新增一条决策，第 K 旧的思考行就从
-    # timeline 中段被抹掉，前缀照断）。锚失效（掉出取数窗 / 重启丢内存态 /
-    # 事件老化出 lookback）时退回朴素裁剪并重新锚定，只多一次缓存 miss。
+    # timeline 中段被抹掉，前缀照断）。锚失效（掉出取数窗 / 重启丢内存态）
+    # 时退回朴素裁剪并重新锚定，只多一次缓存 miss。
     TIMELINE_TRIM_SLACK = 30
     THOUGHT_ROWS_SLACK = 5
 
@@ -133,12 +133,10 @@ class Projector:
         self,
         session_factory: SessionFactory,
         *,
-        lookback_hours: int = 24,
         max_items: int = 300,
         max_timeline_items: int = 100,
     ) -> None:
         self._session_factory = session_factory
-        self._lookback = timedelta(hours=lookback_hours)
         # 拉取 fetch 上限保持较大，给 fold_tasks / fold_tool_results 喂够事件；
         # 真正塞给 LLM 的 timeline 在 project() 里再裁到 max_timeline_items 条。
         self._max_items = max_items
@@ -159,22 +157,20 @@ class Projector:
         bot_user_id: str | None = None,
     ) -> DecisionContext:
         scope, group_id, _ = parse_scope_key(scope_key)
-        # cutoff 按小时向下取整：24h 窗口边界若随 now 连续滑动，安静 scope 里
-        # 几乎每拍都有旧事件从窗口头部掉出，白白掐断前缀缓存；取整后旧事件按
-        # 小时批量退场。实际 lookback 因此在 [24h, 25h) 浮动，折叠与裁剪不受
-        # 影响（fetch 只是候选池，真正的渲染窗口由 project() 的裁剪决定）。
-        cutoff = (now - self._lookback).replace(
-            minute=0, second=0, microsecond=0
-        )
+        # 取数窗只按条数收敛（2026-07-27 去除 24h 时间回溯）：模型要能看到
+        # 任意早的"最近 N 条"，安静 scope 的旧对话不因时间流逝而消失，退场
+        # 唯一路径是被更新的事件挤出条数窗。窗口头部因此只在裁剪重锚时移动，
+        # 前缀缓存反而更稳（原 cutoff 按小时取整的动机随之消失）。
 
         # ``now`` 不只是渲染时钟，也是本拍严格的投影快照上界。消息可能在
         # loop 捕获 now 之后、这条 SELECT 真正执行之前入库；若不设上界，
         # 它会混进本拍 context，却又排在 occurred_at=now 的
         # decision_emitted 之后，下一拍看起来像是本拍已经处理过。明确截到
         # now 后，这类消息留给其自己的 wake/tick 消费。
-        events = await self._fetch(scope, group_id, cutoff, now)
+        events = await self._fetch(scope, group_id, now)
         # bot_role 单独一次 SQL 查 —— runtime.bot_role_observed 可能远早于
-        # lookback 窗口（比如启动 sweep 跑过一次就再没变），不应受 cutoff 影响。
+        # 取数窗（比如启动 sweep 跑过一次就再没变，早被后续事件挤出条数
+        # LIMIT），不应受取数窗影响。
         bot_role: str | None = None
         if scope == "group" and group_id is not None:
             bot_role = await self._fetch_latest_bot_role(group_id, bot_user_id)
@@ -199,7 +195,7 @@ class Projector:
                 if item.kind == "my_thought":
                     self._thought_anchors[scope_key] = item.event_id
                     break
-        # 任务持久化补全：fold_tasks 只看 lookback/300 窗口，未完成任务的
+        # 任务持久化补全：fold_tasks 只看最近 300 条取数窗，未完成任务的
         # task_created 被水群挤出窗口后会从 active_tasks 消失（与"任务跨 tick
         # 持久"契约冲突，是 bug）。这里查 agent_tasks 读模型，把"仍 pending/
         # running 但已不在窗口内"的任务补回来。窗口内折出的任务优先（更新、带
@@ -295,9 +291,10 @@ class Projector:
     ) -> str | None:
         """查该群最新一条 runtime.bot_role_observed。
 
-        不走 _fetch 的 lookback 窗口与 agent_visible 过滤：
-        - lookback：bot 角色可能很久不变，sweep 后几个月才有 group_admin 事件触发
-          下一次写入，硬等窗口会让 bot_role 在 lookback 推进时凭空消失。
+        不走 _fetch 的条数取数窗与 agent_visible 过滤：
+        - 窗口：bot 角色可能很久不变，sweep 后几个月才有 group_admin 事件触发
+          下一次写入，这条老事件早被后续事件挤出 LIMIT，硬依赖取数窗会让
+          bot_role 凭空消失。
         - visibility：runtime.bot_role_observed 默认 agent_visible，但即使未来
           调成 runtime_only 也应能取到——这是事实数据，不是给 LLM 的渲染数据。
 
@@ -330,14 +327,15 @@ class Projector:
         self,
         scope: str,
         group_id: int | None,
-        cutoff: datetime,
         upper_bound: datetime,
     ) -> list[_EventSnapshot]:
+        # 无时间下界（2026-07-27 去除 24h 回溯）：窗口只按 LIMIT 收敛，
+        # (scope, group_id, occurred_at) 索引倒序扫，表再大也只摸最新
+        # max_items 行。
         stmt = (
             select(AgentEvent)
             .where(AgentEvent.scope == scope)
             .where(AgentEvent.visibility == "agent_visible")
-            .where(AgentEvent.occurred_at >= cutoff)
             .where(AgentEvent.occurred_at <= upper_bound)
         )
         if scope == "group" and group_id is not None:
@@ -1759,7 +1757,7 @@ def _build_excerpt_index(events: Iterable[_EventSnapshot]) -> dict[str, str]:
     """timeline 内 onebot_message_id → 摘要（前 40 字）。
 
     用于渲染 reply 段时给 LLM 提供"被回复消息说了啥"的上下文。命中不到
-    （消息在 lookback 窗口外或被 napcat 抛弃了）时由 reply 段自身的
+    （消息在取数窗口外或被 napcat 抛弃了）时由 reply 段自身的
     quoted 富化兜底；两头都没有才渲染裸 reply.to_message_id。
     """
     out: dict[str, str] = {}

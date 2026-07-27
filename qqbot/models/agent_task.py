@@ -2,8 +2,8 @@
 
 为什么存在（开发文档/v2.0/③状态折叠与投影 §6.1 选项A）：
   任务的"真相源"始终是 agent_events 里的 agent.task_* 事件流（append-only）。
-  但 Projector.fold_tasks 只在最近 300 条 / 24h 的窗口里折叠 active_tasks，
-  水群 / 跨天会把未完成任务的 agent.task_created 挤出窗口 —— 之后这个任务从
+  但 Projector.fold_tasks 只在最近 300 条的取数窗里折叠 active_tasks，
+  水群会把未完成任务的 agent.task_created 挤出窗口 —— 之后这个任务从
   active_tasks 凭空消失，且其后续 task_state_changed 因 "task_created 没折到"
   被一并丢弃（projection.fold_tasks）。这与 README "任务跨 tick 持久存在" 的
   契约冲突，是 bug。

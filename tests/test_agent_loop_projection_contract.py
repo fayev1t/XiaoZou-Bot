@@ -89,7 +89,6 @@ class ProjectionSnapshotBoundaryTests(unittest.IsolatedAsyncioTestCase):
         await projector._fetch(
             "group",
             999,
-            BASE_TIME - timedelta(hours=24),
             BASE_TIME,
         )
 
@@ -97,6 +96,8 @@ class ProjectionSnapshotBoundaryTests(unittest.IsolatedAsyncioTestCase):
         compiled = statements[0].compile()
         sql = str(compiled)
         self.assertIn("agent_events.occurred_at <= ", sql)
+        # 2026-07-27 去除 24h 时间回溯：取数窗只按条数收敛，不得再有时间下界。
+        self.assertNotIn("agent_events.occurred_at >= ", sql)
         self.assertIn(BASE_TIME, compiled.params.values())
         self.assertIn(
             "agent_events.occurred_at DESC, agent_events.event_id DESC",

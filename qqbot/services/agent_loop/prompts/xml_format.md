@@ -443,5 +443,5 @@ If the `<agent-input>` element has no `bot_qq` attribute at all (bot not yet con
 ## What this envelope does NOT tell you
 
 - Other groups / scopes — you only see the one in `scope=`.
-- Anything older than the lookback window — use `search_history` to query the historical store.
+- Anything pushed out of the visible window by newer events (the window is count-limited, not time-limited) — use `search_history` to query the historical store.
 - The bot's own internal state machine (event store, projector, etc.) — invisible by design.
