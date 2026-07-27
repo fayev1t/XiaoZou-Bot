@@ -57,7 +57,7 @@ class WaitToolPromptContractTests(unittest.TestCase):
     def test_usage_prompt_uses_append_only_reply_semantics(self) -> None:
         usage_prompt = WaitTool.usage_prompt.lower()
         self.assertNotIn("merge", usage_prompt)
-        self.assertIn("call reply again", usage_prompt)
+        self.assertIn("call `reply` again", usage_prompt)
         self.assertIn("newest hold replaces", usage_prompt)
 
 

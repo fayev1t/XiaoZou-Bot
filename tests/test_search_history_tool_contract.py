@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import unittest
-from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -250,6 +249,11 @@ class SearchHistoryQueryStatementTests(unittest.TestCase):
             )
         )
 
+    def _compile_where(self, stmt: Any) -> str:
+        """只编译过滤谓词，避免把 SELECT 返回列误判成 WHERE 条件。"""
+        self.assertIsNotNone(stmt.whereclause)
+        return self._compile(stmt.whereclause)
+
     def test_query_filter_hits_search_text_via_trgm_operator(self) -> None:
         stmt = _build_query_stmt(
             scope="group",
@@ -294,9 +298,9 @@ class SearchHistoryQueryStatementTests(unittest.TestCase):
             query=None,
             limit=20,
         )
-        compiled = self._compile(stmt)
-        self.assertIn("user_id", compiled)
-        self.assertIn("555", compiled)
+        where_sql = self._compile_where(stmt)
+        self.assertIn("user_id", where_sql)
+        self.assertIn("555", where_sql)
 
     def test_group_scope_does_not_filter_on_user_id(self) -> None:
         stmt = _build_query_stmt(
@@ -309,10 +313,11 @@ class SearchHistoryQueryStatementTests(unittest.TestCase):
             query=None,
             limit=20,
         )
-        compiled = self._compile(stmt)
+        where_sql = self._compile_where(stmt)
         # group scope 传了 user_id 也不该拼进 WHERE——group 场景下它恒为
         # None（parse_scope_key 保证），这里只是确认过滤条件按 scope 互斥。
-        self.assertNotIn("user_id", compiled)
+        self.assertNotIn("user_id", where_sql)
+        self.assertIn("group_id", where_sql)
 
 
 if __name__ == "__main__":
