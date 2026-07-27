@@ -18,7 +18,6 @@ test_tool_permission_enforcement_contract 元测试覆盖。
 
 from __future__ import annotations
 
-import asyncio
 import unittest
 from types import SimpleNamespace
 from typing import Any

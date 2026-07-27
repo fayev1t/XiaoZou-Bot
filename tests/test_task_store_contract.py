@@ -16,7 +16,6 @@ Covers (③状态折叠与投影 §6.1 选项A —— 任务持久化读模型):
 
 from __future__ import annotations
 
-import asyncio
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace

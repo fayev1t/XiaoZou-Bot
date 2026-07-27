@@ -101,8 +101,17 @@ ignore = [
     "ANN401",  # any-type
     "COM812",  # missing-trailing-comma
     "PLC0415", # import-outside-top-level
+    "PLE1205", # logging-too-many-args  # 全项目 logger 来自 core/logging.py(loguru)，
+               # loguru 用 `logger.x("... {}", e)` 的 brace 风格；该规则按 stdlib
+               # logging 的 %s 语义判定，对本项目 100% 误报（122 处）。
 ]
 allowed-confusables = ["，", "。", "“", "”", "：", "；", "？", "！", "【", "】", "《", "》", "…", "—", "（", "）", "、"]
+
+[tool.ruff.lint.per-file-ignores]
+# PEP 562 惰性导入模块：`if TYPE_CHECKING:` 下的导入是给静态分析看的真符号，
+# 运行期由 __getattr__ 解析；__all__ 由 `list(_LAZY)` 动态构造，ruff 关联不上，
+# 于是把这些 re-export 误判为未使用。删掉它们会让类型检查失去符号。
+"qqbot/core/__init__.py" = ["F401"]
 
 [tool.ruff.lint.pyupgrade]
 keep-runtime-typing = true
