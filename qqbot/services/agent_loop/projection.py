@@ -20,8 +20,11 @@ can drive them without a DB.
 Renderers emit a compact XML envelope. Each renderer:
 - Properly escapes user-supplied content (`<`, `>`, `&`, `"`) so chat
   messages cannot inject pseudo-tags into the LLM context.
-- Renders timestamps as full ISO-8601 with timezone (cross-day events
-  distinguishable).
+- Rows carry **no timestamp of their own**（时间流契约 2026-07-26）：
+  信封层用 ``render_timeline_stream`` 把相邻同秒的行嵌进同一个
+  ``<time when="…">`` 时刻节点——时间是最外层结构，模型对每个事件的第一
+  感知是"何时"，然后才是"谁/什么"。``when=`` 为完整 ISO-8601 带时区
+  （跨天事件可分辨）。
 - Walks OneBot V11 segments structurally (at / reply / image / face /
   poke / record / video / share / forward / ...) instead of dumping the
   raw CQ-code string — see `_render_segments` for the per-type contract.
@@ -98,6 +101,23 @@ def _snapshot_from_row(row: AgentEvent) -> _EventSnapshot:
     )
 
 
+def _recap_boundary(recap: _EventSnapshot) -> tuple[datetime, str]:
+    """recap 的覆盖边界 (occurred_at, event_id)。载荷缺字段/损坏时退化以
+    recap 行自身为界——其之前的事件本就在窗口之外（记忆系统契约 §3.1）。"""
+    payload = recap.payload or {}
+    boundary_id = payload.get("covers_until_event_id")
+    raw_at = payload.get("covers_until_occurred_at")
+    boundary_at: datetime | None = None
+    if isinstance(raw_at, str):
+        try:
+            boundary_at = datetime.fromisoformat(raw_at)
+        except ValueError:
+            boundary_at = None
+    if not isinstance(boundary_id, str) or boundary_at is None:
+        return recap.occurred_at, recap.event_id
+    return boundary_at, boundary_id
+
+
 class Projector:
     # 单条 tool_result 渲染上限：超过即截断尾部并加 <truncated/>。websearch
     # 等工具的 results 列表很容易爆掉 prompt token，必须兜底。
@@ -133,12 +153,14 @@ class Projector:
         self,
         session_factory: SessionFactory,
         *,
-        max_items: int = 300,
+        max_items: int = 400,
         max_timeline_items: int = 100,
     ) -> None:
         self._session_factory = session_factory
         # 拉取 fetch 上限保持较大，给 fold_tasks / fold_tool_results 喂够事件；
         # 真正塞给 LLM 的 timeline 在 project() 里再裁到 max_timeline_items 条。
+        # 2026-07-27 300→400：记忆系统不变式③（≥ 压缩触发阈值 250 × 1.5），
+        # tick 侧未覆盖计数在阈值处不被截断、recap 正常时都在取数窗内。
         self._max_items = max_items
         self._max_timeline_items = max_timeline_items
         # scope_key → 上一拍渲染的 timeline 首行 / 首条 <my-thought> 行的
@@ -146,6 +168,16 @@ class Projector:
         # 走朴素裁剪重新锚定，代价只是一次缓存 miss，不落库。
         self._timeline_anchors: dict[str, str] = {}
         self._thought_anchors: dict[str, str] = {}
+        # 记忆压缩触顶探针（记忆系统契约 §4.2）：build_context 每拍投影后
+        # 回调 (scope_key, 最新 recap 之后的事件数)。压缩器在通知入口校验
+        # 阈值；启动/空闲期没有另一路扫描触发。未装配时零开销。
+        self._uncovered_notifier: Callable[[str, int], None] | None = None
+
+    def set_uncovered_notifier(
+        self, notifier: Callable[[str, int], None] | None
+    ) -> None:
+        """装配/卸下记忆压缩探针（回调需廉价；异常由 build_context 兜住）。"""
+        self._uncovered_notifier = notifier
 
     async def build_context(
         self,
@@ -161,13 +193,40 @@ class Projector:
         # 任意早的"最近 N 条"，安静 scope 的旧对话不因时间流逝而消失，退场
         # 唯一路径是被更新的事件挤出条数窗。窗口头部因此只在裁剪重锚时移动，
         # 前缀缓存反而更稳（原 cutoff 按小时取整的动机随之消失）。
+        # 逻辑下界（记忆系统契约 §3.1）：最新 runtime.context_compacted
+        # （含自身）——更早的事件已折叠进它携带的滚动摘要，不再投影。
+        recap: _EventSnapshot | None = None
+        recap_boundary: tuple[datetime, str] | None = None
+        if scope == "group" and group_id is not None:
+            recap = await self._fetch_latest_recap(group_id)
+        if recap is not None:
+            recap_boundary = _recap_boundary(recap)
 
         # ``now`` 不只是渲染时钟，也是本拍严格的投影快照上界。消息可能在
         # loop 捕获 now 之后、这条 SELECT 真正执行之前入库；若不设上界，
         # 它会混进本拍 context，却又排在 occurred_at=now 的
         # decision_emitted 之后，下一拍看起来像是本拍已经处理过。明确截到
         # now 后，这类消息留给其自己的 wake/tick 消费。
-        events = await self._fetch(scope, group_id, now)
+        events = await self._fetch(
+            scope,
+            group_id,
+            now,
+            lower_bound=recap_boundary[0] if recap_boundary else None,
+        )
+        if recap is not None:
+            events = Projector.apply_recap_window(events, recap)
+        # 记忆压缩触顶探针：报告"最新摘要之后"的事件数（≈未覆盖数，饱和
+        # 于 max_items）。阈值由压缩器入口校验；异常绝不允许影响 tick。
+        if self._uncovered_notifier is not None:
+            try:
+                uncovered = len(events) - (1 if recap is not None else 0)
+                self._uncovered_notifier(scope_key, uncovered)
+            except Exception as exc:
+                logger.warning(
+                    "[projection] uncovered notifier failed for {}: {}",
+                    scope_key,
+                    exc,
+                )
         # bot_role 单独一次 SQL 查 —— runtime.bot_role_observed 可能远早于
         # 取数窗（比如启动 sweep 跑过一次就再没变，早被后续事件挤出条数
         # LIMIT），不应受取数窗影响。
@@ -185,12 +244,18 @@ class Projector:
             bot_role=bot_role,
             timeline_anchor=self._timeline_anchors.get(scope_key),
             thought_anchor=self._thought_anchors.get(scope_key),
+            pinned_event_id=recap.event_id if recap is not None else None,
         )
         # 记录本拍窗口锚：timeline 首行 = 下一拍的裁剪起点候选；首条
         # <my-thought> 行 = 下一拍思考选择的起点候选。无思考行时保留旧锚
-        # （下一拍找不到会自动退朴素选择，无需清理）。
+        # （下一拍找不到会自动退朴素选择，无需清理）。钉住的 recap 行不做
+        # 锚——它不参与裁剪计数，锚在它身上会让滞回每拍退回朴素裁剪。
         if ctx.timeline:
-            self._timeline_anchors[scope_key] = ctx.timeline[0].event_id
+            for item in ctx.timeline:
+                if recap is not None and item.event_id == recap.event_id:
+                    continue
+                self._timeline_anchors[scope_key] = item.event_id
+                break
             for item in ctx.timeline:
                 if item.kind == "my_thought":
                     self._thought_anchors[scope_key] = item.event_id
@@ -207,10 +272,12 @@ class Projector:
         # best-effort 降级——查不到收藏夹只影响本 tick 发不了表情包。
         # _augment_with_pending_reply 已于 2026-07-24 删除（待办#19）：它每拍
         # 多查一次 reply_task 事件、只为渲染 <pending-reply>，而那一段的每个
-        # 字段都被 timeline 上的 <tool-call name="reply"> 行逐字段覆盖
+        # Planner 所需字段都被 timeline 上的 <tool-call name="reply"> 行覆盖
         # （reply_task_id / revision / flush_at / hard_deadline 在 <result> 里，
-        # mode / targets / gist 在 <args> 里）。reply 成功行不再折叠之后主从
-        # 关系反转，独立状态区没有存在理由，连带省掉这次查询。
+        # brief / hold_seconds 在 <args> 里）。reply 成功行不再折叠之后主从
+        # 关系反转，Planner 信封没有独立状态区。ReplyExecutor 不走这条投影来取
+        # 当前授权：它从 reply_task 领域事件折叠最新 brief，避免 terminal 竞态与
+        # timeline 裁剪。
         return ctx
 
     async def _augment_with_persisted_tasks(
@@ -323,21 +390,48 @@ class Projector:
                     return role.strip().lower()
         return None
 
+    async def _fetch_latest_recap(
+        self, group_id: int
+    ) -> _EventSnapshot | None:
+        """查该群最新一条 runtime.context_compacted（滚动记忆载体）。
+
+        与 bot_role 同理走独立查询、不受取数 LIMIT 约束：积压超过
+        max_items 时（压缩器暂时追不上），记忆也不能凭空消失
+        （记忆系统契约 §3.2 保底）。"""
+        from sqlalchemy import desc
+
+        stmt = (
+            select(AgentEvent)
+            .where(AgentEvent.type == "runtime.context_compacted")
+            .where(AgentEvent.scope == "group")
+            .where(AgentEvent.group_id == group_id)
+            .order_by(desc(AgentEvent.occurred_at), desc(AgentEvent.event_id))
+            .limit(1)
+        )
+        async with self._session_factory() as session:
+            result = await session.execute(stmt)
+            rows = list(result.scalars().all())
+        return _snapshot_from_row(rows[0]) if rows else None
+
     async def _fetch(
         self,
         scope: str,
         group_id: int | None,
         upper_bound: datetime,
+        lower_bound: datetime | None = None,
     ) -> list[_EventSnapshot]:
-        # 无时间下界（2026-07-27 去除 24h 回溯）：窗口只按 LIMIT 收敛，
+        # 无时间回溯下界（2026-07-27 去除 24h 回溯）：窗口只按 LIMIT 收敛，
         # (scope, group_id, occurred_at) 索引倒序扫，表再大也只摸最新
-        # max_items 行。
+        # max_items 行。lower_bound 是唯一的逻辑下界：最新 recap 的覆盖
+        # 边界（粗滤——同时刻残留由 apply_recap_window 按 event_id 精滤）。
         stmt = (
             select(AgentEvent)
             .where(AgentEvent.scope == scope)
             .where(AgentEvent.visibility == "agent_visible")
             .where(AgentEvent.occurred_at <= upper_bound)
         )
+        if lower_bound is not None:
+            stmt = stmt.where(AgentEvent.occurred_at >= lower_bound)
         if scope == "group" and group_id is not None:
             stmt = stmt.where(AgentEvent.group_id == group_id)
         # event_id 是 ULID；同一 occurred_at 下用它做稳定次序，reverse 后仍是
@@ -355,6 +449,21 @@ class Projector:
     # ─── Pure projection: testable without DB ───
 
     @staticmethod
+    def apply_recap_window(
+        events: Sequence[_EventSnapshot], recap: _EventSnapshot
+    ) -> list[_EventSnapshot]:
+        """窗口下界精滤（记忆系统契约 §3.1/§3.2）：丢弃全序 ≤ 覆盖边界的
+        事件（含更老的 recap 代次），recap 自身保底在场——积压超过取数
+        LIMIT 时它会缺席取数结果，此时前插（记忆永不消失）。"""
+        boundary = _recap_boundary(recap)
+        kept = [
+            ev for ev in events if (ev.occurred_at, ev.event_id) > boundary
+        ]
+        if all(ev.event_id != recap.event_id for ev in kept):
+            kept.insert(0, recap)
+        return kept
+
+    @staticmethod
     def project(
         events: Sequence[_EventSnapshot],
         *,
@@ -367,6 +476,7 @@ class Projector:
         bot_role: str | None = None,
         timeline_anchor: str | None = None,
         thought_anchor: str | None = None,
+        pinned_event_id: str | None = None,
     ) -> DecisionContext:
         active_tasks = Projector.fold_tasks(events, scope_key=scope_key)
         # tool_views 只喂给 timeline 渲染（<tool-call> 行按两态折叠）；不再
@@ -384,9 +494,29 @@ class Projector:
         # MAX_THOUGHT_ROWS 封顶，不会失控。timeline_anchor（上一拍窗口首行）
         # 有效时起点滞回钉住，见 _trim_timeline。
         if max_timeline_items is not None:
-            timeline = Projector._trim_timeline(
-                timeline, max_timeline_items, timeline_anchor
-            )
+            # recap 行钉住（记忆系统契约 §3.2）：摘出裁剪再前插——既不占
+            # max_timeline_items 行预算，也永不被裁掉（借 MaiBot 的
+            # count_in_context=False 思路：记忆不得挤占真实对话的窗口配额）。
+            pinned: TimelineItem | None = None
+            if pinned_event_id is not None:
+                pinned = next(
+                    (
+                        item
+                        for item in timeline
+                        if item.event_id == pinned_event_id
+                    ),
+                    None,
+                )
+            if pinned is not None:
+                rest = [item for item in timeline if item is not pinned]
+                rest = Projector._trim_timeline(
+                    rest, max_timeline_items, timeline_anchor
+                )
+                timeline = [pinned, *rest]
+            else:
+                timeline = Projector._trim_timeline(
+                    timeline, max_timeline_items, timeline_anchor
+                )
         # 如果 caller 没单独传 bot_role（pure project() 测试常常如此），尝试从
         # 事件列表里 fold 一次——支持纯函数测试不需要 DB 也能验证 fold 逻辑。
         if bot_role is None:
@@ -715,12 +845,12 @@ class Projector:
                 tc_id = ev.payload.get("tool_call_id")
                 tv = tool_view_by_id.get(tc_id)
                 # 2026-07-24（待办#19）起 reply 的成功行**不再折叠**：它是
-                # append-only 授权序列的唯一真相源——<args> 是这次授权的原文
-                # （targets/gist/hold_seconds），<result> 是它落成的调度事实
+                # Planner 回看每次授权尝试的时间线记录——<args> 是该次原文
+                # （brief/hold_seconds），<result> 是它落成的调度事实
                 # （reply_task_id/revision/flush_at/hard_deadline）。折叠是为
                 # 了避免与 <pending-reply> 双重渲染，而那一段已随本次改动删除，
-                # 主从关系反转：内容留在 timeline，不另立状态区。Replyer 与
-                # Planner 共用同一份 timeline，因此自动都看到完整授权序列。
+                # Planner 内容留在 timeline，不另立状态区。Replyer 的当前授权
+                # 另从 reply_task 折叠态注入，不依赖这行是否 terminal/仍在窗口。
                 items.append(
                     TimelineItem(
                         event_id=ev.event_id,
@@ -773,6 +903,18 @@ class Projector:
                         render=Projector._render_reply_flushed(ev),
                     )
                 )
+            elif ev.type == "runtime.context_compacted":
+                # 滚动记忆摘要行（记忆系统契约 §3.3）：专门渲染，不落
+                # runtime JSON 兜底——那会把 recall_cues 等内部字段一起
+                # 倾倒进 prompt。
+                items.append(
+                    TimelineItem(
+                        event_id=ev.event_id,
+                        occurred_at=ev.occurred_at,
+                        kind="system_hint",
+                        render=Projector._render_context_recap(ev),
+                    )
+                )
             elif ev.type.startswith("runtime.") and ev.visibility == "agent_visible":
                 items.append(
                     TimelineItem(
@@ -809,7 +951,6 @@ class Projector:
             if anon_name:
                 name = str(anon_name)
         msg_id = ev.payload.get("onebot_message_id") or ""
-        time_str = ev.occurred_at.isoformat(timespec="seconds")
 
         segments = ev.payload.get("segments") or []
         body, images = _render_segments(
@@ -821,10 +962,11 @@ class Projector:
             if raw:
                 body = _esc_text(str(raw))
 
-        # sender_name / sender_qq 是两个独立属性——不再拼 "昵称(QQ)" 复合串，
-        # 模型无需拆括号即可拿到 @人 / 工具 user_id 参数要用的号。_qq 后缀
-        # 显式标注 ID 空间（QQ 号），与 message_id / event_id 一眼可分。缺哪个
-        # 省哪个（=未知），不造 "?" 占位。
+        # 行内不带时间（时间流契约，见模块 docstring）：时刻由外层 <time>
+        # 节点承载。sender_name / sender_qq 是两个独立属性——不再拼 "昵称(QQ)"
+        # 复合串，模型无需拆括号即可拿到 @人 / 工具 user_id 参数要用的号。
+        # _qq 后缀显式标注 ID 空间（QQ 号），与 message_id / event_id 一眼
+        # 可分。缺哪个省哪个（=未知），不造 "?" 占位。
         attrs = []
         if name:
             attrs.append(f'sender_name="{_esc_attr(str(name))}"')
@@ -843,14 +985,12 @@ class Projector:
             attrs.append(f'sender_title="{_esc_attr(title)}"')
         if anonymous:
             attrs.append('anonymous="true"')
-        # time= 而非 at=：时间戳属性名与 <at>（@人）标签撞词是模型混淆源，
-        # 全 timeline 统一用 time=。
-        attrs.append(f'time="{time_str}"')
         # message_id= 而非裸 id=：显式标注这是 OneBot 消息 ID 空间（引用 /
         # recall / set_essence 等工具参数同名直抄），与 task_id / event_id 区分。
         if msg_id:
             attrs.append(f'message_id="{_esc_attr(str(msg_id))}"')
-        return f"<message {' '.join(attrs)}>{body}</message>", images
+        attr_str = f" {' '.join(attrs)}" if attrs else ""
+        return f"<message{attr_str}>{body}</message>", images
 
     @staticmethod
     def _render_notice(
@@ -888,7 +1028,6 @@ class Projector:
             attrs.append(f'target_qq="{target}"')
             _append_name_attr(attrs, "target_name", target, names)
         attrs.extend(_notice_detail_attrs(kind, ev.payload))
-        attrs.append(f'time="{ev.occurred_at.isoformat(timespec="seconds")}"')
         return f"<notice {' '.join(attrs)}/>"
 
     @staticmethod
@@ -918,7 +1057,6 @@ class Projector:
         comment = ev.payload.get("comment")
         if comment:
             attrs.append(f'comment="{_esc_attr(str(comment))}"')
-        attrs.append(f'time="{ev.occurred_at.isoformat(timespec="seconds")}"')
         return f"<request {' '.join(attrs)}/>"
 
     @staticmethod
@@ -929,9 +1067,8 @@ class Projector:
         error_kind 为 None）或 <error>（失败）。status 属性只回答"结束没有"，
         成败让 LLM 看子元素——与 ToolResultView 的两态语义一致。
 
-        time= 是**发起时刻**（tool_called 事件时间）。它曾是全 timeline 唯一
-        没有时间戳的行类型——偏偏 bot 自己的发言（send_message）就渲染在这里，
-        模型判断"我多久前刚说过话"只能靠行序猜，补上让远近判断有锚。"""
+        发起时刻由外层 <time when="…"> 流节点承载（render_timeline_stream，
+        时间流契约 2026-07-26），行内不带 time= 属性。"""
         name = str(ev.payload.get("tool_name", "?"))
         args = ev.payload.get("arguments", {})
         args_json = _safe_json(args)
@@ -951,10 +1088,8 @@ class Projector:
                 tv.error_kind, tv.error_message, tv.error_extra
             )
             status = "complete"
-        time_str = ev.occurred_at.isoformat(timespec="seconds")
         return (
-            f'<tool-call name="{_esc_attr(name)}" status="{status}" '
-            f'time="{_esc_attr(time_str)}">'
+            f'<tool-call name="{_esc_attr(name)}" status="{status}">'
             f"<args>{_esc_text(args_json)}</args>{inner}</tool-call>"
         )
 
@@ -973,10 +1108,9 @@ class Projector:
         body = ""
         if isinstance(reason, str) and reason.strip():
             body = _esc_text(reason.strip()[:600])
-        time_str = ev.occurred_at.isoformat(timespec="seconds")
         return (
             f'<task-closed task_id="{_esc_attr(task_id)}" '
-            f'outcome="{_esc_attr(outcome)}" time="{_esc_attr(time_str)}">'
+            f'outcome="{_esc_attr(outcome)}">'
             f"{body}</task-closed>"
         )
 
@@ -992,10 +1126,30 @@ class Projector:
         reasoning = str((ev.payload or {}).get("reasoning") or "").strip()
         if len(reasoning) > Projector.MAX_THOUGHT_CHARS:
             reasoning = reasoning[: Projector.MAX_THOUGHT_CHARS] + "…"
-        time_str = ev.occurred_at.isoformat(timespec="seconds")
+        return f"<my-thought>{_esc_text(reasoning)}</my-thought>"
+
+    @staticmethod
+    def _render_context_recap(ev: _EventSnapshot) -> str:
+        """记忆摘要（runtime.context_compacted）：正文 = 覆盖区间 + 条数 +
+        摘要全文 + 从属脚注；不渲染 recall_cues / 内部字段。"""
+        payload = ev.payload or {}
+        summary = str(payload.get("summary") or "").strip()
+        head = "[早前对话回忆]"
+        frm = str(payload.get("covers_from_occurred_at") or "")[:16]
+        until = str(payload.get("covers_until_occurred_at") or "")[:16]
+        if frm and until:
+            head += f" 覆盖 {frm} 至 {until}"
+        count = payload.get("dropped_event_count")
+        if isinstance(count, int):
+            head += f" 共 {count} 条"
+        body = (
+            f"{head}\n{summary}\n"
+            "（回忆由更早对话压缩而来，仅供参考；与当前对话冲突时，"
+            "以当前对话为准。）"
+        )
         return (
-            f'<my-thought time="{_esc_attr(time_str)}">'
-            f"{_esc_text(reasoning)}</my-thought>"
+            '<system-hint kind="context_compacted">'
+            f"{_esc_text(body)}</system-hint>"
         )
 
     @staticmethod
@@ -1013,10 +1167,8 @@ class Projector:
                 if k in ("tool_count", "tool_batch_size") and v is not None
             }
         payload_json = _safe_json(payload)
-        time_str = ev.occurred_at.isoformat(timespec="seconds")
         return (
-            f'<system-hint kind="{_esc_attr(kind)}" '
-            f'time="{_esc_attr(time_str)}">'
+            f'<system-hint kind="{_esc_attr(kind)}">'
             f"{_esc_text(payload_json)}</system-hint>"
         )
 
@@ -1026,7 +1178,6 @@ class Projector:
         attrs = [
             f'reply_task_id="{_esc_attr(str(payload.get("reply_task_id") or ""))}"',
             f'status="{_esc_attr(str(payload.get("status") or "unknown"))}"',
-            f'time="{_esc_attr(ev.occurred_at.isoformat(timespec="seconds"))}"',
         ]
         parts = [f"<my-reply {' '.join(attrs)}>"]
         for item in payload.get("sent_messages") or []:
@@ -1054,6 +1205,38 @@ class Projector:
             parts.append(f"<reason>{_esc_text(str(reason))}</reason>")
         parts.append("</my-reply>")
         return "".join(parts)
+
+
+# ─── 时间流渲染（时间流契约 2026-07-26）───
+
+
+def render_timeline_stream(items: Sequence[TimelineItem]) -> list[str]:
+    """timeline 行 → ``<time when="…">`` 时刻节点序列（信封层唯一入口）。
+
+    时间是最外层结构：``<timeline>`` 的直接子元素是时刻节点，事件行嵌在
+    节点内、自身不带任何时间属性——模型对每个事件的第一感知是"何时"。
+    相邻且同秒（timespec=seconds，与旧行内 time= 同精度）的行共享同一
+    节点：同拍派发的工具批次、同秒消息 burst 自然聚簇为"这一刻发生了
+    这些"。属性名取 when= 而非 at=——at 与 <at>（@人）标签撞词是已知的
+    模型混淆源。
+
+    Planner 与 Replyer 两个信封组装层都必须经由本函数渲染 timeline，
+    保证两边看到的时间轴逐字节同构。前缀缓存：新秒的行整块追加；同秒
+    追加只重写上一个 ``</time>`` 闭合位置——破坏面与旧的逐行追加持平。
+    """
+    parts: list[str] = []
+    open_when: str | None = None
+    for item in items:
+        when = item.occurred_at.isoformat(timespec="seconds")
+        if when != open_when:
+            if open_when is not None:
+                parts.append("</time>")
+            parts.append(f'<time when="{_esc_attr(when)}">')
+            open_when = when
+        parts.append(item.render)
+    if open_when is not None:
+        parts.append("</time>")
+    return parts
 
 
 # ─── XML escape + JSON helpers ───

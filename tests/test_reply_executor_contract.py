@@ -33,8 +33,7 @@ def _task(mode: str = "compose") -> ReplyTaskState:
         flush_at=NOW,
         hard_deadline=NOW + timedelta(seconds=90),
         mode=mode,
-        targets=[{"message_id": "M1", "context": "李四@我提问"}],
-        gist={"intent": "解释"},
+        brief="" if mode == "verbatim" else "当前完整授权",
         verbatim_messages=[{"content": CHAT}] if mode == "verbatim" else [],
         latest_event_id="E_UPSERT",
         source_tool_call_event_id="E_TOOL_CALL",
@@ -59,9 +58,11 @@ class _Projector:
 class _Replyer:
     def __init__(self) -> None:
         self.calls = 0
+        self.briefs: list[str] = []
 
-    async def compose(self, *_: object) -> dict:
+    async def compose(self, task: ReplyTaskState, *_: object) -> dict:
         self.calls += 1
+        self.briefs.append(task.brief)
         return {
             "messages": [{"kind": "chat", "content": CHAT}],
             "empty_reason": None,
@@ -137,6 +138,7 @@ class ReplyExecutorContractTests(unittest.TestCase):
         asyncio.run(executor._compose_and_send(_task(), "E_CLAIM", "CID"))
 
         self.assertEqual(replyer.calls, 1)
+        self.assertEqual(replyer.briefs, ["当前完整授权"])
         executor._write_flushed.assert_awaited_once()  # type: ignore[attr-defined]
         kwargs = executor._write_flushed.await_args.kwargs  # type: ignore[attr-defined]
         self.assertEqual(kwargs["status"], "sent")

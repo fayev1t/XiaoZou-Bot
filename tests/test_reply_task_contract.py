@@ -1,8 +1,10 @@
 """ReplyTask / Replyer 的核心合同测试。
 
-钉住四个边界：reply 取代 send_message；草稿折叠与最终事实分离；**授权
-append-only、最新一次获胜**（2026-07-24 待办#19 取代原"合稿去重"）；
-Replyer 一次输出可含多条文本和至多一张已收藏 meme。
+钉住五个边界：reply 取代 send_message；**普通发言的参数只剩 brief +
+hold_seconds，`action` 省略即追加**（2026-07-25，撤稿/逐字直发仍留在同一个工具
+的 action 分支里）；草稿折叠与最终事实分离；授权 append-only、最新一次获胜
+（2026-07-24 待办#19 取代原"合稿去重"）；Replyer 一次输出可含多条文本和至多
+一张已收藏 meme。
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ from qqbot.services.agent_loop.tools.reply import ReplyTool
 TZ = ZoneInfo("Asia/Shanghai")
 NOW = datetime(2026, 7, 19, 12, 0, tzinfo=TZ)
 HASH_A = "ab" * 32
+_CHAT = [{"type": "text", "data": {"text": "精确文本"}}]
 
 
 def _event(
@@ -64,8 +67,7 @@ def _upsert_payload(revision: int = 1) -> dict:
         "flush_at": (NOW + timedelta(seconds=10)).isoformat(),
         "hard_deadline": (NOW + timedelta(seconds=90)).isoformat(),
         "mode": "compose",
-        "targets": [{"message_id": "M1", "context": "李四@我提问"}],
-        "gist": {"intent": "解释清楚", "facts": ["事实 A"]},
+        "brief": "李四@我提问，解释清楚；事实 A 必须准确",
         "verbatim_messages": [],
     }
 
@@ -83,6 +85,53 @@ class RegistryBoundaryTests(unittest.TestCase):
             meme_schema["properties"]["action"]["enum"],
             ["save", "delete", "recaption"],
         )
+
+    def test_speaking_surface_stays_one_tool(self) -> None:
+        """撤稿与逐字直发**不拆成独立工具**（2026-07-25 评估后否决）。
+
+        工具是目录级的东西：每注册一个，Planner 每拍都要读它的 catalog 条目
+        和整段 usage 文档。代价不只是 prompt 体积——verbatim 本该是"Replyer
+        挂了才走"的逃生路径，升格成与 reply 平级的工具就把它的显著性抬到与
+        日常发言同等，等于邀请模型绕过 Replyer 和角色卡说话。
+        """
+        names = build_default_registry().names()
+        self.assertIn("reply", names)
+        for retired in ("cancel_reply", "say_verbatim"):
+            self.assertNotIn(retired, names)
+
+    def test_ordinary_speech_needs_only_brief_and_hold(self) -> None:
+        """字段收敛的硬钉子：targets/gist 九个槽位没有独立程序语义，却用
+        additionalProperties:false 把 Planner 能表达的辅助维度封死，还诱导
+        它把一段判读切成七份填。收敛成一个自由文本 brief 后，折叠态把最新
+        完整 brief 直送 Replyer。
+
+        `action` 仍在，但**省略即追加**——`upsert` 这个取值取消了，普通发言
+        不必先声明一遍状态机操作。
+        """
+        schema = ReplyTool.arguments_schema
+        self.assertEqual(
+            sorted(schema["properties"]),
+            ["action", "brief", "hold_seconds", "messages", "reply_task_id"],
+        )
+        self.assertEqual(schema["required"], [])
+        self.assertEqual(schema["properties"]["action"]["enum"], ["cancel", "verbatim"])
+        # 省略 action 时 brief + hold_seconds 才是必填（allOf 的第一条分支）。
+        self.assertEqual(
+            schema["allOf"][0],
+            {
+                "if": {"not": {"required": ["action"]}},
+                "then": {
+                    "required": ["brief", "hold_seconds"],
+                    "not": {
+                        "anyOf": [
+                            {"required": ["messages"]},
+                            {"required": ["reply_task_id"]},
+                        ]
+                    },
+                },
+            },
+        )
+        self.assertEqual(len(schema["allOf"]), 3)
 
 
 class ReplyToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
@@ -121,15 +170,7 @@ class ReplyToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
         ):
             outcome = await ReplyTool().run(
                 {
-                    "action": "upsert",
-                    "targets": [
-                        {
-                            "message_id": "M1",
-                            "context": "李四@我提问",
-                            "guidance": "直接给结论",
-                        }
-                    ],
-                    "gist": {"intent": "解释清楚", "facts": ["事实 A"]},
+                    "brief": "李四@我提问，直接给结论；事实 A 必须准确",
                     "hold_seconds": 8,
                 },
                 **self._context(notify),
@@ -140,6 +181,10 @@ class ReplyToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("message_id", outcome.result)
         payload = append.await_args.kwargs["payload"]
         self.assertEqual(payload["flush_at"], (NOW + timedelta(seconds=8)).isoformat())
+        self.assertEqual(payload["mode"], "compose")
+        self.assertEqual(
+            payload["brief"], "李四@我提问，直接给结论；事实 A 必须准确"
+        )
         notify.assert_awaited_once()
 
     @staticmethod
@@ -159,8 +204,7 @@ class ReplyToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
             flush_at=NOW + timedelta(seconds=flush_offset),
             hard_deadline=NOW + timedelta(seconds=deadline_offset),
             mode=mode,
-            targets=[{"message_id": "M1", "context": "旧判读"}],
-            gist={"intent": "答复", "facts": ["F1"]},
+            brief="" if mode == "verbatim" else "旧判读",
             verbatim_messages=[],
             latest_event_id="E1",
             source_tool_call_event_id="TC1",
@@ -194,36 +238,23 @@ class ReplyToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_append_needs_no_id_and_does_not_merge_old_content(self) -> None:
         """append-only（待办#19）：不传 reply_task_id / expected_revision 也
-        能续在同一份稿上，且事件里只留**本次授权原文**——旧 targets/gist 不再
-        被并进来（旧 merge 只增不减，撤不掉写错的 target 与 fact）。"""
+        能续在同一份稿上，且事件里只留**本次授权原文**——旧判读不再被并进来
+        （旧 merge 只增不减，撤不掉写错的判读与事实）。"""
         outcome, append = await self._append(
-            {
-                "action": "upsert",
-                "targets": [{"message_id": "M2", "context": "改成先反问一句"}],
-                "gist": {"facts": ["F2"]},
-                "hold_seconds": 10,
-            },
+            {"brief": "改成先反问一句；F2 才是对的", "hold_seconds": 10},
             self._open_task(),
         )
         self.assertTrue(outcome.ok)
         payload = append.await_args.kwargs["payload"]
         self.assertEqual(payload["reply_task_id"], "R1")
         self.assertEqual(payload["revision"], 2)
-        self.assertEqual(
-            [t["message_id"] for t in payload["targets"]], ["M2"]
-        )
-        self.assertEqual(payload["gist"]["facts"], ["F2"])
-        self.assertNotIn("intent", payload["gist"])
+        self.assertEqual(payload["brief"], "改成先反问一句；F2 才是对的")
 
     async def test_newest_hold_wins_and_may_shorten(self) -> None:
         """最新一次调用的 hold 直接获胜——旧实现的 max() 只能延长，模型
         发现"他说完了"也收不回来。"""
         outcome, append = await self._append(
-            {
-                "action": "upsert",
-                "targets": [{"message_id": "M1", "context": "他说完了"}],
-                "hold_seconds": 3,
-            },
+            {"brief": "他说完了，直接回", "hold_seconds": 3},
             self._open_task(flush_offset=40),
         )
         self.assertTrue(outcome.ok)
@@ -237,11 +268,7 @@ class ReplyToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
         硬上界。"""
         current = self._open_task(flush_offset=2, deadline_offset=5)
         outcome, append = await self._append(
-            {
-                "action": "upsert",
-                "targets": [{"message_id": "M1", "context": "还在打字"}],
-                "hold_seconds": 90,
-            },
+            {"brief": "他还在打字，再等等", "hold_seconds": 90},
             current,
         )
         self.assertTrue(outcome.ok)
@@ -253,13 +280,7 @@ class ReplyToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_hold_seconds_is_required_with_no_default(self) -> None:
         """等多久是每拍现场判断的语义，没有默认值——旧的 default 0 等于把
         合并窗口整个关掉。"""
-        outcome, append = await self._append(
-            {
-                "action": "upsert",
-                "targets": [{"message_id": "M1", "context": "判读"}],
-            },
-            None,
-        )
+        outcome, append = await self._append({"brief": "判读"}, None)
         self.assertFalse(outcome.ok)
         self.assertEqual(outcome.error_kind, "invalid_arguments")
         self.assertEqual(
@@ -269,72 +290,263 @@ class ReplyToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_verbatim_draft_is_exclusive(self) -> None:
         """verbatim 绕过 Replyer 直发，没有"综合多条授权"可言：挂着一份就
-        拒绝后续 upsert，只能先 cancel。"""
+        拒绝后续追加，只能先 cancel。"""
         outcome, append = await self._append(
-            {
-                "action": "upsert",
-                "targets": [{"message_id": "M1", "context": "判读"}],
-                "hold_seconds": 5,
-            },
+            {"brief": "判读", "hold_seconds": 5},
             self._open_task(mode="verbatim"),
         )
         self.assertFalse(outcome.ok)
         self.assertEqual(outcome.error_kind, "reply_task_locked")
         append.assert_not_awaited()
 
+    async def test_verbatim_cannot_join_a_pending_compose_draft(self) -> None:
+        """反方向同样拦：逐字语义不该被别的授权改写，也不该改写别人的。"""
+        outcome, append = await self._append(
+            {"action": "verbatim", "messages": [{"content": _CHAT}]},
+            self._open_task(),
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.error_kind, "reply_task_locked")
+        append.assert_not_awaited()
 
-class ReplyToolTargetSemanticsTests(unittest.IsolatedAsyncioTestCase):
-    """2026-07-22 语义换代：targets 传对话分析（context/guidance），不再传
-    points 要点清单——Replyer 已与 Planner 看同一份 timeline。"""
+    async def test_verbatim_creates_a_fresh_draft_flushing_now(self) -> None:
+        """hold 在 verbatim 上可省、默认 0：等待窗口的用处是让 Replyer 在
+        flush 时折进新消息，而逐字直发不经 Replyer、字节已定死。"""
+        outcome, append = await self._append(
+            {"action": "verbatim", "messages": [{"content": _CHAT}]}, None
+        )
+        self.assertTrue(outcome.ok)
+        payload = append.await_args.kwargs["payload"]
+        self.assertEqual(payload["mode"], "verbatim")
+        self.assertEqual(payload["flush_at"], NOW.isoformat())
+        self.assertEqual(payload["verbatim_messages"], [{"content": _CHAT}])
+        self.assertEqual(payload["brief"], "")
 
-    def _context(self) -> dict:
-        return {
-            "scope_key": "group:100",
-            "session_factory": object(),
-            "correlation_id": "CID",
-            "tool_call_event_id": "E_TOOL_CALL",
-        }
+    async def test_verbatim_rejects_empty_and_oversized_batches(self) -> None:
+        outcome, append = await self._append(
+            {"action": "verbatim", "messages": []}, None
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.extra.get("reason_code"), "empty_messages")
+        outcome, append = await self._append(
+            {"action": "verbatim", "messages": [{"content": _CHAT}] * 5}, None
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.extra.get("reason_code"), "too_many_messages")
+        append.assert_not_awaited()
 
-    async def _run(self, targets: list[dict]) -> object:
+
+def _tool_context() -> dict:
+    return {
+        "scope_key": "group:100",
+        "session_factory": object(),
+        "correlation_id": "CID",
+        "tool_call_event_id": "E_TOOL_CALL",
+    }
+
+
+class ReplyArgumentSurfaceTests(unittest.IsolatedAsyncioTestCase):
+    """2026-07-25 字段收敛：brief 一个自由文本顶掉 targets/gist 九个槽位，
+    `action` 从必填判别式变成可选分支（省略即追加，`upsert` 取值取消）。
+    旧形态 fail loudly，不静默丢弃——静默是最坏的：Planner 会以为判读送到了
+    Replyer，而从 <result> 上看不出任何异常。"""
+
+    async def _run(self, arguments: dict) -> object:
         with patch(
             "qqbot.services.agent_loop.tools.reply.find_upsert_for_tool_call",
             new=AsyncMock(return_value=None),
         ):
-            return await ReplyTool().run(
-                {"action": "upsert", "targets": targets, "hold_seconds": 5},
-                **self._context(),
-            )
+            return await ReplyTool().run(arguments, **_tool_context())
 
-    async def test_legacy_points_rejected_with_migration_hint(self) -> None:
+    async def test_retired_argument_shapes_fail_with_migration_hint(self) -> None:
+        cases = {
+            "targets": "targets_gist_replaced_by_brief",
+            "gist": "targets_gist_replaced_by_brief",
+            "points": "targets_gist_replaced_by_brief",
+            "mode": "mode_replaced_by_action",
+            "verbatim_messages": "verbatim_messages_renamed_to_messages",
+            "expected_revision": "expected_revision_removed",
+        }
+        for key, reason_code in cases.items():
+            with self.subTest(key=key):
+                outcome = await self._run(
+                    {"brief": "判读", "hold_seconds": 5, key: "whatever"}
+                )
+                self.assertFalse(outcome.ok)
+                self.assertEqual(outcome.error_kind, "invalid_arguments")
+                self.assertEqual(outcome.extra.get("reason_code"), reason_code)
+
+    async def test_upsert_action_is_gone_with_a_pointed_hint(self) -> None:
+        """2026-07-24 改 append-only 之后 upsert 就名不副实了（那之前它真是
+        upsert：带 id + expected_revision 做 CAS 合并）。留着只是让每次正常
+        发言都先声明一遍状态机操作。"""
         outcome = await self._run(
-            [{"message_id": "M1", "points": ["回答问题"]}]
+            {"action": "upsert", "brief": "判读", "hold_seconds": 5}
         )
         self.assertFalse(outcome.ok)
-        self.assertEqual(outcome.error_kind, "invalid_arguments")
-        self.assertEqual(
-            outcome.extra.get("reason_code"), "points_replaced_by_context"
-        )
+        self.assertEqual(outcome.extra.get("reason_code"), "upsert_removed")
 
-    async def test_target_requires_nonempty_context(self) -> None:
-        outcome = await self._run([{"message_id": "M1"}])
-        self.assertFalse(outcome.ok)
-        self.assertEqual(
-            outcome.extra.get("reason_code"), "bad_target_context"
-        )
-        outcome = await self._run([{"message_id": "M1", "context": "  "}])
-        self.assertFalse(outcome.ok)
-        self.assertEqual(
-            outcome.extra.get("reason_code"), "bad_target_context"
-        )
+    async def test_brief_must_be_a_nonempty_string(self) -> None:
+        for brief in (None, "", "   ", ["判读"]):
+            with self.subTest(brief=brief):
+                arguments: dict = {"hold_seconds": 5}
+                if brief is not None:
+                    arguments["brief"] = brief
+                outcome = await self._run(arguments)
+                self.assertFalse(outcome.ok)
+                self.assertEqual(outcome.extra.get("reason_code"), "bad_brief")
 
-    async def test_guidance_must_be_string_when_present(self) -> None:
+    async def test_brief_and_messages_do_not_cross_branches(self) -> None:
+        """两条分支的字段互不容忍：verbatim 绕过 Replyer，写了 brief 也没有
+        任何读者，静默丢掉正是最难被发现的坏法。"""
         outcome = await self._run(
-            [{"message_id": "M1", "context": "判读", "guidance": ["x"]}]
+            {"action": "verbatim", "brief": "判读", "messages": [{"content": _CHAT}]}
         )
         self.assertFalse(outcome.ok)
         self.assertEqual(
-            outcome.extra.get("reason_code"), "bad_target_guidance"
+            outcome.extra.get("reason_code"), "brief_not_applicable"
         )
+        outcome = await self._run(
+            {"brief": "判读", "hold_seconds": 5, "messages": [{"content": _CHAT}]}
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(
+            outcome.extra.get("reason_code"), "messages_need_verbatim"
+        )
+
+    async def test_reply_task_id_outside_cancel_is_rejected(self) -> None:
+        """带 id 来追加 = 还在用旧的"指名改某一份稿"心智模型。静默忽略会让它
+        以为精确命中了某份稿，实际是往当前 open 的那份上追加。"""
+        outcome = await self._run(
+            {"brief": "判读", "hold_seconds": 5, "reply_task_id": "R1"}
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(
+            outcome.extra.get("reason_code"), "reply_task_id_needs_cancel"
+        )
+
+    async def test_explicit_null_action_is_not_treated_as_omission(self) -> None:
+        outcome = await self._run(
+            {"action": None, "brief": "判读", "hold_seconds": 5}
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.extra.get("reason_code"), "bad_action")
+
+    async def test_non_object_arguments_fail_loudly(self) -> None:
+        outcome = await ReplyTool().run(  # type: ignore[arg-type]
+            ["brief", "判读"], **_tool_context()
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(
+            outcome.extra.get("reason_code"), "arguments_not_object"
+        )
+
+    async def test_unknown_top_level_argument_fails_loudly(self) -> None:
+        outcome = await self._run(
+            {"brief": "判读", "hold_seconds": 5, "hold_second": 5}
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(
+            outcome.extra.get("reason_code"), "unexpected_argument"
+        )
+
+    async def test_cancel_rejects_fields_from_other_branches(self) -> None:
+        cases = {
+            "brief": "判读",
+            "hold_seconds": 5,
+            "messages": [{"content": _CHAT}],
+        }
+        for key, value in cases.items():
+            with self.subTest(key=key):
+                outcome = await self._run({"action": "cancel", key: value})
+                self.assertFalse(outcome.ok)
+                self.assertEqual(
+                    outcome.extra.get("reason_code"),
+                    "cancel_arguments_not_applicable",
+                )
+
+    async def test_verbatim_message_rejects_extra_fields(self) -> None:
+        outcome = await self._run(
+            {
+                "action": "verbatim",
+                "messages": [{"content": _CHAT, "caption": "ignored before"}],
+            }
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(
+            outcome.extra.get("reason_code"),
+            "unexpected_message_argument",
+        )
+
+
+class ReplyCancelActionTests(unittest.IsolatedAsyncioTestCase):
+    """`action="cancel"` 撤掉待发的那份稿，通常无其它参数。"""
+
+    @staticmethod
+    def _open_task() -> ReplyTaskState:
+        return ReplyTaskState(
+            reply_task_id="R1",
+            scope_key="group:100",
+            revision=3,
+            state="open",
+            created_at=NOW,
+            updated_at=NOW,
+            flush_at=NOW + timedelta(seconds=10),
+            hard_deadline=NOW + timedelta(seconds=90),
+            mode="compose",
+            brief="待撤稿",
+            verbatim_messages=[],
+            latest_event_id="E1",
+            source_tool_call_event_id="TC1",
+            correlation_id="CID",
+        )
+
+    async def _run(self, arguments: dict, current: ReplyTaskState | None):
+        cancel = AsyncMock(return_value="E_CANCEL")
+        with (
+            patch(
+                "qqbot.services.agent_loop.tools.reply."
+                "find_cancel_for_tool_call",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "qqbot.services.agent_loop.tools.reply.load_open_reply_task",
+                new=AsyncMock(return_value=current),
+            ),
+            patch(
+                "qqbot.services.agent_loop.tools.reply.append_cancel",
+                new=cancel,
+            ),
+        ):
+            outcome = await ReplyTool().run(arguments, **_tool_context())
+        return outcome, cancel
+
+    async def test_bare_cancel_withdraws_the_pending_draft(self) -> None:
+        outcome, cancel = await self._run(
+            {"action": "cancel"}, self._open_task()
+        )
+        self.assertTrue(outcome.ok)
+        self.assertEqual(outcome.result["reply_task_id"], "R1")
+        self.assertEqual(outcome.result["state"], "cancelled")
+        cancel.assert_awaited_once()
+
+    async def test_stale_id_assertion_fails_instead_of_cancelling_another(
+        self,
+    ) -> None:
+        """可选断言的存在理由：模型以为在撤 R1（其实已 flush），当前 open 的
+        是 R2——没有断言就会静默撤错那一份。"""
+        outcome, cancel = await self._run(
+            {"action": "cancel", "reply_task_id": "R_OLD"}, self._open_task()
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.error_kind, "reply_task_not_found")
+        cancel.assert_not_awaited()
+
+    async def test_nothing_pending_is_a_readable_failure(self) -> None:
+        outcome, cancel = await self._run({"action": "cancel"}, None)
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.error_kind, "reply_task_not_found")
+        cancel.assert_not_awaited()
 
 
 class ReplyTaskFoldTests(unittest.TestCase):
@@ -365,6 +577,9 @@ class ReplyTaskFoldTests(unittest.TestCase):
 
         pending = _fold_rows([upsert])["R1"]
         self.assertEqual(pending.state, "open")
+        self.assertEqual(
+            pending.brief, "李四@我提问，解释清楚；事实 A 必须准确"
+        )
         self.assertEqual(pending.latest_event_id, "E_UPSERT")
         self.assertEqual(pending.source_tool_call_event_id, "E_TOOL_CALL")
         self.assertEqual(_fold_rows([upsert, claimed])["R1"].state, "claimed")
@@ -380,7 +595,7 @@ class ReplyTaskFoldTests(unittest.TestCase):
             causation_id="TC1",
         )
         second_payload = _upsert_payload(2)
-        second_payload["gist"]["facts"].append("事实 B")
+        second_payload["brief"] = "补一个事实 B"
         second = _event(
             "E2",
             "agent.reply_task_upserted",
@@ -391,15 +606,25 @@ class ReplyTaskFoldTests(unittest.TestCase):
         state = _fold_rows([first, second])["R1"]
         self.assertEqual(state.state, "open")
         self.assertEqual(state.revision, 2)
+        self.assertEqual(state.brief, "补一个事实 B")
         self.assertEqual(state.source_tool_call_event_id, "TC2")
 
+    def test_malformed_brief_is_not_stringified_into_authorization(self) -> None:
+        payload = _upsert_payload()
+        payload["brief"] = ["不能把 repr 当授权"]
+        state = _fold_rows(
+            [_event("E_BAD", "agent.reply_task_upserted", payload)]
+        )["R1"]
+        self.assertEqual(state.brief, "")
 
-class AppendOnlyContractTests(unittest.TestCase):
+
+class LatestAuthorizationContractTests(unittest.TestCase):
     """程序侧不再做任何合并计算（2026-07-24，待办#19）。
 
     原 MergeContractTests 钉的是 merge_targets/merge_gist 的并集语义，而那
-    正是"撤不掉已授权的 target / 写错的 fact"的来源。现在每条授权原样入库，
-    谁覆盖谁由 Replyer 按时间顺序判断（最新的是权威），程序只负责调度。
+    正是"撤不掉已授权的 target / 写错的 fact"的来源。事件仍逐条原样入库，
+    但当前有效授权明确折叠为最新 revision 的完整 brief；旧 revision 只供审计，
+    Replyer 不再做隐式语义 merge。
     """
 
     def test_merge_helpers_are_gone(self) -> None:
@@ -407,15 +632,17 @@ class AppendOnlyContractTests(unittest.TestCase):
         self.assertFalse(hasattr(reply_task_module, "merge_gist"))
         self.assertFalse(hasattr(reply_task_module, "_dedupe_strings"))
 
-    def test_fold_takes_scheduling_from_latest_upsert_only(self) -> None:
-        """折叠出的 ReplyTaskState 只回答"什么时候发、到哪一步了"：调度字段
-        取最新一条 upsert，内容字段留的是最近一次授权原文，不是合并态。"""
+    def test_fold_takes_schedule_and_complete_brief_from_latest_upsert(self) -> None:
+        """最新 revision 同时决定调度与完整授权；省略旧内容就是撤回旧内容。
+
+        brief 必须随折叠态进入 Replyer，不能只存在于有终态竞态、且会被裁剪的
+        通用 timeline tool-call 行。
+        """
         first = _event(
             "E1", "agent.reply_task_upserted", _upsert_payload(), causation_id="TC1"
         )
         second_payload = _upsert_payload(2)
-        second_payload["targets"] = [{"message_id": "M2", "context": "改主意了"}]
-        second_payload["gist"] = {"intent": "换个角度"}
+        second_payload["brief"] = "改主意了，换个角度"
         second_payload["flush_at"] = (NOW + timedelta(seconds=3)).isoformat()
         second = _event(
             "E2",
@@ -427,9 +654,10 @@ class AppendOnlyContractTests(unittest.TestCase):
         state = _fold_rows([first, second])["R1"]
         self.assertEqual(state.revision, 2)
         self.assertEqual(state.flush_at, NOW + timedelta(seconds=3))
-        # 最近一次授权原文，不含第一条的 M1 / 事实 A
-        self.assertEqual([t["message_id"] for t in state.targets], ["M2"])
-        self.assertEqual(state.gist, {"intent": "换个角度"})
+        self.assertEqual(state.brief, "改主意了，换个角度")
+        self.assertNotIn("事实 A", state.brief)
+        self.assertFalse(hasattr(state, "targets"))
+        self.assertFalse(hasattr(state, "gist"))
 
 
 class ReplyerOutputTests(unittest.TestCase):
@@ -640,8 +868,7 @@ class ReplyerMultimodalTests(unittest.TestCase):
             flush_at=NOW,
             hard_deadline=NOW + timedelta(seconds=90),
             mode="compose",
-            targets=[{"message_id": "M1", "context": "李四@我提问"}],
-            gist={"intent": "解释"},
+            brief="李四@我提问，解释清楚",
             verbatim_messages=[],
             latest_event_id="E1",
             source_tool_call_event_id="TC1",

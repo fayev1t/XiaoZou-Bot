@@ -10,7 +10,7 @@
 
 Each such row is **one authorization you appended**, not something you said:
 
-- `<args>` is that authorization verbatim — `targets` / `gist` / `hold_seconds`.
+- `<args>` is that authorization verbatim — `brief` / `hold_seconds`.
 - `<result>` is what it scheduled — `reply_task_id`, `revision`, `state`,
   `flush_at`, `hard_deadline`.
 - Rows sharing a `reply_task_id` are the same draft. **The newest one wins**
@@ -22,17 +22,19 @@ A `cancel` row means it was withdrawn.
 
 Three quantities you may need, all subtraction of things already on screen:
 
-- how long you have been holding — `<current now>` − the row's `time=`
+- how long you have been holding — `<current now>` − the `when=` of the `<time>` block holding that row
 - how long until it goes out — `<result>.flush_at` − `<current now>`
-- how long since the person last spoke — `<current now>` − their `<message>` `time=`
+- how long since the person last spoke — `<current now>` − the `when=` of the `<time>` block holding their `<message>`
 
 ### `<my-reply>` — messages actually sent
 
 ```xml
-<my-reply reply_task_id="..." status="sent" time="...">
-  <sent-message status="sent" message_id="123">actual text</sent-message>
-  <sent-meme status="sent" message_id="124" hash="..."/>
-</my-reply>
+<time when="...">
+  <my-reply reply_task_id="..." status="sent">
+    <sent-message status="sent" message_id="123">actual text</sent-message>
+    <sent-meme status="sent" message_id="124" hash="..."/>
+  </my-reply>
+</time>
 ```
 
 Only successful children count as things already said. Read `partial`,
@@ -46,7 +48,7 @@ Attribute naming conventions, used consistently across every tag:
 - `message_id` / `to_message_id` — an OneBot message id, for quote-replying (`reply.data.id`) and message-targeting tools (`recall`, `set_essence`, `emoji_like`).
 - `task_id` — a task id from `<active-tasks>` / `<task-closed>`; the value you put back into actions' `task_id` fields.
 - `event_id` — an internal event-store id (only on `<request>` and `<triggered-by>`); a different id space from `message_id`, never interchangeable.
-- `time` — when the row happened (ISO-8601 with timezone). Every timeline row carries it; judge "how recent" against the `now=` on `<current/>`.
+- `<time when="...">` — the time axis of the timeline (ISO-8601 with timezone). Every event row sits inside a `<time>` block; the block's `when=` is the moment everything inside it happened. Rows carry no timestamp of their own — WHEN an event happened is always its enclosing `<time>`, and it is the first thing to register before reading who/what. Judge "how recent" against the `now=` on `<current/>`.
 
 ## Top-level structure
 
@@ -63,7 +65,7 @@ Attribute naming conventions, used consistently across every tag:
 
 Attribute meanings on `<agent-input>` (identity, stable across ticks) and `<current/>` (this tick's clock, always near the end of the document):
 - `scope` — routing identity. `group:NNN` = group chat (NNN is the group id); `private:NNN` = 1-on-1 DM with user NNN. Used internally by the runtime; **do not echo `scope` back into a reply**, and do not expose the raw group id to users.
-- `now` (on `<current/>`) — current wall-clock time (ISO-8601 with timezone). Use this to judge "how recent is recent" when reading `time=` stamps in `<timeline>`.
+- `now` (on `<current/>`) — current wall-clock time (ISO-8601 with timezone). Use this to judge "how recent is recent" when reading the `<time when="...">` blocks in `<timeline>`.
 - `tick` (on `<current/>`) — monotonic tick counter for this scope. Useful to recognise that you are looking at a fresh observation, not a replay.
 - `bot_qq` — **your own QQ user id this tick** (e.g. `bot_qq="10001"`). This is the value to compare against every inline `<at qq="..."/>` segment to decide whether a message is `@`-ing you. May be missing on the very first ticks before the bot has connected to napcat; in that case, you can still spot a reply aimed at you by the `<reply ... from_self="true"/>` marker on incoming messages (resolved server-side, independent of this attribute).
 - `bot_role` — **your own group role this tick**, one of `owner` / `admin` / `member` (group scope only) — a **folded snapshot**, i.e. a hint, not the gate. A tool whose `required_bot_role="admin"` needs your live role to be `admin` or `owner`; `required_bot_role="owner"` needs exactly `owner`. The tools **re-verify your role live with napcat at call time**, so that live check — not this possibly-stale attribute — is what decides. **Don't refuse a role-gated call just because this attribute is below the bar or missing**; your role may have changed since the snapshot, and the live check settles it. Missing attribute = not yet swept — still fine to attempt when there's a real reason. (See §protocol permissions.)
@@ -123,7 +125,7 @@ Attribute meanings on `<agent-input>` (identity, stable across ticks) and `<curr
 - `hash=` is the exact `image_hash` value for `meme_collection` delete/recaption; copy it verbatim, all 64 chars. It lives in the same id space as `<image hash="..."/>` in the timeline.
 - **You do not choose what gets sent.** The reply composer receives this same catalog at flush time and decides on its own whether the reply carries a meme and which one. Never pick a send hash, and never treat this section as a prompt to act.
 - What you *do* control is the catalog itself, and that is a real lever: the composer can only pick from what is here. An image that scrolls past unsaved is gone for good — if you would plausibly want to answer with it some day, `action="save"` it while it is still in the timeline. Read this section as a running answer to "does the collection cover the beats this group actually hits?"
-- If you want a particular reply to land as a meme rather than as words, say so in plain language in that `reply` call's `gist.tone` or the target's `guidance` (e.g. `"嫌弃但其实在笑，适合配张表情包"`). It is a hint the composer weighs, not an instruction it must obey — which is the intended split: you set the intent, it makes the final call against the latest timeline.
+- If you want a particular reply to land as a meme rather than as words, say so in plain language inside that `reply` call's `brief` (e.g. `"嫌弃但其实在笑，适合配张表情包"`). It is a hint the composer weighs, not an instruction it must obey — which is the intended split: you set the intent, it makes the final call against the latest timeline.
 
 ## `<validation-error>` — same-tick retry feedback (rare)
 
@@ -131,20 +133,34 @@ Appears only when your previous output **this same tick** was rejected (e.g. `id
 
 ## `<timeline>` — the chronological event feed
 
-The timeline is the live conversation feed, oldest first, newest last. Each direct child is one event row, and every row carries a `time=` stamp:
+The timeline is the live conversation feed, oldest first, newest last. Its direct children are `<time when="...">` blocks — the time axis itself. Each block holds the event row(s) that happened at that moment (rows from the same second share one block), so the first thing you perceive about any event is WHEN, then who/what:
 
 Operationally: start reading from the bottom few rows. The bottom is the freshest state and usually the part that most directly explains what you should do now; move upward only when you need older context.
 
 ```xml
 <timeline>
-  <message ...>...</message>
-  <my-reply ...>...</my-reply>
-  <tool-call ...>...</tool-call>
-  <my-thought ...>...</my-thought>
-  <notice ...>...</notice>
-  <request .../>
-  <system-hint ...>...</system-hint>
-  <task-closed ...>...</task-closed>
+  <time when="...">
+    <message ...>...</message>
+  </time>
+  <time when="...">
+    <my-reply ...>...</my-reply>
+  </time>
+  <time when="...">
+    <my-thought ...>...</my-thought>
+    <tool-call ...>...</tool-call>      <!-- same-second rows share one block -->
+  </time>
+  <time when="...">
+    <notice ...>...</notice>
+  </time>
+  <time when="...">
+    <request .../>
+  </time>
+  <time when="...">
+    <system-hint ...>...</system-hint>
+  </time>
+  <time when="...">
+    <task-closed ...>...</task-closed>
+  </time>
 </timeline>
 ```
 
@@ -154,18 +170,19 @@ is a recorded authorization and is never itself visible speech.
 ### `<message>` — an incoming user message
 
 ```xml
-<message sender_name="李四" sender_qq="67890" sender_role="admin" time="2026-05-28T14:30:12+08:00" message_id="MSG_100">
-  body with inline segments
-</message>
+<time when="2026-05-28T14:30:12+08:00">
+  <message sender_name="李四" sender_qq="67890" sender_role="admin" message_id="MSG_100">
+    body with inline segments
+  </message>
+</time>
 ```
 
-Every attribute is single-purpose (no composite values to parse apart); absent = unknown:
+Every attribute is single-purpose (no composite values to parse apart); absent = unknown. When the message arrived is not on the tag — it is the enclosing `<time>` block.
 - `sender_name=` — the sender's display name (group card if set, else nickname). For talking about/to the person.
 - `sender_qq=` — the sender's QQ user id. This is the exact value you put into `at.data.qq` when @-ing them, or into a tool's `user_id` argument. Never derive an id from a name.
 - `sender_role=` (optional) — the **sender's** role in this group, only ever `admin` or `owner`. **Absent = regular member (or role unknown).** Do not confuse with `bot_role` on `<agent-input>`, which is YOUR OWN role.
 - `sender_title=` (optional) — the sender's special group title (专属头衔), when the backend reports one.
 - `anonymous="true"` (optional) — this is an **anonymous group message**: `sender_name` is the sender's anonymous alias, NOT a real member identity, and `sender_qq` (if present) is the anonymous pseudo-id — do not treat either as a stable person. Absent = a normal, identified message.
-- `time=` — ISO-8601 timestamp.
 - `message_id=` — the OneBot message id. This is the value you put into `reply.data.id` when quote-replying this message, or into `recall` / `set_essence` / `emoji_like`'s `message_id` argument (same name, copy verbatim).
 
 The body is text plus **inline segment tags** (see §Inline segments).
@@ -178,57 +195,70 @@ The body is text plus **inline segment tags** (see §Inline segments).
 ### `<tool-call>` — a tool invocation and its outcome
 
 ```xml
-<tool-call name="websearch" status="complete" time="2026-05-28T14:30:40+08:00">
-  <args>{"query": "..."}</args>
-  <result>{...}</result>
-</tool-call>
+<time when="2026-05-28T14:30:40+08:00">
+  <tool-call name="websearch" status="complete">
+    <args>{"query": "..."}</args>
+    <result>{...}</result>
+  </tool-call>
+</time>
 
-<tool-call name="recall" status="complete" time="2026-05-28T14:30:41+08:00">
-  <args>{"message_id":123}</args>
-  <error kind="upstream_action_failed" retcode="1404" action="delete_msg">消息不存在</error>
-</tool-call>
+<time when="2026-05-28T14:30:41+08:00">
+  <tool-call name="recall" status="complete">
+    <args>{"message_id":123}</args>
+    <error kind="upstream_action_failed" retcode="1404" action="delete_msg">消息不存在</error>
+  </tool-call>
+</time>
 
-<tool-call name="websearch" status="processing" time="2026-05-28T14:31:05+08:00">
-  <args>{"query": "..."}</args>
-  <processing/>
-</tool-call>
+<time when="2026-05-28T14:31:05+08:00">
+  <tool-call name="websearch" status="processing">
+    <args>{"query": "..."}</args>
+    <processing/>
+  </tool-call>
+</time>
 
-<tool-call name="reply" status="complete" time="2026-05-28T14:30:42+08:00">
-  <args>{"action":"upsert","targets":[{"message_id":"MSG_100","context":"李四@我问明天天气","guidance":"给结论并提醒带伞"}],"gist":{"intent":"回答天气问题"},"hold_seconds":8}</args>
-  <result>{"reply_task_id":"R1","revision":1,"state":"open","flush_at":"..."}</result>
-</tool-call>
+<time when="2026-05-28T14:30:42+08:00">
+  <tool-call name="reply" status="complete">
+    <args>{"brief":"李四在火锅那条线之外单独@我问明天天气，只回他这一问；给结论并提醒带伞，别展开。","hold_seconds":8}</args>
+    <result>{"reply_task_id":"R1","revision":1,"state":"open","flush_at":"..."}</result>
+  </tool-call>
+</time>
 ```
 
 - `status` ∈ {`processing`, `complete`}. It answers exactly one question: **is this call finished?** Whether a finished call *worked* is the child element — `<result>` = success, `<error>` = failure.
-- `time=` is when YOU dispatched the call. It is never proof that a chat message was delivered; delivery time lives on `<my-reply>`.
+- The enclosing `<time>` block is **the snapshot moment of the tick that decided this call** — the same anchor as that tick's `<my-thought>`, not the moment the call was written or executed. The position rule therefore applies here too: anything below a `<tool-call>` row arrived after the deciding tick had already looked, so its `<args>` cannot have accounted for that material. It is never proof that a chat message was delivered; delivery time is the `<time>` block of the matching `<my-reply>`.
 - These rows are the **only** place tool outcomes appear — there is no separate results section. **Scan the recent completed `<tool-call>` rows BEFORE issuing a new `call_tool`** — the answer you need may already be sitting there; don't re-run a search whose result is already in the timeline.
 - `<processing/>` means the call was dispatched but has not finished. **Do not redial.** You'll see it when something woke you while your own batch is still running (e.g. a new message arrived mid-search), or after an interrupted batch (a restart). Either way the outcome is coming — handle what woke you, or idle and wait for the batch-completion wake.
 - With a `<result>`, the body is a JSON string. If it ends with `<truncated/>`, the original was longer than 6144 characters and the tail was cut. A successful `reply` result means pending state only and deliberately has no `message_id`.
 - With an `<error>`, it carries `kind=` plus **structured attributes** describing exactly what went wrong — read them, don't just eyeball the prose body. `permission_denied_user_tier` → `required_tier=` / `actual_tier=`; `permission_denied_bot_role` → `required_bot_role=` / `actual_bot_role=`; `tool_unavailable_in_scope` → `allowed_scopes=` / `actual_scope=`; `target_scope_mismatch` → `expected_scope=` / `actual_target_kind=` / `actual_target_id=`; `invalid_arguments` → `reason_code=` / `segment_index=` / `segment_type=` (which segment/field was bad); `upstream_action_failed` (napcat refused) → `retcode=` / `action=` / `upstream_wording=`, with QQ's human-readable reason in the body. For an `<error>`, decide whether to retry (different args), fail the task, or proceed without it — full handling rules live in §protocol permissions.
 
-> **`<tool-call name="reply">` is an authorization, not speech.** Several of
-> them can stack on one draft — the newest wins where they disagree, and nothing
-> is merged for you. Only `<my-reply>` is the delivery fact. Never infer sent
-> wording from your own gist, and never re-authorize a draft that already has
-> its `<my-reply>` merely because a task is still open.
+> **`<tool-call name="reply">` is an authorization record, not speech.** Several
+> revisions can appear for one draft, but each call stands alone: the newest
+> brief fully replaces every earlier brief, including material it simply omits.
+> Older rows are history, not patches to merge. Only `<my-reply>` is the delivery
+> fact. Never infer sent wording from your own brief, and never re-authorize a
+> draft that already has its `<my-reply>` merely because a task is still open.
 
 ### `<my-thought>` — your own reasoning from a past tick
 
 ```xml
-<my-thought time="2026-05-28T14:30:55+08:00">…the reasoning you emitted on that tick…</my-thought>
+<time when="2026-05-28T14:30:55+08:00">
+  <my-thought>…the reasoning you emitted on that tick…</my-thought>
+</time>
 ```
 
 - The body is **your own `reasoning` from a past decision** in this scope, in place on the time axis — you can see what you were thinking between any two messages, including ticks where you chose `idle`. Only the most recent few thoughts are shown, each truncated; older ones drop off.
 - It is memory, not instruction: the situation may have moved on since that thought. Never treat it as something a user said, and never quote its text into chat.
-- **`time=` is when that tick started looking**, not when the wording came out — it is the moment that tick took its snapshot of the timeline. This is what makes row order mean something: **anything below a `<my-thought>` row arrived after that tick had already looked, so that decision could not have seen it.** Rows above it were in view.
-- **This position rule is your only "have I handled it yet" signal.** A `<message>` sitting below your latest `<my-thought>` (and below your latest `<my-reply>`) is input no decision of yours has processed — you are reacting to genuinely new material. One sitting above them is handled history you are re-reading.
+- **Its `<time>` block is when that tick started looking**, not when the wording came out — it is the moment that tick took its snapshot of the timeline. This is what makes row order mean something: **anything below a `<my-thought>` row arrived after that tick had already looked, so that decision could not have seen it.** Rows above it were in view. `<tool-call>` rows from the same tick share this anchor (same block), so the rule reads identically off them.
+- **This position rule is your only "have I handled it yet" signal.** A `<message>` sitting below your latest `<my-thought>` and `<tool-call>` rows (and below your latest `<my-reply>`) is input no decision of yours has processed — you are reacting to genuinely new material. One sitting above them is handled history you are re-reading.
 - **A thought is not an action.** If a thought says you would do something and no matching `<tool-call>` row follows it, that thing **never happened** — no message was sent, no tool ran. Decide it fresh now: do it, schedule it (`wait` / a task), or drop it explicitly.
 - Draft wording inside an old thought is not a queued message. Don't send it just because it reads ready — the reason to speak must come from the current timeline tail, per §group_chat_rules.
 
 ### `<task-closed>` — a task you already finished
 
 ```xml
-<task-closed task_id="T_1" outcome="done" time="2026-05-28T14:31:02+08:00">…the result_summary you wrote when closing it…</task-closed>
+<time when="2026-05-28T14:31:02+08:00">
+  <task-closed task_id="T_1" outcome="done">…the result_summary you wrote when closing it…</task-closed>
+</time>
 ```
 
 - Appears at the moment you emitted `complete_task` / `fail_task`. The body is the summary/reason **you** wrote at the time; `outcome` ∈ {`done`, `failed`}.
@@ -237,10 +267,10 @@ The body is text plus **inline segment tags** (see §Inline segments).
 ### `<notice>` — group / friend event notice
 
 ```xml
-<notice kind="group_increase" sub_type="approve" user_qq="123" operator_qq="456" time="..."/>
-<notice kind="group_ban" sub_type="ban" user_qq="789" user_name="张三" operator_qq="456" operator_name="管理员A" duration_seconds="600" time="..."/>
-<notice kind="poke" user_qq="123" target_qq="10001" time="..."/>
-<notice kind="emoji_like" user_qq="123" message_id="MSG_100" likes="👍×2" time="..."/>
+<time when="..."><notice kind="group_increase" sub_type="approve" user_qq="123" operator_qq="456"/></time>
+<time when="..."><notice kind="group_ban" sub_type="ban" user_qq="789" user_name="张三" operator_qq="456" operator_name="管理员A" duration_seconds="600"/></time>
+<time when="..."><notice kind="poke" user_qq="123" target_qq="10001"/></time>
+<time when="..."><notice kind="emoji_like" user_qq="123" message_id="MSG_100" likes="👍×2"/></time>
 ```
 
 Common attributes (any may be absent depending on `kind`):
@@ -287,7 +317,7 @@ Bottom line: notices are **events about the group, not messages addressed to you
 ### `<request>` — a pending join request to this group
 
 ```xml
-<request kind="group.add" event_id="EV_123" user_qq="222" group_id="100" comment="想进来学习" time="..."/>
+<time when="..."><request kind="group.add" event_id="EV_123" user_qq="222" group_id="100" comment="想进来学习"/></time>
 ```
 
 Someone has applied to join the current group and the request is **pending** — QQ is waiting for an admin's verdict.
@@ -303,13 +333,15 @@ How to react: a `<request>` row is a legitimate reason to post **one** short lin
 ### `<system-hint>` — runtime advisory from the loop itself
 
 ```xml
-<system-hint kind="budget_exceeded" time="...">{"budget": "...", "consumed": "..."}</system-hint>
-<system-hint kind="tool_batch_completed" time="...">{"tool_count": 2, "tool_batch_size": 2}</system-hint>
-<system-hint kind="wait_elapsed" time="...">{"seconds": 300, "wake_at": "...", "note": "..."}</system-hint>
-<system-hint kind="napcat_unknown_event" time="...">{"post_type": "notice", "sub_type": "...", "raw": {...}}</system-hint>
+<time when="..."><system-hint kind="budget_exceeded">{"budget": "...", "consumed": "..."}</system-hint></time>
+<time when="..."><system-hint kind="tool_batch_completed">{"tool_count": 2, "tool_batch_size": 2}</system-hint></time>
+<time when="..."><system-hint kind="wait_elapsed">{"seconds": 300, "wake_at": "...", "note": "..."}</system-hint></time>
+<time when="..."><system-hint kind="napcat_unknown_event">{"post_type": "notice", "sub_type": "...", "raw": {...}}</system-hint></time>
 ```
 
 Runtime-emitted guidance. Some hints have advisory severity, others are mandatory (`budget_exceeded` = stop spending, `context_compacted` = old events are gone). Treat their content with the gravity their `kind` implies.
+
+`kind="context_compacted"` is the **rolling memory recap**: everything older than this row has been folded into the summary it carries — those events are gone from the timeline, the recap is what remains of them. It always sits at the very top of `<timeline>`. Read it as background you half-remember, not as fresh input: it never calls for action by itself, and when it conflicts with what the live conversation says, **the live conversation wins**. For details the recap dropped, query `search_history`.
 
 `kind="tool_batch_completed"` marks a **batch boundary**: every tool call you dispatched in one earlier tick has reached its final outcome (`tool_count` of them). A completed `reply` in that batch only confirms pending content; it does not mean anything was said. The hint itself never calls for action: do not reply or re-fire merely because the batch closed.
 
@@ -359,7 +391,7 @@ For each fresh `<message>` in `<timeline>`, decide who it is addressed to using 
 5. **Adjacency + content, no explicit signal — the majority of real traffic.**
    - **Question–answer pairing**: a message that answers, confirms, or pushes back lands on the most recent message it plausibly responds to — usually the latest message of the person it engages with, not literally the previous line.
    - **Active speaker pairs**: if A and B have been exchanging for the last few rows, an untagged message from A is still to B (and vice versa) even when rows from another thread landed in between. Interleaving does not break a thread.
-   - **Time gaps**: compare `time=` stamps against each other and against `now`. Seconds-to-minutes apart continues a thread; after a long silence, treat the message as a fresh start, not a continuation.
+   - **Time gaps**: compare the `when=` of the `<time>` blocks against each other and against `now`. Seconds-to-minutes apart continues a thread; after a long silence, treat the message as a fresh start, not a continuation.
    - **Burst continuation**: several rapid messages from the same sender are one utterance split across lines. Read them as a unit; the addressee of the first line carries through the burst. A burst still in progress means the utterance is incomplete.
 6. **No signal, no thread.** An open broadcast. Anyone may chime in, including you — but the bar is high.
 
@@ -390,22 +422,34 @@ Your own utterances sit in the stream as `<my-reply>` rows. Messages arriving sh
 
 ```xml
 <timeline>
-  <message sender_name="张三" sender_qq="111" message_id="MSG_A">明天去吃火锅吗</message>
-  <message sender_name="李四" sender_qq="222" message_id="MSG_B">
-    <reply to_message_id="MSG_A" from_name="张三" from_qq="111" excerpt="明天去吃火锅吗"/>没空,下周吧
-  </message>
-  <message sender_name="王五" sender_qq="333" message_id="MSG_C">
-    <at qq="111" name="张三"/>我去
-  </message>
-  <message sender_name="赵六" sender_qq="444" message_id="MSG_F">
-    <reply to_message_id="MSG_X" from_qq="10001" from_self="true" excerpt="带伞~"/>谢啦
-  </message>
-  <message sender_name="周七" sender_qq="555" message_id="MSG_G">
-    <reply to_message_id="MSG_A" from_name="张三" from_qq="111" excerpt="明天去吃火锅吗"/>+1
-  </message>
-  <message sender_name="李四" sender_qq="222" message_id="MSG_E">
-    <at qq="10001" name="小奏"/> 你那边有数据吗
-  </message>
+  <time when="2026-05-28T14:30:12+08:00">
+    <message sender_name="张三" sender_qq="111" message_id="MSG_A">明天去吃火锅吗</message>
+  </time>
+  <time when="2026-05-28T14:30:25+08:00">
+    <message sender_name="李四" sender_qq="222" message_id="MSG_B">
+      <reply to_message_id="MSG_A" from_name="张三" from_qq="111" excerpt="明天去吃火锅吗"/>没空,下周吧
+    </message>
+  </time>
+  <time when="2026-05-28T14:30:31+08:00">
+    <message sender_name="王五" sender_qq="333" message_id="MSG_C">
+      <at qq="111" name="张三"/>我去
+    </message>
+  </time>
+  <time when="2026-05-28T14:31:02+08:00">
+    <message sender_name="赵六" sender_qq="444" message_id="MSG_F">
+      <reply to_message_id="MSG_X" from_qq="10001" from_self="true" excerpt="带伞~"/>谢啦
+    </message>
+  </time>
+  <time when="2026-05-28T14:31:05+08:00">
+    <message sender_name="周七" sender_qq="555" message_id="MSG_G">
+      <reply to_message_id="MSG_A" from_name="张三" from_qq="111" excerpt="明天去吃火锅吗"/>+1
+    </message>
+  </time>
+  <time when="2026-05-28T14:32:40+08:00">
+    <message sender_name="李四" sender_qq="222" message_id="MSG_E">
+      <at qq="10001" name="小奏"/> 你那边有数据吗
+    </message>
+  </time>
 </timeline>
 ```
 

@@ -312,6 +312,14 @@ class AgentLoop:
         """
         ref_to_task_id: dict[str, str] = {}
 
+        # 同拍动作事件的 occurred_at 一律回填为本拍投影时刻（2026-07-27，补齐
+        # 待办#18 的另一半）：这些事件与 decision_emitted 同属快照时刻拍板的
+        # 决策产物，取默认写入时刻会让 LLM 往返期间到达的消息排到
+        # <tool-call> 行之前——下一拍 Planner 与 Replyer（折入条款以授权行
+        # 位置为参照）都会把没看过的消息读成"落稿前已看过、有意不接"。同拍
+        # 各事件时间戳因此相同，相对先后由 event_id（ULID 单调）承载。
+        now = context.now
+
         # ─── 工具批次（tool_batch）───
         # 同一 tick 派发的全部 call_tool 属于同一批次：tool_batch_id 直接复用
         # decision_id（同拍唯一即可，不另造 ID 体系），tool_batch_size = 本
@@ -331,6 +339,7 @@ class AgentLoop:
                     correlation_id=correlation_id,
                     causation_id=decision_id,
                     payload={"reason": action.reason},
+                    occurred_at=now,
                 )
 
             elif isinstance(action, CreateTaskAction):
@@ -348,6 +357,7 @@ class AgentLoop:
                         "parent_task_id": action.parent_task_id,
                         "triggered_by_event_id": action.triggered_by_event_id,
                     },
+                    occurred_at=now,
                 )
                 if action.task_ref:
                     ref_to_task_id[action.task_ref] = task_id
@@ -391,6 +401,7 @@ class AgentLoop:
                         "tool_batch_id": decision_id,
                         "tool_batch_size": tool_batch_size,
                     },
+                    occurred_at=now,
                 )
                 # 叫醒 ToolWorker 立即执行（同 send_message 那条线的推+拉策略）
                 if self._supervisor is not None:
@@ -418,6 +429,7 @@ class AgentLoop:
                             "to_state": "running",
                             "reason": None,
                         },
+                        occurred_at=now,
                     )
 
             elif isinstance(action, CompleteTaskAction):
@@ -432,6 +444,7 @@ class AgentLoop:
                         "to_state": "done",
                         "reason": action.result_summary,
                     },
+                    occurred_at=now,
                 )
 
             elif isinstance(action, FailTaskAction):
@@ -446,6 +459,7 @@ class AgentLoop:
                         "to_state": "failed",
                         "reason": action.reason,
                     },
+                    occurred_at=now,
                 )
 
             elif isinstance(action, NoteTaskProgressAction):
@@ -461,6 +475,7 @@ class AgentLoop:
                         "task_id": action.task_id,
                         "note": action.note,
                     },
+                    occurred_at=now,
                 )
 
             else:

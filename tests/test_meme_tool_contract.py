@@ -241,8 +241,10 @@ class ToolIdentityTests(unittest.TestCase):
         usage = MemeCollectionTool.usage_prompt or ""
         self.assertIn("meme_collection", usage)
         self.assertIn("never sends", usage)
-        # 倾向表达的唯一合法出口（不加 gist 字段的前提下）必须写在用法文档里。
-        self.assertIn("gist.tone", usage)
+        # 倾向表达的唯一合法出口必须写在用法文档里——2026-07-25 reply 收敛
+        # 后是 brief 的自由文本（gist.* 形态已废除，钉死防回潮）。
+        self.assertIn("`reply` call's `brief`", usage)
+        self.assertNotIn("gist", usage)
 
 
 class ActionDispatchTests(_MemeToolTestBase):

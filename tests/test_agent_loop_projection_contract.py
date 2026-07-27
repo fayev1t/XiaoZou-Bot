@@ -17,7 +17,12 @@ from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from qqbot.services.agent_loop.projection import Projector, _EventSnapshot
+from qqbot.services.agent_loop.decision import TimelineItem
+from qqbot.services.agent_loop.projection import (
+    Projector,
+    _EventSnapshot,
+    render_timeline_stream,
+)
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 BASE_TIME = datetime(2026, 5, 26, 14, 30, 0, tzinfo=SHANGHAI)
@@ -96,12 +101,210 @@ class ProjectionSnapshotBoundaryTests(unittest.IsolatedAsyncioTestCase):
         compiled = statements[0].compile()
         sql = str(compiled)
         self.assertIn("agent_events.occurred_at <= ", sql)
-        # 2026-07-27 去除 24h 时间回溯：取数窗只按条数收敛，不得再有时间下界。
+        # 2026-07-27 去除 24h 时间回溯：不带 recap 边界时不得出现时间下界
+        # （唯一的逻辑下界是最新 recap 覆盖边界，见 RecapQueryTests）。
         self.assertNotIn("agent_events.occurred_at >= ", sql)
         self.assertIn(BASE_TIME, compiled.params.values())
         self.assertIn(
             "agent_events.occurred_at DESC, agent_events.event_id DESC",
             sql,
+        )
+
+
+class RecapQueryTests(unittest.IsolatedAsyncioTestCase):
+    """记忆摘要取数侧（记忆系统契约 §3.1/§3.2/§4.2）：recap 覆盖边界是唯一
+    逻辑下界；最新 recap 走独立保底查询；推式探针随投影回调且异常不伤 tick。"""
+
+    def _projector(self, statements: list[Any]) -> Projector:
+        def factory() -> _RecordingProjectionSession:
+            return _RecordingProjectionSession(statements)
+
+        return Projector(factory)
+
+    async def test_fetch_gains_lower_bound_only_when_given(self) -> None:
+        statements: list[Any] = []
+        projector = self._projector(statements)
+        await projector._fetch(
+            "group",
+            999,
+            BASE_TIME,
+            lower_bound=BASE_TIME - timedelta(seconds=30),
+        )
+        sql = str(statements[0].compile())
+        self.assertIn("agent_events.occurred_at >= ", sql)
+
+    async def test_latest_recap_query_shape(self) -> None:
+        statements: list[Any] = []
+        projector = self._projector(statements)
+        out = await projector._fetch_latest_recap(999)
+        self.assertIsNone(out)
+        self.assertEqual(len(statements), 1)
+        compiled = statements[0].compile()
+        sql = str(compiled)
+        self.assertIn("agent_events.type = ", sql)
+        self.assertIn(
+            "runtime.context_compacted", list(compiled.params.values())
+        )
+        self.assertIn("agent_events.occurred_at DESC", sql)
+
+    async def test_uncovered_notifier_fires_and_failure_is_swallowed(
+        self,
+    ) -> None:
+        statements: list[Any] = []
+        projector = self._projector(statements)
+        calls: list[tuple[str, int]] = []
+        projector.set_uncovered_notifier(lambda sk, n: calls.append((sk, n)))
+        await projector.build_context(
+            scope_key="group:999",
+            correlation_id="corr",
+            tick_seq=1,
+            now=BASE_TIME,
+        )
+        self.assertEqual(calls, [("group:999", 0)])
+
+        def boom(scope_key: str, uncovered: int) -> None:
+            raise RuntimeError("boom")
+
+        projector.set_uncovered_notifier(boom)
+        ctx = await projector.build_context(
+            scope_key="group:999",
+            correlation_id="corr",
+            tick_seq=2,
+            now=BASE_TIME,
+        )
+        self.assertEqual(ctx.tick_seq, 2)  # 探针异常绝不允许影响 tick
+
+
+def _recap_snap(
+    boundary: _EventSnapshot,
+    *,
+    seconds_offset: float,
+    event_id: str = "RECAP1",
+    payload: dict | None = None,
+) -> _EventSnapshot:
+    """标准 recap 夹具：覆盖到 boundary、occurred_at 落在接缝处（边界+1ms）。"""
+    if payload is None:
+        payload = {
+            "summary": "早前大家定了周六晚八点开黑。",
+            "recall_cues": ["再约开黑时"],
+            "covers_until_event_id": boundary.event_id,
+            "covers_until_occurred_at": boundary.occurred_at.isoformat(),
+            "covers_from_occurred_at": BASE_TIME.isoformat(),
+            "dropped_event_count": 7,
+            "folded_revision": 1,
+            "compactor_version": 1,
+        }
+    return _snap(
+        type="runtime.context_compacted",
+        event_id=event_id,
+        payload=payload,
+        seconds_offset=seconds_offset,
+    )
+
+
+def _hint(i: float, *, event_id: str = "") -> _EventSnapshot:
+    return _snap(
+        type="runtime.wait_elapsed",
+        payload={"seconds": 1},
+        event_id=event_id,
+        seconds_offset=i,
+    )
+
+
+class ContextRecapWindowTests(unittest.TestCase):
+    """apply_recap_window 纯函数（记忆系统契约 §3.1/§3.2）。"""
+
+    def test_drops_covered_keeps_recap_and_tail(self) -> None:
+        folded = [_hint(i) for i in range(5)]
+        recap = _recap_snap(folded[-1], seconds_offset=4.001)
+        tail = [_hint(10 + i) for i in range(3)]
+        kept = Projector.apply_recap_window([*folded, recap, *tail], recap)
+        self.assertEqual(
+            [ev.event_id for ev in kept],
+            ["RECAP1", *[ev.event_id for ev in tail]],
+        )
+
+    def test_prepends_recap_missing_from_fetch(self) -> None:
+        # 积压超过取数 LIMIT 时 recap 缺席取数结果——保底前插，记忆不消失。
+        recap = _recap_snap(_hint(4), seconds_offset=4.001)
+        tail = [_hint(10 + i) for i in range(3)]
+        kept = Projector.apply_recap_window(list(tail), recap)
+        self.assertEqual(kept[0].event_id, "RECAP1")
+        self.assertEqual(len(kept), 4)
+
+    def test_broken_payload_falls_back_to_recap_row_boundary(self) -> None:
+        folded = [_hint(i) for i in range(5)]
+        recap = _recap_snap(
+            folded[-1], seconds_offset=5.0, payload={"summary": "只有摘要"}
+        )
+        tail = [_hint(10 + i) for i in range(2)]
+        kept = Projector.apply_recap_window([*folded, recap, *tail], recap)
+        self.assertEqual(kept[0].event_id, "RECAP1")
+        self.assertEqual(
+            [ev.event_id for ev in kept[1:]], [ev.event_id for ev in tail]
+        )
+
+    def test_drops_older_recap_generations(self) -> None:
+        old_recap = _recap_snap(_hint(2), seconds_offset=2.001, event_id="RECAP0")
+        boundary = _hint(6)
+        recap = _recap_snap(boundary, seconds_offset=6.001)
+        tail = [_hint(10)]
+        kept = Projector.apply_recap_window(
+            [old_recap, boundary, recap, *tail], recap
+        )
+        self.assertEqual(
+            [ev.event_id for ev in kept], ["RECAP1", tail[0].event_id]
+        )
+
+
+class ContextRecapRenderAndPinTests(unittest.TestCase):
+    """recap 的专门渲染与裁剪钉住（记忆系统契约 §3.2/§3.3）。"""
+
+    def test_renders_summary_with_footer_not_payload_json(self) -> None:
+        recap = _recap_snap(_hint(0), seconds_offset=0.001)
+        items = Projector.build_timeline([recap], tool_views=[])
+        self.assertEqual(len(items), 1)
+        row = items[0]
+        self.assertEqual(row.kind, "system_hint")
+        self.assertIn('kind="context_compacted"', row.render)
+        self.assertIn("早前大家定了周六晚八点开黑。", row.render)
+        self.assertIn("仅供参考", row.render)
+        self.assertIn("共 7 条", row.render)
+        # 内部字段绝不进 prompt（recall_cues 只写不读，契约 §3.3）。
+        self.assertNotIn("recall_cues", row.render)
+        self.assertNotIn("covers_until_event_id", row.render)
+
+    def test_pinned_recap_survives_trim_outside_budget(self) -> None:
+        recap = _recap_snap(_hint(0), seconds_offset=0.001)
+        hints = [_hint(10 + i, event_id=f"H{i}") for i in range(8)]
+        ctx = Projector.project(
+            [recap, *hints],
+            scope_key="group:999",
+            correlation_id="corr",
+            tick_seq=1,
+            now=BASE_TIME + timedelta(seconds=100),
+            max_timeline_items=3,
+            pinned_event_id="RECAP1",
+        )
+        self.assertEqual(ctx.timeline[0].event_id, "RECAP1")
+        self.assertEqual(
+            [it.event_id for it in ctx.timeline[1:]], ["H5", "H6", "H7"]
+        )
+
+    def test_unpinned_recap_is_trimmed_like_any_row(self) -> None:
+        # 对照组：不钉住时 recap 与普通行同权被裁掉——证明钉住是必要的。
+        recap = _recap_snap(_hint(0), seconds_offset=0.001)
+        hints = [_hint(10 + i, event_id=f"H{i}") for i in range(8)]
+        ctx = Projector.project(
+            [recap, *hints],
+            scope_key="group:999",
+            correlation_id="corr",
+            tick_seq=1,
+            now=BASE_TIME + timedelta(seconds=100),
+            max_timeline_items=3,
+        )
+        self.assertEqual(
+            [it.event_id for it in ctx.timeline], ["H5", "H6", "H7"]
         )
 
 
@@ -1092,10 +1295,12 @@ class BuildTimelineTests(unittest.TestCase):
                 },
             ),
         ]
-        rendered = Projector.build_timeline(evs, tool_views=[])[0].render
-        # 2026-05-26T14:30:00+08:00 这种形态
-        self.assertIn("2026-05-26T14:30:00", rendered)
-        self.assertIn("+08:00", rendered)
+        row = Projector.build_timeline(evs, tool_views=[])[0]
+        # 时间流契约 2026-07-26：行自身不带时间戳，时间由信封层
+        # <time when="2026-05-26T14:30:00+08:00"> 时刻节点承载。
+        self.assertNotIn("2026-05-26T14:30:00", row.render)
+        stream = render_timeline_stream([row])
+        self.assertIn('<time when="2026-05-26T14:30:00+08:00">', stream[0])
 
     def test_message_falls_back_to_raw_when_segments_empty(self) -> None:
         # 异常路径：mapper 没填 segments，但有 raw_message
@@ -1386,9 +1591,9 @@ class BuildTimelineTests(unittest.TestCase):
         self.assertIn('status="complete"', items[0].render)
         self.assertIn("<result>", items[0].render)
         self.assertIn("[1, 2]", items[0].render)
-        # tool-call 行必须带发起时刻 time= —— 曾是全 timeline 唯一无时间戳的
-        # 行类型（bot 发言恰好渲染在这里，模型判断"多久前说过"只能靠行序）。
-        self.assertIn('time="', items[0].render)
+        # 时间流契约（2026-07-26）：行内不再带 time= —— 发起时刻由信封层
+        # render_timeline_stream 包裹的 <time when="…"> 时刻节点承载。
+        self.assertNotIn('time="', items[0].render)
 
     def test_tool_called_without_result_renders_processing(self) -> None:
         called = _snap(
@@ -1454,7 +1659,7 @@ class BuildTimelineTests(unittest.TestCase):
         rendered = items[0].render
         self.assertIn('kind="tool_batch_completed"', rendered)
         self.assertIn("tool_count", rendered)
-        self.assertIn('time="', rendered)  # system-hint 行同样带时间戳
+        self.assertNotIn('time="', rendered)  # 行内无时间戳：时刻在 <time> 节点上
         self.assertNotIn("01JBATCHULIDNOISE0000000000", rendered)
         self.assertNotIn("tool_batch_id", rendered)
 
@@ -1839,7 +2044,8 @@ class ProjectIntegrationTests(unittest.TestCase):
         self.assertEqual(kinds, ["my_thought", "my_thought"])
         self.assertIn("先观望", context.timeline[0].render)
         self.assertIn("等他贴完", context.timeline[1].render)
-        self.assertIn('time="', context.timeline[1].render)
+        # 时间流契约：思考行内也不带 time=，时刻在 <time> 节点上
+        self.assertNotIn('time="', context.timeline[1].render)
         # 单条折叠接口随 <last-reasoning> 一并删除，防复活
         self.assertFalse(hasattr(Projector, "fold_last_reasoning"))
 
@@ -2142,20 +2348,16 @@ class RecallRenderingNoteTests(unittest.TestCase):
 class ReplyFlushedProjectionTests(unittest.TestCase):
     def test_successful_reply_tool_row_is_rendered_as_authorization(self) -> None:
         """2026-07-24（待办#19）起 reply 成功行**不再折叠**：它是 append-only
-        授权序列的唯一真相源——<args> 是这次授权原文（含 hold_seconds），
-        <result> 是它落成的调度事实。原先折叠是为了不与 <pending-reply> 双重
-        渲染，而那一段已随本次改动删除，主从关系反转。"""
+        规划历史的一部分——<args> 是这次授权原文（含 hold_seconds），<result>
+        是它落成的调度事实。Replyer 的当前唯一授权另由 ReplyTaskState 中最新
+        完整 brief 提供；这里不做历史合并。"""
         called = _snap(
             type="agent.tool_called",
             event_id="TC_EVENT",
             payload={
                 "tool_call_id": "TC_REPLY",
                 "tool_name": "reply",
-                "arguments": {
-                    "action": "upsert",
-                    "gist": {"intent": "回答"},
-                    "hold_seconds": 8,
-                },
+                "arguments": {"brief": "他在问天气，回答", "hold_seconds": 8},
             },
         )
         result = _snap(
@@ -2176,8 +2378,8 @@ class ReplyFlushedProjectionTests(unittest.TestCase):
         self.assertEqual([it.kind for it in items], ["tool_call"])
         render = items[0].render
         self.assertIn('<tool-call name="reply" status="complete"', render)
-        # 授权原文（<args>）与调度事实（<result>）都在同一行上，模型据此
-        # 判断"我授权了什么、什么时候发"，不需要另一个状态区。
+        # 授权原文（<args>）与调度事实（<result>）都在同一行上，Planner 据此
+        # 回看"我当时授权了什么、什么时候发"；Replyer 不依赖这行取当前 brief。
         self.assertIn("hold_seconds", render)
         self.assertIn("回答", render)
         self.assertIn("R1", render)
@@ -2685,6 +2887,69 @@ class WindowAnchorHysteresisTests(unittest.TestCase):
         )
         self.assertEqual(len(items), Projector.MAX_THOUGHT_ROWS)
         self.assertEqual(items[0].event_id, "D011")
+
+
+class RenderTimelineStreamContractTests(unittest.TestCase):
+    """时间流渲染契约（2026-07-26）：<time when="…"> 是 timeline 的唯一
+    直接子元素，行嵌节点内、行内无时间属性；相邻同秒的行共享一个节点。"""
+
+    @staticmethod
+    def _item(
+        event_id: str, seconds_offset: float, render: str
+    ) -> TimelineItem:
+        return TimelineItem(
+            event_id=event_id,
+            occurred_at=BASE_TIME + timedelta(seconds=seconds_offset),
+            kind="message",
+            render=render,
+        )
+
+    def test_groups_same_second_rows_into_one_time_node(self) -> None:
+        items = [
+            self._item("E1", 0, "<message>a</message>"),
+            self._item("E2", 0, '<tool-call name="reply" status="complete"/>'),
+            self._item("E3", 5, "<message>b</message>"),
+        ]
+        parts = render_timeline_stream(items)
+        self.assertEqual(
+            parts,
+            [
+                '<time when="2026-05-26T14:30:00+08:00">',
+                "<message>a</message>",
+                '<tool-call name="reply" status="complete"/>',
+                "</time>",
+                '<time when="2026-05-26T14:30:05+08:00">',
+                "<message>b</message>",
+                "</time>",
+            ],
+        )
+
+    def test_sub_second_offsets_fold_into_same_node(self) -> None:
+        # timespec=seconds：毫秒差不拆节点（与旧行内 time= 同精度）。
+        items = [
+            self._item("E1", 0.1, "<message>a</message>"),
+            self._item("E2", 0.9, "<message>b</message>"),
+        ]
+        parts = render_timeline_stream(items)
+        self.assertEqual(parts.count("</time>"), 1)
+        self.assertEqual(parts[0], '<time when="2026-05-26T14:30:00+08:00">')
+
+    def test_empty_timeline_renders_nothing(self) -> None:
+        self.assertEqual(render_timeline_stream([]), [])
+
+    def test_every_block_is_closed(self) -> None:
+        items = [
+            self._item("E1", 0, "<message>a</message>"),
+            self._item("E2", 1, "<message>b</message>"),
+            self._item("E3", 1, "<message>c</message>"),
+            self._item("E4", 7, "<message>d</message>"),
+        ]
+        parts = render_timeline_stream(items)
+        opens = sum(1 for p in parts if p.startswith("<time when="))
+        closes = parts.count("</time>")
+        self.assertEqual(opens, 3)
+        self.assertEqual(closes, 3)
+        self.assertEqual(parts[-1], "</time>")
 
 
 if __name__ == "__main__":

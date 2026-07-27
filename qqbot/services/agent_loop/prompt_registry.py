@@ -47,6 +47,15 @@ class RenderedSection:
     name: str
     text: str
 
+
+class PromptSectionMissing(RuntimeError):
+    """必需段（required=True）缺失或为空：部署损坏，fail loudly。
+
+    2026-07-27（待办#17 目标 2 前半）：此前 render 对**所有**异常段静默丢弃，
+    identity / protocol 这类关键段丢了也拿残缺 system prompt 继续跑——正是
+    #17 验收标准点名要堵的"悄悄以残缺 prompt 运行"。voice.md 的 fail-loudly
+    先例（replyer._load_voice_text）推广为 registry 级语义。"""
+
 # source 可以是纯字符串、无参 ``() -> str``、或接受一个 scope 位置参的
 # ``(scope) -> str``（如 ToolRegistry.usage_docs）。render(scope=...) 会按 arity
 # 自动决定是否把 scope 传进去——见 _resolve_source。
@@ -58,6 +67,7 @@ class _Section:
     name: str
     order: int
     source: PromptSource
+    required: bool = False
 
 
 # 段间分隔符。公开导出：llm_planner 用 render_sections() 拿逐段结果后需要
@@ -75,6 +85,8 @@ class PromptRegistry:
         name: str,
         order: int,
         content: PromptSource,
+        *,
+        required: bool = False,
     ) -> None:
         """注册或覆盖一段 prompt。
 
@@ -86,10 +98,17 @@ class PromptRegistry:
             150-299 决策协议（protocol）
             300+    工具用法（每个工具一段，order 内部相对随意）
         - content: 字符串或 () -> str；后者在 render 时才求值
+        - required: True = 关键段。求值抛异常或产出空文本时 render 直接
+          raise（PromptSectionMissing / 原异常），绝不静默丢段跑残缺
+          prompt。source 返回 **None** 表示"本 scope 不适用"，主动跳过，
+          不触发 required——这是 per-scope 条件装配（如 group_chat_rules
+          不进 system scope）的表达通道。
         """
         if not name:
             raise ValueError("section name required")
-        self._sections[name] = _Section(name=name, order=order, source=content)
+        self._sections[name] = _Section(
+            name=name, order=order, source=content, required=required
+        )
 
     def remove(self, name: str) -> None:
         self._sections.pop(name, None)
@@ -107,8 +126,11 @@ class PromptRegistry:
         照常无参调用。``scope=None``（默认）= 不过滤，兼容旧调用。
 
         空 section（求值后 strip 为 ""）忽略；不会产生 `---\n\n---` 这种相邻分隔符。
-        callable 抛异常时该段静默丢弃 —— 启动期 prompt 不应阻断整个 tick，丢失的内容
-        由日志暴露即可。
+        异常/空段的处理按 required 分流（2026-07-27，待办#17 目标 2）：
+        required 段抛异常原样上抛、产出空文本抛 PromptSectionMissing——关键段
+        缺失绝不悄悄以残缺 system prompt 继续运行；非 required 段维持旧语义
+        （静默丢弃 + warning，如逐工具的 usage 文档）。source 返回 None 一律
+        视为"本 scope 不适用"主动跳过，required 亦然。
         """
         return _SECTION_SEP.join(
             sec.text for sec in self.render_sections(scope=scope)
@@ -133,14 +155,21 @@ class PromptRegistry:
             try:
                 text = _resolve_source(sec.source, scope)
             except Exception as exc:
+                if sec.required:
+                    raise
                 logger.warning(
                     "[prompt_registry] section {!r} render failed: {}", sec.name, exc
                 )
                 continue
             if text is None:
+                # None = 本 scope 不适用（条件装配的主动跳过），required 不管。
                 continue
             stripped = str(text).strip()
             if not stripped:
+                if sec.required:
+                    raise PromptSectionMissing(
+                        f"required prompt section {sec.name!r} rendered empty"
+                    )
                 continue
             rendered.append(RenderedSection(name=sec.name, text=stripped))
         return rendered

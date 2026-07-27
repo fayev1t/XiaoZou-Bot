@@ -1,11 +1,42 @@
-"""reply 工具：向当前 scope 追加一条发言授权，或撤掉待发的那份。
+"""reply 工具：当前 scope 唯一的发言入口。
 
-2026-07-24（待办#19）起是 **append-only**：每次调用都是完整、自足的一条授权，
-不引用上一次调用、程序也不做任何合并计算。scope 内仍只有一份 open reply_task
-承载"等到什么时候发"，后续调用 append 上去并把 flush_at 换成自己的（最新一次
-直接获胜，能延长也能缩短）。多条授权怎么综合成一段话，交给 flush 时的
-Replyer——它拿到与 Planner 同权重的完整 timeline，每条授权都以
-``<tool-call name="reply">`` 行留在上面。
+**2026-07-25 参数收敛**：compose 授权的内容从九个结构化槽位收敛成一个自由文本
+`brief`，加一个 `hold_seconds`——普通发言的调用面就是这两个字段，没有第三个。
+
+砍掉的是 `targets[] {message_id, sender_qq, context, guidance}` +
+`gist {situation, intent, facts, avoid, tone}` 那套结构化槽位。它们**从来不
+是机器契约**——程序侧除了一条"compose 不能为空"的兜底之外一个字段都不消费；
+Replyer 需要的是 Planner 的完整判读，而不是固定槽位。既然只是提示词交接形状，
+就该按"能不能帮它把局势讲清楚"评判，而九个槽位在这上面是负分：
+  - `additionalProperties: false` 把辅助维度封死——Planner 想说"这人上周说过
+    讨厌被叫全名"、"接住我上一条的梗"、"别用问句收尾"，没有格子，只能硬塞进
+    `avoid` 或 `tone`，语义降级；
+  - 槽位诱导填充——`gist.situation` 与 `targets[].context` 天然重叠、
+    `intent` 与 `guidance` 天然重叠，一个两句话的判读被切成七份写；
+  - 与 append-only 语义打架——授权是追加的、最新一条为准，但结构化槽位一追加
+    就有"第二条的空 facts 是不是撤销了第一条的"这种歧义，只能靠文档打补丁。
+一段自然语言没有这三个问题：想说几个维度写几个维度，"最新一条为准"也天然成立。
+被回应消息的 message_id 不再单列字段（Replyer 看同一份 timeline，自己认得出，
+要精确锚定就在 brief 里写"回 MSG_42 那条"）。
+
+**`action` 保留，但改成可选**：省略 = 追加一条授权（普通发言的唯一形态），
+`"cancel"` 撤稿，`"verbatim"` 逐字直发。取消的是 `"upsert"` 这个取值——
+2026-07-24 改 append-only 之后它就名不副实了（那之前它真是 upsert：带
+reply_task_id + expected_revision 做 CAS 合并），留着只是让每次正常发言都先
+声明一遍状态机操作，把一个纯粹的表达行为包装成状态迁移。
+
+**为什么不把 cancel / verbatim 拆成独立工具**（2026-07-25 评估后否决）：它们
+确实是另外两件事，但工具是**目录级**的东西——每注册一个，Planner 每拍都要读
+它的 catalog 条目（name/description/arguments_schema）和整段 usage 文档。代价
+不只是 prompt 体积：`verbatim` 本该是"Replyer 挂了才走"的逃生路径，一旦升格成
+与 `reply` 平级的工具，它的显著性就和日常发言一样高，等于主动邀请模型绕过
+Replyer 和角色卡说话。留在 action 分支里，它的可见度才与它应有的使用频率匹配。
+
+授权仍是 **append-only**（2026-07-24，待办#19）：每次调用都是完整、自足的一
+条，不引用上一次、程序也不做任何字段合并。scope 内仍只有一份 open reply_task；
+后续调用 append 新 revision，并让最新 revision 的完整 brief 与 flush_at 直接
+获胜（能延长也能缩短）。旧 revision 留在事件流供审计与 Planner 回看，但 Replyer
+只消费折叠态里的最新 brief，不再做“旧授权未冲突部分继续生效”的隐式语义合并。
 """
 
 from __future__ import annotations
@@ -33,106 +64,103 @@ from qqbot.services.agent_loop.tools.send_message import _validate_content
 _USAGE_PROMPT = load_sibling_md(__file__, "reply.md")
 logger = get_logger(__name__)
 
+MAX_VERBATIM_MESSAGES = 4
+
+# 退役字段：旧形态的调用不静默吃掉，按字段给可读 reason_code，让 Planner 下一
+# 拍照错误自纠（沿用 2026-07-22 `points_replaced_by_context` 的先例）。静默忽略
+# 是最坏的处理——模型会以为那套判读送到了 Replyer，而从 <result> 上看不出异常。
+_BRIEF_HINT = (
+    "targets/gist are retired: write the whole read — what is going on, "
+    "which thread you are entering, how to answer it, what must stay true, "
+    "what must not surface — as one plain-language `brief`"
+)
+_RETIRED_KEYS: dict[str, tuple[str, str]] = {
+    "targets": ("targets_gist_replaced_by_brief", _BRIEF_HINT),
+    "gist": ("targets_gist_replaced_by_brief", _BRIEF_HINT),
+    "points": ("targets_gist_replaced_by_brief", _BRIEF_HINT),
+    "mode": (
+        "mode_replaced_by_action",
+        'there is no mode; exact bytes are action="verbatim"',
+    ),
+    "verbatim_messages": (
+        "verbatim_messages_renamed_to_messages",
+        'exact bytes go in `messages` alongside action="verbatim"',
+    ),
+    "expected_revision": (
+        "expected_revision_removed",
+        "revisions are not CAS-checked; every call appends",
+    ),
+}
+
 
 class ReplyTool(BaseTool):
     name = "reply"
     allowed_scopes = ("group", "private")
     # reply-only 成功批次不应为“草稿已落定”再开一拍；失败仍需让 Planner 看见。
+    # cancel 同理：撤稿后没有 flush 会来，为"我决定不说了"再开一拍只会引诱模型
+    # 立刻改主意重新落稿。
     wake_policy = "on_failure"
     description = (
-        "Append one self-contained authorization to speak, or cancel the "
-        "pending draft. Each call stands alone — never reference an earlier "
-        "call; the newest hold_seconds wins outright. A successful call only "
-        "stores pending intent; it does NOT mean anything was sent. Actual "
-        "speech appears later as <my-reply> after runtime.reply_flushed."
+        "Speak. Normally you pass just two arguments — `brief`, your read of "
+        "the situation and how you want it answered in plain language, and "
+        "`hold_seconds` — and that appends one self-contained authorization "
+        "to this scope's pending draft. Each call stands alone; never "
+        "reference an earlier one; the newest brief and hold_seconds replace "
+        "the previous revision outright. "
+        "A successful call only stores pending intent; it does NOT mean "
+        "anything was sent — actual speech appears later as <my-reply> after "
+        'runtime.reply_flushed. Two rare branches: action="cancel" withdraws '
+        'the pending draft, action="verbatim" sends exact bytes bypassing the '
+        "Replyer (escape hatch — it costs you the account's voice)."
     )
     usage_prompt = _USAGE_PROMPT
     arguments_schema = {
         "type": "object",
         "properties": {
-            "action": {
-                "type": "string",
-                "enum": ["upsert", "cancel"],
-                "description": (
-                    "upsert appends one authorization; cancel withdraws the "
-                    "pending draft entirely."
-                ),
-            },
-            "reply_task_id": {
+            "brief": {
                 "type": "string",
                 "description": (
-                    "cancel only, and optional even there: omit to withdraw "
-                    "whatever draft is pending. Never needed on upsert."
+                    "Free text, no fixed shape and no length target: what is "
+                    "going on in the room, which thread you are entering, "
+                    "what you want said and in what spirit, anything that "
+                    "must stay true, anything that must not surface. The "
+                    "Replyer reads the same timeline you do — hand over your "
+                    "*read* of it, not a relay of its content, and never the "
+                    "final wording."
                 ),
-            },
-            "mode": {
-                "type": "string",
-                "enum": ["compose", "verbatim"],
-                "description": "compose by default; verbatim bypasses Replyer.",
-            },
-            "targets": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "message_id": {"type": ["string", "integer"]},
-                        "sender_qq": {"type": ["string", "integer"]},
-                        "context": {
-                            "type": "string",
-                            "description": (
-                                "Conversation analysis for this message: who "
-                                "is talking to whom and what it means in its "
-                                "thread."
-                            ),
-                        },
-                        "guidance": {
-                            "type": "string",
-                            "description": (
-                                "How to respond: angle, approach, boundaries. "
-                                "Not final wording."
-                            ),
-                        },
-                    },
-                    "required": ["context"],
-                    "additionalProperties": False,
-                },
-            },
-            "gist": {
-                "type": "object",
-                "properties": {
-                    "situation": {
-                        "type": "string",
-                        "description": (
-                            "Map of the room's current conversation threads."
-                        ),
-                    },
-                    "intent": {"type": "string"},
-                    "facts": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "avoid": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "tone": {"type": "string"},
-                },
-                "additionalProperties": False,
             },
             "hold_seconds": {
                 "type": "integer",
                 "minimum": 0,
                 "maximum": MAX_HOLD_SECONDS,
                 "description": (
-                    "Required on upsert — no default. How long to hold this "
-                    "draft before it is composed and sent. The newest call "
-                    "wins outright: it may shorten as well as extend."
+                    "Required when appending — there is no default. How long "
+                    "to hold this draft before it is composed and sent. The "
+                    "newest call wins outright: it may shorten as well as "
+                    'extend. Optional on action="verbatim" (defaults to 0, '
+                    "send now)."
                 ),
             },
-            "verbatim_messages": {
+            "action": {
+                "type": "string",
+                "enum": ["cancel", "verbatim"],
+                "description": (
+                    "Omit it for ordinary speech — that is what this tool "
+                    "does. `cancel` withdraws the pending draft entirely; "
+                    "`verbatim` sends `messages` exactly as written, "
+                    "bypassing the Replyer."
+                ),
+            },
+            "messages": {
                 "type": "array",
                 "minItems": 1,
-                "maxItems": 4,
+                "maxItems": MAX_VERBATIM_MESSAGES,
+                "description": (
+                    'action="verbatim" only: 1-4 messages sent in order, each '
+                    "with OneBot v11 content segments (text / at / reply / "
+                    "face only; a reply segment is at most one and must come "
+                    "first)."
+                ),
                 "items": {
                     "type": "object",
                     "properties": {"content": {"type": "array"}},
@@ -140,28 +168,69 @@ class ReplyTool(BaseTool):
                     "additionalProperties": False,
                 },
             },
+            "reply_task_id": {
+                "type": "string",
+                "description": (
+                    'action="cancel" only, and optional even there: omit to '
+                    "withdraw whatever draft is pending. If given it must "
+                    "match, so a stale id fails loudly instead of silently "
+                    "cancelling a different draft."
+                ),
+            },
         },
-        "required": ["action"],
+        "required": [],
         "additionalProperties": False,
         "allOf": [
             {
-                "if": {
-                    "properties": {"action": {"const": "upsert"}},
-                    "required": ["action"],
+                "if": {"not": {"required": ["action"]}},
+                "then": {
+                    "required": ["brief", "hold_seconds"],
+                    "not": {
+                        "anyOf": [
+                            {"required": ["messages"]},
+                            {"required": ["reply_task_id"]},
+                        ]
+                    },
                 },
-                "then": {"required": ["hold_seconds"]},
             },
             {
                 "if": {
-                    "properties": {"mode": {"const": "verbatim"}},
-                    "required": ["mode"],
+                    "properties": {"action": {"const": "verbatim"}},
+                    "required": ["action"],
                 },
-                "then": {"required": ["verbatim_messages"]},
+                "then": {
+                    "required": ["messages"],
+                    "not": {
+                        "anyOf": [
+                            {"required": ["brief"]},
+                            {"required": ["reply_task_id"]},
+                        ]
+                    },
+                },
+            },
+            {
+                "if": {
+                    "properties": {"action": {"const": "cancel"}},
+                    "required": ["action"],
+                },
+                "then": {
+                    "not": {
+                        "anyOf": [
+                            {"required": ["brief"]},
+                            {"required": ["hold_seconds"]},
+                            {"required": ["messages"]},
+                        ]
+                    }
+                },
             },
         ],
     }
 
     async def execute(self, arguments: dict, **context: Any) -> ToolOutcome:
+        if not isinstance(arguments, dict):
+            return _invalid(
+                "arguments_not_object", "reply arguments must be a JSON object"
+            )
         if fail := await self.enforce_access(context):
             return fail
         scope_key = context.get("scope_key")
@@ -175,10 +244,39 @@ class ReplyTool(BaseTool):
             return ToolOutcome.failure(
                 "internal_tool_error", "reply task persistence is not wired"
             )
+        if fail := _reject_retired(arguments):
+            return fail
+        if fail := _reject_unknown(arguments):
+            return fail
 
         action = arguments.get("action")
-        if action not in ("upsert", "cancel"):
-            return _invalid("bad_action", "action must be upsert or cancel")
+        if "action" in arguments and action not in ("cancel", "verbatim"):
+            if action == "upsert":
+                return _invalid(
+                    "upsert_removed",
+                    "there is no upsert action: omit `action` entirely to "
+                    "append an authorization",
+                )
+            return _invalid(
+                "bad_action", 'action must be omitted, "cancel" or "verbatim"'
+            )
+        if action != "cancel" and "reply_task_id" in arguments:
+            # 带 id 来追加 = 还在用旧的"指名改某一份稿"心智模型。静默忽略会让它
+            # 以为自己精确命中了某份稿，实际是往当前 open 的那份上追加。
+            return _invalid(
+                "reply_task_id_needs_cancel",
+                "reply_task_id only applies to action=\"cancel\"; every other "
+                "call appends to the scope's one pending draft, so there is "
+                "nothing to name",
+            )
+        if action == "cancel":
+            extras = sorted(set(arguments) - {"action", "reply_task_id"})
+            if extras:
+                return _invalid(
+                    "cancel_arguments_not_applicable",
+                    "action=\"cancel\" accepts only optional reply_task_id; "
+                    f"remove: {', '.join(extras)}",
+                )
         async with scope_lock(scope_key):
             if action == "cancel":
                 return await self._cancel(
@@ -188,8 +286,9 @@ class ReplyTool(BaseTool):
                     correlation_id=correlation_id,
                     tool_call_event_id=tool_call_event_id,
                 )
-            return await self._upsert(
+            return await self._append(
                 arguments,
+                verbatim=action == "verbatim",
                 session_factory=session_factory,
                 scope_key=scope_key,
                 correlation_id=correlation_id,
@@ -197,10 +296,11 @@ class ReplyTool(BaseTool):
                 notify=context.get("notify_reply_task"),
             )
 
-    async def _upsert(
+    async def _append(
         self,
         arguments: dict,
         *,
+        verbatim: bool,
         session_factory: Any,
         scope_key: str,
         correlation_id: str,
@@ -214,44 +314,19 @@ class ReplyTool(BaseTool):
         if existing_payload is not None:
             return ToolOutcome.success(_result_from_payload(existing_payload))
 
-        # hold_seconds 无默认值（2026-07-24，待办#19）：等多久是每次调用都要
-        # 现场判断的语义（"这个人说完了没"），给默认值等于替模型做决定——
-        # 曾经的 default 0 就把合并窗口整个关掉了。
-        if "hold_seconds" not in arguments:
-            return _invalid(
-                "missing_hold_seconds",
-                "hold_seconds is required on upsert; there is no default",
-            )
-        hold = _coerce_hold(arguments.get("hold_seconds"))
-        if hold is None:
-            return _invalid(
-                "bad_hold_seconds",
-                f"hold_seconds must be an integer in [0, {MAX_HOLD_SECONDS}]",
-            )
-        mode = arguments.get("mode", "compose")
-        if mode not in ("compose", "verbatim"):
-            return _invalid("bad_mode", "mode must be compose or verbatim")
-        targets, fail = _validate_targets(arguments.get("targets", []))
-        if fail:
-            return fail
-        gist, fail = _validate_gist(arguments.get("gist", {}))
-        if fail:
-            return fail
-        verbatim, fail = _validate_verbatim(
-            arguments.get("verbatim_messages", []), mode
-        )
+        brief, messages, hold, fail = _validate_append(arguments, verbatim)
         if fail:
             return fail
 
         # ─── append-only 授权（2026-07-24，待办#19）───
-        # 每次调用就是一条完整、自足的授权，不引用上一次、不做合并计算：
-        # 模型不再抄 reply_task_id/expected_revision，程序也不再 merge
-        # targets/gist（旧 merge 只增不删，撤不掉写错的 target 与 fact）。
-        # scope 内仍只有一份 open reply_task 承载"等到什么时候发"，后续调用
-        # append 上去、把 flush_at 换成自己的——**最新一次调用直接获胜，能
-        # 延长也能缩短**。内容怎么综合交给 flush 时的 Replyer：它拿的是与
-        # Planner 同权重的完整 timeline，每条授权都以 <tool-call name="reply">
-        # 行留在上面（投影不再折叠 reply 成功行）。
+        # 每次调用就是一条完整、自足的授权，不引用上一次、不做字段合并：
+        # 模型不再抄 reply_task_id/expected_revision，程序也不再 merge 内容
+        # （旧 merge 只增不删，撤不掉写错的判读与事实）。scope 内仍只有一份
+        # open reply_task 承载"等到什么时候发"，后续调用 append 上去、把
+        # flush_at 换成自己的——**最新一次调用直接获胜，能延长也能缩短**。
+        # 最新 revision 的 brief 就是完整当前授权。旧 revision 仍以
+        # <tool-call name="reply"> 留在 Planner timeline 供回看，但 Replyer 从
+        # ReplyTaskState 直接拿最新 brief，避免 tool_result 终态竞态与窗口裁剪。
         now = china_now()
         current = await load_open_reply_task(session_factory, scope_key)
         if current is None:
@@ -259,15 +334,19 @@ class ReplyTool(BaseTool):
             revision = 1
             created_at = now
             hard_deadline = now + timedelta(seconds=MAX_HOLD_SECONDS)
+        elif verbatim or current.mode != "compose":
+            # verbatim 独占：它绕过 Replyer 直发，没有"综合多条授权"可言，
+            # "逐字"语义也不该被别的授权改写。两个方向都拦——挂着 verbatim 时
+            # 后续 append 被拒，挂着 compose 时 verbatim 也不能插进来。
+            return ToolOutcome.failure(
+                "reply_task_locked",
+                "a verbatim draft is exclusive; cancel it first"
+                if current.mode != "compose"
+                else "a draft is already pending; cancel it before sending "
+                "verbatim bytes",
+                reply_task_id=current.reply_task_id,
+            )
         else:
-            # verbatim 独占：它绕过 Replyer 直发，没有"综合多条授权"可言。
-            # 撞上就只能先 cancel 再重落。
-            if current.mode != "compose" or mode != "compose":
-                return ToolOutcome.failure(
-                    "reply_task_locked",
-                    "a verbatim reply_task is exclusive; cancel it first",
-                    reply_task_id=current.reply_task_id,
-                )
             task_id = current.reply_task_id
             revision = current.revision + 1
             created_at = current.created_at
@@ -276,10 +355,6 @@ class ReplyTool(BaseTool):
         # 必须发出去"的硬上界。
         flush_at = min(now + timedelta(seconds=hold), hard_deadline)
 
-        if mode == "compose" and not targets and not gist.get("intent"):
-            return _invalid(
-                "empty_reply_task", "compose reply requires targets or gist.intent"
-            )
         payload = build_upsert_payload(
             reply_task_id=task_id,
             revision=revision,
@@ -287,10 +362,9 @@ class ReplyTool(BaseTool):
             updated_at=now,
             flush_at=flush_at,
             hard_deadline=hard_deadline,
-            mode=mode,
-            targets=targets,
-            gist=gist,
-            verbatim_messages=verbatim,
+            mode="verbatim" if verbatim else "compose",
+            brief=brief,
+            verbatim_messages=messages,
         )
         event_id = await append_upsert(
             session_factory,
@@ -367,6 +441,131 @@ class ReplyTool(BaseTool):
         )
 
 
+def _validate_append(
+    arguments: dict, verbatim: bool
+) -> tuple[str, list[dict], int, ToolOutcome | None]:
+    """append 路径的参数校验：compose 要 brief，verbatim 要 messages。
+
+    两者互斥且都不静默容忍对方的字段——verbatim 绕过 Replyer，写了 brief 也
+    没有任何读者，静默丢掉正是最难被发现的坏法。
+    """
+    if verbatim:
+        if "brief" in arguments:
+            return (
+                "",
+                [],
+                0,
+                _invalid(
+                    "brief_not_applicable",
+                    "verbatim bypasses the Replyer, so nothing reads a brief; "
+                    "put the exact wording in `messages`",
+                ),
+            )
+        messages, fail = _validate_messages(arguments.get("messages"))
+        if fail:
+            return "", [], 0, fail
+        # hold 在 verbatim 上可省、默认 0（立刻发）。等待窗口的用处是让 Replyer
+        # 在 flush 时把这期间的新消息折进来，而逐字直发根本不经 Replyer、字节
+        # 已经定死，多等一秒不会让内容更贴切。
+        if "hold_seconds" not in arguments:
+            return "", messages, 0, None
+        hold = _coerce_hold(arguments.get("hold_seconds"))
+        if hold is None:
+            return "", [], 0, _bad_hold()
+        return "", messages, hold, None
+
+    if "messages" in arguments:
+        return (
+            "",
+            [],
+            0,
+            _invalid(
+                "messages_need_verbatim",
+                'messages only apply to action="verbatim"; ordinary speech '
+                "hands the Replyer a `brief` instead",
+            ),
+        )
+    brief = arguments.get("brief")
+    if not isinstance(brief, str) or not brief.strip():
+        return (
+            "",
+            [],
+            0,
+            _invalid(
+                "bad_brief",
+                "brief must be a non-empty string — say what is going on and "
+                "how you want it answered",
+            ),
+        )
+    # hold_seconds 无默认值（2026-07-24，待办#19）：等多久是每次调用都要现场
+    # 判断的语义（"这个人说完了没"），给默认值等于替模型做决定——曾经的
+    # default 0 就把合并窗口整个关掉了。
+    if "hold_seconds" not in arguments:
+        return (
+            "",
+            [],
+            0,
+            _invalid(
+                "missing_hold_seconds",
+                "hold_seconds is required; there is no default",
+            ),
+        )
+    hold = _coerce_hold(arguments.get("hold_seconds"))
+    if hold is None:
+        return "", [], 0, _bad_hold()
+    return brief.strip(), [], hold, None
+
+
+def _validate_messages(raw: Any) -> tuple[list[dict], ToolOutcome | None]:
+    """1..4 条，每条的 content 走 send_message 的严格段校验（text/at/reply/
+    face，reply 段至多一个且必须首位）。"""
+    if not isinstance(raw, list) or not raw:
+        return [], _invalid(
+            "empty_messages", 'action="verbatim" requires at least one message'
+        )
+    if len(raw) > MAX_VERBATIM_MESSAGES:
+        return [], _invalid(
+            "too_many_messages",
+            f"at most {MAX_VERBATIM_MESSAGES} verbatim messages",
+        )
+    out: list[dict] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            return [], _invalid(
+                "bad_message", f"messages[{index}] must be an object"
+            )
+        extras = sorted(set(item) - {"content"})
+        if extras:
+            return [], _invalid(
+                "unexpected_message_argument",
+                f"messages[{index}] accepts only content; remove: "
+                f"{', '.join(extras)}",
+            )
+        content = item.get("content")
+        if fail := _validate_content(content):
+            return [], fail
+        out.append({"content": content})
+    return out, None
+
+
+def _reject_retired(arguments: dict) -> ToolOutcome | None:
+    for key, (reason_code, message) in _RETIRED_KEYS.items():
+        if key in arguments:
+            return _invalid(reason_code, f"reply.{key} is retired: {message}")
+    return None
+
+
+def _reject_unknown(arguments: dict) -> ToolOutcome | None:
+    known = {"action", "brief", "hold_seconds", "messages", "reply_task_id"}
+    extras = sorted(set(arguments) - known)
+    if not extras:
+        return None
+    return _invalid(
+        "unexpected_argument",
+        f"reply received unknown argument(s): {', '.join(extras)}",
+    )
+
+
 def _coerce_hold(raw: Any) -> int | None:
     if isinstance(raw, bool):
         return None
@@ -378,88 +577,11 @@ def _coerce_hold(raw: Any) -> int | None:
     return None
 
 
-def _validate_targets(raw: Any) -> tuple[list[dict], ToolOutcome | None]:
-    """2026-07-22 语义换代：points（要点清单，"教 Replyer 说什么"）→
-    context + guidance（对话关系分析 + 回法，"教 Replyer 怎么回"）。
-    Replyer 已与 Planner 看同一份 timeline，不需要转述内容；旧 points 形态
-    直接拒绝并给出可读 reason_code，让 Planner 下一拍照错误自纠。"""
-    if not isinstance(raw, list):
-        return [], _invalid("bad_targets", "targets must be an array")
-    out: list[dict] = []
-    for index, item in enumerate(raw):
-        if not isinstance(item, dict):
-            return [], _invalid("bad_target", f"targets[{index}] must be an object")
-        if "points" in item:
-            return [], _invalid(
-                "points_replaced_by_context",
-                f"targets[{index}].points is retired: describe the "
-                "conversation in `context` and how to respond in `guidance`",
-            )
-        context_val = item.get("context")
-        if not isinstance(context_val, str) or not context_val.strip():
-            return [], _invalid(
-                "bad_target_context",
-                f"targets[{index}].context must be a non-empty string",
-            )
-        normalized: dict[str, Any] = {"context": context_val.strip()}
-        guidance = item.get("guidance")
-        if guidance is not None and not isinstance(guidance, str):
-            return [], _invalid(
-                "bad_target_guidance",
-                f"targets[{index}].guidance must be a string",
-            )
-        if isinstance(guidance, str) and guidance.strip():
-            normalized["guidance"] = guidance.strip()
-        for key in ("message_id", "sender_qq"):
-            value = item.get(key)
-            if value is not None:
-                normalized[key] = str(value)
-        out.append(normalized)
-    return out, None
-
-
-def _validate_gist(raw: Any) -> tuple[dict, ToolOutcome | None]:
-    if not isinstance(raw, dict):
-        return {}, _invalid("bad_gist", "gist must be an object")
-    out: dict[str, Any] = {}
-    for key in ("situation", "intent", "tone"):
-        value = raw.get(key)
-        if value is not None and not isinstance(value, str):
-            return {}, _invalid("bad_gist", f"gist.{key} must be a string")
-        if isinstance(value, str) and value.strip():
-            out[key] = value.strip()
-    for key in ("facts", "avoid"):
-        value = raw.get(key, [])
-        if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
-            return {}, _invalid("bad_gist", f"gist.{key} must be an array of strings")
-        out[key] = [v.strip() for v in value if v.strip()]
-    return out, None
-
-
-def _validate_verbatim(raw: Any, mode: str) -> tuple[list[dict], ToolOutcome | None]:
-    if mode == "compose":
-        if raw not in (None, []):
-            return [], _invalid(
-                "verbatim_not_applicable",
-                "compose mode cannot include verbatim_messages",
-            )
-        return [], None
-    if not isinstance(raw, list) or not raw:
-        return [], _invalid("empty_verbatim", "verbatim mode requires messages")
-    if len(raw) > 4:
-        return [], _invalid("too_many_messages", "at most 4 verbatim messages")
-    out: list[dict] = []
-    for index, item in enumerate(raw):
-        if not isinstance(item, dict):
-            return [], _invalid(
-                "bad_verbatim",
-                f"verbatim_messages[{index}] must be an object",
-            )
-        content = item.get("content")
-        if fail := _validate_content(content):
-            return [], fail
-        out.append({"content": content})
-    return out, None
+def _bad_hold() -> ToolOutcome:
+    return _invalid(
+        "bad_hold_seconds",
+        f"hold_seconds must be an integer in [0, {MAX_HOLD_SECONDS}]",
+    )
 
 
 def _invalid(reason_code: str, message: str) -> ToolOutcome:
@@ -474,6 +596,8 @@ def _invalid(reason_code: str, message: str) -> ToolOutcome:
 
 
 def _result_from_payload(payload: dict) -> dict:
+    """成功结果 = 这份稿的身份与调度事实。**永远没有 message_id**——落稿不是
+    发言，真发出去了只体现在后续 runtime.reply_flushed 折出的 <my-reply>。"""
     return {
         "reply_task_id": payload.get("reply_task_id"),
         "revision": payload.get("revision"),

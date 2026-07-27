@@ -37,21 +37,18 @@ from qqbot.services.agent_loop.prompt_snapshot import (
 logger = get_logger(__name__)
 
 # 描述上限（字符）。收藏夹整体进 prompt（MAX_SAVED_MEMES 条），单条必须短；
-# prompt 里要求 ≤120 字，这里再硬截兜底。
+# prompt 里要求 ≤150 字（2026-07-27 起，给使用场景留篇幅），这里再硬截兜底。
 MAX_DESCRIPTION_CHARS = 300
 
-# 看图写描述的专用 prompt：只描述、不寒暄、限长。描述要同时可"检索"（画面/
-# 文字）与可"使用"（情绪/场景）——meme.send 选图时模型只看这段文本。
-# 收藏夹是全 bot 共享的（meme_store 全局收藏），描述会出现在收录时所在会话
-# 之外的聊天里，因此要求自包含：附注里只有特定群才懂的背景要概括成通用场景，
-# 不写死"本群/群友名"这类离开原群就失效的指代。
-CAPTION_PROMPT = (
-    "你在为 QQ 群机器人的表情包收藏夹写检索描述。看图输出一段不超过 120 字的"
-    "中文描述，依次覆盖：画面内容（角色/动作/构图），图上文字（原样抄录，无则"
-    "不提），情绪与语气，适合发出来的聊天场景。这份收藏夹会在多个聊天里使用，"
-    "描述必须自包含：不要依赖只有某个群才懂的背景，附注里的群内梗请概括成"
-    "通用的使用场景。只输出描述本身，不要任何前缀、引号、换行或解释。"
-)
+# 看图写描述的专用 prompt 2026-07-27 外置为 prompts/meme_caption.md（收口，
+# 段目录见 prompts/catalog.py）：只描述、不寒暄、限长；描述要同时可"检索"
+# （画面/文字）与可"使用"（情绪/场景）——meme.send 选图时模型只看这段文本，
+# 且收藏夹全 bot 共享，描述必须自包含。required 段：文件缺失/为空时上抛，
+# caption_image 折成 CaptionError（收藏失败、不落表），不静默用空指令看图。
+def _load_caption_prompt() -> str:
+    from qqbot.services.agent_loop.prompts.catalog import render_system_prompt
+
+    return render_system_prompt("caption")
 
 # caption 用低温：同一张图的描述应当稳定，不需要发散。
 _CAPTION_TEMPERATURE = 0.2
@@ -89,7 +86,12 @@ async def caption_image(
 
     from langchain_core.messages import HumanMessage
 
-    prompt = CAPTION_PROMPT
+    try:
+        prompt = _load_caption_prompt()
+    except Exception as exc:
+        raise CaptionError(
+            f"caption prompt asset missing: {type(exc).__name__}: {exc}"
+        ) from exc
     if context_note:
         prompt += f"\n收藏者附注（聊天语境，据实融进描述）：{context_note}"
     b64 = base64.b64encode(image_bytes).decode("ascii")

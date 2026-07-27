@@ -75,10 +75,13 @@ _PENDING_QUERY = text(
           WHERE d.causation_id = r.event_id
             AND d.type IN ('agent.tool_result', 'agent.tool_failed')
       )
-    ORDER BY r.occurred_at ASC
+    ORDER BY r.occurred_at ASC, r.event_id ASC
     LIMIT 100
     """
 )
+# ↑ event_id（ULID 单调）做第二排序键：同拍动作事件的 occurred_at 统一回填为
+# 投影时刻（loop._apply_actions，2026-07-27）后时间戳相同，认领次序退化为不
+# 定序；ULID 恢复写入相对顺序。
 
 # 批次收口判定：该批次已落库的 tool_called 总数 + 其中已有 terminal
 # （tool_result/tool_failed）配对的条数。收口条件 = terminal == called 且

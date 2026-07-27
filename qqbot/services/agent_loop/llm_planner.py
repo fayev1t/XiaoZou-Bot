@@ -48,6 +48,7 @@ from qqbot.services.agent_loop.projection import (
     _esc_attr,
     _esc_text,
     _safe_json,
+    render_timeline_stream,
 )
 from qqbot.services.agent_loop.prompt_registry import (
     SECTION_SEP,
@@ -65,75 +66,29 @@ from qqbot.services.agent_loop.tool_registry import ToolRegistry
 logger = get_logger(__name__)
 
 
-# 默认 prompt section order 约定（PromptRegistry 文档 §register）：
-#   0   identity           机器身份：决策引擎操作一个 QQ 账号（无人格层）
-#   50  xml_format         输入 XML 信封语法与读法
-#   100 group_chat_rules   参与规则（什么时候有理由落 reply_task）
-#   150 protocol           决策协议（任务状态机、JSON 输出规则）
-#   300 tools_usage        每个已注册工具的 sibling .md 汇总
-#
-# 逻辑递进：你是什么 → 你怎么读输入 → 什么时候需要发言 → 你怎么决定 →
-# 你能调什么工具
-#
-# 人格（小奏角色卡）不进 Planner；Replyer 在最终组稿时单独加载。
-SECTION_IDENTITY = "identity"
-SECTION_XML_FORMAT = "xml_format"
-SECTION_PROTOCOL = "protocol"
-SECTION_GROUP_CHAT_RULES = "group_chat_rules"
-SECTION_TOOLS_USAGE = "tools_usage"
+# Planner 五段（identity / xml_format / group_chat_rules / protocol /
+# tools_usage）的段目录、order 约定与装配单 2026-07-27 起收口在
+# prompts/catalog.py —— 逻辑递进不变：你是什么 → 你怎么读输入 → 什么时候
+# 需要发言 → 你怎么决定 → 你能调什么工具。人格（小奏角色卡）不进 Planner，
+# 该红线在 catalog 里是结构性校验，不再只靠注释。
+
 
 def build_default_prompt_registry(
     *,
     tool_registry: ToolRegistry | None = None,
 ) -> PromptRegistry:
-    """v2 默认 system prompt 装配。
+    """v2 默认 system prompt 装配 —— 委托 prompts/catalog.py（2026-07-27 收口）。
 
-    各段从对应 .md 文件懒加载，缺失即静默跳过（PromptRegistry render 会
-    忽略空 section）。tools_usage 在 render 时才遍历 ToolRegistry，新增 /
-    下架工具立即生效，无需重启 planner。reply 的机械用法走 tools_usage；
-    小奏角色卡只由 Replyer 消费。
+    段目录、装配单、分层红线（persona 不进 Planner 等）与 required 失败
+    语义全部住在 catalog；这里只是 Planner 侧的兼容入口。各段仍是 render
+    时才读盘：改 .md 即生效、新增/下架工具立即反映，均与收口前一致。
+    关键段（identity / xml_format / group_chat_rules / protocol）缺失或为
+    空现在 fail loudly（待办#17 目标 2），不再静默跳过；逐工具 usage 文档
+    维持降级 + warning。
     """
-    from qqbot.services.agent_loop import prompts as prompts_pkg
-    from qqbot.services.agent_loop.prompts import load_sibling_md
+    from qqbot.services.agent_loop.prompts.catalog import build_registry
 
-    anchor = prompts_pkg.__file__  # qqbot/services/agent_loop/prompts/__init__.py
-
-    registry = PromptRegistry()
-
-    registry.register(
-        SECTION_IDENTITY,
-        0,
-        lambda: load_sibling_md(anchor, "identity.md"),
-    )
-    registry.register(
-        SECTION_XML_FORMAT,
-        50,
-        lambda: load_sibling_md(anchor, "xml_format.md"),
-    )
-    # 参与规则只对有聊天面的 scope 有意义；system loop（审批请求）不渲染，
-    # 少一段无关噪音。arity-1 callable：PromptRegistry.render(scope=...) 会把
-    # scope 传进来（scope=None 的旧调用不过滤，照常渲染）。
-    registry.register(
-        SECTION_GROUP_CHAT_RULES,
-        100,
-        lambda scope=None: ""
-        if scope == "system"
-        else load_sibling_md(anchor, "group_chat_rules.md"),
-    )
-    registry.register(
-        SECTION_PROTOCOL,
-        150,
-        lambda: load_sibling_md(anchor, "protocol.md"),
-    )
-
-    if tool_registry is not None:
-        registry.register(
-            SECTION_TOOLS_USAGE,
-            300,
-            tool_registry.usage_docs,
-        )
-
-    return registry
+    return build_registry("planner", tool_registry=tool_registry)
 
 
 class LLMPlanner:
@@ -367,7 +322,10 @@ def _render_input_xml(
           <meme hash="..." saved_at="...">描述</meme>
         </saved-memes>                                  (有收藏才出)
         <timeline>
-          {item.render \n item.render ...}
+          <time when="...">
+            {item.render ...}           (同秒的行共享一个时刻节点)
+          </time>
+          ...
         </timeline>
         <active-tasks>
           <task task_id="..." state="..." description="...">
@@ -468,9 +426,9 @@ def _render_input_xml(
         parts.append("</saved-memes>")
 
     parts.append("<timeline>")
-    # 每条 item.render 单独占一行，纯字符串拼接已足够；不再 JSON 包装。
-    for item in context.timeline:
-        parts.append(item.render)
+    # 时间流渲染：行按同秒分组嵌进 <time when="…"> 时刻节点，行内无时间
+    # 属性（render_timeline_stream，时间流契约 2026-07-26）。
+    parts.extend(render_timeline_stream(context.timeline))
     parts.append("</timeline>")
 
     # active-tasks 在 timeline 之后：任务活跃期它逐拍变（pending_tool_call_ids

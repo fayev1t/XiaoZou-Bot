@@ -65,6 +65,10 @@ def build_default_registry() -> ToolRegistry:
     # 即可，无需改别处。（respond_to_request 已于 2026-07-03 拆分删除，见下。）
     registry = ToolRegistry()
     # ── 基础能力（当前在用）──
+    # reply：唯一发言入口。2026-07-25 参数收敛成 brief + hold_seconds，撤稿与
+    # 逐字直发留在 action 分支里——曾评估拆成三个工具，因每个工具都要占一条
+    # catalog 条目 + 整段 usage 文档，会把"Replyer 挂了才走"的 verbatim 逃生
+    # 路径抬到与日常发言同等显著，故否决（见 reply.py docstring）。
     registry.register(ReplyTool())
     # wait：模型的时间自主权（自我延迟唤醒），2026-07-02 新增。
     registry.register(WaitTool())

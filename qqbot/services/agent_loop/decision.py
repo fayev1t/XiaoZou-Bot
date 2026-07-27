@@ -152,9 +152,10 @@ class MemeView:
 
 
 # PendingReplyView 已于 2026-07-24 删除（待办#19）：它是 <pending-reply> 段的
-# 载体，而那一段的每个字段都被 timeline 上的 <tool-call name="reply"> 行覆盖
-# （调度字段在 <result>、内容在 <args>）。reply 成功行不再折叠后，独立状态区
-# 属于重复渲染，一并撤掉。
+# 载体，而 Planner 所需的每个字段都被 timeline 上的
+# <tool-call name="reply"> 行覆盖（调度字段在 <result>、内容在 <args>）。
+# Replyer 不复用这个有界投影视图取当前授权；ReplyExecutor 另把 reply_task
+# 折叠出的最新 brief 注入其专用信封。
 
 
 @dataclass(frozen=True)
@@ -242,8 +243,9 @@ class DecisionContext:
 
     timeline: list[TimelineItem] = field(default_factory=list)
     active_tasks: list[TaskView] = field(default_factory=list)
-    # 2026-07-24 起没有 pending_reply 字段（待办#19）：待发稿的调度状态与内容
-    # 都在 timeline 的 <tool-call name="reply"> 行上，不再另立状态区。
+    # 2026-07-24 起 Planner context 没有 pending_reply 字段（待办#19）：待发稿
+    # 的调度状态与历史调用都在 timeline 的 <tool-call name="reply"> 行上。
+    # Replyer 的当前 brief 来自独立 ReplyTaskState，不经过 DecisionContext 字段。
 
     # ─── 表情包收藏夹（meme 管收藏；Replyer 在 flush 时决定是否发送）───
     # 全局共享的 agent_memes（2026-07-06 起全 bot 一份，created_at 倒序、

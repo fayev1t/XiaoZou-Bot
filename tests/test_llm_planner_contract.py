@@ -88,9 +88,7 @@ class LLMPlannerContractTest(unittest.TestCase):
         body = (
             '{"reasoning":"hi","actions":[{"type":"call_tool",'
             '"tool_name":"reply",'
-            '"arguments":{"action":"upsert","targets":[{"message_id":"M1",'
-            '"points":["回答问题"]}],"gist":{"intent":"答复"},'
-            '"hold_seconds":8}}]}'
+            '"arguments":{"brief":"他在问我，答复他","hold_seconds":8}}]}'
         )
         llm = _StubLLM(response_content=body)
         planner = LLMPlanner(llm_client=llm)
@@ -388,8 +386,11 @@ class LLMPlannerContractTest(unittest.TestCase):
 
         # 按工具名分段的标题
         self.assertIn("## Tool: reply", content)
-        self.assertIn("short-lived `reply_task`", content)
-        self.assertIn("successful tool result means **pending**, not sent", content)
+        # 锚点随 reply.md 的现行措辞（f46aa3c 参数收敛时改写了原
+        # "short-lived `reply_task`; a successful tool result means…" 一句，
+        # 本测试当时漏更，2026-07-27 补上）：
+        self.assertIn("short-lived draft", content)
+        self.assertIn("successful result means **pending**, not sent", content)
         self.assertNotIn("## Tool: send_message", content)
 
     def test_system_prompt_includes_tool_usage_docs(self) -> None:
@@ -932,14 +933,15 @@ class EnvelopeSelfMemoryTests(unittest.TestCase):
         self.assertFalse(hasattr(DecisionContext, "last_reasoning"))
 
     def test_my_thought_timeline_rows_pass_through_envelope(self) -> None:
-        # 思考行是普通 TimelineItem：planner 原样拼进 <timeline>，无需特殊处理
+        # 思考行是普通 TimelineItem：planner 按时间流包进 <time when="…">
+        # 节点后原样嵌入（render_timeline_stream，时间流契约 2026-07-26）
         from dataclasses import replace
 
         row = TimelineItem(
             event_id="D1",
             occurred_at=china_now(),
             kind="my_thought",
-            render='<my-thought time="2026-07-06T12:00:00+08:00">先观望</my-thought>',
+            render="<my-thought>先观望</my-thought>",
         )
         llm = _StubLLM(
             response_content='{"actions":[{"type":"idle","reason":"x"}]}'
@@ -947,8 +949,8 @@ class EnvelopeSelfMemoryTests(unittest.TestCase):
         planner = LLMPlanner(llm_client=llm)
         asyncio.run(planner.decide(replace(_ctx(), timeline=[row])))
         xml = llm.invocations[0][1].content[0]["text"]
-        self.assertIn("<my-thought time=", xml)
-        self.assertIn("先观望", xml)
+        self.assertIn('<time when="', xml)
+        self.assertIn("<my-thought>先观望</my-thought>", xml)
 
     def test_validation_feedback_rendered_on_retry_context(self) -> None:
         xml = self._render_with(
@@ -1066,7 +1068,7 @@ class PendingReplySectionRemovedTests(unittest.TestCase):
 
     它的每个字段都被 timeline 上的 `<tool-call name="reply">` 行逐字段覆盖
     （reply_task_id / revision / flush_at / hard_deadline 在 `<result>` 里，
-    mode / targets / gist 在 `<args>` 里）。reply 成功行不再折叠之后，独立
+    brief / hold_seconds 在 `<args>` 里）。reply 成功行不再折叠之后，独立
     状态区就是重复渲染，一并撤掉；顺带撤掉了信封里变化最频繁的那一段
     （每次落稿都变、创建/flush 时整段出现消失），`</active-tasks>` 到
     `<current/>` 之间不再有缓存抖动源。

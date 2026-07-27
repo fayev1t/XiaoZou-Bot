@@ -23,7 +23,6 @@ import asyncio
 import unittest
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
 
 from qqbot.services.agent_loop import (
     AgentLoop,
@@ -157,6 +156,36 @@ class _SlowIdlePlanner:
         return DecisionOutput(actions=[IdleAction(reason="slow-planner")])
 
 
+class _SlowCallToolPlanner:
+    """模拟 LLM 往返后产出动作的拍：睡完 DELAY 返回 create_task + call_tool。
+
+    用来断言 _apply_actions 派生的动作事件（task_created / tool_called /
+    自动推进的 task_state_changed）与 decision_emitted 同步回填投影时刻。
+    """
+
+    DELAY = 0.15
+
+    async def decide(self, context: Any) -> Any:
+        from qqbot.services.agent_loop import (
+            CallToolAction,
+            CreateTaskAction,
+            DecisionOutput,
+        )
+
+        _ = context
+        await asyncio.sleep(self.DELAY)
+        return DecisionOutput(
+            actions=[
+                CreateTaskAction(description="慢拍任务", task_ref="ref-1"),
+                CallToolAction(
+                    tool_name="reply",
+                    arguments={"brief": "x", "hold_seconds": 0},
+                    task_ref="ref-1",
+                ),
+            ]
+        )
+
+
 class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
     async def test_single_wake_produces_idle_tick_event_chain(self) -> None:
         captured: list[Any] = []
@@ -240,6 +269,54 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
         # 说明上面的 <= 不是"planner 快到看不出差别"蒙对的。
         self.assertGreaterEqual(
             (ended - decision).total_seconds(), _SlowIdlePlanner.DELAY
+        )
+        # idle_decision 属同拍动作事件，与 decision 同步回填（2026-07-27）。
+        idle = by_type["agent.idle_decision"]["occurred_at"]
+        self.assertEqual(idle, decision)
+
+    async def test_action_timestamps_are_tick_start_not_write_time(self) -> None:
+        """_apply_actions 派生的动作事件（task_created / tool_called / 自动
+        推进的 task_state_changed）occurred_at = 本拍投影时刻（2026-07-27，
+        补齐待办清单#18 的另一半）。
+
+        #18 只回填了 decision_emitted：<my-thought> 行归位了，但真正携带授权
+        内容的 <tool-call> 行仍取写入时刻，LLM 往返期间到达的消息排在它之前
+        ——下一拍 Planner 与 Replyer（折入条款以授权行位置为参照）都把没进
+        本拍 context 的消息读成"落稿前已看过、有意不接"，连发的后续消息就此
+        既不被补授权也不被折入。行位置是"处理过没有"的唯一判据（unseen 已
+        删），因此动作事件必须与 decision 同锚。
+        """
+        captured: list[Any] = []
+        loop = AgentLoop(
+            scope_key="group:12345",
+            planner=_SlowCallToolPlanner(),
+            session_factory=_factory_for(captured),
+        )
+        loop.start()
+        loop.wake()
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if len(captured) >= 6:
+                break
+        await loop.stop()
+
+        by_type = {
+            _values_of(stmt).get("type"): _values_of(stmt) for stmt in captured
+        }
+        started = by_type["runtime.tick_started"]["occurred_at"]
+        decision = by_type["agent.decision_emitted"]["occurred_at"]
+        ended = by_type["runtime.tick_ended"]["occurred_at"]
+        for event_type in (
+            "agent.task_created",
+            "agent.tool_called",
+            "agent.task_state_changed",
+        ):
+            action_at = by_type[event_type]["occurred_at"]
+            self.assertEqual(action_at, decision, event_type)
+            self.assertLessEqual(action_at, started, event_type)
+        # 反证 planner 确实慢过一拍（同 decision 测试的护栏语义）。
+        self.assertGreaterEqual(
+            (ended - decision).total_seconds(), _SlowCallToolPlanner.DELAY
         )
 
     async def test_loop_idle_when_not_waked(self) -> None:

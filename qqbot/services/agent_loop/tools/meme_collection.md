@@ -67,7 +67,7 @@ is the only way to fix it.
 
 Do not look for a meme-send action and do not choose a send hash. You cannot
 send an image from here, and picking one is not your call. If you want a reply
-to land as a meme rather than as words, say so in the `reply` task's `gist.tone`
-or in the target's `guidance`, in plain language — the composer reads it, weighs
-it against the latest timeline and the collection, and makes the final call
-once, when that task flushes.
+to land as a meme rather than as words, say so in plain language inside that
+`reply` call's `brief` — the composer reads it, weighs it against the latest
+timeline and the collection, and makes the final call once, when that task
+flushes.
