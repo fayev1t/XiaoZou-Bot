@@ -8,6 +8,9 @@ XML 信封、timeline 行原样嵌入、身份属性与 <agent-input> 同名同�
 （ReplyerMemeGuidanceTests）：发送决策权归 Replyer 之后，判据只能长在这两处。
 同日新增 ReplyerPersonhoodTests，钉住角色卡的存在层（voice.md §关于人的
 存在）：人格必须是第一人称的前提，不是"在群友眼里"的观感。
+
+2026-07-29 新增 ReplyerQuoteSegmentTests：引用（reply 段）与表情包同类，
+是 Replyer 自主决定的表达形态，判据必须在场，否则模型按先验条条挂引用。
 """
 
 from __future__ import annotations
@@ -180,6 +183,40 @@ class ReplyerMemeGuidanceTests(unittest.TestCase):
         self.assertIn("小奏", prompt)
         # 人格层的表情包动机段（voice.md §表情包）也必须随卡片进来。
         self.assertIn("表情包对你不是装饰", prompt)
+
+
+class ReplyerQuoteSegmentTests(unittest.TestCase):
+    """引用（OneBot reply 段）的使用判据（2026-07-29 新增）。
+
+    2026-07-28 把 quote/@ 形态从 Planner 手里划归 Replyer + voice.md 之后，
+    voice.md 里一个字都没写过引用——"自主决定"落地就是没有判据的自由发挥，
+    模型回落到"明确指向最安全"的先验，几乎条条挂引用。同时 replyer.md 里
+    reply 段的曝光全在读入语义与输出格式上（"optional, at most one, and
+    first" 是格式约束，被读成标配槽位），analysis 点名 message id 又被读成
+    "请引用这条"。本类钉住补上的三处：判据长在角色卡、格式清单不是槽位、
+    analysis 里的 id 只是指针。
+    """
+
+    def _prompt(self) -> str:
+        return _build_system_prompt()
+
+    def test_voice_card_states_when_a_quote_is_warranted(self) -> None:
+        prompt = self._prompt()
+        # 判据只能长在角色卡（表达形态归 Replyer 自己），且是"默认不挂"。
+        self.assertIn("引用和 @ 不是礼貌，是定位手段", prompt)
+        self.assertIn("默认一条都不挂", prompt)
+
+    def test_segment_list_is_not_read_as_a_slot_to_fill(self) -> None:
+        prompt = self._prompt()
+        self.assertIn("not a set of slots to fill", prompt)
+        # 格式约束本身仍在（至多一个、必须首位），只是不再是唯一的一句话。
+        self.assertIn("at most one, and first", prompt)
+
+    def test_analysis_message_id_is_a_pointer_not_a_quote_request(self) -> None:
+        prompt = self._prompt()
+        self.assertIn("never a request to attach a quote segment", prompt)
+        # 旧措辞不得残留：它把"点了 id"和"去引用"直接连在一起。
+        self.assertNotIn("when you actually quote, copy the id", prompt)
 
 
 class ReplyerAuthorizationTests(unittest.TestCase):
