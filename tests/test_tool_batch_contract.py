@@ -90,13 +90,15 @@ def _values_of(stmt: Any) -> dict:
 
 
 class _RecordingLoop:
-    """替身 AgentLoop：只数 wake 次数。"""
+    """替身 AgentLoop：数 wake 次数，并记下每次是否走了攒批窗口。"""
 
     def __init__(self) -> None:
         self.wakes = 0
+        self.immediate_flags: list[bool] = []
 
-    def wake(self) -> None:
+    def wake(self, *, immediate: bool = False) -> None:
         self.wakes += 1
+        self.immediate_flags.append(immediate)
 
     async def stop(self) -> None:
         return None
@@ -121,6 +123,19 @@ class SupervisorBatchWakeTests(unittest.IsolatedAsyncioTestCase):
         sup, fake = self._supervisor_with_fake_loop("group:1")
         await sup.notify_tool_batch_completed("group:1", "B1")
         self.assertEqual(fake.wakes, 1)
+
+    async def test_batch_completed_wake_bypasses_debounce(self) -> None:
+        """2026-07-28 攒批窗口：批次收口的唤醒必须 immediate。工具结果已经
+        落库、模型正等着看，窗口里没有任何可攒的东西，等它纯属白加延迟。"""
+        sup, fake = self._supervisor_with_fake_loop("group:1")
+        await sup.notify_tool_batch_completed("group:1", "B1")
+        self.assertEqual(fake.immediate_flags, [True])
+
+    async def test_plain_supervisor_wake_goes_through_window(self) -> None:
+        """反过来：普通的消息唤醒**不**走 immediate，否则窗口形同虚设。"""
+        sup, fake = self._supervisor_with_fake_loop("group:1")
+        await sup.wake("group:1")
+        self.assertEqual(fake.immediate_flags, [False])
 
     async def test_latch_interfaces_removed(self) -> None:
         # 2026-07-02 门闩拆除：上闩/查闩接口不得复活（防止有人把程序级
@@ -164,7 +179,7 @@ class AgentLoopNoBatchGateTests(unittest.IsolatedAsyncioTestCase):
             supervisor=sup,
         )
         loop.start()
-        loop.wake()
+        loop.wake(immediate=True)
         for _ in range(50):
             await asyncio.sleep(0.01)
             if len(captured) >= 4:
@@ -197,7 +212,7 @@ class AgentLoopNoBatchGateTests(unittest.IsolatedAsyncioTestCase):
             supervisor=sup,
         )
         loop.start()
-        loop.wake()
+        loop.wake(immediate=True)
         for _ in range(80):
             await asyncio.sleep(0.01)
             types = [_values_of(stmt).get("type") for stmt in captured]

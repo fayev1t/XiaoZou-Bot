@@ -106,7 +106,7 @@ async def _run_one_tick(planner: _StaticPlanner, scope_key: str) -> list[Any]:
         session_factory=_factory_for(captured),
     )
     loop.start()
-    loop.wake()
+    loop.wake(immediate=True)
     # Give the tick room to complete.
     for _ in range(80):
         await asyncio.sleep(0.01)

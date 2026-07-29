@@ -15,6 +15,8 @@ Also verifies:
 - EventIngest.wake is dispatched to supervisor on inserted external events
   and not dispatched for private / no-mapper events.
 - scope_key parser handles all three scopes.
+- 唤醒攒批窗口（2026-07-28）：默认 wake() 等安静后才开拍，一串唤醒并成一拍，
+  immediate=True 绕过窗口，持续刷屏被 max delay 兜住。
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ import asyncio
 import unittest
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 from qqbot.services.agent_loop import (
     AgentLoop,
@@ -195,7 +198,7 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
             session_factory=_factory_for(captured),
         )
         loop.start()
-        loop.wake()
+        loop.wake(immediate=True)
         # 给 tick 一点时间跑完
         for _ in range(50):
             await asyncio.sleep(0.01)
@@ -247,7 +250,7 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
             session_factory=_factory_for(captured),
         )
         loop.start()
-        loop.wake()
+        loop.wake(immediate=True)
         for _ in range(200):
             await asyncio.sleep(0.01)
             if len(captured) >= 4:
@@ -293,7 +296,7 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
             session_factory=_factory_for(captured),
         )
         loop.start()
-        loop.wake()
+        loop.wake(immediate=True)
         for _ in range(200):
             await asyncio.sleep(0.01)
             if len(captured) >= 6:
@@ -348,7 +351,7 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
             bot_user_id_resolver=_resolver,
         )
         loop.start()
-        loop.wake()
+        loop.wake(immediate=True)
         for _ in range(50):
             await asyncio.sleep(0.01)
             if call_count["n"] >= 1:
@@ -372,7 +375,7 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
             bot_user_id_resolver=_broken_resolver,
         )
         loop.start()
-        loop.wake()
+        loop.wake(immediate=True)
         for _ in range(50):
             await asyncio.sleep(0.01)
             if len(captured) >= 4:
@@ -383,6 +386,113 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
         types = [_values_of(stmt).get("type") for stmt in captured]
         self.assertIn("runtime.tick_started", types)
         self.assertIn("runtime.tick_ended", types)
+
+
+class WakeDebounceTests(unittest.IsolatedAsyncioTestCase):
+    """唤醒攒批窗口（2026-07-28）。
+
+    存在的理由不是省 tick —— asyncio.Event 早就能把"上一拍还在跑"期间的多次
+    唤醒并成一次。堵的是 loop **空闲**时第一条消息立刻开拍这个洞：QQ 上一句话
+    拆成三条发是常态，不等一等就会对着半截话表态。
+
+    窗口值用 patch 压到毫秒级跑，避免测试挂在真实的 2s 上。
+    """
+
+    @staticmethod
+    async def _settle(captured: list[Any], count: int, budget: float) -> None:
+        deadline = budget
+        while deadline > 0 and len(captured) < count:
+            await asyncio.sleep(0.01)
+            deadline -= 0.01
+
+    async def _tick_count(self, captured: list[Any]) -> int:
+        return sum(
+            1
+            for stmt in captured
+            if _values_of(stmt).get("type") == "runtime.tick_started"
+        )
+
+    async def test_plain_wake_waits_for_quiet_window(self) -> None:
+        captured: list[Any] = []
+        loop = AgentLoop(
+            scope_key="group:12345",
+            planner=FakeIdlePlanner(),
+            session_factory=_factory_for(captured),
+        )
+        with patch(
+            "qqbot.services.agent_loop.loop._WAKE_DEBOUNCE_SECONDS", 0.2
+        ):
+            loop.start()
+            loop.wake()
+            # 窗口未到：还不该开拍
+            await asyncio.sleep(0.05)
+            self.assertEqual(await self._tick_count(captured), 0)
+            # 安静下来之后开拍
+            await self._settle(captured, 4, budget=1.0)
+            await loop.stop()
+        self.assertEqual(await self._tick_count(captured), 1)
+
+    async def test_burst_of_wakes_collapses_into_one_tick(self) -> None:
+        """一句话拆成三条发 → 只开一拍，且这拍看得到全部三条。"""
+        captured: list[Any] = []
+        loop = AgentLoop(
+            scope_key="group:12345",
+            planner=FakeIdlePlanner(),
+            session_factory=_factory_for(captured),
+        )
+        with patch(
+            "qqbot.services.agent_loop.loop._WAKE_DEBOUNCE_SECONDS", 0.2
+        ):
+            loop.start()
+            for _ in range(3):
+                loop.wake()
+                await asyncio.sleep(0.05)  # 窗口内陆续到达 → 顺延 deadline
+            self.assertEqual(await self._tick_count(captured), 0)
+            await self._settle(captured, 4, budget=1.0)
+            await loop.stop()
+        self.assertEqual(await self._tick_count(captured), 1)
+
+    async def test_immediate_wake_bypasses_window(self) -> None:
+        """工具批次收口这类唤醒直接开拍：结果已经落库，没有可攒的东西。"""
+        captured: list[Any] = []
+        loop = AgentLoop(
+            scope_key="group:12345",
+            planner=FakeIdlePlanner(),
+            session_factory=_factory_for(captured),
+        )
+        with patch(
+            "qqbot.services.agent_loop.loop._WAKE_DEBOUNCE_SECONDS", 5.0
+        ):
+            loop.start()
+            loop.wake(immediate=True)
+            await self._settle(captured, 4, budget=1.0)
+            await loop.stop()
+        self.assertEqual(await self._tick_count(captured), 1)
+
+    async def test_continuous_wakes_capped_by_max_delay(self) -> None:
+        """持续刷屏不能把 tick 饿死：deadline 顺延有硬上限，到点必开拍。"""
+        captured: list[Any] = []
+        loop = AgentLoop(
+            scope_key="group:12345",
+            planner=FakeIdlePlanner(),
+            session_factory=_factory_for(captured),
+        )
+        with (
+            patch(
+                "qqbot.services.agent_loop.loop._WAKE_DEBOUNCE_SECONDS", 0.2
+            ),
+            patch(
+                "qqbot.services.agent_loop.loop._WAKE_MAX_DELAY_SECONDS", 0.3
+            ),
+        ):
+            loop.start()
+            # 每 50ms 一次唤醒，始终不让窗口安静下来，持续 0.6s（> max delay）
+            for _ in range(12):
+                loop.wake()
+                await asyncio.sleep(0.05)
+            await self._settle(captured, 4, budget=1.0)
+            await loop.stop()
+        self.assertGreaterEqual(await self._tick_count(captured), 1)
 
 
 class LoopSupervisorContractTests(unittest.IsolatedAsyncioTestCase):
@@ -404,7 +514,7 @@ class LoopSupervisorContractTests(unittest.IsolatedAsyncioTestCase):
             session_factory=_factory_for(captured),
         )
         await sup.start()
-        await sup.wake("group:12345")
+        await sup.wake("group:12345", immediate=True)
         # 等 tick 落库
         for _ in range(50):
             await asyncio.sleep(0.01)

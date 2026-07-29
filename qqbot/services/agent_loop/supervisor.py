@@ -195,7 +195,13 @@ class LoopSupervisor:
                 self._memory_compactor = None
         logger.info("[supervisor] stopped, {} loops drained", len(loops))
 
-    async def wake(self, scope_key: str) -> None:
+    async def wake(self, scope_key: str, *, immediate: bool = False) -> None:
+        """唤醒某个 scope 的 loop。
+
+        默认走 AgentLoop 的攒批窗口（2026-07-28）：新消息不立刻开拍，安静下来
+        才开，避免对着拆成几条发的半截话表态。immediate=True 直接开拍，留给
+        "活干完了，来看结果"类唤醒（工具批次收口）——那里没有可攒的东西。
+        """
         if self._stopped:
             return
         if scope_key.startswith("private:"):
@@ -206,7 +212,7 @@ class LoopSupervisor:
         except ValueError:
             logger.warning("[supervisor] invalid scope_key: {}", scope_key)
             return
-        loop.wake()
+        loop.wake(immediate=immediate)
 
     def notify_tool_pending(self) -> None:
         """AgentLoop 写完 tool_called 后调，叫醒 ToolWorker 立即执行；未注入
@@ -243,13 +249,16 @@ class LoopSupervisor:
 
         2026-07-02 起没有批次门闩：这里只负责唤醒，不再有解闩/stale 匹配逻辑。
         批次进行期间的其它 wake 早已随时开拍。
+
+        immediate=True（2026-07-28）：工具结果已经落库，模型正等着看，攒批窗口
+        在这里没有任何东西可攒，等它就是白加延迟。
         """
         logger.info(
             "[supervisor] tool batch completed, waking scope={} batch={}",
             scope_key,
             tool_batch_id,
         )
-        await self.wake(scope_key)
+        await self.wake(scope_key, immediate=True)
 
     async def _ensure(self, scope_key: str) -> AgentLoop:
         async with self._lock:

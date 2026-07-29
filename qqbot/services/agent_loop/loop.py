@@ -13,6 +13,15 @@ Skeleton tick (will grow as projection + real planner come online):
 The loop is awoken by LoopSupervisor.wake(); when idle it parks on an
 asyncio.Event without burning CPU.
 
+唤醒攒批窗口（2026-07-28）：wake() 默认**不立刻**开拍，而是把唤醒推迟
+_WAKE_DEBOUNCE_SECONDS；窗口内再来的唤醒顺延这个 deadline，直到安静下来才
+真正开拍（_WAKE_MAX_DELAY_SECONDS 封顶，防止持续刷屏把 tick 饿死）。
+asyncio.Event 本身已经能把"上一拍还在跑"期间的多次唤醒并成一次，但 loop 空闲
+时第一条消息会立刻开拍——而 QQ 上一句话拆成三条发是常态，那会让 bot 对着半截
+话表态，然后下一拍再看到后半句。窗口堵的是这个洞，不是省 tick。
+工具批次收口这类"活干完了，来看结果"的唤醒走 immediate=True 直接开拍：那里
+没有什么可攒的，等窗口纯属白白加延迟。
+
 工具批次（tool_batch）：同一 tick 派发的全部 call_tool 属于同一个批次
 （tool_batch_id 复用 decision_id），批次收口时 ToolWorker 经 supervisor 批次级
 唤醒一次。2026-07-02 起**没有批次门闩**：批次进行期间的任何唤醒都随时开拍，
@@ -29,6 +38,7 @@ idle(reason="invalid_output_giveup")——先给模型自我修正的机会，�
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import replace
 from typing import Any, Callable
 
@@ -57,6 +67,12 @@ from qqbot.services.agent_loop.projection import Projector
 from qqbot.services.agent_loop.tool_registry import ToolRegistry
 
 logger = get_logger(__name__)
+
+# 唤醒攒批窗口（2026-07-28，见模块 docstring）。安静 _WAKE_DEBOUNCE_SECONDS
+# 后才开拍；一串连续唤醒最多把首次唤醒推迟 _WAKE_MAX_DELAY_SECONDS —— 没有这
+# 个上限的话，一个持续刷屏的群会把 deadline 无限往后推，loop 永远不开拍。
+_WAKE_DEBOUNCE_SECONDS = 2.0
+_WAKE_MAX_DELAY_SECONDS = 6.0
 
 SessionFactory = Callable[[], AsyncSession]
 
@@ -93,6 +109,12 @@ class AgentLoop:
         self._stopped = False
         self._tick_seq = 0
         self._task: asyncio.Task[None] | None = None
+        # 攒批窗口状态：deadline 每次 wake() 顺延，burst_started 钉住这一串
+        # 唤醒的起点（用于 _WAKE_MAX_DELAY_SECONDS 封顶）；timer 是当前在睡的
+        # 那个协程，同一时刻至多一个。
+        self._wake_deadline: float | None = None
+        self._wake_burst_started: float | None = None
+        self._wake_timer: asyncio.Task[None] | None = None
 
     @property
     def scope_key(self) -> str:
@@ -105,6 +127,7 @@ class AgentLoop:
 
     async def stop(self) -> None:
         self._stopped = True
+        self._cancel_wake_timer()
         self._wake.set()
         if self._task is not None:
             try:
@@ -114,10 +137,54 @@ class AgentLoop:
             finally:
                 self._task = None
 
-    def wake(self) -> None:
+    def wake(self, *, immediate: bool = False) -> None:
+        """请求开拍。默认走攒批窗口（见模块 docstring）。
+
+        immediate=True 用于"活干完了，来看结果"类唤醒（工具批次收口）：那里
+        没有后续消息可攒，等窗口只是白加延迟。
+        """
         if self._stopped:
             return
+        if immediate or _WAKE_DEBOUNCE_SECONDS <= 0:
+            self._cancel_wake_timer()
+            self._wake_deadline = None
+            self._wake_burst_started = None
+            self._wake.set()
+            return
+
+        now = time.monotonic()
+        if self._wake_burst_started is None:
+            self._wake_burst_started = now
+        # 新唤醒把 deadline 往后推，但不越过这一串唤醒的硬上限。
+        self._wake_deadline = min(
+            now + _WAKE_DEBOUNCE_SECONDS,
+            self._wake_burst_started + _WAKE_MAX_DELAY_SECONDS,
+        )
+        if self._wake_timer is None or self._wake_timer.done():
+            self._wake_timer = asyncio.create_task(
+                self._wake_after_quiet(),
+                name=f"agent_loop_wake:{self._scope_key}",
+            )
+
+    async def _wake_after_quiet(self) -> None:
+        """睡到 deadline 再置位。窗口内又有新唤醒 → wake() 已把
+        _wake_deadline 推后，这里重读后接着睡（不新建 timer）。"""
+        while not self._stopped:
+            deadline = self._wake_deadline
+            if deadline is None:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(remaining)
+        self._wake_deadline = None
+        self._wake_burst_started = None
         self._wake.set()
+
+    def _cancel_wake_timer(self) -> None:
+        timer, self._wake_timer = self._wake_timer, None
+        if timer is not None and not timer.done():
+            timer.cancel()
 
     async def _run(self) -> None:
         logger.info("[loop {}] started", self._scope_key)
