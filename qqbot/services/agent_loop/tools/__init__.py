@@ -37,6 +37,7 @@ from qqbot.services.agent_loop.tools.get_stranger_info import GetStrangerInfoToo
 from qqbot.services.agent_loop.tools.group_notice import GroupNoticeTool
 from qqbot.services.agent_loop.tools.kick import KickTool
 from qqbot.services.agent_loop.tools.leave_group import LeaveGroupTool
+from qqbot.services.agent_loop.tools.look_at_image import LookAtImageTool
 from qqbot.services.agent_loop.tools.meme_collection import MemeCollectionTool
 from qqbot.services.agent_loop.tools.poke import PokeTool
 from qqbot.services.agent_loop.tools.recall import RecallTool
@@ -82,6 +83,12 @@ def build_default_registry() -> ToolRegistry:
     # "表情包能力"，而发送 2026-07-19 就不在它参数面上了，新名点明操作对象是
     # 收藏夹本身（历史事件的旧 tool_name 原样保留，投影 author index 仍认）。
     registry.register(MemeCollectionTool())
+    # look_at_image：带着具体问题重看一张图（2026-07-28 新增）。同日 Planner/
+    # Replyer 降级为纯文本模型、图片改由 ingest 期 VLM 转录成 desc= 进 timeline，
+    # 本工具是那条无语境描述覆盖不到时的兜底 —— 没有它这次改动就是纯降级。
+    # 明知每个注册工具都要占一条 catalog 条目 + 整段 usage 文档仍然收下它，
+    # 理由就是这个能力天花板（对比 reply 拒绝拆分的取舍，见 reply.py）。
+    registry.register(LookAtImageTool())
     # ── 群信息查询（2026-07-07 重做后恢复 / 新增）──
     # 查询三件套按下架备注的路线重做后恢复：get_group_info（no_cache + 可选
     # 字段透传）、get_member_list（role 过滤 / include_activity / banned_until）、
@@ -150,6 +157,7 @@ __all__ = [
     "GroupNoticeTool",
     "KickTool",
     "LeaveGroupTool",
+    "LookAtImageTool",
     "MemeCollectionTool",
     "PokeTool",
     "RecallTool",

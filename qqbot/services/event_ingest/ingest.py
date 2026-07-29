@@ -58,6 +58,7 @@ class EventIngest:
         registry: MapperRegistry,
         session_factory: SessionFactory,
         supervisor: Any | None = None,
+        image_describer: Any | None = None,
     ) -> None:
         self._registry = registry
         self._session_factory = session_factory
@@ -65,6 +66,10 @@ class EventIngest:
         # 决定是否注入 LoopSupervisor。EventIngest 仅依赖 .wake(scope_key)
         # 这一接口，刻意不做静态类型耦合（避免 ingest 反向依赖 agent_loop）。
         self._supervisor = supervisor
+        # 看图写客观描述的回调（2026-07-28）。与 supervisor 同样是鸭子类型注入：
+        # 生产实现在 agent_loop.image_description，由 v2_main 绑好 session_factory
+        # 传进来；None = 不描述（早期骨架 / 大量既有测试），图仍照常下载落盘。
+        self._image_describer = image_describer
 
     async def ingest(self, event: Any) -> IngestResult:
         # heartbeat 旁路：不入库，仅原子写 runtime_data/napcat_heartbeat.json
@@ -89,8 +94,10 @@ class EventIngest:
 
         # 媒体副作用：图片同步下载、sha256、本地落盘并就地补充 payload.segments
         # 中 image 段的 file_hash/local_path/downloaded 等字段。见 EventIngest契约.md §6。
-        # frozen dataclass 不阻止 dict 字段被 in-place 修改。
-        await attach_media_to_payload(partial.payload)
+        # 2026-07-28 起同一步里还会调 VLM 写 description（Planner/Replyer 已无
+        # 多模态能力，描述是它们看到图片的唯一途径）。frozen dataclass 不阻止
+        # dict 字段被 in-place 修改。
+        await attach_media_to_payload(partial.payload, self._image_describer)
 
         occurred_at = normalize_china_time(getattr(event, "time", None))
         sys_event = finalize(partial, occurred_at=occurred_at)

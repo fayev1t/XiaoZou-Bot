@@ -82,6 +82,10 @@ SECTIONS: dict[str, SectionSpec] = {
         SectionSpec("voice", 100, "persona", None),
         # ── meme caption 单段 ──
         SectionSpec("meme_caption", 0, "doc", "meme_caption.md"),
+        # ── timeline 图片客观转录单段（2026-07-28）──
+        SectionSpec("image_description", 0, "doc", "image_description.md"),
+        # ── look_at_image 带问重看单段（2026-07-28）──
+        SectionSpec("image_look", 0, "doc", "image_look.md"),
         # ── 记忆压缩单段（记忆系统契约 §5）──
         SectionSpec("memory_compaction", 0, "doc", "memory_compaction.md"),
     )
@@ -97,6 +101,8 @@ ASSEMBLY: dict[str, tuple[str, ...]] = {
     ),
     "replyer": ("replyer_composer", "voice"),
     "caption": ("meme_caption",),
+    "image_description": ("image_description",),
+    "image_look": ("image_look",),
     "memory": ("memory_compaction",),
 }
 
@@ -104,6 +110,15 @@ _FORBIDDEN_KINDS: dict[str, frozenset[str]] = {
     "planner": frozenset({"persona"}),
     "replyer": frozenset({"policy", "protocol", "tools"}),
     "caption": frozenset({"persona", "policy", "protocol", "tools"}),
+    # 图片转录是纯记录层：无人格、无群规、无工具。它的输出会被永久写进事件
+    # 正文，任何"这图适合怎么用"的判断都会污染下游模型自己的语境合成。
+    "image_description": frozenset(
+        {"persona", "policy", "protocol", "tools"}
+    ),
+    # 带问重看同样是纯观察层：它只回答被问到的事，人格/群规/协议一律不进。
+    "image_look": frozenset(
+        {"persona", "policy", "protocol", "tools"}
+    ),
     # 记忆压缩是事实记录员：无人格、无群规、无工具（记忆系统契约 §5.1）。
     "memory": frozenset({"persona", "policy", "protocol", "tools"}),
 }

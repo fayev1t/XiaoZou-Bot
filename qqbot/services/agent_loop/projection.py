@@ -1357,12 +1357,19 @@ def _render_segments(
                   被引用消息的作者，author_by_msg_id 命中时；from_self 仅在
                   被引消息是 bot 自己发的时渲染 "true"；excerpt= 在 timeline
                   内可查时）
-      image    → <image kind="photo|sticker" summary="外显文案" hash="sha256"/>
+      image    → <image kind="photo|sticker" summary="外显文案" hash="sha256"
+                        desc="VLM 客观描述"/>
                  kind：napcat data.sub_type 0→photo（相册照片/截图类），
                  1→sticker（表情包），或 data.emoji_id 存在→sticker（商城
                  表情——napcat 接收侧 mface 一律折成 image 段到达）；判断
                  不出则不渲染该属性。summary：QQ 的外显文案（如 "[动画表情]"
                  或商城表情名 "[赞]"），下载失败时它是唯一语义兜底。
+                 desc：2026-07-28 起 Planner/Replyer 是纯文本模型，这段
+                 ingest 期生成的客观转录是它们看到这张图的**唯一**途径。
+                 描述随消息内联渲染（就在它所属的那条 <message> 里），图文
+                 时序天然对齐，不再需要旧多模态路径的 hash label 对位。
+                 未描述成功（未配置 VLM / 调用失败 / 图没下载下来）则不渲染
+                 该属性——模型知道有图但看不到内容，可调 look_at_image 补看。
       face     → <face face_id="N" name="[微笑]"/>（QQ 原生黄豆表情；name 取
                  napcat data.raw.faceText，LLM 背不出表情 id 表，没名字
                  的 face id 是纯噪声）
@@ -1388,10 +1395,11 @@ def _render_segments(
       xml      → <card format="xml"/>（napcat 收发均不产生，兼容保留）
       其他     → <misc segment_type="..."/>
 
-    image segment 的富化字段 (file_hash / local_path / mime / downloaded)
-    由 event_ingest/media.py 写在 segment 顶层（不在 data 内），见
-    EventIngest契约.md §6.1。downloaded=true 且 local_path 存在的图片
-    才会进 images 列表，供 llm_planner 后续读 bytes 拼 multimodal block。
+    image segment 的富化字段 (file_hash / local_path / mime / downloaded /
+    description) 由 event_ingest/media.py 写在 segment 顶层（不在 data 内），见
+    EventIngest契约.md §6.1。downloaded=true 且 local_path 存在的图片才会进
+    images 列表 —— 2026-07-28 起没有任何 prompt 装配路径消费它（Planner/Replyer
+    已不看像素），保留是因为它仍是"这条消息带了哪些已落盘图片"的结构化记录。
     """
     parts: list[str] = []
     images: list[ImageRef] = []
@@ -1472,6 +1480,8 @@ def _render_segments(
             file_hash = seg.get("file_hash")
             if file_hash:
                 attrs.append(f'hash="{_esc_attr(str(file_hash))}"')
+                # ImageRef 的收集条件只看 downloaded + local_path，与有没有
+                # description 无关（描述失败的图仍是"这条消息带了这张图"）。
                 if seg.get("downloaded") and seg.get("local_path"):
                     images.append(
                         ImageRef(
@@ -1480,6 +1490,16 @@ def _render_segments(
                             mime=str(seg.get("mime") or "image/png"),
                         )
                     )
+            # desc：ingest 期 VLM 写的客观转录，模型看图的唯一途径。写时已按
+            # MAX_DESCRIPTION_CHARS 截断，这里再兜一道上界防历史脏数据把整个
+            # timeline 冲垮。空白折成单空格——_esc_attr 不处理换行，多行描述直
+            # 接塞进属性会把 XML 信封排版打散。
+            description = str(seg.get("description") or "").strip()
+            if description:
+                flattened = " ".join(description.split())
+                attrs.append(
+                    f'desc="{_esc_attr(_clip(flattened, _MAX_IMAGE_DESC_CHARS))}"'
+                )
             parts.append(f"<image {' '.join(attrs)}/>" if attrs else "<image/>")
         elif t == "face":
             fid = str(d.get("id", "")).strip()
@@ -1571,6 +1591,9 @@ def _render_segments(
 
 # markdown 段正文渲染上限：官方机器人可能发整页 md，塞满 prompt 不值。
 _MAX_MARKDOWN_CHARS = 500
+# 图片客观描述的渲染上界。与 image_description.MAX_DESCRIPTION_CHARS 同值但不
+# import —— 那是写入端的截断，这里是渲染端对任意来源（含历史事件）的兜底。
+_MAX_IMAGE_DESC_CHARS = 1200
 
 
 def _clip(s: str, limit: int) -> str:

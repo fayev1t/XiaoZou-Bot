@@ -19,7 +19,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
-from qqbot.services.agent_loop.decision import DecisionContext
+from qqbot.services.agent_loop.decision import (
+    DecisionContext,
+    ImageRef,
+    TimelineItem,
+)
 from qqbot.services.agent_loop import reply_task as reply_task_module
 from qqbot.services.agent_loop.reply_task import ReplyTaskState, _fold_rows
 from qqbot.services.agent_loop.replyer import (
@@ -875,25 +879,18 @@ class ReplyerMultimodalTests(unittest.TestCase):
             correlation_id="CID",
         )
 
-    def _run_compose(
-        self, blocks: list[dict], meta: list[dict]
-    ) -> _CapturingLLM:
+    def _run_compose(self, timeline: list[TimelineItem]) -> _CapturingLLM:
         llm = _CapturingLLM()
         context = DecisionContext(
             scope_key="group:100",
             correlation_id="CID",
             tick_seq=0,
             now=NOW,
+            timeline=timeline,
         )
-        with (
-            patch(
-                "qqbot.services.agent_loop.replyer.should_snapshot",
-                return_value=False,
-            ),
-            patch(
-                "qqbot.services.agent_loop.replyer._timeline_image_blocks",
-                return_value=(blocks, meta),
-            ),
+        with patch(
+            "qqbot.services.agent_loop.replyer.should_snapshot",
+            return_value=False,
         ):
             result = asyncio.run(
                 Replyer(llm_client=llm).compose(
@@ -903,28 +900,34 @@ class ReplyerMultimodalTests(unittest.TestCase):
         self.assertEqual(result["messages"][0]["kind"], "chat")
         return llm
 
-    def test_compose_attaches_timeline_image_blocks(self) -> None:
-        blocks = [
-            {"type": "text", "text": f"↓ image hash={HASH_A}"},
-            {
-                "type": "image_url",
-                "image_url": {"url": "data:image/png;base64,QUJD"},
-            },
-        ]
-        llm = self._run_compose(
-            blocks, [{"hash": HASH_A, "mime": "image/png", "bytes": 3}]
+    def test_compose_never_attaches_image_blocks(self) -> None:
+        """2026-07-28：Replyer 降级为纯文本模型。timeline 里带已落盘图片的
+        消息**不再**让 content 变成多模态数组——图片内容以 ingest 期写好的
+        desc= 属性随 render 文本进 prompt（见 image_description 模块）。"""
+        item = TimelineItem(
+            event_id="E1",
+            occurred_at=NOW,
+            kind="message",
+            render=f'<message><image hash="{HASH_A}" desc="一只猫"/></message>',
+            images=[
+                ImageRef(
+                    file_hash=HASH_A,
+                    local_path="/nonexistent/never-read",
+                    mime="image/png",
+                )
+            ],
         )
+        llm = self._run_compose([item])
         assert llm.messages is not None
         content = llm.messages[1].content
-        self.assertIsInstance(content, list)
-        self.assertEqual(content[0]["type"], "text")
-        text = content[0]["text"]
-        self.assertTrue(text.startswith("<replyer-input "))
-        self.assertIn('reply_task_id="R1"', text)
-        self.assertEqual(content[1:], blocks)
+        self.assertIsInstance(content, str)
+        self.assertTrue(content.startswith("<replyer-input "))
+        # 图片语义只经 render 文本抵达，且没有任何 base64 载荷。
+        self.assertIn('desc="一只猫"', content)
+        self.assertNotIn("base64", content)
 
     def test_compose_without_images_keeps_plain_text_content(self) -> None:
-        llm = self._run_compose([], [])
+        llm = self._run_compose([])
         assert llm.messages is not None
         content = llm.messages[1].content
         self.assertIsInstance(content, str)

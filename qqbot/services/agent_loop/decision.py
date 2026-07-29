@@ -119,10 +119,15 @@ class DecisionOutput:
 class ImageRef:
     """已下载落盘的图片素材引用。
 
-    projection 把 message 里 downloaded=true 的 image segment
-    收集到 TimelineItem.images 上，llm_planner 再据此从 local_path 读
-    bytes、base64 编码、按 hash 去重塞进 multimodal content block。
-    downloaded=false 的图不进 ImageRef（只在 render 文本里留占位）。
+    projection 把 message 里 downloaded=true 的 image segment 收集到
+    TimelineItem.images 上。downloaded=false 的图不进 ImageRef（只在 render
+    文本里留占位）。
+
+    2026-07-28 起**没有任何 prompt 装配路径消费它**：Planner/Replyer 已是纯
+    文本模型，图片语义经 ingest 期写入的 desc= 属性随 render 文本抵达（见
+    services/agent_loop/image_description.py）。保留本结构是因为它仍是"这条
+    消息带了哪些已落盘图片"的结构化记录，读盘取像素的活现在只有
+    look_at_image 工具做，且它按 hash 自己定位文件、不走这里。
     """
 
     file_hash: str

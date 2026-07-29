@@ -19,6 +19,12 @@
           "capabilities": [
             "vision"
           ]
+        },
+        {
+          "name": "qwen-vl-max",
+          "capabilities": [
+            "vision"
+          ]
         }
       ]
     }
@@ -26,6 +32,16 @@
   "roles": {
     "planner": "deepseek-chat",
     "replyer": "deepseek-chat",
+    "vision": {
+      "targets": [
+        "gpt-4o",
+        "qwen-vl-max"
+      ],
+      "strategy": "round_robin",
+      "require": [
+        "vision"
+      ]
+    },
     "caption": "gpt-4o",
     "memory": "deepseek-chat",
     "default": "deepseek-chat"

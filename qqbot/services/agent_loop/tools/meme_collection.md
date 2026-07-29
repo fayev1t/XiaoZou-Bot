@@ -23,6 +23,11 @@ Do not save: photos people posted in earnest, screenshots carrying someone's
 personal information, documents, or anything that only makes sense inside the
 one exchange it appeared in.
 
+You are judging from the image's `desc=` in the timeline, not from the picture
+itself — that transcription is enough to tell a reaction face from a document.
+When it genuinely isn't enough to decide, `look_at_image` settles it; saving is
+cheap enough that hesitating usually costs more than saving would.
+
 ## Arguments
 
 - `action` (required): `save`, `delete`, or `recaption`.

@@ -49,6 +49,8 @@ class AssemblyPinningTests(unittest.TestCase):
                 ),
                 "replyer": ("replyer_composer", "voice"),
                 "caption": ("meme_caption",),
+                "image_description": ("image_description",),
+                "image_look": ("image_look",),
                 "memory": ("memory_compaction",),
             },
         )
@@ -208,6 +210,10 @@ class FileAssemblyTests(unittest.TestCase):
         rendered = render_system_prompt("caption")
         self.assertEqual(rendered, self._md("meme_caption.md"))
         self.assertIn("120 字", rendered)
+
+    def test_image_description_render_matches_file(self) -> None:
+        rendered = render_system_prompt("image_description")
+        self.assertEqual(rendered, self._md("image_description.md"))
 
     def test_memory_render_matches_file(self) -> None:
         rendered = render_system_prompt("memory")

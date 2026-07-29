@@ -21,11 +21,9 @@ tick 草草收尾，看不到错误，不利于排障。
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import re
 import time
-from pathlib import Path
 from typing import Any
 
 from qqbot.core.llm import create_llm
@@ -40,10 +38,8 @@ from qqbot.services.agent_loop.decision import (
     DecisionOutput,
     FailTaskAction,
     IdleAction,
-    ImageRef,
     NoteTaskProgressAction,
 )
-from qqbot.services.agent_loop.image_utils import normalize_image_for_llm
 from qqbot.services.agent_loop.projection import (
     _esc_attr,
     _esc_text,
@@ -257,10 +253,12 @@ def _build_messages(
     `<timeline>` 标签嵌套时上下引用关系（reply、at、tool_call ↔ result）
     依然连贯，而不会被 JSON 字符串转义压平成扁平的字段表。
 
-    多模态：本系统只对接 VLM，timeline 渲染里出现 `<image hash="..."/>` 的
-    每张已落盘图片都会随 HumanMessage 一并发出。content 结构 = 一个 text
-    block（XML payload）+ 若干 image_url block（base64 data URL），按
-    hash 全局去重，LLM 靠文本里的 hash 字符串与图片对齐。
+    图片（2026-07-28 起）：Planner 是**纯文本模型**，HumanMessage 只有 XML
+    文本，不再附带任何图像 block。群里的图在 EventIngest 落盘时就由专用 VLM
+    转录成客观描述，随事件正文进 timeline，渲染成 `<image hash="..."
+    desc="..."/>` —— 描述内联在它所属的那条消息里，图文时序天然对齐，旧多模态
+    路径靠 `↓ image hash=` label 给图块对位的做法（3 张图以上常错位）随之作废。
+    需要就某张图追问具体问题时走 look_at_image 工具现场重看。
     """
     from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -279,10 +277,6 @@ def _build_messages(
     )
     xml_text = _render_input_xml(context, tool_catalog)
 
-    text_block = {"type": "text", "text": xml_text}
-    image_blocks, image_meta = _build_image_blocks(context)
-    human_content: list[dict] = [text_block, *image_blocks]
-
     snapshot: PromptSnapshot | None = None
     if should_snapshot(context.scope_key):
         snapshot = PromptSnapshot(
@@ -293,15 +287,16 @@ def _build_messages(
             system_prompt=system_content,
             user_text=xml_text,
             sections=section_stats(sections),
-            images=image_meta,
             validation_retry=bool(
                 getattr(context, "validation_feedback", None)
             ),
         )
 
+    # content 是**纯字符串**而非单元素 block 数组：Planner 不再有图，多模态
+    # 结构没有存在意义，字符串也是各网关兼容性最好的形态。
     return [
         SystemMessage(content=system_content),
-        HumanMessage(content=human_content),
+        HumanMessage(content=xml_text),
     ], snapshot
 
 
@@ -508,75 +503,6 @@ def _render_task_xml(task: Any) -> str:
     )
 
 
-def _build_image_blocks(
-    context: DecisionContext,
-) -> tuple[list[dict], list[dict]]:
-    """汇总 timeline 中所有 ImageRef，按 hash 去重后读盘 + base64，
-    返回 (OpenAI 兼容的 content blocks, 快照用图片元信息)。
-
-    元信息只有 {hash, mime, bytes}（编码前字节数）——Prompt 快照的脱敏契约
-    要求像素数据永不落盘，快照层拿到的从源头就不含 base64。
-
-    每张图前面**挂一个文本 label `↓ image hash=<sha256>`**，让 LLM 能把
-    XML timeline 里出现的 `<image hash="XXX"/>` 占位符和实际图像 bytes
-    一一对应起来 —— 否则一长串 image_url 紧跟在 XML 文本后面，LLM 只能
-    靠"按出现顺序数"来对位，3 张图以上就经常错位（用户说"上上一张图"
-    时定位不到对应像素）。label 用 ↓ 箭头明示"指向下一块"，hash 是
-    universal binder。
-
-    GIF 在编码前取首帧转 PNG，兼容只接受 JPG/PNG/WebP/ICO 的 VLM 网关。
-    读盘或转换失败的图跳过 label + 图 —— text 里
-    的 `<image hash="..."/>` 占位还在，LLM 知道存在但看不到，避免整
-    tick 失败。
-    """
-    seen: set[str] = set()
-    ordered: list[ImageRef] = []
-    for item in context.timeline:
-        for ref in getattr(item, "images", ()) or ():
-            if ref.file_hash in seen:
-                continue
-            seen.add(ref.file_hash)
-            ordered.append(ref)
-
-    blocks: list[dict] = []
-    meta: list[dict] = []
-    for ref in ordered:
-        try:
-            data = Path(ref.local_path).read_bytes()
-        except OSError as exc:
-            logger.warning(
-                "[llm_planner] image read failed: {} hash={} path={}",
-                exc,
-                ref.file_hash,
-                ref.local_path,
-            )
-            continue
-        try:
-            data, mime = normalize_image_for_llm(data, ref.mime or "image/png")
-        except Exception as exc:
-            logger.warning(
-                "[llm_planner] image conversion failed: {} hash={} path={}",
-                exc,
-                ref.file_hash,
-                ref.local_path,
-            )
-            continue
-        b64 = base64.b64encode(data).decode("ascii")
-        blocks.append(
-            {"type": "text", "text": f"↓ image hash={ref.file_hash}"}
-        )
-        blocks.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{b64}"},
-            }
-        )
-        meta.append(
-            {"hash": ref.file_hash, "mime": mime, "bytes": len(data)}
-        )
-    return blocks, meta
-
-
 def _elapsed_ms(started_monotonic: float) -> int:
     return int((time.monotonic() - started_monotonic) * 1000)
 
@@ -604,27 +530,21 @@ def _log_request(context: DecisionContext, messages: list[Any]) -> None:
     system_text = getattr(sys_msg, "content", "") or ""
     human_content = getattr(human_msg, "content", "") or ""
 
+    # 2026-07-28 起 content 恒为 str（Planner 无图）；list 分支留着兜住早期
+    # 快照/测试里手工构造的多模态消息，不为它多记一个恒零的 image_blocks 计数。
     if isinstance(human_content, list):
-        text_blocks = [
+        user_text = "\n".join(
             b.get("text", "")
             for b in human_content
             if isinstance(b, dict) and b.get("type") == "text"
-        ]
-        image_count = sum(
-            1
-            for b in human_content
-            if isinstance(b, dict) and b.get("type") == "image_url"
         )
-        user_text = "\n".join(text_blocks)
     else:
         user_text = str(human_content)
-        image_count = 0
 
     sep = "=" * 80
     logger.info(
         "\n{sep}\n[llm_planner] → LLM  scope={scope} tick={tick} "
-        "system_prompt_chars={syslen} user_xml_chars={ulen} "
-        "image_blocks={imgs}\n"
+        "system_prompt_chars={syslen} user_xml_chars={ulen}\n"
         "{sep}\n"
         "── system_prompt (head 400 / tail 200) ──\n{sys_head}\n…\n{sys_tail}\n"
         "── user_xml ──\n{user}\n{sep}",
@@ -633,7 +553,6 @@ def _log_request(context: DecisionContext, messages: list[Any]) -> None:
         tick=context.tick_seq,
         syslen=len(system_text),
         ulen=len(user_text),
-        imgs=image_count,
         sys_head=system_text[:400],
         sys_tail=system_text[-200:] if len(system_text) > 600 else "",
         user=user_text,

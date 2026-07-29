@@ -949,6 +949,51 @@ class BuildTimelineTests(unittest.TestCase):
             Projector.build_timeline(evs, tool_views=[])[0].render,
         )
 
+    def test_image_segment_renders_ingest_description(self) -> None:
+        """2026-07-28：ingest 期 VLM 写在 segment 顶层的 description 必须以
+        desc= 属性内联渲染 —— Planner/Replyer 是纯文本模型，这是它们看到这张
+        图的唯一途径。描述里的换行折成空格（_esc_attr 不处理换行，多行会把
+        XML 信封排版打散），引号照常转义。"""
+        evs = [
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "segments": [
+                        {
+                            "type": "image",
+                            "data": {},
+                            "file_hash": "abc123",
+                            "description": '终端截图\n第二行 引号"在此',
+                        }
+                    ],
+                    "sender": {"nickname": "u", "user_id": 1},
+                },
+            ),
+        ]
+        render = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertIn(
+            '<image hash="abc123" desc="终端截图 第二行 引号&quot;在此"/>',
+            render,
+        )
+
+    def test_image_segment_without_description_omits_desc(self) -> None:
+        """描述失败（未配置 VLM / 调用失败）→ 不渲染 desc=，图仍留占位。
+        模型知道有图但看不到内容，可调 look_at_image 补看。"""
+        evs = [
+            _snap(
+                type="external.message.group.normal",
+                payload={
+                    "segments": [
+                        {"type": "image", "data": {}, "file_hash": "abc123"}
+                    ],
+                    "sender": {"nickname": "u", "user_id": 1},
+                },
+            ),
+        ]
+        render = Projector.build_timeline(evs, tool_views=[])[0].render
+        self.assertIn('<image hash="abc123"/>', render)
+        self.assertNotIn("desc=", render)
+
     def test_image_segment_without_hash_falls_back(self) -> None:
         evs = [
             _snap(

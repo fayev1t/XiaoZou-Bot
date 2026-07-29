@@ -20,8 +20,9 @@ from qqbot.services.agent_loop.reply_task import ReplyTaskState
 
 MAX_OUTBOUND_MESSAGES = 4
 MAX_MEMES_PER_REPLY = 1
-# 2026-07-22 随 Replyer 看图放宽：多模态载荷（timeline 图 base64）比纯文本
-# 上传+推理更慢，多图拍 12s 易触顶。
+# 2026-07-22 随 Replyer 看图放宽从 12s 提到 25s（多模态载荷上传+推理更慢）。
+# 2026-07-28 Replyer 改回纯文本后没有调低：组稿本身仍可能长（timeline + 收藏夹
+# 全量进 prompt），25s 是给慢端点的余量，不是当初为图片留的。
 REPLYER_TIMEOUT_SECONDS = 25.0
 REPLYER_TEMPERATURE = 0.3
 
@@ -47,14 +48,6 @@ class Replyer:
             raise ReplyerError("replyer LLM is not configured")
         system_prompt = _build_system_prompt()
         user_text = _build_user_text(task, context, memes)
-        image_blocks, image_meta = _timeline_image_blocks(context)
-        # 无图时 content 保持纯字符串（与旧行为逐字节一致）；有图时文本块在
-        # 前、图块（label + base64）依序其后，对位约定与 Planner 完全相同。
-        human_content: str | list[dict] = (
-            [{"type": "text", "text": user_text}, *image_blocks]
-            if image_blocks
-            else user_text
-        )
         snapshot: PromptSnapshot | None = None
         if should_snapshot(task.scope_key):
             snapshot = PromptSnapshot(
@@ -64,7 +57,6 @@ class Replyer:
                 model=getattr(llm, "model_name", None) or getattr(llm, "model", None),
                 system_prompt=system_prompt,
                 user_text=user_text,
-                images=image_meta,
             )
         from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -74,7 +66,7 @@ class Replyer:
                 llm.ainvoke(
                     [
                         SystemMessage(content=system_prompt),
-                        HumanMessage(content=human_content),
+                        HumanMessage(content=user_text),
                     ]
                 ),
                 timeout=REPLYER_TIMEOUT_SECONDS,
@@ -212,20 +204,6 @@ def _build_user_text(
     parts.append(f'<current now="{_esc_attr(context.now.isoformat())}"/>')
     parts.append("</replyer-input>")
     return "\n".join(parts)
-
-
-def _timeline_image_blocks(
-    context: DecisionContext,
-) -> tuple[list[dict], list[dict]]:
-    """timeline 图片 → 多模态 content blocks（2026-07-22 起 Replyer 与
-    Planner 同等看图）。直接复用 Planner 侧 `_build_image_blocks`：同一份
-    投影 context、同一套「`↓ image hash=` label + base64 data URL」对位
-    约定、hash 去重、GIF 转 PNG 与读盘失败跳过语义。懒 import 避免模块
-    加载期拖入 planner 依赖栈（跨模块私有复用沿 reply_executor ←
-    send_message 先例）。"""
-    from qqbot.services.agent_loop.llm_planner import _build_image_blocks
-
-    return _build_image_blocks(context)
 
 
 # LLM 输出边界的段格式归一表：新模型（尤其 Gemini 系，2026-07-22 快照实证）常把

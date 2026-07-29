@@ -36,6 +36,7 @@ from qqbot.services.agent_loop.bot_role_sweep import (
     reflect_bot_role_from_meta,
     reflect_bot_role_from_notice,
 )
+from qqbot.services.agent_loop.image_description import describe_image
 from qqbot.services.agent_loop.meme_caption import caption_image
 from qqbot.services.agent_loop.tools import build_default_registry as build_tool_registry
 from qqbot.services.event_ingest import EventIngest, IngestResult
@@ -77,6 +78,16 @@ def _get_supervisor() -> LoopSupervisor:
     return _supervisor
 
 
+async def _describe_image(
+    data: bytes, mime: str, file_hash: str
+) -> str | None:
+    """EventIngest → media 的看图描述回调：把 session_factory 绑上，其余交给
+    image_description（查缓存 / 限并发 / 落表 / 失败吞成 None 全在那边）。"""
+    return await describe_image(
+        data, mime, file_hash, session_factory=AsyncSessionLocal
+    )
+
+
 def _get_ingest() -> EventIngest:
     global _ingest
     if _ingest is None:
@@ -84,6 +95,10 @@ def _get_ingest() -> EventIngest:
             registry=build_default_registry(),
             session_factory=AsyncSessionLocal,
             supervisor=_get_supervisor(),
+            # 图片客观描述（2026-07-28）：Planner/Replyer 降级为纯文本模型后，
+            # 这是它们"看到"群里图片的唯一途径。与 caption_image 同为 VLM 调用
+            # 但职责相反——这条是客观转录，那条是收藏用途标注，刻意不合并。
+            image_describer=_describe_image,
         )
     return _ingest
 

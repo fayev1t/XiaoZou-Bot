@@ -487,209 +487,14 @@ class LLMPlannerContractTest(unittest.TestCase):
             "prompt should explicitly state that new messages do not cancel tasks",
         )
 
-    def test_multimodal_human_message_dedup_by_hash(self) -> None:
-        """timeline 里同一 hash 出现多次 → 只附一份 image_url block；
-        text block 永远是 list 中第一个，方便 LLM 找到主提示。"""
-        import base64
-        import tempfile
-        from pathlib import Path
+    def test_human_message_is_plain_text_never_multimodal(self) -> None:
+        """2026-07-28：Planner 是纯文本模型。timeline 里带已落盘图片的消息
+        **不再**让 HumanMessage.content 变成 block 数组 —— 图片语义经 ingest
+        期写好的 desc= 属性随 render 文本抵达（见 image_description 模块），
+        像素永不进 Planner 的 prompt，也就没有旧路径那套「↓ image hash= label
+        + base64」的对位约定了。
 
-        with tempfile.TemporaryDirectory() as tmp:
-            p1 = Path(tmp) / "h1"
-            p1.write_bytes(b"\x89PNG-bytes-1")
-            p2 = Path(tmp) / "h2"
-            p2.write_bytes(b"\x89PNG-bytes-2")
-
-            ctx = DecisionContext(
-                scope_key="group:100",
-                correlation_id="CID",
-                tick_seq=1,
-                now=china_now(),
-                timeline=[
-                    TimelineItem(
-                        event_id="E1",
-                        occurred_at=china_now(),
-                        kind="message",
-                        render='<message>hi <image hash="h1"/></message>',
-                        images=[
-                            ImageRef(
-                                file_hash="h1",
-                                local_path=str(p1),
-                                mime="image/png",
-                            )
-                        ],
-                    ),
-                    TimelineItem(
-                        event_id="E2",
-                        occurred_at=china_now(),
-                        kind="message",
-                        render='<message><image hash="h1"/></message>',
-                        # 同 hash 再次出现 — 不应再附 block
-                        images=[
-                            ImageRef(
-                                file_hash="h1",
-                                local_path=str(p1),
-                                mime="image/png",
-                            )
-                        ],
-                    ),
-                    TimelineItem(
-                        event_id="E3",
-                        occurred_at=china_now(),
-                        kind="message",
-                        render='<message><image hash="h2"/></message>',
-                        images=[
-                            ImageRef(
-                                file_hash="h2",
-                                local_path=str(p2),
-                                mime="image/jpeg",
-                            )
-                        ],
-                    ),
-                ],
-            )
-
-            llm = _StubLLM(
-                response_content='{"actions":[{"type":"idle","reason":"x"}]}'
-            )
-            planner = LLMPlanner(llm_client=llm)
-            asyncio.run(planner.decide(ctx))
-
-        human_content = llm.invocations[0][1].content
-        # content 必须是分块 list（不能再是纯字符串），首块是 text，其后是图
-        self.assertIsInstance(human_content, list)
-        self.assertEqual(human_content[0]["type"], "text")
-        image_blocks = [b for b in human_content if b["type"] == "image_url"]
-        self.assertEqual(len(image_blocks), 2)  # h1 去重，h2 各一
-        urls = [b["image_url"]["url"] for b in image_blocks]
-        b64_1 = base64.b64encode(b"\x89PNG-bytes-1").decode("ascii")
-        b64_2 = base64.b64encode(b"\x89PNG-bytes-2").decode("ascii")
-        self.assertIn(f"data:image/png;base64,{b64_1}", urls)
-        self.assertIn(f"data:image/jpeg;base64,{b64_2}", urls)
-
-    def test_multimodal_image_blocks_preceded_by_hash_label(self) -> None:
-        """每个 image_url block 前面必须有一个文本 block，内容包含该图的 hash。
-        这是 VLM 把 XML 里 `<image hash="X"/>` 占位符和实际像素绑定的桥梁——
-        没有这个 label，3 张图以上模型就会按出现顺序错位（用户说"上上一张图"
-        定位不到）。"""
-        import tempfile
-        from pathlib import Path
-
-        with tempfile.TemporaryDirectory() as tmp:
-            p1 = Path(tmp) / "h1"
-            p1.write_bytes(b"\x89PNG-bytes-1")
-            p2 = Path(tmp) / "h2"
-            p2.write_bytes(b"\x89PNG-bytes-2")
-
-            ctx = DecisionContext(
-                scope_key="group:100",
-                correlation_id="CID",
-                tick_seq=1,
-                now=china_now(),
-                timeline=[
-                    TimelineItem(
-                        event_id="E1",
-                        occurred_at=china_now(),
-                        kind="message",
-                        render='<message><image hash="hash-A"/></message>',
-                        images=[
-                            ImageRef(
-                                file_hash="hash-A",
-                                local_path=str(p1),
-                                mime="image/png",
-                            )
-                        ],
-                    ),
-                    TimelineItem(
-                        event_id="E2",
-                        occurred_at=china_now(),
-                        kind="message",
-                        render='<message><image hash="hash-B"/></message>',
-                        images=[
-                            ImageRef(
-                                file_hash="hash-B",
-                                local_path=str(p2),
-                                mime="image/jpeg",
-                            )
-                        ],
-                    ),
-                ],
-            )
-
-            llm = _StubLLM(
-                response_content='{"actions":[{"type":"idle","reason":"x"}]}'
-            )
-            planner = LLMPlanner(llm_client=llm)
-            asyncio.run(planner.decide(ctx))
-
-        human_content = llm.invocations[0][1].content
-        # 每张 image_url 的前一个 block 必须是 text 且包含对应 hash
-        for i, b in enumerate(human_content):
-            if b.get("type") != "image_url":
-                continue
-            prev = human_content[i - 1]
-            self.assertEqual(prev["type"], "text")
-            # label 应该提到这张图的 hash —— 用 hash-A 出现在某 label 文本里
-            # 来锁定"label 紧挨 image"绑定关系
-            self.assertTrue(
-                "hash-A" in prev["text"] or "hash-B" in prev["text"],
-                f"image at index {i} not preceded by a hash label: {prev!r}",
-            )
-
-    def test_multimodal_gif_is_converted_to_png(self) -> None:
-        """GIF 取首帧转 PNG 再发给 VLM，避免严格网关拒绝整次请求。"""
-        import base64
-        import tempfile
-        from pathlib import Path
-
-        # 1x1 transparent GIF89a.
-        gif_bytes = base64.b64decode(
-            "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "animated-gif"
-            path.write_bytes(gif_bytes)
-            ctx = DecisionContext(
-                scope_key="group:100",
-                correlation_id="CID",
-                tick_seq=1,
-                now=china_now(),
-                timeline=[
-                    TimelineItem(
-                        event_id="E1",
-                        occurred_at=china_now(),
-                        kind="message",
-                        render='<message><image hash="gif-hash"/></message>',
-                        images=[
-                            ImageRef(
-                                file_hash="gif-hash",
-                                local_path=str(path),
-                                mime="image/gif",
-                            )
-                        ],
-                    )
-                ],
-            )
-
-            llm = _StubLLM(
-                response_content='{"actions":[{"type":"idle","reason":"x"}]}'
-            )
-            planner = LLMPlanner(llm_client=llm)
-            asyncio.run(planner.decide(ctx))
-
-        human_content = llm.invocations[0][1].content
-        image_blocks = [
-            block for block in human_content if block.get("type") == "image_url"
-        ]
-        self.assertEqual(len(image_blocks), 1)
-        data_url = image_blocks[0]["image_url"]["url"]
-        self.assertTrue(data_url.startswith("data:image/png;base64,"))
-        png_bytes = base64.b64decode(data_url.split(",", 1)[1])
-        self.assertTrue(png_bytes.startswith(b"\x89PNG\r\n\x1a\n"))
-
-    def test_multimodal_skips_missing_file(self) -> None:
-        """落盘文件被清理 / 路径不存在 → 跳过该图，整 tick 仍然成功。
-        text 里的 <image hash="..."/> 占位还在，LLM 知道图存在过。"""
+        local_path 指向不存在的文件：正是要证明**根本没有读盘**这一步。"""
         ctx = DecisionContext(
             scope_key="group:100",
             correlation_id="CID",
@@ -700,11 +505,14 @@ class LLMPlannerContractTest(unittest.TestCase):
                     event_id="E1",
                     occurred_at=china_now(),
                     kind="message",
-                    render='<message><image hash="gone"/></message>',
+                    render=(
+                        '<message>hi <image hash="h1" '
+                        'desc="一张终端截图，文字内容：ImportError"/></message>'
+                    ),
                     images=[
                         ImageRef(
-                            file_hash="gone",
-                            local_path="/nonexistent/path/gone",
+                            file_hash="h1",
+                            local_path="/nonexistent/never-read",
                             mime="image/png",
                         )
                     ],
@@ -719,9 +527,12 @@ class LLMPlannerContractTest(unittest.TestCase):
         self.assertIsInstance(out.actions[0], IdleAction)
 
         human_content = llm.invocations[0][1].content
-        self.assertIsInstance(human_content, list)
-        self.assertEqual(
-            [b for b in human_content if b["type"] == "image_url"], []
+        self.assertIsInstance(human_content, str)
+        self.assertNotIn("base64", human_content)
+        self.assertNotIn("image_url", human_content)
+        # 描述本身必须原样进 prompt —— 它是模型看到这张图的唯一途径。
+        self.assertIn(
+            'desc="一张终端截图，文字内容：ImportError"', human_content
         )
 
     def test_bot_user_id_rendered_as_agent_input_attribute(self) -> None:
@@ -739,7 +550,7 @@ class LLMPlannerContractTest(unittest.TestCase):
         )
         planner = LLMPlanner(llm_client=llm)
         asyncio.run(planner.decide(ctx))
-        human_text = llm.invocations[0][1].content[0]["text"]
+        human_text = llm.invocations[0][1].content
         self.assertIn('bot_qq="3167291813"', human_text)
         # scope/now/tick 也仍在
         self.assertIn('scope="group:100"', human_text)
@@ -760,7 +571,7 @@ class LLMPlannerContractTest(unittest.TestCase):
         )
         planner = LLMPlanner(llm_client=llm)
         asyncio.run(planner.decide(ctx))
-        human_text = llm.invocations[0][1].content[0]["text"]
+        human_text = llm.invocations[0][1].content
         self.assertNotIn("bot_qq", human_text)
 
     def test_agent_input_now_always_rendered_in_china_timezone(self) -> None:
@@ -780,7 +591,7 @@ class LLMPlannerContractTest(unittest.TestCase):
         )
         planner = LLMPlanner(llm_client=llm)
         asyncio.run(planner.decide(ctx))
-        human_text = llm.invocations[0][1].content[0]["text"]
+        human_text = llm.invocations[0][1].content
         # UTC 01:55 → 北京 09:55 +08:00
         self.assertIn('now="2026-05-28T09:55:46+08:00"', human_text)
         self.assertNotIn("+00:00", human_text)
@@ -798,7 +609,7 @@ class LLMPlannerContractTest(unittest.TestCase):
         llm = _StubLLM(response_content='{"actions":[{"type":"idle","reason":"x"}]}')
         planner = LLMPlanner(llm_client=llm)
         asyncio.run(planner.decide(ctx))
-        human_text = llm.invocations[0][1].content[0]["text"]
+        human_text = llm.invocations[0][1].content
         self.assertIn('bot_role="admin"', human_text)
 
     def test_no_bot_role_omits_attribute(self) -> None:
@@ -812,7 +623,7 @@ class LLMPlannerContractTest(unittest.TestCase):
         llm = _StubLLM(response_content='{"actions":[{"type":"idle","reason":"x"}]}')
         planner = LLMPlanner(llm_client=llm)
         asyncio.run(planner.decide(ctx))
-        human_text = llm.invocations[0][1].content[0]["text"]
+        human_text = llm.invocations[0][1].content
         self.assertNotIn("bot_role=", human_text)
 
     def test_tool_permission_metadata_rendered_in_catalog(self) -> None:
@@ -843,7 +654,7 @@ class LLMPlannerContractTest(unittest.TestCase):
         llm = _StubLLM(response_content='{"actions":[{"type":"idle","reason":"x"}]}')
         planner = LLMPlanner(llm_client=llm, tool_registry=registry)
         asyncio.run(planner.decide(ctx))
-        human_text = llm.invocations[0][1].content[0]["text"]
+        human_text = llm.invocations[0][1].content
         self.assertIn('name="kick_member"', human_text)
         self.assertIn('required_permission="ADMIN"', human_text)
         # _KickTool 用旧字段 require_bot_admin=True，经 get_tool_required_bot_role
@@ -919,7 +730,7 @@ class EnvelopeSelfMemoryTests(unittest.TestCase):
         planner = LLMPlanner(llm_client=llm)
         ctx = replace(_ctx(), **overrides)
         asyncio.run(planner.decide(ctx))
-        return llm.invocations[0][1].content[0]["text"]
+        return llm.invocations[0][1].content
 
     def test_last_reasoning_block_removed(self) -> None:
         # DecisionContext 已无 last_reasoning 字段，信封任何情况下都不得再
@@ -948,7 +759,7 @@ class EnvelopeSelfMemoryTests(unittest.TestCase):
         )
         planner = LLMPlanner(llm_client=llm)
         asyncio.run(planner.decide(replace(_ctx(), timeline=[row])))
-        xml = llm.invocations[0][1].content[0]["text"]
+        xml = llm.invocations[0][1].content
         self.assertIn('<time when="', xml)
         self.assertIn("<my-thought>先观望</my-thought>", xml)
 
@@ -1017,7 +828,7 @@ class SavedMemesEnvelopeTests(unittest.TestCase):
         )
         planner = LLMPlanner(llm_client=llm)
         asyncio.run(planner.decide(ctx))
-        return llm.invocations[0][1].content[0]["text"]
+        return llm.invocations[0][1].content
 
     def _ctx_with_memes(self, description: str) -> DecisionContext:
         from qqbot.services.agent_loop import MemeView
@@ -1086,7 +897,7 @@ class PendingReplySectionRemovedTests(unittest.TestCase):
         )
         planner = LLMPlanner(llm_client=llm)
         asyncio.run(planner.decide(ctx))
-        text = llm.invocations[0][1].content[0]["text"]
+        text = llm.invocations[0][1].content
         self.assertNotIn("<pending-reply", text)
         # </active-tasks> 之后直接就是尾部时钟字段
         self.assertLess(
@@ -1116,7 +927,7 @@ class EnvelopeCacheLayoutTests(unittest.TestCase):
         )
         planner = LLMPlanner(llm_client=llm)
         asyncio.run(planner.decide(ctx))
-        return llm.invocations[0][1].content[0]["text"]
+        return llm.invocations[0][1].content
 
     def test_agent_input_head_has_no_per_tick_attributes(self) -> None:
         text = self._render(_ctx())

@@ -130,6 +130,95 @@ class AttachMediaSuccessTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(seg["local_path"], str(file_path))
 
 
+class ImageDescriptionTests(unittest.IsolatedAsyncioTestCase):
+    """2026-07-28：下载成功的图再同步走一次 VLM 客观描述，写进
+    seg["description"]（投影据此渲染 desc=）。生产实现在
+    agent_loop/image_description.py，这里塞假 describer 全离线跑。"""
+
+    @staticmethod
+    async def _ok(url: str) -> tuple[bytes, str]:
+        return b"\x89PNG\r\n\x1a\nfake", "image/png"
+
+    async def test_describer_result_written_to_segment(self) -> None:
+        seen: list[tuple[bytes, str, str]] = []
+
+        async def describer(data: bytes, mime: str, file_hash: str) -> str:
+            seen.append((data, mime, file_hash))
+            return "一张终端截图"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with _PatchedMedia(self._ok, Path(tmp)):
+                payload = {"segments": [_img_seg(url="http://x/y.png")]}
+                await attach_media_to_payload(payload, describer)
+
+        seg = payload["segments"][0]
+        self.assertEqual(seg["description"], "一张终端截图")
+        # describer 拿到的是原始 bytes + 嗅探到的 mime + 落盘用的 hash
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][1], "image/png")
+        self.assertEqual(seen[0][2], seg["file_hash"])
+
+    async def test_no_describer_leaves_segment_without_description(self) -> None:
+        """未注入 describer（早期骨架 / 既有测试）→ 图照常下载落盘，只是没有
+        description 字段，行为与 2026-07-28 之前逐字节一致。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            with _PatchedMedia(self._ok, Path(tmp)):
+                payload = {"segments": [_img_seg(url="http://x/y.png")]}
+                await attach_media_to_payload(payload)
+
+        seg = payload["segments"][0]
+        self.assertTrue(seg["downloaded"])
+        self.assertNotIn("description", seg)
+
+    async def test_describer_failure_never_breaks_ingest(self) -> None:
+        """describer 抛异常 → 吞掉，图仍然算下载成功、只是没描述。
+        "ingest never raises" 是硬约束，描述只是锦上添花。"""
+
+        async def boom(data: bytes, mime: str, file_hash: str) -> str:
+            raise RuntimeError("vlm gateway exploded")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with _PatchedMedia(self._ok, Path(tmp)):
+                payload = {"segments": [_img_seg(url="http://x/y.png")]}
+                await attach_media_to_payload(payload, boom)
+
+        seg = payload["segments"][0]
+        self.assertTrue(seg["downloaded"])
+        self.assertNotIn("description", seg)
+
+    async def test_empty_description_not_written(self) -> None:
+        """describer 返回 None/空串 → 不写字段（投影据此省掉 desc= 属性）。"""
+
+        async def empty(data: bytes, mime: str, file_hash: str) -> None:
+            return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with _PatchedMedia(self._ok, Path(tmp)):
+                payload = {"segments": [_img_seg(url="http://x/y.png")]}
+                await attach_media_to_payload(payload, empty)
+
+        self.assertNotIn("description", payload["segments"][0])
+
+    async def test_failed_download_is_never_described(self) -> None:
+        """下载失败的图不该浪费一次 VLM 调用 —— 根本没有 bytes 可看。"""
+        called = {"n": 0}
+
+        async def describer(data: bytes, mime: str, file_hash: str) -> str:
+            called["n"] += 1
+            return "never"
+
+        async def fail(url: str) -> tuple[bytes, str]:
+            raise RuntimeError("network down")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with _PatchedMedia(fail, Path(tmp)):
+                payload = {"segments": [_img_seg(url="http://x/y.png")]}
+                await attach_media_to_payload(payload, describer)
+
+        self.assertFalse(payload["segments"][0]["downloaded"])
+        self.assertEqual(called["n"], 0)
+
+
 class CrossScopeDedupTests(unittest.IsolatedAsyncioTestCase):
     async def test_same_content_writes_file_once(self) -> None:
         content = b"identical"
@@ -196,9 +285,11 @@ class IngestPipelineAttachesMediaTests(unittest.IsolatedAsyncioTestCase):
     async def test_ingest_calls_attach_media_between_mapper_and_persist(self) -> None:
         seen: list[dict] = []
         attached_segs: list[dict] = []
+        describers: list[Any] = []
 
-        async def fake_attach(payload: dict) -> None:
+        async def fake_attach(payload: dict, describer: Any = None) -> None:
             seen.append(payload)
+            describers.append(describer)
             # mimic side effect: mark image segs downloaded=true
             for seg in payload.get("segments", []):
                 if isinstance(seg, dict) and seg.get("type") == "image":
@@ -254,11 +345,14 @@ class IngestPipelineAttachesMediaTests(unittest.IsolatedAsyncioTestCase):
         # the captured payload contained the image segment we mutated
         self.assertEqual(len(attached_segs), 1)
         self.assertTrue(attached_segs[0]["downloaded"])
+        # 未注入 image_describer 的 EventIngest 透传 None（2026-07-28）：
+        # 描述是可选注入，不注入时图片照常下载落盘、只是没有 desc。
+        self.assertEqual(describers, [None])
 
     async def test_heartbeat_skips_attach_media(self) -> None:
         called = MagicMock()
 
-        async def fake_attach(payload: dict) -> None:
+        async def fake_attach(payload: dict, describer: Any = None) -> None:
             called()
 
         import qqbot.services.event_ingest.ingest as ingest_mod
