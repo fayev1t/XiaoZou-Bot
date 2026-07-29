@@ -3,8 +3,10 @@
 钉住四件事：
 1. 装配单本身（哪个消费者拿哪些段、什么顺序）——收口后这就是三个 LLM 的
    prompt 组成的唯一权威，改动必须是有意的；
-2. 分层红线是**结构性**的：persona（voice）进 Planner、policy/protocol/
-   tools 进 Replyer，build 期直接炸，不再只靠注释与自觉；
+2. 分层红线是**结构性**的：persona（voice）进 Planner、disposition 进
+   Replyer、policy/protocol/tools 进 Replyer，build 期直接炸，不再只靠
+   注释与自觉。2026-07-29 起 Planner 收下 disposition（参与倾向）那一
+   窄段，但整张角色卡仍然禁入——红线收窄，不是拆除；
 3. required 失败语义（待办#17 目标 2 前半）：关键段缺失/为空 fail loudly，
    非 required 段维持降级；source 返回 None = 本 scope 不适用，主动跳过；
 4. 装配产物与 prompts/*.md 文件逐字节对账（外置重构不改内容的护栏）。
@@ -44,6 +46,7 @@ class AssemblyPinningTests(unittest.TestCase):
                     "identity",
                     "xml_format",
                     "group_chat_rules",
+                    "disposition",
                     "protocol",
                     "tools_usage",
                 ),
@@ -58,6 +61,9 @@ class AssemblyPinningTests(unittest.TestCase):
     def test_red_line_kinds_are_pinned(self) -> None:
         """红线靠 kind 生效；改掉 kind 等于拆红线，必须显式过这里。"""
         self.assertEqual(SECTIONS["voice"].kind, "persona")
+        # disposition 自成一类而不复用 persona：复用就等于把整张角色卡
+        # 也放进 Planner（kind 是红线的唯一抓手）。
+        self.assertEqual(SECTIONS["disposition"].kind, "disposition")
         self.assertEqual(SECTIONS["group_chat_rules"].kind, "policy")
         self.assertEqual(SECTIONS["protocol"].kind, "protocol")
         self.assertEqual(SECTIONS["tools_usage"].kind, "tools")
@@ -74,8 +80,20 @@ class AssemblyPinningTests(unittest.TestCase):
 
 class RedLineTests(unittest.TestCase):
     def test_persona_forbidden_in_planner(self) -> None:
+        """整张角色卡仍然禁入 Planner——2026-07-29 放进去的是 disposition
+        那一窄段，红线的目的（措辞/情绪/形态不驱动规划）原样保住。"""
         with self.assertRaisesRegex(PromptAssemblyError, "voice"):
             _validate_assembly("planner", ("identity", "voice"))
+
+    def test_disposition_forbidden_in_replyer(self) -> None:
+        """反向也封死：组稿层已有 voice 这份更全的来源，再塞一份为规划
+        写的窄投影只会两份打架。"""
+        with self.assertRaisesRegex(PromptAssemblyError, "disposition"):
+            _validate_assembly("replyer", ("replyer_composer", "disposition"))
+
+    def test_disposition_forbidden_in_memory(self) -> None:
+        with self.assertRaisesRegex(PromptAssemblyError, "disposition"):
+            _validate_assembly("memory", ("memory_compaction", "disposition"))
 
     def test_policy_forbidden_in_replyer(self) -> None:
         with self.assertRaisesRegex(PromptAssemblyError, "group_chat_rules"):
@@ -164,12 +182,15 @@ class FileAssemblyTests(unittest.TestCase):
                 "identity.md",
                 "xml_format.md",
                 "group_chat_rules.md",
+                "disposition.md",
                 "protocol.md",
             )
         )
         self.assertEqual(rendered, expected)
 
     def test_system_scope_drops_group_chat_rules(self) -> None:
+        """disposition 与 group_chat_rules 同 scope：system loop 没有聊天
+        面，闸门与调制闸门的那段一起跳过。"""
         names = [
             sec.name
             for sec in build_registry("planner").render_sections(scope="system")

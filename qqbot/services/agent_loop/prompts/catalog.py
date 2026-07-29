@@ -9,12 +9,25 @@ kind、required、适用 scope），`ASSEMBLY` 是每个消费者的有序装配
 的注释）。**
 
 分层红线（`_FORBIDDEN_KINDS`，build 时结构性校验，契约测试钉死）：
-  - persona（voice）不进 Planner——"要不要说话是规则问题，不是性情问题"
-    （identity.md 开篇教义）；
+  - persona（voice）不进 Planner——整张角色卡是"说出来什么样"的权威，把
+    12KB 措辞/情绪/形态塞进一个输出 JSON 决策的层，`reasoning` 会开始演戏、
+    拿心情当调工具的理由；
+  - disposition（参与倾向）不进 Replyer / caption / 图片 / 记忆——它是同一
+    个人为"要不要开口"写的窄投影，组稿层已有 voice 这份更全的来源，两份
+    并存只会互相打架；
   - policy（group_chat_rules）不进 Replyer——它握着 empty_reason 这个小
     否决权，读了参与政策会二次审查已授权的回复，架空 Planner 的决定；
   - protocol / tools 不进 Replyer——一个 prompt 里两套输出 JSON 规范必然
     串台；组稿层也没有工具可调。
+
+2026-07-29 起 Planner 六段：新增 disposition（`disposition.md`，kind 自成
+一类）。此前 identity.md 的开篇教义是"要不要说话是规则问题，不是性情问
+题"，group_chat_rules 因此是一份纯相关性闸门；但角色卡把这个人写成对关系
+与距离极其敏感，两者并不自洽，落地表现就是只有被点名才开口。现改为：性情
+只能**增加**开口的理由（且必须在 timeline 上指得出被拽住的那一处），负面
+清单一条都不因性情松动；"说出来什么样"仍然一个字都不进这一层。disposition
+与 voice 回答两个不相交的问题（要不要开口 / 说出来什么样），各自是各自那
+问的唯一权威，不得互相抄正文。
 
 失败语义（待办#17 目标 2 前半）：目录内除 tools_usage 外全部 required——
 文件缺失/为空时 render 直接 raise（PromptSectionMissing），绝不静默拿残缺
@@ -65,7 +78,7 @@ class SectionSpec:
 SECTIONS: dict[str, SectionSpec] = {
     spec.name: spec
     for spec in (
-        # ── Planner 五段（order 沿用 llm_planner 的既有约定区间）──
+        # ── Planner 六段（order 沿用 llm_planner 的既有约定区间）──
         SectionSpec("identity", 0, "doc", "identity.md"),
         SectionSpec("xml_format", 50, "doc", "xml_format.md"),
         SectionSpec(
@@ -73,6 +86,16 @@ SECTIONS: dict[str, SectionSpec] = {
             100,
             "policy",
             "group_chat_rules.md",
+            scopes=("group", "private"),
+        ),
+        # 紧贴 group_chat_rules 之后：它调制的正是那份闸门，隔开会读成
+        # 两套无关的东西。scope 与闸门一致——system loop 没有聊天面，
+        # 参与倾向在那里是纯噪音。
+        SectionSpec(
+            "disposition",
+            120,
+            "disposition",
+            "disposition.md",
             scopes=("group", "private"),
         ),
         SectionSpec("protocol", 150, "protocol", "protocol.md"),
@@ -96,6 +119,7 @@ ASSEMBLY: dict[str, tuple[str, ...]] = {
         "identity",
         "xml_format",
         "group_chat_rules",
+        "disposition",
         "protocol",
         "tools_usage",
     ),
@@ -107,20 +131,26 @@ ASSEMBLY: dict[str, tuple[str, ...]] = {
 }
 
 _FORBIDDEN_KINDS: dict[str, frozenset[str]] = {
+    # persona 仍然禁入：2026-07-29 放进来的是 disposition 那一窄段，不是
+    # 整张角色卡——红线的目的（措辞/情绪/形态不驱动规划）原样保住。
     "planner": frozenset({"persona"}),
-    "replyer": frozenset({"policy", "protocol", "tools"}),
-    "caption": frozenset({"persona", "policy", "protocol", "tools"}),
+    "replyer": frozenset({"disposition", "policy", "protocol", "tools"}),
+    "caption": frozenset(
+        {"persona", "disposition", "policy", "protocol", "tools"}
+    ),
     # 图片转录是纯记录层：无人格、无群规、无工具。它的输出会被永久写进事件
     # 正文，任何"这图适合怎么用"的判断都会污染下游模型自己的语境合成。
     "image_description": frozenset(
-        {"persona", "policy", "protocol", "tools"}
+        {"persona", "disposition", "policy", "protocol", "tools"}
     ),
     # 带问重看同样是纯观察层：它只回答被问到的事，人格/群规/协议一律不进。
     "image_look": frozenset(
-        {"persona", "policy", "protocol", "tools"}
+        {"persona", "disposition", "policy", "protocol", "tools"}
     ),
     # 记忆压缩是事实记录员：无人格、无群规、无工具（记忆系统契约 §5.1）。
-    "memory": frozenset({"persona", "policy", "protocol", "tools"}),
+    "memory": frozenset(
+        {"persona", "disposition", "policy", "protocol", "tools"}
+    ),
 }
 
 

@@ -211,12 +211,41 @@ class LLMPlannerContractTest(unittest.TestCase):
         )
 
     def test_no_persona_section_registered(self) -> None:
-        """Planner 无 persona 段；角色卡只由独立 Replyer 消费。"""
+        """Planner 无 persona 段：整张角色卡仍只由独立 Replyer 消费。
+
+        2026-07-29 起 Planner 多了 disposition 段（参与倾向），但它是为
+        "要不要开口"单写的窄投影，不是 voice.md 的副本——红线从"人格
+        一律不进"收窄为"角色卡正文不进"，故这里同时钉两头：段名里没有
+        persona，渲染结果里也不得出现角色卡的形态/情绪正文。"""
         llm = _StubLLM(response_content='{"actions":[{"type":"idle","reason":"x"}]}')
         planner = LLMPlanner(llm_client=llm)
         names = planner._prompt_registry.section_names()
         self.assertIn("identity", names)
+        self.assertIn("disposition", names)
         self.assertNotIn("persona", names)
+        self.assertNotIn("voice", names)
+        rendered = planner._prompt_registry.render(scope="group")
+        # 角色卡的形态层与情绪层正文一个字都不许漏进规划层——漏进来
+        # `reasoning` 就会开始演戏、拿心情当调工具的理由。
+        self.assertNotIn("表情包对你不是装饰", rendered)
+        self.assertNotIn("你不会把喜欢说得很甜", rendered)
+        self.assertNotIn("字打出来的样子", rendered)
+
+    def test_disposition_can_only_widen_the_gate(self) -> None:
+        """性情只增加理由、不豁免禁止，且不碰"说出来什么样"。
+
+        这个不对称是整段的安全阀：少了它，参与倾向会被读成负面清单的
+        通用例外，闸门等于拆掉。"""
+        llm = _StubLLM(response_content='{"actions":[{"type":"idle","reason":"x"}]}')
+        planner = LLMPlanner(llm_client=llm)
+        rendered = planner._prompt_registry.render(scope="group")
+        self.assertIn("性情只能增加理由，不能豁免禁止", rendered)
+        self.assertIn("负面清单里的每一条都是硬的，性情不构成例外", rendered)
+        # 被拽住要在 timeline 上指得出来，否则就是"想说话"。
+        self.assertIn("指得出来", rendered)
+        # 旧教义不得残留：它与本段直接冲突，并存会互相抵消。
+        self.assertNotIn("This layer has no personality", rendered)
+        self.assertNotIn("not a temperament", rendered)
 
     def test_reply_usage_scoped_without_persona_card(self) -> None:
         """Planner 看 reply_task 机械契约，但不再携带最终措辞角色卡。"""
@@ -233,13 +262,19 @@ class LLMPlannerContractTest(unittest.TestCase):
 
     def test_group_chat_rules_skipped_in_system_scope(self) -> None:
         """参与规则段只对有聊天面的 scope 渲染；system loop 的 system prompt
-        不含 group_chat_rules（render(scope="system") 时该段返回空串）。"""
+        不含 group_chat_rules（render(scope="system") 时该段返回空串）。
+        2026-07-29 起 disposition 跟着同一个 scope 走——system loop 没有
+        聊天面，参与倾向在那里是纯噪音。"""
         llm = _StubLLM(response_content='{"actions":[{"type":"idle","reason":"x"}]}')
         planner = LLMPlanner(llm_client=llm)
         rendered_group = planner._prompt_registry.render(scope="group")
         rendered_system = planner._prompt_registry.render(scope="system")
         self.assertIn("什么时候调用 reply", rendered_group)
         self.assertNotIn("什么时候调用 reply", rendered_system)
+        # 锚点取 disposition.md 独有的正文——identity.md 里那句
+        # "(§参与倾向)" 交叉引用各 scope 都在，拿标题名会误判。
+        self.assertIn("这些规则落在谁身上", rendered_group)
+        self.assertNotIn("这些规则落在谁身上", rendered_system)
         # 协议与身份段两个 scope 都在
         self.assertIn("decision engine", rendered_system)
         self.assertIn("tasks persist, conversation flows around them", rendered_system)

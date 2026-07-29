@@ -80,7 +80,8 @@ class V2MainPluginContractTests(unittest.TestCase):
         # 2026-07-02 起决策层无人格：prompts/persona.md 删除，v2_main 的
         # persona 读取/注入链路一并移除。角色卡历经 tools/send_message.md
         # Voice 节，2026-07-19 随 ReplyTask 换轨迁至 prompts/voice.md，仅由
-        # Replyer 组稿时加载——Planner 五段 prompt 不含它。
+        # Replyer 组稿时加载——Planner 六段 prompt 仍不含它（2026-07-29 收下
+        # 的是 disposition.md 那一窄段，不是角色卡；红线收窄见 catalog.py）。
         persona_path = (
             ROOT / "qqbot" / "services" / "agent_loop" / "prompts" / "persona.md"
         )
