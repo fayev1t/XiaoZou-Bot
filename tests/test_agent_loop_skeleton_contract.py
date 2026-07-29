@@ -570,15 +570,29 @@ class MemoryCompactorWiringTests(unittest.IsolatedAsyncioTestCase):
     安全 no-op。"""
 
     async def test_disabled_by_default_no_compactor(self) -> None:
-        captured: list[Any] = []
-        sup = LoopSupervisor(
-            planner=FakeIdlePlanner(),
-            session_factory=_factory_for(captured),
-        )
-        await sup.start()
-        self.assertIsNone(sup._memory_compactor)
-        sup.notify_compaction("group:1", 250)  # 未启用：安全 no-op
-        await sup.stop()
+        import os
+
+        # 显式关掉开关再断言（与下面 enabled 用例对称）。原先靠"环境里没配"
+        # 隐式成立，而部署机的 .env 里 MEMORY_COMPACTION_ENABLED=true，
+        # memory_compaction_enabled() 读的就是真实 env —— 这条在开了压缩的
+        # 机器上必然失败。测试必须自己控制前置条件，不能继承部署配置。
+        old = os.environ.get("MEMORY_COMPACTION_ENABLED")
+        os.environ["MEMORY_COMPACTION_ENABLED"] = "false"
+        try:
+            captured: list[Any] = []
+            sup = LoopSupervisor(
+                planner=FakeIdlePlanner(),
+                session_factory=_factory_for(captured),
+            )
+            await sup.start()
+            self.assertIsNone(sup._memory_compactor)
+            sup.notify_compaction("group:1", 250)  # 未启用：安全 no-op
+            await sup.stop()
+        finally:
+            if old is None:
+                os.environ.pop("MEMORY_COMPACTION_ENABLED", None)
+            else:
+                os.environ["MEMORY_COMPACTION_ENABLED"] = old
 
     async def test_enabled_env_wires_compactor_and_probe(self) -> None:
         import os

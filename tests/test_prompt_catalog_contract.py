@@ -209,7 +209,9 @@ class FileAssemblyTests(unittest.TestCase):
     def test_caption_render_matches_file(self) -> None:
         rendered = render_system_prompt("caption")
         self.assertEqual(rendered, self._md("meme_caption.md"))
-        self.assertIn("120 字", rendered)
+        # 限长锚点：2026-07-27 由 120 字放宽到 150（给"适用场景"留篇幅），
+        # 当时漏改这条断言。数字本身不是契约，"有硬限长"才是。
+        self.assertIn("150 字", rendered)
 
     def test_image_description_render_matches_file(self) -> None:
         rendered = render_system_prompt("image_description")
