@@ -7,6 +7,9 @@
 由投影的触顶通知单向驱动；worker 启动与空闲期不扫描数据库。投影以最新
 recap 为窗口下界，重启后继续复用已落盘摘要与覆盖游标。
 
+单批折叠条数有硬上限：超出的更早积压**整段跳过、不进摘要**，游标一步
+跨过去。记忆只覆盖"开始记之后"的历史，输入长度与积压规模脱钩。
+
 失败语义：LLM 调用失败 / 输出不可解析 → 不写事件、游标不动，等待后续
 事件再次触顶；绝不在启动或定时扫描时主动补压。每次触顶只做一次 LLM
 merge、写一代完整替换摘要（投影只认最新一条 recap）。
@@ -56,6 +59,10 @@ RECAP_EVENT_TYPE = "runtime.context_compacted"
 # 压缩器算法 / prompt 代次，写入 payload.compactor_version 供回放与演进区分。
 # v2：主输出契约由 JSON 改为标签块，旧 JSON 仅作兼容降级。
 COMPACTOR_VERSION = 2
+
+# 单批折叠上限 = 稳态批量（TRIGGER − KEEP）的这个倍数。留一整批余量吸收
+# 探针过冲与突发，稳态下恒不触发；超出即判定为异常积压并整段跳过。
+MAX_FOLD_BATCH_MULTIPLIER = 2
 
 _TRUTHY = {"1", "true", "yes", "on"}
 
@@ -350,18 +357,28 @@ class MemoryCompactor:
         keys = await self._fetch_uncovered_keys(scope, group_id, cursor, now)
         if len(keys) < cfg.trigger_events:
             return CompactionOutcome(scope_key, 0, (), "below_trigger")
-        slice_keys = keys[: len(keys) - cfg.keep_events]
-        if not slice_keys:
+        foldable = keys[: len(keys) - cfg.keep_events]
+        batch_size = cfg.trigger_events - cfg.keep_events
+        if batch_size <= 0 or not foldable:
             logger.warning(
-                "[memory] {} keep({}) ≥ 未覆盖数({})，配置违反不变式②",
+                "[memory] {} keep({}) ≥ trigger({}) / 未覆盖数({})，配置违反不变式②",
                 scope_key,
                 cfg.keep_events,
+                cfg.trigger_events,
                 len(keys),
             )
             return CompactionOutcome(scope_key, 0, (), "config_invalid")
-        boundary_id, boundary_at = slice_keys[-1]
+        # 定量批：只折最靠近窗口的一段，更早的积压整段跳过（契约 §4.3）。
+        # 上界不动——游标照旧推进到"恰留 KEEP 条"处，一步跨过被跳过的积压，
+        # 下一拍即回稳态。否则积压规模直接决定单次输入长度：首次开启 /
+        # 停机 / 上一轮失败攒下的历史会一次性灌进单次调用撑爆上下文，而
+        # 失败又不推进游标 → 积压更大 → 永久卡死（2026-07-27 生产实况）。
+        batch = foldable[-(batch_size * MAX_FOLD_BATCH_MULTIPLIER) :]
+        skipped = len(foldable) - len(batch)
+        start_id, start_at = batch[0]
+        boundary_id, boundary_at = batch[-1]
         snaps = await self._fetch_slice_rows(
-            scope, group_id, cursor, boundary_id, boundary_at
+            scope, group_id, start_id, start_at, boundary_id, boundary_at
         )
         if not snaps:
             return CompactionOutcome(scope_key, 0, (), "empty_slice")
@@ -394,6 +411,7 @@ class MemoryCompactor:
             cues=cues,
             snaps=snaps,
             revision=revision,
+            skipped=skipped,
             correlation_id=new_event_id(),
         )
         logger.info(
@@ -403,6 +421,15 @@ class MemoryCompactor:
             len(snaps),
             len(summary),
         )
+        if skipped:
+            # 这批历史永久不进记忆（append-only，无补压通道）——该出现的
+            # 场合只有首次开启与积压异常，日常刷屏说明该调 TRIGGER/KEEP。
+            logger.warning(
+                "[memory] {} 跳过 {} 条更早积压（超单批上限 {}），不进摘要",
+                scope_key,
+                skipped,
+                batch_size * MAX_FOLD_BATCH_MULTIPLIER,
+            )
         return CompactionOutcome(scope_key, 1, (event_id,), None)
 
     # ─── 查询 ───
@@ -491,15 +518,29 @@ class MemoryCompactor:
         self,
         scope: str,
         group_id: int | None,
-        cursor: _Cursor | None,
+        start_id: str,
+        start_at: datetime,
         boundary_id: str,
         boundary_at: datetime,
     ) -> list[Any]:
+        """取折叠区间 [start, boundary] 的完整事件行（全序闭区间）。
+
+        下界取自定量批首条而非游标——游标与 start 之间的积压本轮整段
+        跳过，SQL 必须同步收窄，否则仍会把全部积压捞回来。"""
         stmt = (
             select(AgentEvent)
             .where(AgentEvent.scope == scope)
             .where(AgentEvent.visibility == "agent_visible")
             .where(AgentEvent.type != RECAP_EVENT_TYPE)
+            .where(
+                or_(
+                    AgentEvent.occurred_at > start_at,
+                    and_(
+                        AgentEvent.occurred_at == start_at,
+                        AgentEvent.event_id >= start_id,
+                    ),
+                )
+            )
             .where(
                 or_(
                     AgentEvent.occurred_at < boundary_at,
@@ -512,7 +553,6 @@ class MemoryCompactor:
         )
         if scope == "group" and group_id is not None:
             stmt = stmt.where(AgentEvent.group_id == group_id)
-        stmt = self._uncovered_filters(stmt, cursor)
         stmt = stmt.order_by(
             AgentEvent.occurred_at.asc(), AgentEvent.event_id.asc()
         )
@@ -682,6 +722,7 @@ class MemoryCompactor:
         cues: list[str],
         snaps: list[Any],
         revision: int,
+        skipped: int,
         correlation_id: str,
     ) -> str:
         covers_until_at = normalize_china_time(snaps[-1].occurred_at)
@@ -694,6 +735,7 @@ class MemoryCompactor:
                 snaps[0].occurred_at
             ).isoformat(),
             "dropped_event_count": len(snaps),
+            "skipped_event_count": skipped,
             "folded_revision": revision,
             "compactor_version": COMPACTOR_VERSION,
         }

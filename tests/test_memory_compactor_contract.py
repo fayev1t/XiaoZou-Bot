@@ -1,8 +1,9 @@
 """MemoryCompactor 契约测试（记忆系统契约 §2/§4/§5）。
 
 钉住：
-1. 批选取与游标——折叠区间 (旧游标, covers_until] 不重叠、保留最新 KEEP 条、
-   低于 TRIGGER 不动手、非 group scope 直接拒绝；
+1. 批选取与游标——折叠区间与上代不重叠、保留最新 KEEP 条、低于 TRIGGER
+   不动手、非 group scope 直接拒绝；**单批条数封顶**，超出的更早积压整段
+   跳过且取数下界同步收窄（输入长度与积压规模脱钩）；
 2. recap 事件字段——type/origin/visibility、correlation 运行级新配、
    causation=覆盖边界事件、occurred_at 回填边界+1ms、payload 全字段；
 3. 失败语义——LLM 输出不可解析时不写任何事件（宁可没记忆不写脏记忆）；
@@ -294,8 +295,9 @@ class CompactScopeTests(_EnvMixin, unittest.IsolatedAsyncioTestCase):
 
     async def test_first_generation_full_flow(self) -> None:
         captured: list[Any] = []
-        rows = [_ev_row(i) for i in range(1, 11)]  # 10 ≥ TRIGGER(6)
-        slice_rows = rows[:7]  # 10 - KEEP(3) → EV00001..EV00007
+        rows = [_ev_row(i) for i in range(1, 10)]  # 9 ≥ TRIGGER(6)
+        # 9 - KEEP(3) = 6 条可折，恰等于单批上限 (TRIGGER−KEEP)×2 → 零跳过
+        slice_rows = rows[:6]  # EV00001..EV00006
         script = [
             _AnyResult([]),  # 游标：无 recap
             _AnyResult(_keys(rows)),  # 未覆盖键
@@ -318,22 +320,23 @@ class CompactScopeTests(_EnvMixin, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(params["visibility"], "agent_visible")
         self.assertEqual(params["scope"], "group")
         self.assertEqual(params["group_id"], 999)
-        self.assertEqual(params["causation_id"], "EV00007")
+        self.assertEqual(params["causation_id"], "EV00006")
         self.assertEqual(len(params["correlation_id"]), 26)
         self.assertIsNone(params["idempotency_key"])
         # occurred_at 回填 = 覆盖边界 + 1ms（渲染落在接缝处）。
-        boundary_at = BASE + timedelta(seconds=7)
+        boundary_at = BASE + timedelta(seconds=6)
         self.assertEqual(params["occurred_at"], boundary_at + timedelta(milliseconds=1))
         payload = params["payload"]
         self.assertEqual(payload["summary"], "首代总结。")
         self.assertEqual(payload["recall_cues"], ["约饭场景", "开黑时间"])
-        self.assertEqual(payload["covers_until_event_id"], "EV00007")
+        self.assertEqual(payload["covers_until_event_id"], "EV00006")
         self.assertEqual(payload["covers_until_occurred_at"], boundary_at.isoformat())
         self.assertEqual(
             payload["covers_from_occurred_at"],
             (BASE + timedelta(seconds=1)).isoformat(),
         )
-        self.assertEqual(payload["dropped_event_count"], 7)
+        self.assertEqual(payload["dropped_event_count"], 6)
+        self.assertEqual(payload["skipped_event_count"], 0)
         self.assertEqual(payload["folded_revision"], 1)
         self.assertEqual(payload["compactor_version"], 2)
         # 首代：user 信封声明无旧摘要。
@@ -360,8 +363,8 @@ class CompactScopeTests(_EnvMixin, unittest.IsolatedAsyncioTestCase):
                 "folded_revision": 1,
             },
         )
-        rows = [_ev_row(i) for i in range(8, 21)]  # EV00008..EV00020，共 13
-        slice_rows = rows[:10]  # 13 - KEEP(3) → ..EV00017
+        rows = [_ev_row(i) for i in range(8, 17)]  # EV00008..EV00016，共 9
+        slice_rows = rows[:6]  # 9 - KEEP(3) = 6 条可折，未超单批上限
         script = [
             _AnyResult([recap_row]),
             _AnyResult(_keys(rows)),
@@ -375,7 +378,7 @@ class CompactScopeTests(_EnvMixin, unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(outcome.skipped_reason)
         params = _params(captured[3])
-        self.assertEqual(params["causation_id"], "EV00017")
+        self.assertEqual(params["causation_id"], "EV00013")
         self.assertEqual(params["payload"]["folded_revision"], 2)
         user_text = llm.calls[0][1].content
         self.assertIn("旧摘要内容。", user_text)
@@ -387,7 +390,7 @@ class CompactScopeTests(_EnvMixin, unittest.IsolatedAsyncioTestCase):
         script = [
             _AnyResult([]),
             _AnyResult(_keys(rows)),
-            _AnyResult(rows[:7]),
+            _AnyResult(rows[1:7]),  # 可折 7 条，单批上限 6 → 折 EV00002..EV00007
         ]
         llm = _FakeLLM(["自由发挥，没有标签或 JSON"])
         compactor = _make_compactor(script, captured, llm)
@@ -398,14 +401,48 @@ class CompactScopeTests(_EnvMixin, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.rounds, 0)
         self.assertEqual(len(captured), 3)  # 只有三次查询，绝无 insert
 
-    async def test_large_input_is_merged_in_one_request_and_one_write(self) -> None:
+    async def test_backlog_beyond_cap_is_skipped_not_folded(self) -> None:
+        """积压超单批上限时只折最靠近窗口的一批，更早的整段跳过（契约 §4.3）。
+
+        单次输入长度必须与积压规模脱钩：否则首次开启 / 停机 / 上一轮失败
+        攒下的历史会一次性灌进单次调用撑爆上下文，而失败又不推进游标 →
+        积压更大 → 永久卡死（2026-07-27 生产实况，group:1082834723 连续
+        40 小时 context overflow）。"""
         captured: list[Any] = []
-        rows = [_ev_row(i) for i in range(1, 51)]
-        slice_rows = rows[:47]
+        rows = [_ev_row(i) for i in range(1, 51)]  # 50 条积压，远超 TRIGGER(6)
+        # 可折 47 条，单批上限 (TRIGGER 6 − KEEP 3) × 2 = 6 → 只折 EV00042..EV00047
+        slice_rows = rows[41:47]
         script = [
             _AnyResult([]),
             _AnyResult(_keys(rows)),
             _AnyResult(slice_rows),
+            _AnyResult(),  # insert
+        ]
+        llm = _FakeLLM([_reply("完整总结。")])
+        compactor = _make_compactor(script, captured, llm)
+
+        outcome = await compactor.compact_scope("group:999", now=RUN_AT)
+
+        self.assertEqual(outcome.rounds, 1)
+        self.assertEqual(len(llm.calls), 1)  # 一次触顶恒一次 merge，不分块
+        self.assertEqual(len(captured), 4)
+        payload = _params(captured[3])["payload"]
+        self.assertEqual(payload["dropped_event_count"], 6)
+        self.assertEqual(payload["skipped_event_count"], 41)
+        # 上界不动：游标照旧推进到"恰留 KEEP 条"处，一步跨过被跳过的积压，
+        # 下一拍即回稳态（否则卡死的群永远追不上）。
+        self.assertEqual(payload["covers_until_event_id"], "EV00047")
+        self.assertIn("<row EV00042/>", llm.calls[0][1].content)
+        self.assertNotIn("<row EV00001/>", llm.calls[0][1].content)
+
+    async def test_huge_rendered_batch_still_one_request(self) -> None:
+        """封顶只按条数，不按字符：批内渲染再长也只发一次、不分块（§4.4）。"""
+        captured: list[Any] = []
+        rows = [_ev_row(i) for i in range(1, 10)]
+        script = [
+            _AnyResult([]),
+            _AnyResult(_keys(rows)),
+            _AnyResult(rows[:6]),
             _AnyResult(),  # insert
         ]
         llm = _FakeLLM([_reply("完整总结。")])
@@ -421,9 +458,41 @@ class CompactScopeTests(_EnvMixin, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(llm.calls), 1)
         self.assertEqual(len(captured), 4)
         self.assertIn(huge_input, llm.calls[0][1].content)
-        payload = _params(captured[3])["payload"]
-        self.assertEqual(payload["dropped_event_count"], 47)
-        self.assertEqual(payload["covers_until_event_id"], "EV00047")
+
+    async def test_slice_query_lower_bound_follows_batch_not_cursor(self) -> None:
+        """被跳过的积压必须同步从取数下界里消失。
+
+        批选取只是键列表，真正决定单次输入长度的是折叠区间 SQL——下界若
+        仍是游标，跳过就只是账面数字，全部积压照样进 prompt。"""
+        captured: list[Any] = []
+        covered_at = BASE + timedelta(seconds=5)
+        recap_row = SimpleNamespace(
+            event_id="RC00001",
+            occurred_at=covered_at + timedelta(milliseconds=1),
+            payload={
+                "summary": "旧摘要。",
+                "recall_cues": [],
+                "covers_until_event_id": "EV00005",
+                "covers_until_occurred_at": covered_at.isoformat(),
+                "folded_revision": 1,
+            },
+        )
+        rows = [_ev_row(i) for i in range(6, 56)]  # EV00006..EV00055，50 条未覆盖
+        slice_rows = rows[41:47]  # 可折 47 → 批 = EV00047..EV00052
+        script = [
+            _AnyResult([recap_row]),
+            _AnyResult(_keys(rows)),
+            _AnyResult(slice_rows),
+            _AnyResult(),  # insert
+        ]
+        compactor = _make_compactor(script, captured, _FakeLLM([_reply("总结。")]))
+
+        await compactor.compact_scope("group:999", now=RUN_AT)
+
+        bound = set(_params(captured[2]).values())
+        self.assertIn("EV00047", bound)  # 批首条 = 新下界（闭区间）
+        self.assertIn("EV00052", bound)  # 批末条 = 上界
+        self.assertNotIn("EV00005", bound)  # 游标不再参与折叠区间
 
     async def test_budget_truncates_without_second_llm_call(self) -> None:
         captured: list[Any] = []
@@ -431,7 +500,7 @@ class CompactScopeTests(_EnvMixin, unittest.IsolatedAsyncioTestCase):
         script = [
             _AnyResult([]),
             _AnyResult(_keys(rows)),
-            _AnyResult(rows[:7]),
+            _AnyResult(rows[1:7]),
             _AnyResult(),  # insert
         ]
         long_summary = "这是一句测试。" * 20
