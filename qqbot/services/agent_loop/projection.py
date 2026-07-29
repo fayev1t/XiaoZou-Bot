@@ -485,6 +485,7 @@ class Projector:
         timeline = Projector.build_timeline(
             events,
             tool_views=tool_views,
+            unseen_message_ids=Projector.fold_unseen_message_ids(events),
             thought_anchor=thought_anchor,
         )
         # 裁到尾部 max_timeline_items 条 —— fetch 上限给得宽是为了 fold 任务/
@@ -582,15 +583,45 @@ class Projector:
                 break  # 超出滞回带：一次性前移回朴素起点
         return timeline[naive:]
 
-    # fold_unseen_message_ids / <message unseen="true"> 已于 2026-07-24 删除
-    # （待办清单#18）。它是"这拍是不是第一次看到这条消息"的二值标签，两个
-    # 问题使它弊大于利：① 锚定——模型只在带标签的消息里找发言理由；② 一次
-    # 性——一条消息只享有一拍的"值得看"，那拍若决定观望就永久降级成历史，
-    # 与"等一等再全面处理"直接冲突。引导发言的职责 2026-07-19 起已交给
-    # reply_task + Replyer，标签的原始动机（待办#1 拆句观望）不再成立。
-    # 现在"我处理到哪儿"完全由 timeline 的时间顺序表达：<my-thought> /
-    # <my-reply> 行之后的消息就是我看过之后才来的——前提是 decision_emitted
-    # 的 occurred_at 回填为本拍投影时刻（见 loop._tick 的同批改动）。
+    @staticmethod
+    def fold_unseen_message_ids(
+        events: Sequence[_EventSnapshot],
+    ) -> frozenset[str]:
+        """第一拍判定（2026-07-06，待办清单#1 群聊拆句观望；2026-07-24 删除、
+        2026-07-28 复活，见下方"复活说明"）：找出"还没有任何一拍决策看过"
+        的新外部消息。
+
+        每条消息入库即 wake(scope)，第一拍常在对方话说到一半时开拍。这里以
+        窗口内**最后一条** agent.decision_emitted 为水位线：其后到达的
+        external.message.* 即"未见过"，渲染时标 `unseen="true"`（见
+        _render_message），把"这拍是这些消息的第一拍"变成结构性事实——
+        不靠模型比对 <my-thought time=> 自行推断。窗口内从没有过决策时
+        全部消息算未见过（该 scope 真正意义上的第一拍）。
+
+        planner 抛异常的残拍不写 decision_emitted（loop._tick 直接收尾），
+        不推进水位线——那一拍确实没"看到"消息，语义自洽。bot 自己的发言
+        不会误触发：reply 走 agent.tool_called，不产生 external.message
+        事件。notice / request / runtime hint 亦不参与——这个标签只对
+        "人还在说话"这件事成立。
+
+        复活说明（2026-07-28）：2026-07-24 删除时的两条理由——① 锚定，模型
+        只在带标签的消息里找发言理由；② 一次性，一条消息只享有一拍的
+        "值得看"，那拍若观望就永久降级成历史——都没有被推翻，这次是权衡后
+        认为"能不能一眼看出哪几行是新的"更重要。同时确认过一个新增代价：
+        `unseen="true"` 逐拍变化，消息从 unseen 变为非 unseen 时该行字节
+        改变，会在窗口锚定滞回（见类常量注释）之外额外叠加一个前缀缓存
+        失效点，且集中在消息密集的场景——用同一个 group 的真实 prompt
+        快照估过量级，大致是把"正常拍"的缓存命中率从 65-68% 拉到接近
+        "窗口锚点跳动那几拍"的 38-43%。这个取舍是知情做出的，不要当成
+        没考虑过的疏漏又删一遍。
+        """
+        unseen: list[str] = []
+        for ev in events:
+            if ev.type == "agent.decision_emitted":
+                unseen.clear()
+            elif ev.type.startswith("external.message."):
+                unseen.append(ev.event_id)
+        return frozenset(unseen)
 
     @staticmethod
     def fold_bot_role(
@@ -734,6 +765,7 @@ class Projector:
         events: Sequence[_EventSnapshot],
         *,
         tool_views: Sequence[ToolResultView],
+        unseen_message_ids: frozenset[str] | set[str] = frozenset(),
         thought_anchor: str | None = None,
     ) -> list[TimelineItem]:
         tool_view_by_id = {tv.tool_call_id: tv for tv in tool_views}
@@ -752,9 +784,11 @@ class Projector:
         # 预扫出要渲染成 <my-thought> 行的决策事件：只保留最近
         # MAX_THOUGHT_ROWS 条、reasoning 非空白的（空白 reasoning 没有内容
         # 可看，跳过）。更早的决策不渲染：思考是辅助记忆，K 之外的旧念头换
-        # token 不划算。2026-07-24 起这些行还兼任"我处理到哪儿"的唯一信号
-        # （unseen 标签已删，待办#18）——decision_emitted 的 occurred_at 回填
-        # 为本拍投影时刻后，行在消息之前=那拍没看到它，之后=看过了。
+        # token 不划算。这些行同时也是"我处理到哪儿"的信号——decision_emitted
+        # 的 occurred_at 回填为本拍投影时刻后，行在消息之前=那拍没看到它，
+        # 之后=看过了；2026-07-28 起 <message> 自己的 unseen="true"（见
+        # fold_unseen_message_ids）是同一件事更直接的信号，行位置规则仍然
+        # 成立，当兜底。
         # thought_anchor（上一拍首条思考行）有效时选择起点滞回钉住——否则
         # 每拍新增一条决策就把第 K 旧的思考行从 timeline 中段抹掉，掐断
         # 前缀缓存（见类常量注释）；攒满 K + THOUGHT_ROWS_SLACK 条才一次性
@@ -866,6 +900,7 @@ class Projector:
                     excerpt_by_msg_id,
                     name_by_user_id,
                     author_by_msg_id,
+                    unseen=ev.event_id in unseen_message_ids,
                 )
                 items.append(
                     TimelineItem(
@@ -935,6 +970,8 @@ class Projector:
         excerpt_by_msg_id: dict[str, str],
         name_by_user_id: dict[str, str],
         author_by_msg_id: "dict[str, _AuthorRef] | None" = None,
+        *,
+        unseen: bool = False,
     ) -> tuple[str, list[ImageRef]]:
         sender = ev.payload.get("sender") or {}
         name = sender.get("card") or sender.get("nickname")
@@ -989,6 +1026,11 @@ class Projector:
         # recall / set_essence 等工具参数同名直抄），与 task_id / event_id 区分。
         if msg_id:
             attrs.append(f'message_id="{_esc_attr(str(msg_id))}"')
+        # unseen="true"：该消息在最后一条 agent.decision_emitted 之后到达，
+        # 还没有任何一拍处理过（fold_unseen_message_ids）。缺失 = 已经历过
+        # 至少一拍。属性总语义"缺失=默认"的又一实例。
+        if unseen:
+            attrs.append('unseen="true"')
         attr_str = f" {' '.join(attrs)}" if attrs else ""
         return f"<message{attr_str}>{body}</message>", images
 

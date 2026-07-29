@@ -240,8 +240,9 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
         occurred_at 排序（Projector._fetch）。若取写入时刻，LLM 往返期间到达
         的消息会排到决策事件**之前**——那些消息根本没进本拍 context，却被读
         成"这拍已经看过"（人连发的第二句因此被吞），`<my-thought>` 行也会渲染
-        到它们之后。unseen 标签删除后行位置是唯一判据，本条时间戳语义即其
-        地基，故设回归护栏。
+        到它们之后，水位线取自这个时间戳的 `<message unseen="true">`（2026-
+        07-28 复活）同样会误标。行位置判据是这条语义的地基，本条时间戳护栏
+        即其基础。
         """
         captured: list[Any] = []
         loop = AgentLoop(
@@ -286,8 +287,9 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
         内容的 <tool-call> 行仍取写入时刻，LLM 往返期间到达的消息排在它之前
         ——下一拍 Planner 与 Replyer（折入条款以授权行位置为参照）都把没进
         本拍 context 的消息读成"落稿前已看过、有意不接"，连发的后续消息就此
-        既不被补授权也不被折入。行位置是"处理过没有"的唯一判据（unseen 已
-        删），因此动作事件必须与 decision 同锚。
+        既不被补授权也不被折入。行位置是"处理过没有"的判据，因此动作事件
+        必须与 decision 同锚——`<message unseen="true">`（2026-07-28 复活）
+        的水位线同样依赖这批事件的时间戳，锚点错了它也会跟着误标。
         """
         captured: list[Any] = []
         loop = AgentLoop(

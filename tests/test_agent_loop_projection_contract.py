@@ -2659,19 +2659,19 @@ class SavedMemesAugmentTests(unittest.IsolatedAsyncioTestCase):
 
 
 class HandledBoundaryByRowOrderTests(unittest.TestCase):
-    """"我处理到哪儿了"由 timeline 的时间顺序表达（2026-07-24，待办清单#18）。
+    """"我处理到哪儿了"由 `<message unseen="true">` 与 timeline 的行位置
+    共同表达（2026-07-24 待办清单#18 删除 unseen、改用纯行位置；2026-07-28
+    复活 unseen，见 projection.py::fold_unseen_message_ids 的复活说明）。
 
-    原 UnseenMessagesTests 覆盖的 `unseen="true"` 水位线已随本次改动删除：
-    二值标签造成锚定（模型只在带标签的消息里找发言理由），且它是一次性的
-    ——一条消息只享有一拍的"值得看"，那拍若观望就永久降级成历史。替代物
-    是行位置本身：`<my-thought>` / `<my-reply>` 行**之后**的消息 = 那拍没
-    看到它。前提是 decision_emitted 的 occurred_at 回填为本拍投影时刻，
-    护栏在 test_agent_loop_skeleton_contract.py::
-    test_decision_timestamp_is_tick_start_not_write_time。
+    行位置规则本身没变过，继续成立：`<my-thought>` / `<my-reply>` 行
+    **之后**的消息 = 那拍没看到它，前提是 decision_emitted 的 occurred_at
+    回填为本拍投影时刻，护栏在 test_agent_loop_skeleton_contract.py::
+    test_decision_timestamp_is_tick_start_not_write_time。unseen="true"
+    是同一件事更直接的信号，水位线取窗口内最后一条 agent.decision_emitted。
     """
 
-    def test_message_never_carries_unseen_attribute(self) -> None:
-        """回归护栏：属性彻底消失，决策前后一视同仁。"""
+    def test_message_after_last_decision_carries_unseen_attribute(self) -> None:
+        """水位线之后到达的消息标 unseen="true"；水位线之前的不标。"""
         evs = [
             _snap(
                 type="external.message.group",
@@ -2710,8 +2710,45 @@ class HandledBoundaryByRowOrderTests(unittest.TestCase):
             tick_seq=2,
             now=BASE_TIME + timedelta(seconds=10),
         )
-        for item in context.timeline:
-            self.assertNotIn("unseen", item.render)
+        messages = [it for it in context.timeline if it.kind == "message"]
+        self.assertEqual(len(messages), 2)
+        self.assertNotIn("unseen", messages[0].render)
+        self.assertIn('unseen="true"', messages[1].render)
+
+    def test_fold_unseen_message_ids_resets_on_each_decision(self) -> None:
+        """水位线遇 agent.decision_emitted 清零重算：只有最后一次决策之后
+        到达的消息才算未见过，不是全程累加。"""
+        evs = [
+            _snap(type="external.message.group", event_id="M1", seconds_offset=1),
+            _snap(
+                type="agent.decision_emitted",
+                payload={"reasoning": "先看看"},
+                seconds_offset=2,
+            ),
+            _snap(type="external.message.group", event_id="M2", seconds_offset=3),
+            _snap(
+                type="agent.decision_emitted",
+                payload={"reasoning": "还是先等"},
+                seconds_offset=4,
+            ),
+            _snap(type="external.message.group", event_id="M3", seconds_offset=5),
+        ]
+        self.assertEqual(
+            Projector.fold_unseen_message_ids(evs), frozenset({"M3"})
+        )
+
+    def test_fold_unseen_message_ids_all_unseen_without_any_decision(
+        self,
+    ) -> None:
+        """窗口内从没有过决策时，全部消息算未见过——该 scope 真正意义上的
+        第一拍。"""
+        evs = [
+            _snap(type="external.message.group", event_id="M1", seconds_offset=1),
+            _snap(type="external.message.group", event_id="M2", seconds_offset=2),
+        ]
+        self.assertEqual(
+            Projector.fold_unseen_message_ids(evs), frozenset({"M1", "M2"})
+        )
 
     def test_row_order_places_thought_between_the_two_messages(self) -> None:
         """行位置就是判据：决策事件夹在两条消息之间时，<my-thought> 行必须
@@ -2755,10 +2792,6 @@ class HandledBoundaryByRowOrderTests(unittest.TestCase):
         self.assertEqual(
             [it.event_id for it in context.timeline][::2], ["M1", "M2"]
         )
-
-    def test_fold_unseen_message_ids_is_gone(self) -> None:
-        """折叠函数本身已删除——防止后续改动无意间把它加回来。"""
-        self.assertFalse(hasattr(Projector, "fold_unseen_message_ids"))
 
 
 class MyThoughtTests(unittest.TestCase):
