@@ -64,12 +64,27 @@ class EnvCentralizationContractTests(unittest.TestCase):
             "MEMORY_SUMMARY_MAX_CHARS=1200",
             "MEMORY_COMPACTION_TRIGGER_EVENTS=250",
             "MEMORY_COMPACTION_KEEP_EVENTS=150",
-            # 多服务商 LLM 路由：注册表在 config/model_providers.json（可选特性，默认单
-            # 服务商扁平形态），模板只保留路径覆写键的注释示例
+            # LLM 路由：注册表在 config/model_providers.json（2026-07-28 起是
+            # **唯一**来源，无扁平 env 回落），模板只保留路径覆写键的注释示例
             "# MODEL_PROVIDERS_PATH=",
         ):
             with self.subTest(key=key):
                 self.assertIn(key, env_example)
+
+        # 扁平 LLM 服务商配置已于 2026-07-28 删除：两个真相源会让"改了 .env
+        # 不生效"要靠记优先级才能解释，且那条路径把唯一端点硬标成 vision，
+        # 与 planner/replyer 改用纯文本模型直接冲突。防回潮。
+        for retired in (
+            "LLM_PROVIDER=",
+            "LLM_API_KEY=",
+            "LLM_MODEL=",
+            "LLM_BASE_URL=",
+        ):
+            with self.subTest(retired=retired):
+                self.assertNotIn(retired, env_example)
+        # 全局缺省两项保留（与服务商无关）
+        self.assertIn("LLM_TEMPERATURE=", env_example)
+        self.assertIn("LLM_MAX_TOKENS=", env_example)
 
         # websearch 的 SearXNG + Crawl4AI 容器方案已下线（2026-07-18 Tavily
         # 化），env 模板不应再出现两者的配置（防回潮，同 sqlite 断言风格）。

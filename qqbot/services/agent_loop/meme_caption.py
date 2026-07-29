@@ -81,7 +81,7 @@ async def caption_image(
     if llm is None:
         raise CaptionError(
             "caption LLM not configured "
-            "(LLM_API_KEY / LLM_MODEL，或 config/model_providers.json 无带 vision 能力的候选)"
+            "(config/model_providers.json 缺失，或 caption role 无带 vision 能力的候选)"
         )
 
     from langchain_core.messages import HumanMessage

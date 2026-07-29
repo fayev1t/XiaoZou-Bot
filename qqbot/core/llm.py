@@ -5,23 +5,25 @@
 ChatOpenAI 客户端（streaming / stream_usage 探测 / max_tokens / timeout）、
 把路由事件接到日志。契约见 `开发文档/v2.0/20-横切契约/LLM路由契约.md`。
 
-配置两种形态（互斥）：
+配置**只有一个来源**：``config/model_providers.json``（路径可用 env
+``MODEL_PROVIDERS_PATH`` 覆写；模板见 ``config/model_providers.example.json``，
+真实文件含 api_key、已被 .gitignore 排除）。三段：``providers``（服务商注册表：
+名称 / base_url / api_key / 持有的模型）+ ``roles``（用途 → 模型名，可选钉死
+服务商）+ ``settings``（全局策略缺省 random、冷却秒数）。调用方只给模型名即可，
+路由器在持有该模型的服务商里按策略挑选。文件缺失或解析失败 → LLM 整体不可用
+（fail loudly：``create_llm`` 返回 None，各调用方按自己的降级语义处理），
+**绝不静默回落到别处的配置**。
 
-- **配置文件（推荐）**：``config/model_providers.json``（路径可用 env
-  ``MODEL_PROVIDERS_PATH`` 覆写；模板见 ``config/model_providers.example.json``，真实文件
-  含 api_key、已被 .gitignore 排除）。三段：``providers``（服务商注册表：
-  名称 / base_url / api_key / 持有的模型）+ ``roles``（用途 → 模型名，
-  可选钉死服务商）+ ``settings``（全局策略缺省 random、冷却秒数）。
-  调用方只给模型名即可，路由器在持有该模型的服务商里按策略挑选。
-  文件存在即启用并忽略下面扁平键的服务商字段；文件存在但解析失败 →
-  LLM 整体不可用（fail loudly，不静默回落旧配置）。
-- **扁平 env（向后兼容）**：``LLM_PROVIDER / LLM_API_KEY / LLM_MODEL /
-  LLM_BASE_URL`` ——行为与旧版一致（openai 流式 + stream_usage 探测、
-  deepseek 缺 base_url 补官方默认、视为天然多模态）。
+2026-07-28 删除扁平 env 形态（``LLM_PROVIDER / LLM_API_KEY / LLM_MODEL /
+LLM_BASE_URL``）。它当年是单服务商时代的向后兼容层，留着有两处实际危害：
+一是同一份部署有两个真相源，"为什么改了 .env 不生效"要靠记住优先级才能答；
+二是它把那个唯一端点硬标成 ``capabilities={"vision"}``（"旧配置视为天然
+多模态"），于是配一个纯文本模型时，图片描述与表情包收藏会去调它然后失败——
+而 Planner/Replyer 去多模态化之后，"planner 用纯文本模型"恰恰成了常态配置。
+``LLM_TEMPERATURE / LLM_MAX_TOKENS`` 保留，它们是全局缺省、与服务商无关。
 
-``LLM_TEMPERATURE / LLM_MAX_TOKENS`` 在两种形态下都作全局缺省。配置在
-首次 ``create_llm()`` 时读取并缓存为进程级单例——冷却/熔断状态必须跨
-调用方（planner / replyer / caption）共享；改配置需重启生效。
+配置在首次 ``create_llm()`` 时读取并缓存为进程级单例——冷却/熔断状态必须跨
+调用方（planner / replyer / vision / caption）共享；改配置需重启生效。
 """
 
 from typing import Any
@@ -43,12 +45,10 @@ logger = get_logger(__name__)
 
 
 class LLMConfig(BaseSettings):
-    # ── 单服务商扁平形态（向后兼容；config/model_providers.json 存在时服务商字段被忽略）──
-    llm_provider: str = "openai"
-    llm_api_key: str = ""
-    llm_model: str = ""
+    # 全局缺省，与服务商无关：调用方不显式传 temperature 时用 llm_temperature，
+    # 端点自身没配 max_tokens 时用 llm_max_tokens。服务商/模型/密钥/base_url
+    # 一律只从 config/model_providers.json 读（2026-07-28 起扁平键已删除）。
     llm_temperature: float = 0.7
-    llm_base_url: str = ""
     llm_max_tokens: int | None = None
 
     class Config:
@@ -79,38 +79,9 @@ def reset_llm_runtime() -> None:
     _runtime_failed = False
 
 
-def _legacy_endpoints(config: LLMConfig) -> list[ModelEndpoint]:
-    """扁平 LLM_* env → 单端点注册表（保持旧 create_llm 的全部行为）。"""
-    if not config.llm_api_key:
-        logger.warning("LLM_API_KEY not configured")
-        return []
-    if not config.llm_model:
-        logger.warning("LLM_MODEL not configured")
-        return []
-    if config.llm_provider not in {"deepseek", "openai"}:
-        logger.error(f"Unknown LLM provider: {config.llm_provider}")
-        return []
-
-    base_url = config.llm_base_url.strip()
-    if config.llm_provider == "deepseek" and not base_url:
-        base_url = "https://api.deepseek.com/v1"
-    return [
-        ModelEndpoint(
-            provider=config.llm_provider,
-            model=config.llm_model,
-            base_url=base_url,
-            api_key=config.llm_api_key,
-            # 旧行为假定这份配置天然多模态（meme_caption 直接用它看图）。
-            capabilities=frozenset({"vision"}),
-            # 旧行为只给 openai 开流式（deepseek 走非流式）。
-            streaming=config.llm_provider == "openai",
-        )
-    ]
-
-
 def _load_routing_config() -> RoutingConfig | None:
-    """读 ``config/model_providers.json``。不存在 → None（回落扁平 env）；存在但
-    读不了/解析失败 → raise（fail loudly，绝不静默换成另一套配置）。"""
+    """读 ``config/model_providers.json``。不存在 → None（无回落，LLM 不可用）；
+    存在但读不了/解析失败 → raise（fail loudly，绝不静默换成另一套配置）。"""
     path = get_model_providers_path()
     if not path.exists():
         return None
@@ -127,20 +98,24 @@ def _build_runtime() -> _LLMRuntime | None:
         logger.error(f"[llm] 配置文件加载失败（{get_model_providers_path()}）：{exc}")
         return None
 
-    if routing is not None:
-        endpoints: list[ModelEndpoint] = list(routing.endpoints)
-        roles = routing.roles
-        default_strategy = routing.default_strategy
-        cooldown = routing.cooldown_seconds
-        source = str(get_model_providers_path())
-    else:
-        endpoints = _legacy_endpoints(config)
-        if not endpoints:
-            return None
-        roles = {}
-        default_strategy = "primary_failover"  # 单端点，策略无实际意义
-        cooldown = 60.0
-        source = "env(LLM_*)"
+    if routing is None:
+        # 2026-07-28 起没有扁平 env 回落：这里是唯一的配置来源，缺了就是
+        # 部署没配好，必须是 error 而不是 warning——LLM 全线不可用（Planner
+        # 每拍降级 idle、Replyer/caption raise、图片不描述），排查时第一眼
+        # 就要看到这行。
+        logger.error(
+            "[llm] 未找到模型配置文件 {}：LLM 全部不可用。"
+            "从 config/model_providers.example.json 复制一份并填好 api_key，"
+            "或用 env MODEL_PROVIDERS_PATH 指向实际路径。",
+            get_model_providers_path(),
+        )
+        return None
+
+    endpoints: list[ModelEndpoint] = list(routing.endpoints)
+    roles = routing.roles
+    default_strategy = routing.default_strategy
+    cooldown = routing.cooldown_seconds
+    source = str(get_model_providers_path())
 
     router = EndpointRouter(
         endpoints,

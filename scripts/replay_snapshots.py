@@ -242,7 +242,7 @@ async def _amain(args: argparse.Namespace) -> int:
     llm = await create_llm(role="planner")
     if llm is None:
         print(  # noqa: T201
-            "LLM 未配置（LLM_API_KEY / LLM_MODEL 或 config/model_providers.json）",
+            "LLM 未配置（config/model_providers.json 缺失或解析失败）",
             file=sys.stderr,
         )
         return 1

@@ -695,9 +695,9 @@ class LLMPlannerContractTest(unittest.TestCase):
         self.assertIsNone(action.triggered_by_event_id)
 
     def test_no_llm_client_returns_unavailable_idle(self) -> None:
-        # llm_client=None and create_llm() will probably return None too
-        # (no LLM_API_KEY in test env), so this exercises that branch.
-        # We simulate the empty path by stubbing _ensure_llm to return None.
+        # 直接 stub _ensure_llm 返回 None，不依赖任何真实配置——这条验的是
+        # "拿不到 LLM 时降级成 idle(llm_unavailable)"，而拿不到的原因（缺
+        # config/model_providers.json、解析失败、role 无候选）不在本例范围内。
         planner = LLMPlanner(llm_client=None)
 
         async def _no_llm() -> Any:

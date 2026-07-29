@@ -51,6 +51,9 @@ DEFAULT_SNAPSHOT_KEEP = 200
 DEFAULT_SNAPSHOT_SCOPES = "group,system"
 
 # 值出现在快照文本里就必须被抹掉的 env 键（脱敏契约 #2）。
+# LLM_API_KEY 于 2026-07-28 不再被路由读取（密钥只在 model_providers.json 里，
+# 那份由 collect_api_keys 单独收集），但**保留在本列表**：老部署的 .env 里多半
+# 还留着这一行，脱敏的职责是"环境里存在的密钥都别泄漏"，而不是"我们读的才管"。
 _SECRET_ENV_KEYS = (
     "LLM_API_KEY",
     "TAVILY_API_KEY",
