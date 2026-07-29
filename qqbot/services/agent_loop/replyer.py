@@ -152,7 +152,7 @@ def _build_user_text(
     谁说话"的输入低 Planner 一等。现改为与 Planner 同构的 XML 信封：
     timeline 行原样逐行嵌入，身份属性同名（bot_qq / bot_role，缺失不渲染，
     语义同 <agent-input>），<reply-task> 锚紧邻文档尾部（最贴近输出位置）。
-    2026-07-25 补强后，``<reply-task>`` 携带折叠出的**最新完整 brief**。旧
+    2026-07-28 起，``<reply-task>`` 携带折叠出的**最新完整 analysis**。旧
     revision 仍在 timeline 的 tool-call 行里供历史回看，但不再参与 Replyer
     授权合并；这同时消除 hold=0 时 terminal result 尚未落库、以及活跃群窗口
     裁剪掉授权行造成的空授权竞态。
@@ -190,15 +190,16 @@ def _build_user_text(
     # 与 Planner 逐字节同构的时间流渲染（render_timeline_stream，2026-07-26）。
     parts.extend(render_timeline_stream(context.timeline))
     parts.append("</timeline>")
-    if not isinstance(task.brief, str) or not task.brief.strip():
-        raise ReplyerError("compose reply_task has no current brief")
+    analysis = task.analysis.strip() if isinstance(task.analysis, str) else ""
+    if not analysis:
+        raise ReplyerError("compose reply_task has no current analysis")
     # 当前授权来自已提交的 reply_task upsert 折叠态，而不是通用 timeline：
     # notify 发生在 ToolWorker 写 terminal result 之前，hold=0 时 tool-call 仍可
     # 是 processing；timeline 也有条数上限。revision 一并透出，方便快照审计。
     parts.append(
         f'<reply-task reply_task_id="{_esc_attr(task.reply_task_id)}" '
         f'revision="{task.revision}">'
-        f"<brief>{_esc_text(task.brief.strip())}</brief>"
+        f"<analysis>{_esc_text(analysis)}</analysis>"
         "</reply-task>"
     )
     parts.append(f'<current now="{_esc_attr(context.now.isoformat())}"/>')

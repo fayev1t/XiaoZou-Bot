@@ -274,9 +274,9 @@ class Projector:
         # 多查一次 reply_task 事件、只为渲染 <pending-reply>，而那一段的每个
         # Planner 所需字段都被 timeline 上的 <tool-call name="reply"> 行覆盖
         # （reply_task_id / revision / flush_at / hard_deadline 在 <result> 里，
-        # brief / hold_seconds 在 <args> 里）。reply 成功行不再折叠之后主从
+        # analysis / hold_seconds 在 <args> 里）。reply 成功行不再折叠之后主从
         # 关系反转，Planner 信封没有独立状态区。ReplyExecutor 不走这条投影来取
-        # 当前授权：它从 reply_task 领域事件折叠最新 brief，避免 terminal 竞态与
+        # 当前授权：它从 reply_task 领域事件折叠最新 analysis，避免 terminal 竞态与
         # timeline 裁剪。
         return ctx
 
@@ -846,7 +846,7 @@ class Projector:
                 tv = tool_view_by_id.get(tc_id)
                 # 2026-07-24（待办#19）起 reply 的成功行**不再折叠**：它是
                 # Planner 回看每次授权尝试的时间线记录——<args> 是该次原文
-                # （brief/hold_seconds），<result> 是它落成的调度事实
+                # （analysis/hold_seconds），<result> 是它落成的调度事实
                 # （reply_task_id/revision/flush_at/hard_deadline）。折叠是为
                 # 了避免与 <pending-reply> 双重渲染，而那一段已随本次改动删除，
                 # Planner 内容留在 timeline，不另立状态区。Replyer 的当前授权

@@ -3,12 +3,13 @@
 ReplyTask 是 scope 内唯一、最长只存活几十秒的待发聚合，不使用读模型表。
 
 2026-07-24（待办#19）起**内容不再合并**：每次 upsert 事件记录的是那一次调用
-自己的授权原文（brief / verbatim_messages），不是与历史的合并态。
+自己的授权原文（analysis / verbatim_messages），不是与历史的合并态。
 
 2026-07-25 的补强把“完整、自足”落实为明确的 **latest-revision-wins**：
-折叠出的 ``ReplyTaskState`` 同时携带最新一条 upsert 的调度字段与完整 ``brief``。
+折叠出的 ``ReplyTaskState`` 同时携带最新一条 upsert 的调度字段与完整
+``analysis``。
 旧 revision 仍留在 append-only 事件流供审计与 Planner 回看，但不再由 Replyer
-做“未冲突部分继续生效”的隐式语义合并。把当前 brief 放在折叠态还有一个运行时
+做“未冲突部分继续生效”的隐式语义合并。把当前 analysis 放在折叠态还有一个运行时
 必要性：Replyer 不能依赖通用 timeline 上的 tool-call 行——``hold_seconds=0`` 时
 对应 ``agent.tool_result`` 可能尚未落库，活跃群里该行也可能被窗口裁掉。
 ``verbatim_messages`` 同理是执行器真正要照着发送的最新内容。cancel/claim/flush
@@ -57,7 +58,7 @@ class ReplyTaskState:
     flush_at: datetime
     hard_deadline: datetime
     mode: str
-    brief: str
+    analysis: str
     verbatim_messages: list[dict]
     latest_event_id: str
     source_tool_call_event_id: str | None
@@ -194,14 +195,14 @@ def build_upsert_payload(
     flush_at: datetime,
     hard_deadline: datetime,
     mode: str,
-    brief: str,
+    analysis: str,
     verbatim_messages: list[dict],
 ) -> dict:
     """一次授权的领域事件 payload。
 
-    ``brief`` 是 compose 授权的自由文本判读（verbatim 恒为空串）。每次事件仍
-    原样留档；折叠态只取最新 revision 的完整 brief，作为 Replyer 不受 timeline
-    终态竞态与窗口裁剪影响的当前授权。
+    ``analysis`` 是 compose 授权的对话分析交接（verbatim 恒为空串）。每次事件
+    仍原样留档；折叠态只取最新 revision 的完整 analysis，作为 Replyer 不受
+    timeline 终态竞态与窗口裁剪影响的当前授权。
     """
     return {
         "reply_task_id": reply_task_id,
@@ -212,7 +213,7 @@ def build_upsert_payload(
         "flush_at": flush_at.isoformat(),
         "hard_deadline": hard_deadline.isoformat(),
         "mode": mode,
-        "brief": brief,
+        "analysis": analysis,
         "verbatim_messages": verbatim_messages,
     }
 
@@ -222,8 +223,9 @@ def build_upsert_payload(
 # 一个已授权的 target，merge_gist 的 facts/avoid 是并集去重、写错的事实撤不
 # 回来，模型只能往 avoid 里塞反向指令去抵消，让 gist 自相矛盾。改成 append-
 # only 之后不存在"合并"这件事——每条授权原样入库，折叠态只取最新 revision
-# 的完整 brief；旧 revision 不再作为补丁参与组稿。targets/gist 本身随后于
-# 2026-07-25 被单个自由文本字段 brief 取代，省略旧内容即撤回旧内容。
+# 的完整 analysis；旧 revision 不再作为补丁参与组稿。targets/gist 本身随后于
+# 2026-07-25 被单个自由文本字段取代；2026-07-28 该字段进一步明确为 analysis，
+# 专门承载人物/话题/时序与事实判读，省略旧内容即撤回旧内容。
 
 
 _REPLY_EVENT_TYPES = (
@@ -264,7 +266,13 @@ def _fold_rows(rows: Any) -> dict[str, ReplyTaskState]:
         if not task_id:
             continue
         if row.type == "agent.reply_task_upserted":
-            raw_brief = payload.get("brief")
+            # 2026-07-28 工具与领域事件改名为 analysis。升级前已经持久化的事件
+            # 仍使用 brief；只在新键完全不存在时读取旧键，避免损坏的新事件被旧值
+            # 悄悄掩盖。
+            if "analysis" in payload:
+                raw_analysis = payload.get("analysis")
+            else:
+                raw_analysis = payload.get("brief")
             tasks[task_id] = ReplyTaskState(
                 reply_task_id=task_id,
                 scope_key=_scope_key(row),
@@ -280,7 +288,7 @@ def _fold_rows(rows: Any) -> dict[str, ReplyTaskState]:
                 # 领域事件正常只可能来自 ReplyTool 的严格校验；若旧库/损坏事件
                 # 仍塞入非字符串，折成空授权让 Replyer fail loudly，绝不能把
                 # list/dict 的 repr 当成一份可发送授权。
-                brief=raw_brief if isinstance(raw_brief, str) else "",
+                analysis=raw_analysis if isinstance(raw_analysis, str) else "",
                 verbatim_messages=list(payload.get("verbatim_messages") or []),
                 latest_event_id=row.event_id,
                 source_tool_call_event_id=row.causation_id,

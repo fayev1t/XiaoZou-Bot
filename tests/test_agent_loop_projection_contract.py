@@ -2395,14 +2395,17 @@ class ReplyFlushedProjectionTests(unittest.TestCase):
         """2026-07-24（待办#19）起 reply 成功行**不再折叠**：它是 append-only
         规划历史的一部分——<args> 是这次授权原文（含 hold_seconds），<result>
         是它落成的调度事实。Replyer 的当前唯一授权另由 ReplyTaskState 中最新
-        完整 brief 提供；这里不做历史合并。"""
+        完整 analysis 提供；这里不做历史合并。"""
         called = _snap(
             type="agent.tool_called",
             event_id="TC_EVENT",
             payload={
                 "tool_call_id": "TC_REPLY",
                 "tool_name": "reply",
-                "arguments": {"brief": "他在问天气，回答", "hold_seconds": 8},
+                "arguments": {
+                    "analysis": "他在 MSG_1 单独问天气；问题尚未回答",
+                    "hold_seconds": 8,
+                },
             },
         )
         result = _snap(
@@ -2424,7 +2427,7 @@ class ReplyFlushedProjectionTests(unittest.TestCase):
         render = items[0].render
         self.assertIn('<tool-call name="reply" status="complete"', render)
         # 授权原文（<args>）与调度事实（<result>）都在同一行上，Planner 据此
-        # 回看"我当时授权了什么、什么时候发"；Replyer 不依赖这行取当前 brief。
+        # 回看"我当时授权了什么、什么时候发"；Replyer 不依赖这行取当前 analysis。
         self.assertIn("hold_seconds", render)
         self.assertIn("回答", render)
         self.assertIn("R1", render)

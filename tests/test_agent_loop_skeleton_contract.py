@@ -182,7 +182,7 @@ class _SlowCallToolPlanner:
                 CreateTaskAction(description="慢拍任务", task_ref="ref-1"),
                 CallToolAction(
                     tool_name="reply",
-                    arguments={"brief": "x", "hold_seconds": 0},
+                    arguments={"analysis": "x", "hold_seconds": 0},
                     task_ref="ref-1",
                 ),
             ]

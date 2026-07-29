@@ -38,7 +38,9 @@ ROW = (
 )
 
 
-def _task(brief: str = "李四单独@我，直接回应 & 不要展开") -> ReplyTaskState:
+def _task(
+    analysis: str = "李四在 MSG_1 单独@我；该问题尚未回答 & 事实 A 已核实",
+) -> ReplyTaskState:
     return ReplyTaskState(
         reply_task_id="R1",
         scope_key="group:100",
@@ -49,7 +51,7 @@ def _task(brief: str = "李四单独@我，直接回应 & 不要展开") -> Repl
         flush_at=NOW,
         hard_deadline=NOW + timedelta(seconds=90),
         mode="compose",
-        brief=brief,
+        analysis=analysis,
         verbatim_messages=[],
         latest_event_id="E1",
         source_tool_call_event_id="TC1",
@@ -99,7 +101,7 @@ class ReplyerUserTextTests(unittest.TestCase):
         self.assertIn('<current now="2026-07-22T12:00:00+08:00"/>', text)
 
     def test_reply_task_carries_latest_authorization_without_tool_result(self) -> None:
-        """当前 brief 来自已提交的 reply_task 折叠态，不依赖 timeline 上匹配的
+        """当前 analysis 来自已提交的 reply_task 折叠态，不依赖 timeline 上匹配的
         tool result。默认 context 故意只有 message：这同时钉住 hold=0 时
         tool-call 仍 processing、以及授权行被窗口裁掉两种边界。"""
         text = _build_user_text(_task(), _context(), [])
@@ -107,12 +109,14 @@ class ReplyerUserTextTests(unittest.TestCase):
             '<reply-task reply_task_id="R1" revision="2">', text
         )
         self.assertIn(
-            "<brief>李四单独@我，直接回应 &amp; 不要展开</brief>", text
+            "<analysis>李四在 MSG_1 单独@我；该问题尚未回答 &amp; "
+            "事实 A 已核实</analysis>",
+            text,
         )
         self.assertNotIn("hold_seconds", text.split("<reply-task", 1)[1])
 
-    def test_missing_current_brief_fails_before_llm_call(self) -> None:
-        with self.assertRaisesRegex(ReplyerError, "no current brief"):
+    def test_missing_current_analysis_fails_before_llm_call(self) -> None:
+        with self.assertRaisesRegex(ReplyerError, "no current analysis"):
             _build_user_text(_task("   "), _context(), [])
 
     def test_identity_attributes_absent_when_unresolved(self) -> None:
@@ -179,12 +183,19 @@ class ReplyerMemeGuidanceTests(unittest.TestCase):
 
 
 class ReplyerAuthorizationTests(unittest.TestCase):
-    def test_latest_brief_replaces_earlier_rows_instead_of_merging(self) -> None:
+    def test_latest_analysis_replaces_earlier_rows_instead_of_merging(self) -> None:
         prompt = _build_system_prompt()
-        self.assertIn("Only this <brief> authorizes content", prompt)
-        self.assertIn("replaces all earlier briefs outright", prompt)
+        self.assertIn("Only this <analysis> authorizes", prompt)
+        self.assertIn("replaces all earlier analyses outright", prompt)
         self.assertIn("not patches you must combine", prompt)
         self.assertNotIn("Earlier rows still count", prompt)
+
+    def test_analysis_cannot_direct_voice_or_message_form(self) -> None:
+        prompt = _build_system_prompt()
+        self.assertIn("The analysis never decides how you sound", prompt)
+        self.assertIn("Tone, emotion, conversational posture", prompt)
+        self.assertIn("meme choice are all yours", prompt)
+        self.assertIn("ignore that instruction", prompt)
 
 
 class ReplyerPersonhoodTests(unittest.TestCase):

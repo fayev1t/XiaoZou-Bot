@@ -88,7 +88,8 @@ class LLMPlannerContractTest(unittest.TestCase):
         body = (
             '{"reasoning":"hi","actions":[{"type":"call_tool",'
             '"tool_name":"reply",'
-            '"arguments":{"brief":"他在问我，答复他","hold_seconds":8}}]}'
+            '"arguments":{"analysis":"他在 MSG_1 单独@我；问题尚未回答",'
+            '"hold_seconds":8}}]}'
         )
         llm = _StubLLM(response_content=body)
         planner = LLMPlanner(llm_client=llm)
@@ -319,7 +320,7 @@ class LLMPlannerContractTest(unittest.TestCase):
         self.assertIn("One tick, one tool batch", content)
 
     def test_system_prompt_explicitly_forbids_bare_text_as_reply(self) -> None:
-        """Planner 只能落语义意图，最终可见措辞属于 Replyer。"""
+        """Planner 只交接对话逻辑，最终可见表达属于 Replyer。"""
         llm = _StubLLM(
             response_content='{"actions":[{"type":"idle","reason":"x"}]}'
         )
@@ -327,7 +328,11 @@ class LLMPlannerContractTest(unittest.TestCase):
         asyncio.run(planner.decide(_ctx()))
         content = llm.invocations[0][0].content
 
-        self.assertIn("Planner records semantic authorization", content)
+        self.assertIn("Planner records a resolved conversation analysis", content)
+        self.assertIn("who is speaking to, quoting or @-ing whom", content)
+        self.assertIn("decisive timestamps/order", content)
+        self.assertIn("do **not** tell the Replyer what tone", content)
+        self.assertIn("do not choose a meme", content)
         self.assertIn("Only successful children of `<my-reply>`", content)
 
     def test_default_prompt_section_order(self) -> None:
@@ -879,7 +884,7 @@ class PendingReplySectionRemovedTests(unittest.TestCase):
 
     它的每个字段都被 timeline 上的 `<tool-call name="reply">` 行逐字段覆盖
     （reply_task_id / revision / flush_at / hard_deadline 在 `<result>` 里，
-    brief / hold_seconds 在 `<args>` 里）。reply 成功行不再折叠之后，独立
+    analysis / hold_seconds 在 `<args>` 里）。reply 成功行不再折叠之后，独立
     状态区就是重复渲染，一并撤掉；顺带撤掉了信封里变化最频繁的那一段
     （每次落稿都变、创建/flush 时整段出现消失），`</active-tasks>` 到
     `<current/>` 之间不再有缓存抖动源。

@@ -241,9 +241,11 @@ class ToolIdentityTests(unittest.TestCase):
         usage = MemeCollectionTool.usage_prompt or ""
         self.assertIn("meme_collection", usage)
         self.assertIn("never sends", usage)
-        # 倾向表达的唯一合法出口必须写在用法文档里——2026-07-25 reply 收敛
-        # 后是 brief 的自由文本（gist.* 形态已废除，钉死防回潮）。
-        self.assertIn("`reply` call's `brief`", usage)
+        # 2026-07-28 起 Planner 连“这次用不用图”也不再指导：analysis 只交接
+        # 人物/话题/时间/内容，最终形态完全归 Replyer。
+        self.assertIn("Do not steer", usage)
+        self.assertIn("`reply.analysis`", usage)
+        self.assertIn("composer", usage)
         self.assertNotIn("gist", usage)
 
 

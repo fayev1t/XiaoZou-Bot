@@ -1,23 +1,23 @@
 """reply 工具：当前 scope 唯一的发言入口。
 
-**2026-07-25 参数收敛**：compose 授权的内容从九个结构化槽位收敛成一个自由文本
-`brief`，加一个 `hold_seconds`——普通发言的调用面就是这两个字段，没有第三个。
+**2026-07-28 分工收敛**：compose 授权只接收一个自由文本 ``analysis``，加一个
+``hold_seconds``。analysis 是 Planner 对人物指向、话题线、时间节点、待回答内容
+与可靠事实的解析结果，不是给 Replyer 的语气、情感、姿态或措辞指令。
 
 砍掉的是 `targets[] {message_id, sender_qq, context, guidance}` +
 `gist {situation, intent, facts, avoid, tone}` 那套结构化槽位。它们**从来不
 是机器契约**——程序侧除了一条"compose 不能为空"的兜底之外一个字段都不消费；
 Replyer 需要的是 Planner 的完整判读，而不是固定槽位。既然只是提示词交接形状，
 就该按"能不能帮它把局势讲清楚"评判，而九个槽位在这上面是负分：
-  - `additionalProperties: false` 把辅助维度封死——Planner 想说"这人上周说过
-    讨厌被叫全名"、"接住我上一条的梗"、"别用问句收尾"，没有格子，只能硬塞进
-    `avoid` 或 `tone`，语义降级；
+  - `additionalProperties: false` 把辅助维度封死——人物之间的引用/@关系、并行
+    话题和关键先后顺序没有稳定槽位，只能被硬塞进 context/gist，语义降级；
   - 槽位诱导填充——`gist.situation` 与 `targets[].context` 天然重叠、
     `intent` 与 `guidance` 天然重叠，一个两句话的判读被切成七份写；
   - 与 append-only 语义打架——授权是追加的、最新一条为准，但结构化槽位一追加
     就有"第二条的空 facts 是不是撤销了第一条的"这种歧义，只能靠文档打补丁。
 一段自然语言没有这三个问题：想说几个维度写几个维度，"最新一条为准"也天然成立。
-被回应消息的 message_id 不再单列字段（Replyer 看同一份 timeline，自己认得出，
-要精确锚定就在 brief 里写"回 MSG_42 那条"）。
+被回应消息的 message_id 不再单列字段（需要消歧时直接写进 analysis；Replyer 从
+同一份 timeline 复制真实 id）。
 
 **`action` 保留，但改成可选**：省略 = 追加一条授权（普通发言的唯一形态），
 `"cancel"` 撤稿，`"verbatim"` 逐字直发。取消的是 `"upsert"` 这个取值——
@@ -34,9 +34,11 @@ Replyer 和角色卡说话。留在 action 分支里，它的可见度才与它�
 
 授权仍是 **append-only**（2026-07-24，待办#19）：每次调用都是完整、自足的一
 条，不引用上一次、程序也不做任何字段合并。scope 内仍只有一份 open reply_task；
-后续调用 append 新 revision，并让最新 revision 的完整 brief 与 flush_at 直接
+后续调用 append 新 revision，并让最新 revision 的完整 analysis 与 flush_at 直接
 获胜（能延长也能缩短）。旧 revision 留在事件流供审计与 Planner 回看，但 Replyer
-只消费折叠态里的最新 brief，不再做“旧授权未冲突部分继续生效”的隐式语义合并。
+只消费折叠态里的最新 analysis，不再做“旧授权未冲突部分继续生效”的隐式语义
+合并。历史 ``brief`` 领域事件由折叠层兼容读取，但旧工具参数会 fail loudly，促使
+Planner 按新边界重发。
 """
 
 from __future__ import annotations
@@ -69,15 +71,21 @@ MAX_VERBATIM_MESSAGES = 4
 # 退役字段：旧形态的调用不静默吃掉，按字段给可读 reason_code，让 Planner 下一
 # 拍照错误自纠（沿用 2026-07-22 `points_replaced_by_context` 的先例）。静默忽略
 # 是最坏的处理——模型会以为那套判读送到了 Replyer，而从 <result> 上看不出异常。
-_BRIEF_HINT = (
-    "targets/gist are retired: write the whole read — what is going on, "
-    "which thread you are entering, how to answer it, what must stay true, "
-    "what must not surface — as one plain-language `brief`"
+_ANALYSIS_HINT = (
+    "targets/gist are retired: synthesize the participants and addressee "
+    "relationships, topic threads, decisive time/order changes, unresolved "
+    "content, verified facts and uncertainty as one plain-language `analysis`; "
+    "do not prescribe tone, emotion, persona, posture or final wording"
 )
 _RETIRED_KEYS: dict[str, tuple[str, str]] = {
-    "targets": ("targets_gist_replaced_by_brief", _BRIEF_HINT),
-    "gist": ("targets_gist_replaced_by_brief", _BRIEF_HINT),
-    "points": ("targets_gist_replaced_by_brief", _BRIEF_HINT),
+    "brief": (
+        "brief_renamed_to_analysis",
+        "brief was renamed to analysis and its old style-steering semantics "
+        "were removed",
+    ),
+    "targets": ("targets_gist_replaced_by_analysis", _ANALYSIS_HINT),
+    "gist": ("targets_gist_replaced_by_analysis", _ANALYSIS_HINT),
+    "points": ("targets_gist_replaced_by_analysis", _ANALYSIS_HINT),
     "mode": (
         "mode_replaced_by_action",
         'there is no mode; exact bytes are action="verbatim"',
@@ -101,12 +109,15 @@ class ReplyTool(BaseTool):
     # 立刻改主意重新落稿。
     wake_policy = "on_failure"
     description = (
-        "Speak. Normally you pass just two arguments — `brief`, your read of "
-        "the situation and how you want it answered in plain language, and "
-        "`hold_seconds` — and that appends one self-contained authorization "
+        "Speak. Normally you pass exactly `analysis` — your resolved map of "
+        "the participants, addressee relationships, topic threads, decisive "
+        "chronology, unresolved content and reliable facts — plus "
+        "`hold_seconds`. That appends one self-contained authorization "
         "to this scope's pending draft. Each call stands alone; never "
-        "reference an earlier one; the newest brief and hold_seconds replace "
+        "reference an earlier one; the newest analysis and hold_seconds replace "
         "the previous revision outright. "
+        "Do not prescribe tone, emotion, persona, posture, meme use, bubble "
+        "shape or final wording; the Replyer owns every expressive choice. "
         "A successful call only stores pending intent; it does NOT mean "
         "anything was sent — actual speech appears later as <my-reply> after "
         'runtime.reply_flushed. Two rare branches: action="cancel" withdraws '
@@ -117,16 +128,19 @@ class ReplyTool(BaseTool):
     arguments_schema = {
         "type": "object",
         "properties": {
-            "brief": {
+            "analysis": {
                 "type": "string",
                 "description": (
-                    "Free text, no fixed shape and no length target: what is "
-                    "going on in the room, which thread you are entering, "
-                    "what you want said and in what spirit, anything that "
-                    "must stay true, anything that must not surface. The "
-                    "Replyer reads the same timeline you do — hand over your "
-                    "*read* of it, not a relay of its content, and never the "
-                    "final wording."
+                    "Free-text resolved conversation analysis for the Replyer: "
+                    "who is talking to/quoting/@-ing whom, the relevant social "
+                    "relationship when evidenced, active topic threads, "
+                    "decisive time/order changes, the exact unresolved "
+                    "question/claim/request, verified facts and uncertainty, "
+                    "plus unrelated or already-resolved threads to exclude. "
+                    "Synthesize the conclusions instead of merely pointing at "
+                    "the shared timeline. Do not prescribe final wording, "
+                    "tone, emotion, persona, conversational posture, humor, "
+                    "meme use, bubble count or any other presentation choice."
                 ),
             },
             "hold_seconds": {
@@ -184,7 +198,7 @@ class ReplyTool(BaseTool):
             {
                 "if": {"not": {"required": ["action"]}},
                 "then": {
-                    "required": ["brief", "hold_seconds"],
+                    "required": ["analysis", "hold_seconds"],
                     "not": {
                         "anyOf": [
                             {"required": ["messages"]},
@@ -202,7 +216,7 @@ class ReplyTool(BaseTool):
                     "required": ["messages"],
                     "not": {
                         "anyOf": [
-                            {"required": ["brief"]},
+                            {"required": ["analysis"]},
                             {"required": ["reply_task_id"]},
                         ]
                     },
@@ -216,7 +230,7 @@ class ReplyTool(BaseTool):
                 "then": {
                     "not": {
                         "anyOf": [
-                            {"required": ["brief"]},
+                            {"required": ["analysis"]},
                             {"required": ["hold_seconds"]},
                             {"required": ["messages"]},
                         ]
@@ -314,7 +328,7 @@ class ReplyTool(BaseTool):
         if existing_payload is not None:
             return ToolOutcome.success(_result_from_payload(existing_payload))
 
-        brief, messages, hold, fail = _validate_append(arguments, verbatim)
+        analysis, messages, hold, fail = _validate_append(arguments, verbatim)
         if fail:
             return fail
 
@@ -324,9 +338,9 @@ class ReplyTool(BaseTool):
         # （旧 merge 只增不删，撤不掉写错的判读与事实）。scope 内仍只有一份
         # open reply_task 承载"等到什么时候发"，后续调用 append 上去、把
         # flush_at 换成自己的——**最新一次调用直接获胜，能延长也能缩短**。
-        # 最新 revision 的 brief 就是完整当前授权。旧 revision 仍以
+        # 最新 revision 的 analysis 就是完整当前授权。旧 revision 仍以
         # <tool-call name="reply"> 留在 Planner timeline 供回看，但 Replyer 从
-        # ReplyTaskState 直接拿最新 brief，避免 tool_result 终态竞态与窗口裁剪。
+        # ReplyTaskState 直接拿最新 analysis，避免 tool_result 终态竞态与窗口裁剪。
         now = china_now()
         current = await load_open_reply_task(session_factory, scope_key)
         if current is None:
@@ -363,7 +377,7 @@ class ReplyTool(BaseTool):
             flush_at=flush_at,
             hard_deadline=hard_deadline,
             mode="verbatim" if verbatim else "compose",
-            brief=brief,
+            analysis=analysis,
             verbatim_messages=messages,
         )
         event_id = await append_upsert(
@@ -444,20 +458,20 @@ class ReplyTool(BaseTool):
 def _validate_append(
     arguments: dict, verbatim: bool
 ) -> tuple[str, list[dict], int, ToolOutcome | None]:
-    """append 路径的参数校验：compose 要 brief，verbatim 要 messages。
+    """append 路径的参数校验：compose 要 analysis，verbatim 要 messages。
 
-    两者互斥且都不静默容忍对方的字段——verbatim 绕过 Replyer，写了 brief 也
+    两者互斥且都不静默容忍对方的字段——verbatim 绕过 Replyer，写了 analysis 也
     没有任何读者，静默丢掉正是最难被发现的坏法。
     """
     if verbatim:
-        if "brief" in arguments:
+        if "analysis" in arguments:
             return (
                 "",
                 [],
                 0,
                 _invalid(
-                    "brief_not_applicable",
-                    "verbatim bypasses the Replyer, so nothing reads a brief; "
+                    "analysis_not_applicable",
+                    "verbatim bypasses the Replyer, so nothing reads analysis; "
                     "put the exact wording in `messages`",
                 ),
             )
@@ -482,19 +496,19 @@ def _validate_append(
             _invalid(
                 "messages_need_verbatim",
                 'messages only apply to action="verbatim"; ordinary speech '
-                "hands the Replyer a `brief` instead",
+                "hands the Replyer an `analysis` instead",
             ),
         )
-    brief = arguments.get("brief")
-    if not isinstance(brief, str) or not brief.strip():
+    analysis = arguments.get("analysis")
+    if not isinstance(analysis, str) or not analysis.strip():
         return (
             "",
             [],
             0,
             _invalid(
-                "bad_brief",
-                "brief must be a non-empty string — say what is going on and "
-                "how you want it answered",
+                "bad_analysis",
+                "analysis must be a non-empty string — resolve who is talking "
+                "to whom, the topic and chronology, and what remains to answer",
             ),
         )
     # hold_seconds 无默认值（2026-07-24，待办#19）：等多久是每次调用都要现场
@@ -513,7 +527,7 @@ def _validate_append(
     hold = _coerce_hold(arguments.get("hold_seconds"))
     if hold is None:
         return "", [], 0, _bad_hold()
-    return brief.strip(), [], hold, None
+    return analysis.strip(), [], hold, None
 
 
 def _validate_messages(raw: Any) -> tuple[list[dict], ToolOutcome | None]:
@@ -556,7 +570,7 @@ def _reject_retired(arguments: dict) -> ToolOutcome | None:
 
 
 def _reject_unknown(arguments: dict) -> ToolOutcome | None:
-    known = {"action", "brief", "hold_seconds", "messages", "reply_task_id"}
+    known = {"action", "analysis", "hold_seconds", "messages", "reply_task_id"}
     extras = sorted(set(arguments) - known)
     if not extras:
         return None

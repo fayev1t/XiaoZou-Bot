@@ -71,8 +71,8 @@ is the only way to fix it.
 ## Speaking boundary
 
 Do not look for a meme-send action and do not choose a send hash. You cannot
-send an image from here, and picking one is not your call. If you want a reply
-to land as a meme rather than as words, say so in plain language inside that
-`reply` call's `brief` — the composer reads it, weighs it against the latest
-timeline and the collection, and makes the final call once, when that task
-flushes.
+send an image from here, and picking one is not your call. Do not steer a
+particular reply toward or away from memes through `reply.analysis` either:
+that field is only for people/topic/time/content analysis. The composer reads
+the latest timeline, its voice card and the collection, then independently
+decides whether a meme is the natural reply when the task flushes.

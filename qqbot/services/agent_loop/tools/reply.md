@@ -9,45 +9,58 @@ Ordinary speech is two arguments and nothing else:
 
 ```json
 {
-  "brief": "李四在和张三约火锅的间隙 @我，单独问明天天气；火锅那条线不是问我的，别接。直接给结论并提醒带伞，别展开。查到的是明天有雨，气温没查到，别编。",
+  "analysis": "20:30 李四在与张三讨论火锅；20:31 他在 MSG_42 单独@我问明天天气，因此真正指向我的只有天气线，火锅线仍是李四与张三之间的对话。天气工具随后确认明天有雨，气温未知。待解决内容是李四的天气问题；不要把未知气温当成已知事实。",
   "hold_seconds": 8
 }
 ```
 
 **Every call stands alone.** You never pass a task id, never copy a revision,
-and nothing you wrote before is merged into what you write now. Say what you
-want said *as of this tick*, and how long to hold it. When you call again on a
-later tick, that new call is the complete replacement authorization: repeat
-anything that must remain and omit anything you are withdrawing.
+and nothing you wrote before is merged into what you write now. Hand over the
+complete analysis *as of this tick*, and how long to hold it. When you call
+again on a later tick, that new call is the complete replacement authorization:
+repeat anything that must remain and omit anything you are withdrawing.
 
 There is no `upsert` — appending is what happens when you don't say otherwise.
 `action` exists only for the two rare branches at the bottom of this page.
 
-## `brief` — the whole of what you hand over
+## `analysis` — resolve the conversation before handoff
 
 Free text. No fixed shape, no field list, no length target — one line when one
 line is all there is, several sentences when the situation is tangled.
 
-Write the *read* of the situation, which is the one thing the Replyer cannot
-produce for itself. It sees the same timeline you do, at the same fidelity, so
-it does not need content relayed to it; what it lacks is your analysis. Anything
-that helps it land the reply belongs here, in whatever terms fit:
+Write the resolved map of the situation, which the Replyer should not have to
+derive again. It sees the same raw timeline, but you must
+synthesize the tangled logic instead of merely pointing it back at those rows.
+Include whichever of these dimensions actually matter:
 
-- what is going on in the room, and which thread this reply enters
-- who is talking to whom, and what the message actually means in that thread
-- what you want said, and what you deliberately do not want said
-- facts that must stay exact (especially anything a tool just told you)
-- the spirit of it — blunt, teasing, careful, apologetic
-- anything situational: this person hates being called by full name; this picks
-  up a joke you made earlier; don't end on a question
+- who is speaking to, quoting or @-ing whom; mention a social relationship only
+  when the timeline or memory actually supports it
+- the active topic threads, what each contribution means inside its own thread,
+  and which thread contains the unresolved matter
+- decisive times/order: when a thread started, what arrived later, and which new
+  message or tool result changed the interpretation
+- the exact question, claim or request still needing an answer, plus the logical
+  conclusion the available evidence supports
+- verified facts and tool results that must stay exact, uncertainty that must
+  remain uncertain, and unrelated/already-settled threads to leave alone
 
-Two things never belong in it: **final wording** (the Replyer writes the visible
-words — handing it a finished line makes it a typist) and **a retelling of
-messages the timeline already shows**.
+This is a concise handoff, not raw transcript duplication or step-by-step private
+reasoning. But do include the conclusions of your content analysis even when the
+underlying messages are visible; the whole point is that the Replyer should not
+have to reconstruct the group-chat topology and chronology itself.
 
-No message ids either. The Replyer copies those off the timeline itself. If you
-need to pin down exactly which message is being answered, just say so in the
-text — `回 MSG_42 那条`.
+The expressive boundary is hard. Never prescribe **tone, emotion, persona,
+conversational posture, warmth, bluntness, humor, wording, length, bubble count,
+quote/@ style, meme use, opening or ending shape**. Do not write “say it
+teasingly”, “be apologetic”, “one sharp sentence”, “use a meme”, or equivalent
+instructions. The Replyer owns all of those through its own voice card. A
+logical content conclusion such as “the claim is false; the verified value is
+X” belongs here; a performance instruction for how to deliver that conclusion
+does not.
+
+There is no dedicated message-id field. The Replyer copies real ids off the
+timeline itself. If you need to pin down exactly which message is being
+answered, name it in the analysis — `待回答的是 MSG_42`.
 
 ## `hold_seconds` — how long to hold it
 
@@ -76,7 +89,7 @@ To work out where you stand, subtract what you can already see:
 
 The scope holds one pending draft. Your calls remain visible as
 `<tool-call name="reply">` history in the timeline, while the current draft
-folds to the newest complete brief for the Replyer.
+folds to the newest complete analysis for the Replyer.
 
 - **The newest row replaces every older row outright.** Changed your read of the
   situation, corrected a fact, decided a thread should not be answered after all?
@@ -87,21 +100,14 @@ folds to the newest complete brief for the Replyer.
 - Don't re-authorize with nothing new to add. A tick that starts is not a reason
   to call again.
 
-## Steering the form, not picking it
+## Presentation belongs entirely to the Replyer
 
-Form — words versus a saved meme, one bubble or three, how blunt it lands — is
-the Replyer's call, decided against the newest timeline. You still get a say:
-write the intent into the brief in plain language, e.g. `"嫌弃但其实在笑，适合
-配张表情包"`, `"一句话怼回去就行"`, `"这条别耍宝，他是认真在问"`. There is no
-field for choosing a meme and no hash goes in this call; what you write is a
-hint the Replyer weighs, not an order it must follow. Use that say often, not
-sparingly: whenever the beat is reaction rather than information — 接梗、拆台、
-嫌弃、装凶、起哄 — name the mood in the brief. Naming the mood is what licenses
-the Replyer to answer with a picture instead of a flat line of text; a brief
-that never mentions tone quietly steers everything toward plain words. That is
-the intended split — steering the beat is yours, landing it is its. Whether a
-fitting meme even exists is upstream of both: only what `meme_collection` has
-already saved can be picked.
+Words versus a saved meme, one bubble or three, quote versus plain text, and how
+the reply emotionally lands are all the Replyer's decisions. Do not encode a
+preference for any of them in `analysis`, and never put a meme hash in this
+call. Your responsibility ends after the people/topic/time/content logic is
+resolved accurately. The Replyer reads the latest timeline, its own voice card
+and `<saved-memes>` to choose the natural visible form.
 
 One flush emits at most 4 bubbles (at most one of them a meme). Output the user
 explicitly wants in more parts than one flush can carry is a cross-tick task:
@@ -159,10 +165,12 @@ pending, and while it is pending an ordinary `reply` fails the same way
 
 ## Failures worth recognising
 
-- `invalid_arguments` with `reason_code="targets_gist_replaced_by_brief"` /
-  `"mode_replaced_by_action"` / `"upsert_removed"` — you sent the old argument
-  shape. Everything the retired structured fields carried now goes into `brief`;
-  `mode` is now `action="verbatim"`; appending needs no action at all.
+- `invalid_arguments` with `reason_code="brief_renamed_to_analysis"` /
+  `"targets_gist_replaced_by_analysis"` / `"mode_replaced_by_action"` /
+  `"upsert_removed"` — you sent an old argument shape. Conversation topology,
+  topics, chronology and content conclusions now go into `analysis`; old
+  tone/guidance slots are deliberately gone. `mode` is now
+  `action="verbatim"`; appending needs no action at all.
 - `reply_task_locked` — a verbatim draft is pending, or you tried to send
   verbatim bytes onto an existing draft. Cancel first.
 
