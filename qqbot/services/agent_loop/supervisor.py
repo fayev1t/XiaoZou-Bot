@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from qqbot.core.logging import get_logger
 from qqbot.services.agent_loop import bot_registry
 from qqbot.services.agent_loop.decision import Planner
+from qqbot.services.agent_loop.event_writer import RuntimeEventPublisher
 from qqbot.services.agent_loop.loop import AgentLoop
 from qqbot.services.agent_loop.projection import Projector
 from qqbot.services.agent_loop.reply_executor import ReplyExecutor
@@ -104,13 +105,17 @@ class LoopSupervisor:
         # 自己注入进去让 worker 在**整批工具收口后**（写完 runtime.
         # tool_batch_completed）经 notify_tool_batch_completed 批次级唤醒对应
         # scope 的 AgentLoop——不再是每 drain 一轮就按 scope wake 一次。
-        # ReplyExecutor 独立负责 reply_task 的到点组稿与发送。
+        # ReplyExecutor 独立负责 reply_task 的到点组稿与发送；它只向通用
+        # RuntimeEventPublisher 发布事件，不直接持有 wake 接口。
         if self._tool_registry is not None:
             if self._projector is not None:
                 self._reply_executor = ReplyExecutor(
                     session_factory=self._session_factory,
                     projector=self._projector,
-                    wake_scope=self.wake,
+                    event_publisher=RuntimeEventPublisher(
+                        self._session_factory,
+                        notify_event_available=self.wake,
+                    ),
                     replyer=self._replyer,
                     # 与 AgentLoop 同一把 resolver：Replyer 的组稿 context 同样
                     # 带 bot_qq/bot_role（输入权重与 Planner 对齐，2026-07-22）。
@@ -273,6 +278,7 @@ class LoopSupervisor:
                 supervisor=self,
                 bot_user_id_resolver=_default_bot_user_id_resolver,
                 tool_registry=self._tool_registry,
+                caption_image=self._caption_image,
             )
             loop.start()
             self._loops[scope_key] = loop

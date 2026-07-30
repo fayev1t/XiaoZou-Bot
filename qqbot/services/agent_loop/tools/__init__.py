@@ -6,8 +6,9 @@
 LoopSupervisor / LLMPlanner。
 
 工具不再有构造依赖：系统级依赖（session_factory 写/查 agent_events、触发身份
-triggered_by_event_id / bot_role 等）一律由 ToolWorker 在 run() 的 context 里
-统一注入。这样新增工具只要 register 一行，系统也不必按名字特判任何工具。
+triggered_by_event_id / bot_role 等）一律由执行层在 run() 的 context 里统一
+注入；worker 工具由 ToolWorker 执行，inline 工具由 AgentLoop 当前 tick 执行。
+这样新增工具只要 register 一行，系统也不必按名字特判任何工具。
 
 napcat 动作工具集（kick / ban / recall / get_* / ...）把 OneBot V11 能对 QQ
 做的事进一步工具化，公共出站约定收敛在 `_onebot_common.py`：群操作的
@@ -52,6 +53,7 @@ from qqbot.services.agent_loop.tools.set_essence import SetEssenceTool
 from qqbot.services.agent_loop.tools.set_group_avatar import SetGroupAvatarTool
 from qqbot.services.agent_loop.tools.set_group_name import SetGroupNameTool
 from qqbot.services.agent_loop.tools.set_title import SetTitleTool
+from qqbot.services.agent_loop.tools.task import TaskTool
 from qqbot.services.agent_loop.tools.wait import WaitTool
 from qqbot.services.agent_loop.tools.webfetch import WebfetchTool
 from qqbot.services.agent_loop.tools.websearch import WebsearchTool
@@ -66,6 +68,10 @@ def build_default_registry() -> ToolRegistry:
     # 即可，无需改别处。（respond_to_request 已于 2026-07-03 拆分删除，见下。）
     registry = ToolRegistry()
     # ── 基础能力（当前在用）──
+    # task：跨 tick 任务生命周期。它是 execution_mode="inline" 的普通工具，
+    # AgentLoop 在当前拍 await 并原子写 called + task 事件 + terminal；create
+    # 结果里的 task_ref 可供同拍后续 call_tool 解析。
+    registry.register(TaskTool())
     # reply：唯一发言入口。2026-07-28 参数收敛成 analysis + hold_seconds，撤稿与
     # 逐字直发留在 action 分支里——曾评估拆成三个工具，因每个工具都要占一条
     # catalog 条目 + 整段 usage 文档，会把"Replyer 挂了才走"的 verbatim 逃生
@@ -170,6 +176,7 @@ __all__ = [
     "SetGroupAvatarTool",
     "SetGroupNameTool",
     "SetTitleTool",
+    "TaskTool",
     "WaitTool",
     "WebfetchTool",
     "WebsearchTool",

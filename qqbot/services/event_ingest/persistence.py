@@ -12,10 +12,17 @@ from qqbot.models.agent_event import AgentEvent
 from qqbot.services.event_ingest.system_event import SystemEvent
 
 
-async def persist_event(session: AsyncSession, event: SystemEvent) -> bool:
+async def persist_event(
+    session: AsyncSession,
+    event: SystemEvent,
+    *,
+    commit: bool = True,
+) -> bool:
     """Insert an event; return True on insert, False on idempotency-key conflict.
 
-    Single-event transaction. See EventIngest契约.md §4.2.
+    ``commit=True`` 保持 EventIngest 的单事件事务语义；内部批量 writer 传
+    ``commit=False``，在同一 session 写完一组因果事件后统一提交。
+    See EventIngest契约.md §4.2.
     """
     stmt = (
         pg_insert(AgentEvent)
@@ -38,5 +45,6 @@ async def persist_event(session: AsyncSession, event: SystemEvent) -> bool:
     )
 
     result = await session.execute(stmt)
-    await session.commit()
+    if commit:
+        await session.commit()
     return (result.rowcount or 0) > 0

@@ -1,4 +1,4 @@
-"""ToolWorker — 消费 agent.tool_called 调用 ToolRegistry 并写 agent.tool_result/failed。
+"""ToolWorker — 执行 worker 模式工具并写 agent.tool_result/failed。
 
 push+pull dispatcher 设计（详见 2026-05-26 设计讨论）：本 worker 派发
 Planner 工具；reply_task 的最终发送由独立 ReplyExecutor 负责。
@@ -13,20 +13,25 @@ Planner 工具；reply_task 的最终发送由独立 ReplyExecutor 负责。
      tool_batch_size），本轮写完 terminal 后对涉及的每个批次判定"整批是否
      全部 terminal 且条数 ≥ batch_size"——收口了才写一条
      runtime.tool_batch_completed 标记事件，再经
-     supervisor.notify_tool_batch_completed 解闩 + 唤醒该 scope **一次**。
+     supervisor.notify_tool_batch_completed 通知并唤醒该 scope **一次**。
      不再是"每 drain 一轮就按 scope wake"（那会让先完成的工具提前
      唤醒下一拍，慢工具还没回来，模型容易复读）。无批次标记的遗留
      tool_called（升级前落库的）维持旧行为：drain 后按 scope 直接 wake。
 
-幂等：SQL `NOT EXISTS(tool_result|tool_failed WHERE causation_id=tool_called.event_id)`，
+幂等：SQL `NOT EXISTS(tool_result|tool_failed WHERE
+causation_id=tool_called.event_id)`，
 重启 / 重入安全；runtime.tool_batch_completed 写前查重（同 batch_id 只写一条），
-但已存在时仍会补发解闩通知（修复"写了标记、进程在唤醒前挂了"的半截状态）。
+但已存在时仍会补发完成通知（修复"写了标记、进程在唤醒前挂了"的半截状态）。
 
-批次判定/completion 事件写入/唤醒时机全在本编排层——工具保持黑盒（输入
-arguments、返回 ToolOutcome），对批次一无所知。
+批次判定/completion 事件写入/唤醒由共享 ``tool_batch`` 编排层负责——
+AgentLoop 的 inline 工具和本 worker 谁最后补齐整批 terminal，谁执行收口；
+工具保持黑盒（输入 arguments、返回 ToolOutcome），对批次一无所知。
+
+``execution_mode="inline"`` 的调用由 AgentLoop 在当前 tick 原子写入 called +
+领域事件 + terminal，因此不会出现在本 worker 的 pending 查询中。
 
 执行后**不自动**推进任务状态（pending→running 已由 AgentLoop 在写 tool_called
-时附带完成；最终 done/failed 由 LLM 通过 complete_task / fail_task 显式驱动）。
+时附带完成；最终 done/failed 由 LLM 通过 inline task 工具显式驱动）。
 
 契约：任务与决策契约.md §5.1 ToolResultView, §6 ToolCall lifecycle
 """
@@ -46,12 +51,15 @@ from qqbot.services.agent_loop.delivery_claims import (
     claim_delivery,
 )
 from qqbot.services.agent_loop.event_writer import (
+    AgentEventWrite,
     write_agent_event,
-    write_runtime_event,
+    write_agent_events,
 )
+from qqbot.services.agent_loop.tool_batch import maybe_close_tool_batch
 from qqbot.services.agent_loop.tool_registry import (
     ToolOutcome,
     ToolRegistry,
+    coerce_tool_outcome,
 )
 
 logger = get_logger(__name__)
@@ -83,47 +91,6 @@ _PENDING_QUERY = text(
 # 投影时刻（loop._apply_actions，2026-07-27）后时间戳相同，认领次序退化为不
 # 定序；ULID 恢复写入相对顺序。
 
-# 批次收口判定：该批次已落库的 tool_called 总数 + 其中已有 terminal
-# （tool_result/tool_failed）配对的条数。收口条件 = terminal == called 且
-# called >= tool_batch_size —— 后者防住"AgentLoop 还在写同批后续 tool_called、
-# drain 恰好撞进写间隙"的竞态（已写的都 terminal 了但整批还没写全）。
-_BATCH_STATUS_QUERY = text(
-    """
-    SELECT
-        COUNT(*) AS called,
-        COUNT(*) FILTER (
-            WHERE EXISTS (
-                SELECT 1 FROM agent_events d
-                WHERE d.causation_id = r.event_id
-                  AND d.type IN ('agent.tool_result', 'agent.tool_failed')
-            )
-        ) AS terminal,
-        COUNT(*) FILTER (
-            WHERE r.payload->>'tool_name' <> 'reply'
-        ) AS non_reply,
-        COUNT(*) FILTER (
-            WHERE EXISTS (
-                SELECT 1 FROM agent_events d
-                WHERE d.causation_id = r.event_id
-                  AND d.type = 'agent.tool_failed'
-            )
-        ) AS failed
-    FROM agent_events r
-    WHERE r.type = 'agent.tool_called'
-      AND r.payload->>'tool_batch_id' = :tool_batch_id
-    """
-)
-
-_BATCH_COMPLETED_EXISTS_QUERY = text(
-    """
-    SELECT 1
-    FROM agent_events
-    WHERE type = 'runtime.tool_batch_completed'
-      AND payload->>'tool_batch_id' = :tool_batch_id
-    LIMIT 1
-    """
-)
-
 
 @dataclass(frozen=True)
 class _ProcessedCall:
@@ -134,7 +101,6 @@ class _ProcessedCall:
     tool_batch_size: int | None
     terminal_event_id: str
     correlation_id: str
-    wake_requested: bool = True
 
 
 class ToolWorker:
@@ -220,7 +186,6 @@ class ToolWorker:
         # (scope_key, tool_batch_id) → 本轮该批次最后一条 _ProcessedCall（其
         # terminal_event_id 作 completion 事件的 causation 锚）。
         touched_batches: dict[tuple[str, str], _ProcessedCall] = {}
-        batch_should_wake: dict[tuple[str, str], bool] = {}
         # 无批次标记（升级前落库）的遗留 tool_called 涉及的 scope。
         legacy_scopes: set[str] = set()
         for row in rows:
@@ -239,14 +204,11 @@ class ToolWorker:
             if done.tool_batch_id:
                 key = (done.scope_key, done.tool_batch_id)
                 touched_batches[key] = done
-                batch_should_wake[key] = batch_should_wake.get(key, False) or getattr(
-                    done, "wake_requested", True
-                )
-            elif done.wake_requested:
+            else:
                 legacy_scopes.add(done.scope_key)
 
-        # 遗留（无批次标记）：维持旧的"drain 后按 scope 直接唤醒"。若该 scope
-        # 恰有新批次门闩开着，AgentLoop 侧会把这次唤醒推迟——不会误开 tick。
+        # 遗留（无批次标记）：维持旧的"drain 后按 scope 直接唤醒"。即使该
+        # scope 同时还有新批次在执行也不推迟；模型会从 processing 行识别现状。
         if self._supervisor is not None:
             for scope_key in sorted(legacy_scopes):
                 try:
@@ -264,15 +226,18 @@ class ToolWorker:
                     )
 
         # 批次收口：整批全部 terminal → 写 runtime.tool_batch_completed →
-        # 解闩 + 批次级唤醒一次。判定放在本轮所有 terminal 都落库之后，保证
+        # 完成通知 + 批次级唤醒一次。判定放在本轮所有 terminal 都落库之后，保证
         # "唤醒到达时完成事件必已在事件流里"。
         for (scope_key, batch_id), last in touched_batches.items():
             try:
-                await self._maybe_close_batch(
-                    scope_key,
-                    batch_id,
-                    last,
-                    should_wake=batch_should_wake.get((scope_key, batch_id), True),
+                await maybe_close_tool_batch(
+                    self._session_factory,
+                    supervisor=self._supervisor,
+                    scope_key=scope_key,
+                    tool_batch_id=batch_id,
+                    tool_batch_size=last.tool_batch_size,
+                    terminal_event_id=last.terminal_event_id,
+                    correlation_id=last.correlation_id,
                 )
             except Exception as exc:
                 logger.exception(
@@ -284,93 +249,6 @@ class ToolWorker:
                 )
         self._last_drain_completed = completed
         return len(rows)
-
-    async def _maybe_close_batch(
-        self,
-        scope_key: str,
-        tool_batch_id: str,
-        last: _ProcessedCall,
-        *,
-        should_wake: bool = True,
-    ) -> None:
-        """判定批次是否收口；是则写 completion 标记事件并通知 supervisor。"""
-        async with self._session_factory() as session:
-            result = await session.execute(
-                _BATCH_STATUS_QUERY, {"tool_batch_id": tool_batch_id}
-            )
-            row = result.mappings().first()
-        called = int(row["called"] or 0) if row else 0
-        terminal = int(row["terminal"] or 0) if row else 0
-        if row is not None:
-            # “不唤醒”只允许真正的 reply-only 全成功批次。多实例/分轮处理
-            # 时，当前 drain 可能只碰到最后一条 reply，必须从整批 DB 事实
-            # 恢复是否还含普通工具或失败，不能只看本轮 touched calls。
-            non_reply = int(row.get("non_reply") or 0)
-            failed = int(row.get("failed") or 0)
-            should_wake = should_wake or non_reply > 0 or failed > 0
-        if called == 0:
-            # 理论不可达（本轮刚处理过该批次的行），防御分支
-            return
-        if terminal < called:
-            return  # 同批还有工具在跑 / 待跑
-        expected = last.tool_batch_size
-        if expected is not None and called < expected:
-            return  # AgentLoop 还没写完同批后续 tool_called（写间隙竞态）
-
-        # 查重：同 batch_id 只写一条 completion；已存在时仍补发解闩通知，
-        # 修复"标记写了、进程在唤醒前挂了"的半截状态（通知幂等，多发无害——
-        # AgentLoop 侧门闩会吞掉不该开拍的唤醒）。
-        async with self._session_factory() as session:
-            result = await session.execute(
-                _BATCH_COMPLETED_EXISTS_QUERY,
-                {"tool_batch_id": tool_batch_id},
-            )
-            already_written = result.first() is not None
-        if not already_written:
-            # agent_visible：标记既给调度层当解锁依据，也进模型的 timeline
-            # （渲染成 <system-hint kind="tool_batch_completed">）——让模型
-            # 显式看到"上一批工具已整体收口"的批次边界，而不是只能从
-            # 各 <tool-call> 都 complete 里自己归纳。渲染时剔除 ULID 噪音，
-            # 见 projection._render_runtime。
-            await write_runtime_event(
-                self._session_factory,
-                event_type="runtime.tool_batch_completed",
-                scope_key=scope_key,
-                visibility="agent_visible",
-                correlation_id=last.correlation_id,
-                causation_id=last.terminal_event_id,
-                payload={
-                    "tool_batch_id": tool_batch_id,
-                    "tool_count": called,
-                    "tool_batch_size": expected,
-                },
-            )
-        if self._supervisor is None or not should_wake:
-            return
-        notify = getattr(
-            self._supervisor, "notify_tool_batch_completed", None
-        )
-        try:
-            if notify is not None:
-                await notify(scope_key, tool_batch_id)
-            else:
-                # 旧接口兜底（fake / 早期骨架没有批次门闩）：直接唤醒
-                await self._supervisor.wake(scope_key)
-            logger.info(
-                "[tool_worker] tool batch completed: scope={} batch={} "
-                "tools={}",
-                scope_key,
-                tool_batch_id,
-                called,
-            )
-        except Exception as exc:
-            logger.warning(
-                "[tool_worker] batch completion notify failed: scope={} "
-                "batch={}: {}",
-                scope_key,
-                tool_batch_id,
-                exc,
-            )
 
     async def _process_one(self, row: Any) -> _ProcessedCall | None:
         event_id: str = row["event_id"]
@@ -405,16 +283,13 @@ class ToolWorker:
         scope_key = _scope_key_from_row(scope, group_id, user_id)
         tool = self._registry.get(tool_name)
 
-        def _processed(
-            terminal_event_id: str, *, wake_requested: bool = True
-        ) -> _ProcessedCall:
+        def _processed(terminal_event_id: str) -> _ProcessedCall:
             return _ProcessedCall(
                 scope_key=scope_key,
                 tool_batch_id=tool_batch_id,
                 tool_batch_size=tool_batch_size,
                 terminal_event_id=terminal_event_id,
                 correlation_id=correlation_id,
-                wake_requested=wake_requested,
             )
 
         if tool is None:
@@ -503,22 +378,30 @@ class ToolWorker:
                     "internal_tool_error", f"{type(exc).__name__}: {exc}"
                 )
             else:
-                outcome = _coerce_outcome(raw)
+                outcome = coerce_tool_outcome(raw)
 
-            # ── 落表：outcome → agent.tool_result | agent.tool_failed ──
-            if outcome.ok:
-                terminal_id = await write_agent_event(
-                    self._session_factory,
-                    event_type="agent.tool_result",
-                    scope_key=scope_key,
-                    correlation_id=correlation_id,
+            # ── 落表：工具声明的领域事件 + terminal 同事务提交 ──
+            event_writes = [
+                AgentEventWrite(
+                    event_type=generated.event_type,
                     causation_id=event_id,
-                    payload={
-                        "tool_call_id": tool_call_id,
-                        "tool_name": tool_name,
-                        "task_id": task_id,
-                        "result": outcome.result,
-                    },
+                    payload=generated.payload,
+                    occurred_at=generated.occurred_at,
+                )
+                for generated in outcome.emitted_events
+            ]
+            if outcome.ok:
+                event_writes.append(
+                    AgentEventWrite(
+                        event_type="agent.tool_result",
+                        causation_id=event_id,
+                        payload={
+                            "tool_call_id": tool_call_id,
+                            "tool_name": tool_name,
+                            "task_id": task_id,
+                            "result": outcome.result,
+                        },
+                    )
                 )
             else:
                 logger.warning(
@@ -536,23 +419,22 @@ class ToolWorker:
                 }
                 if isinstance(outcome.extra, dict):
                     fail_payload.update(outcome.extra)
-                terminal_id = await write_agent_event(
-                    self._session_factory,
-                    event_type="agent.tool_failed",
-                    scope_key=scope_key,
-                    correlation_id=correlation_id,
-                    causation_id=event_id,
-                    payload=fail_payload,
+                event_writes.append(
+                    AgentEventWrite(
+                        event_type="agent.tool_failed",
+                        causation_id=event_id,
+                        payload=fail_payload,
+                    )
                 )
+            written_ids = await write_agent_events(
+                self._session_factory,
+                scope_key=scope_key,
+                correlation_id=correlation_id,
+                events=event_writes,
+            )
+            terminal_id = written_ids[-1]
             terminal_written = True
-            wake_policy = getattr(tool, "wake_policy", "always")
-            if wake_policy == "never":
-                wake_requested = False
-            elif wake_policy == "on_failure":
-                wake_requested = not outcome.ok
-            else:
-                wake_requested = True
-            return _processed(terminal_id, wake_requested=wake_requested)
+            return _processed(terminal_id)
         finally:
             if claimed_here and not terminal_written:
                 self._schedule_retry(float(DEFAULT_LEASE_SECONDS))
@@ -580,22 +462,6 @@ class ToolWorker:
         if self._stopped:
             return
         self._wake.set()
-
-
-def _coerce_outcome(raw: Any) -> ToolOutcome:
-    """把工具返回值归一成 ToolOutcome。
-
-    工具直接返回 ToolOutcome（成功或失败）→ 原样；返回 dict → 桥接成 success
-    （兼容轻量 stub）；None → 空 success；其它标量 → 包成 ``{"value": raw}``。
-    黑盒工具**永不 raise**：失败由工具**返回** ToolOutcome.failure，这里原样透传。
-    """
-    if isinstance(raw, ToolOutcome):
-        return raw
-    if isinstance(raw, dict):
-        return ToolOutcome.success(raw)
-    if raw is None:
-        return ToolOutcome.success({})
-    return ToolOutcome.success({"value": raw})
 
 
 def _scope_key_from_row(

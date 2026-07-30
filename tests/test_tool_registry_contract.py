@@ -10,6 +10,7 @@ Covers (任务与决策契约 §5.1):
   只是向后兼容的旧布尔字段（True 等价 required_bot_role="admin"），仍随 catalog
   透出但不再是首要判据
 - 缺 required_permission / required_bot_role 的老 stub 默认 GUEST / None
+- 缺 execution_mode 的老 stub 默认 worker；显式 inline 原样读取
 - 显式标注的 tool 正确透传（含 owner 级）
 - in 运算符 / len 实现
 """
@@ -23,6 +24,7 @@ from qqbot.core.permissions import PermissionTier
 from qqbot.services.agent_loop.tool_registry import (
     ToolRegistry,
     get_tool_allowed_scopes,
+    get_tool_execution_mode,
     get_tool_require_bot_admin,
     get_tool_required_bot_role,
     get_tool_required_permission,
@@ -157,13 +159,28 @@ class ToolRegistryContractTest(unittest.TestCase):
         self.assertTrue(entry["require_bot_admin"])
 
     def test_get_helpers_fallback(self) -> None:
-        """老 stub 没标权限属性 → helpers 返回 GUEST / None / False。"""
+        """老 stub 没标元数据 → 权限默认值 + worker 调度模式。"""
         tool = _StubTool("plain")
         self.assertEqual(
             get_tool_required_permission(tool), PermissionTier.GUEST
         )
         self.assertIsNone(get_tool_required_bot_role(tool))
         self.assertFalse(get_tool_require_bot_admin(tool))
+        self.assertEqual(get_tool_execution_mode(tool), "worker")
+
+    def test_execution_mode_inline_and_invalid_registration(self) -> None:
+        class _Inline(_StubTool):
+            execution_mode = "inline"
+
+        class _Invalid(_StubTool):
+            execution_mode = "background"
+
+        inline = _Inline("inline")
+        self.assertEqual(get_tool_execution_mode(inline), "inline")
+        registry = ToolRegistry()
+        registry.register(inline)
+        with self.assertRaises(ValueError):
+            registry.register(_Invalid("invalid"))
 
     def test_get_required_bot_role_helper(self) -> None:
         """主契约 helper `get_tool_required_bot_role`：显式 "admin"/"owner" 原样返回；

@@ -6,7 +6,7 @@
   ——工具本身保持黑盒，对批次一无所知。
 - ToolWorker 判定"整批全部 terminal 且条数 ≥ batch_size"后，先写
   runtime.tool_batch_completed 标记事件，再经 notify_tool_batch_completed
-  唤醒一次——批次级一次，不是工具级一次。
+  唤醒一次——批次级一次，不是工具级一次；reply 没有例外。
 - **没有门闩**（2026-07-02，模型+prompt 优先哲学）：批次进行期间的任何唤醒
   随时开拍——即便注入的 supervisor 还残留 has_open_tool_batch 接口，loop 也
   不问不理；AgentLoop 亦不再调用 notify_tool_batch_opened。防复读靠 prompt
@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
+from qqbot.core.time import china_now
 from qqbot.services.agent_loop import FakeIdlePlanner
 from qqbot.services.agent_loop.decision import (
     CallToolAction,
@@ -34,6 +35,7 @@ from qqbot.services.agent_loop.loop import AgentLoop
 from qqbot.services.agent_loop.supervisor import LoopSupervisor
 from qqbot.services.agent_loop.tool_registry import ToolRegistry
 from qqbot.services.agent_loop.tool_worker import ToolWorker
+from qqbot.services.agent_loop.tools.task import TaskTool
 
 
 # ─── 共用 fakes ───
@@ -332,10 +334,11 @@ def _batched_row(
     group_id: int = 100,
     batch_id: str | None = "B1",
     batch_size: int | None = 2,
+    tool_name: str = "websearch",
 ) -> dict:
     payload: dict[str, Any] = {
         "tool_call_id": tool_call_id,
-        "tool_name": "websearch",
+        "tool_name": tool_name,
         "arguments": {},
     }
     if batch_id is not None:
@@ -363,6 +366,7 @@ def _completion_inserts(harness: _BatchHarness) -> list[Any]:
 def _worker_for(harness: _BatchHarness) -> tuple[ToolWorker, _BatchSupervisor]:
     reg = ToolRegistry()
     reg.register(_StubTool("websearch"))
+    reg.register(_StubTool("reply"))
     sup = _BatchSupervisor(harness)
 
     def factory() -> _BatchSession:
@@ -409,7 +413,7 @@ class ToolWorkerBatchCloseTests(unittest.TestCase):
 
     def test_full_batch_completion_event_then_single_wake(self) -> None:
         """核心断言②：整批 terminal 后先写 runtime.tool_batch_completed，
-        再解闩唤醒——且只唤醒一次。"""
+        再发完成通知并唤醒——且只唤醒一次。"""
         rows = [
             _batched_row("EID1", "TC1"),
             _batched_row("EID2", "TC2"),
@@ -432,12 +436,33 @@ class ToolWorkerBatchCloseTests(unittest.TestCase):
         # 批次级通知恰好一次；不走 per-scope 直接 wake
         self.assertEqual(sup.batch_completed, [("group:100", "B1")])
         self.assertEqual(sup.woke, [])
-        # 顺序：completion 事件必须先于解闩通知落 timeline
+        # 顺序：completion 事件必须先于批次完成通知落 timeline
         completed_idx = harness.timeline.index(completions[0])
         notify_idx = harness.timeline.index(
             ("batch_completed", "group:100", "B1")
         )
         self.assertLess(completed_idx, notify_idx)
+
+    def test_successful_reply_only_batch_still_notifies(self) -> None:
+        """reply 落稿成功与普通工具一致，不得吞掉批次收口唤醒。"""
+        rows = [
+            _batched_row(
+                "E_REPLY",
+                "TC_REPLY",
+                batch_size=1,
+                tool_name="reply",
+            )
+        ]
+        harness = _BatchHarness(
+            pending_rows=rows,
+            batch_status={"B1": {"called": 1, "terminal": 1}},
+        )
+        worker, sup = _worker_for(harness)
+
+        asyncio.run(worker._drain_once())
+
+        self.assertEqual(len(_completion_inserts(harness)), 1)
+        self.assertEqual(sup.batch_completed, [("group:100", "B1")])
 
     def test_write_race_called_below_size_does_not_close(self) -> None:
         """AgentLoop 还没写完同批后续 tool_called（called < batch_size）时不得
@@ -456,7 +481,7 @@ class ToolWorkerBatchCloseTests(unittest.TestCase):
 
     def test_existing_completion_not_rewritten_but_still_notifies(self) -> None:
         # completion 已存在（上次写完后进程在唤醒前挂了）→ 不重写事件，但仍
-        # 补发解闩通知。
+        # 补发批次完成通知。
         rows = [_batched_row("EID1", "TC1", batch_size=1)]
         harness = _BatchHarness(
             pending_rows=rows,
@@ -480,6 +505,62 @@ class ToolWorkerBatchCloseTests(unittest.TestCase):
         self.assertEqual(sup.woke, ["group:100"])
         self.assertEqual(sup.batch_completed, [])
         self.assertEqual(_completion_inserts(harness), [])
+
+
+class InlineToolBatchCloseTests(unittest.TestCase):
+    def test_inline_only_batch_uses_same_completion_event_and_wake(self) -> None:
+        harness = _BatchHarness(
+            pending_rows=[],
+            batch_status={"B_INLINE": {"called": 1, "terminal": 1}},
+        )
+        supervisor = _BatchSupervisor(harness)
+        registry = ToolRegistry()
+        registry.register(TaskTool())
+
+        def factory() -> _BatchSession:
+            return _BatchSession(harness)
+
+        loop = AgentLoop(
+            scope_key="group:100",
+            planner=FakeIdlePlanner(),
+            session_factory=factory,
+            supervisor=supervisor,
+            tool_registry=registry,
+        )
+        context = DecisionContext(
+            scope_key="group:100",
+            correlation_id="CID",
+            tick_seq=1,
+            now=china_now(),
+        )
+        asyncio.run(
+            loop._apply_actions(
+                [
+                    CallToolAction(
+                        tool_name="task",
+                        arguments={"action": "create", "description": "x"},
+                    )
+                ],
+                "CID",
+                "B_INLINE",
+                context,
+            )
+        )
+
+        event_types = [
+            _values_of(stmt).get("type")
+            for stmt in harness.timeline
+            if not isinstance(stmt, tuple)
+        ]
+        self.assertIn("agent.tool_called", event_types)
+        self.assertIn("agent.task_created", event_types)
+        self.assertIn("agent.tool_result", event_types)
+        self.assertEqual(len(_completion_inserts(harness)), 1)
+        self.assertEqual(
+            supervisor.batch_completed,
+            [("group:100", "B_INLINE")],
+        )
+        self.assertEqual(supervisor.woke, [])
 
 
 if __name__ == "__main__":

@@ -10,7 +10,8 @@ Covers (任务与决策契约 §5.1, §6, dispatcher 设计 2026-05-26):
   supervisor.wake()；带 tool_batch_id 的批次收口唤醒契约见
   test_tool_batch_contract.py。
 
-直接测 `_process_one()`，跳过 SQL SELECT 路径，session 用 _RecordingSession 捕获 inserts。
+直接测 `_process_one()`，跳过 SQL SELECT 路径，session 用
+_RecordingSession 捕获 inserts。
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from qqbot.services.agent_loop.delivery_claims import (
     ClaimResult,
 )
 from qqbot.services.agent_loop.tool_registry import (
+    ToolGeneratedEvent,
     ToolOutcome,
     ToolRegistry,
 )
@@ -207,9 +209,55 @@ class ToolWorkerContractTest(unittest.TestCase):
         failed = _payloads_by_type(store)["agent.tool_failed"]
         self.assertEqual(failed["error_kind"], "upstream_action_failed")
         self.assertEqual(failed["error_message"], "群成员不存在")
-        # extra 字段平铺进 payload，供审计与 protocol.md 描述的渲染
+        # extra 字段平铺进 payload，供审计与 envelope.md 描述的渲染
         self.assertEqual(failed["retcode"], 1404)
         self.assertEqual(failed["action"], "set_group_kick")
+
+    def test_declared_domain_events_are_written_before_terminal(self) -> None:
+        reg = ToolRegistry()
+        reg.register(
+            _StubTool(
+                "audit",
+                return_value=ToolOutcome.success(
+                    {"ok": True},
+                    emitted_events=[
+                        ToolGeneratedEvent(
+                            event_type="agent.audit_recorded",
+                            payload={"value": 1},
+                        )
+                    ],
+                ),
+            )
+        )
+        store: list[Any] = []
+        worker = ToolWorker(session_factory=_factory_for(store), registry=reg)
+
+        asyncio.run(
+            worker._process_one(
+                _row(
+                    event_id="EID_DOMAIN",
+                    payload={
+                        "tool_call_id": "TC_DOMAIN",
+                        "tool_name": "audit",
+                    },
+                )
+            )
+        )
+
+        event_rows: list[dict] = []
+        for stmt in store:
+            params = stmt.compile().params
+            event_type = params.get("type")
+            if isinstance(event_type, str) and event_type.startswith("agent."):
+                event_rows.append(params)
+        self.assertEqual(
+            [row["type"] for row in event_rows],
+            ["agent.audit_recorded", "agent.tool_result"],
+        )
+        self.assertEqual(
+            {row["causation_id"] for row in event_rows},
+            {"EID_DOMAIN"},
+        )
 
     def test_tool_returns_tool_outcome_success(self) -> None:
         # 工具直接返回 ToolOutcome.success → tool_result.result 取 outcome.result。
@@ -318,7 +366,7 @@ class ToolWorkerContractTest(unittest.TestCase):
             "qqbot.services.agent_loop.tool_worker.claim_delivery",
             new=AsyncMock(return_value=ClaimResult(claimed=True)),
         ), patch(
-            "qqbot.services.agent_loop.tool_worker.write_agent_event",
+            "qqbot.services.agent_loop.tool_worker.write_agent_events",
             new=AsyncMock(side_effect=RuntimeError("db down")),
         ):
             with self.assertRaises(RuntimeError):
@@ -369,7 +417,7 @@ class _SelectSession:
 
 def _drain_factory(store: list[Any], select_rows: list[dict]):
     """First session call returns the SELECT result; later calls (one per
-    write_agent_event) record inserts into `store`."""
+    event writers) record inserts into `store`."""
     state = {"calls": 0}
 
     def factory():
@@ -461,10 +509,9 @@ class ToolWorkerSelfWakeTest(unittest.TestCase):
         self.assertEqual(processed, 1)
         self.assertIn("agent.tool_result", _types(store))
 
-    def test_legacy_successful_reply_does_not_wake_supervisor(self) -> None:
+    def test_legacy_successful_reply_wakes_supervisor(self) -> None:
         reg = ToolRegistry()
         tool = _StubTool("reply", return_value={"reply_task_id": "R1"})
-        tool.wake_policy = "on_failure"
         reg.register(tool)
         supervisor = _StubSupervisor()
         rows = [
@@ -486,7 +533,7 @@ class ToolWorkerSelfWakeTest(unittest.TestCase):
         processed = asyncio.run(worker._drain_once())
 
         self.assertEqual(processed, 1)
-        self.assertEqual(supervisor.woke, [])
+        self.assertEqual(supervisor.woke, ["group:100"])
 
     def test_process_one_returns_processed_call(self) -> None:
         """会落终态事件的分支需返回 _ProcessedCall（scope + 批次线索 +
@@ -545,11 +592,10 @@ class ToolWorkerSelfWakeTest(unittest.TestCase):
         self.assertEqual(done_unknown.scope_key, "private:42")
         self.assertIsNone(done_unknown.tool_batch_id)
 
-    def test_successful_reply_style_tool_does_not_request_planner_wake(self) -> None:
-        """落稿成功只等 ReplyExecutor；不能因 tool_result 自激活下一拍。"""
+    def test_successful_reply_style_tool_requests_normal_batch_wake(self) -> None:
+        """reply 与其它工具一致：terminal 后请求批次收口唤醒。"""
         reg = ToolRegistry()
         tool = _StubTool("reply", return_value={"reply_task_id": "R1"})
-        tool.wake_policy = "on_failure"
         reg.register(tool)
         worker = ToolWorker(
             session_factory=_factory_for([]),
@@ -569,7 +615,7 @@ class ToolWorkerSelfWakeTest(unittest.TestCase):
         )
         self.assertIsNotNone(done)
         assert done is not None
-        self.assertFalse(done.wake_requested)
+        self.assertFalse(hasattr(done, "wake_requested"))
 
 
 class ToolWorkerCaptionInjectionTests(unittest.TestCase):

@@ -33,6 +33,8 @@ from qqbot.services.agent_loop import (
     LoopSupervisor,
 )
 from qqbot.services.agent_loop.event_writer import parse_scope_key
+from qqbot.services.agent_loop.tool_registry import ToolRegistry
+from qqbot.services.agent_loop.tools.task import TaskTool
 from qqbot.services.event_ingest.ingest import _scope_key_for_wake
 from qqbot.services.event_ingest.system_event import SystemEvent
 from datetime import datetime
@@ -49,6 +51,9 @@ class _EmptyResult:
     def all(self) -> list:
         return []
 
+    def first(self) -> None:
+        return None
+
 
 class _RecordingSession:
     """async session double that captures every executed insert statement.
@@ -62,9 +67,10 @@ class _RecordingSession:
     def __init__(self, store: list[Any]) -> None:
         self._store = store
 
-    async def execute(self, stmt: Any) -> Any:
+    async def execute(self, stmt: Any, params: dict | None = None) -> Any:
         from sqlalchemy.sql.elements import TextClause
 
+        _ = params
         if isinstance(stmt, TextClause):
             return _EmptyResult()
         self._store.append(stmt)
@@ -160,9 +166,9 @@ class _SlowIdlePlanner:
 
 
 class _SlowCallToolPlanner:
-    """模拟 LLM 往返后产出动作的拍：睡完 DELAY 返回 create_task + call_tool。
+    """模拟 LLM 往返后产出动作的拍：睡完 DELAY 返回 task + reply 调用。
 
-    用来断言 _apply_actions 派生的动作事件（task_created / tool_called /
+    用来断言 inline task 与普通派发产生的事件（task_created / tool_called /
     自动推进的 task_state_changed）与 decision_emitted 同步回填投影时刻。
     """
 
@@ -171,7 +177,6 @@ class _SlowCallToolPlanner:
     async def decide(self, context: Any) -> Any:
         from qqbot.services.agent_loop import (
             CallToolAction,
-            CreateTaskAction,
             DecisionOutput,
         )
 
@@ -179,7 +184,14 @@ class _SlowCallToolPlanner:
         await asyncio.sleep(self.DELAY)
         return DecisionOutput(
             actions=[
-                CreateTaskAction(description="慢拍任务", task_ref="ref-1"),
+                CallToolAction(
+                    tool_name="task",
+                    arguments={
+                        "action": "create",
+                        "description": "慢拍任务",
+                        "task_ref": "ref-1",
+                    },
+                ),
                 CallToolAction(
                     tool_name="reply",
                     arguments={"analysis": "x", "hold_seconds": 0},
@@ -292,16 +304,23 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
         的水位线同样依赖这批事件的时间戳，锚点错了它也会跟着误标。
         """
         captured: list[Any] = []
+        registry = ToolRegistry()
+        registry.register(TaskTool())
         loop = AgentLoop(
             scope_key="group:12345",
             planner=_SlowCallToolPlanner(),
             session_factory=_factory_for(captured),
+            tool_registry=registry,
         )
         loop.start()
         loop.wake(immediate=True)
         for _ in range(200):
             await asyncio.sleep(0.01)
-            if len(captured) >= 6:
+            if any(
+                _values_of(stmt).get("type") == "runtime.tick_ended"
+                for stmt in captured
+                if getattr(stmt, "table", None) is not None
+            ):
                 break
         await loop.stop()
 

@@ -104,10 +104,6 @@ _RETIRED_KEYS: dict[str, tuple[str, str]] = {
 class ReplyTool(BaseTool):
     name = "reply"
     allowed_scopes = ("group", "private")
-    # reply-only 成功批次不应为“草稿已落定”再开一拍；失败仍需让 Planner 看见。
-    # cancel 同理：撤稿后没有 flush 会来，为"我决定不说了"再开一拍只会引诱模型
-    # 立刻改主意重新落稿。
-    wake_policy = "on_failure"
     description = (
         "Speak. Normally you pass exactly `analysis` — your resolved map of "
         "the participants, addressee relationships, topic threads, decisive "

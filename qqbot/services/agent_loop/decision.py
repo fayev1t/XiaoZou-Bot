@@ -2,9 +2,9 @@
 
 Contract: 开发文档/v2.0/任务与决策契约.md §2-§4
 
-Action union currently only contains IdleAction (skeleton); create_task /
-call_tool / complete_task / fail_task will be added when the real
-planner comes online.
+Planner actions form a deliberately small closed set: idle / call_tool.
+Task lifecycle operations are provided by the inline ``task`` tool rather
+than growing a parallel family of Planner-only actions.
 """
 
 from __future__ import annotations
@@ -20,25 +20,6 @@ class IdleAction:
 
     type: str = "idle"
     reason: str = ""
-
-
-@dataclass(frozen=True)
-class CreateTaskAction:
-    """Spawn a new task. `task_ref` is an in-tick alias the LLM uses so a
-    later CallToolAction in the same `actions` list can reference this
-    task before the loop has minted a real task_id.
-
-    `triggered_by_event_id` is the LLM-supplied anchor of "what event made
-    me create this task" — used by search_history to look up earlier context
-    relative to the task's birthplace. Optional; tools degrade gracefully.
-    """
-
-    description: str
-    related_tools: list[str] = field(default_factory=list)
-    parent_task_id: str | None = None
-    task_ref: str | None = None
-    triggered_by_event_id: str | None = None
-    type: str = "create_task"
 
 
 @dataclass(frozen=True)
@@ -63,47 +44,15 @@ class CallToolAction:
     type: str = "call_tool"
 
 
-@dataclass(frozen=True)
-class CompleteTaskAction:
-    task_id: str
-    result_summary: str | None = None
-    type: str = "complete_task"
-
-
-@dataclass(frozen=True)
-class FailTaskAction:
-    task_id: str
-    reason: str = ""
-    type: str = "fail_task"
-
-
-@dataclass(frozen=True)
-class NoteTaskProgressAction:
-    """Append a progress note to an existing task WITHOUT changing its
-    state. Used so the LLM can "think out loud" across ticks: each tick
-    sees a short tail of these notes per task and can build on its earlier
-    reasoning instead of restarting from the timeline alone."""
-
-    task_id: str
-    note: str
-    type: str = "note_task_progress"
-
-
-# Union of every action type the loop translates. Order matters only for
-# isinstance dispatch readability, not semantics.
+# Union of every action type the loop translates.
 #
 # 注意：发言不在这里 —— v2 中 Planner 通过 reply 工具落 reply_task，
 # 不再是一类独立的 Action。这是为了让 LLM 把"要不要说话"当成一次工具调
 # 用决策，与调 websearch / search_history 同构，避免被旧 ReplyAction 诱
 # 导成"群里每条消息都要选择回 vs idle"的二分法。
-Action = (
-    IdleAction
-    | CreateTaskAction
-    | CallToolAction
-    | CompleteTaskAction
-    | FailTaskAction
-    | NoteTaskProgressAction
-)
+# Task 生命周期同理：创建、记笔记、完成、失败都走 inline task 工具，Action
+# 不再为某一个业务域复制一套专属协议。
+Action = IdleAction | CallToolAction
 
 
 @dataclass(frozen=True)

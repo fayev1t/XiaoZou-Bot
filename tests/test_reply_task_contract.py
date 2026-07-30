@@ -81,6 +81,8 @@ class RegistryBoundaryTests(unittest.TestCase):
         registry = build_default_registry()
         self.assertIn("reply", registry.names())
         self.assertNotIn("send_message", registry.names())
+        # reply 不再覆盖工具批次的统一唤醒语义。
+        self.assertFalse(hasattr(registry.get("reply"), "wake_policy"))
         # 2026-07-25 改名：`meme` → `meme_collection`（工具面仍无 send 动作）。
         meme_tool = registry.get("meme_collection")
         self.assertIsNotNone(meme_tool)
@@ -817,33 +819,36 @@ class ReplyerOutputTests(unittest.TestCase):
         self.assertIn("小奏", prompt)
         self.assertNotIn("小奏", build_default_registry().usage_docs("group"))
 
-    def test_voice_card_home_is_prompts_voice_md(self) -> None:
-        """角色卡 2026-07-19 迁至 prompts/voice.md（唯一权威来源）；已下架的
-        send_message.md 不再承载人格，防止两处副本漂移。"""
-        from qqbot.services.agent_loop import replyer as replyer_mod
+    def test_voice_card_home_is_prompts_replyer_md(self) -> None:
+        """角色卡的居所：2026-07-19 自已下架的 send_message.md 迁到
+        prompts/voice.md，2026-07-30 又并入 prompts/replyer.md（职责页与
+        角色卡同一份）。旧居所都不得再承载人格，防两处副本漂移。"""
+        from qqbot.services.agent_loop.prompts.catalog import _PROMPTS_DIR
 
-        voice_text = replyer_mod._VOICE_PATH.read_text(encoding="utf-8")
-        self.assertIn("小奏", voice_text)
-        self.assertIn("那个特殊的人", voice_text)
+        card = (_PROMPTS_DIR / "replyer.md").read_text(encoding="utf-8")
+        self.assertIn("小奏", card)
+        self.assertIn("最重要的人", card)
+        self.assertFalse((_PROMPTS_DIR / "voice.md").exists())
         legacy = (
-            replyer_mod._VOICE_PATH.parent.parent / "tools" / "send_message.md"
+            _PROMPTS_DIR.parent / "tools" / "send_message.md"
         ).read_text(encoding="utf-8")
         self.assertNotIn("你叫小奏", legacy)
 
-    def test_missing_voice_file_fails_loudly(self) -> None:
-        """voice.md 缺失 = 部署损坏：组稿必须失败（final 记 failed 并唤醒
-        Planner），绝不静默降级成无人格腔——那是最难被发现的坏法。"""
-        from pathlib import Path
-
+    def test_missing_card_file_fails_loudly(self) -> None:
+        """角色卡所在文件缺失 = 部署损坏：组稿必须失败（final 记 failed 并
+        回注时间线），绝不静默降级成无人格腔——那是最难被发现的坏法。
+        2026-07-30 起这条由 catalog 的文件段不变量兜住（缺失 OSError /
+        为空 PromptSectionMissing），_build_system_prompt 统一转 ReplyerError。"""
         from qqbot.services.agent_loop import replyer as replyer_mod
+        from qqbot.services.agent_loop.prompts import catalog
 
-        original = replyer_mod._VOICE_PATH
-        replyer_mod._VOICE_PATH = Path("/nonexistent/voice-card.md")
+        original = catalog._FILES["replyer"]
+        catalog._FILES["replyer"] = "__no_such_replyer_card__.md"
         try:
             with self.assertRaises(replyer_mod.ReplyerError):
                 _build_system_prompt()
         finally:
-            replyer_mod._VOICE_PATH = original
+            catalog._FILES["replyer"] = original
 
 
 class _CapturingLLM:

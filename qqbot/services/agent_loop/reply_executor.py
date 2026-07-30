@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections.abc import Callable
 from datetime import datetime
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from qqbot.core.ids import new_event_id
 from qqbot.core.logging import get_logger
@@ -14,7 +15,10 @@ from qqbot.services.agent_loop.delivery_claims import (
     has_delivery_claim,
     try_claim_once_strict,
 )
-from qqbot.services.agent_loop.event_writer import parse_scope_key, write_runtime_event
+from qqbot.services.agent_loop.event_writer import (
+    RuntimeEventPublisher,
+    parse_scope_key,
+)
 from qqbot.services.agent_loop.meme_store import get_meme
 from qqbot.services.agent_loop.reply_task import (
     ReplyTaskState,
@@ -40,13 +44,13 @@ class ReplyExecutor:
         *,
         session_factory: Any,
         projector: Any,
-        wake_scope: Callable[[str], Awaitable[None]],
+        event_publisher: RuntimeEventPublisher | None = None,
         replyer: Replyer | None = None,
         bot_user_id_resolver: Callable[[], str | None] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._projector = projector
-        self._wake_scope = wake_scope
+        self._events = event_publisher or RuntimeEventPublisher(session_factory)
         self._replyer = replyer or Replyer()
         # 与 AgentLoop 同一把 resolver（supervisor 注入）：组稿 context 也带
         # bot_qq/bot_role，Replyer 判"谁在对谁说话"的输入不再低 Planner 一等。
@@ -73,15 +77,13 @@ class ReplyExecutor:
                 )
             await self._write_uncertain_recovery(task, reason)
             recovered.add(task.reply_task_id)
-            await self._wake_for_attention(task.scope_key)
         for task in (
             task
             for task in recent
             if task.state == "open" and task.reply_task_id not in recovered
         ):
             if task.flush_at <= china_now():
-                await write_runtime_event(
-                    self._session_factory,
+                await self._events.publish(
                     event_type="runtime.reply_task_overdue",
                     scope_key=task.scope_key,
                     visibility="agent_visible",
@@ -93,7 +95,6 @@ class ReplyExecutor:
                         "flush_at": task.flush_at.isoformat(),
                     },
                 )
-                await self._wake_for_attention(task.scope_key)
             else:
                 self._schedule(task.reply_task_id, task.revision, task.flush_at)
 
@@ -178,8 +179,7 @@ class ReplyExecutor:
             ):
                 return
             correlation_id = current.correlation_id or new_event_id()
-            claimed_id = await write_runtime_event(
-                self._session_factory,
+            claimed_id = await self._events.publish(
                 event_type="runtime.reply_flush_claimed",
                 scope_key=current.scope_key,
                 visibility="runtime_only",
@@ -278,23 +278,6 @@ class ReplyExecutor:
                 exc,
             )
             return
-        # 2026-07-22 起无论 status 都唤醒（含 sent）：flush 才是新架构里"话已
-        # 说完"的时刻，这次唤醒对应 send_message 时代批次收口唤醒的锚点搬迁。
-        # final 先落库、唤醒在后，醒来的拍必能看到 <my-reply>；要不要续说由
-        # 模型按 prompt 判断（多段任务续发下一段，无事则 idle）——程序不替
-        # 模型决定何时思考（模型+prompt 优先，同 loop.py 批次门闩拆除注记）。
-        await self._wake_for_attention(task.scope_key)
-
-    async def _wake_for_attention(self, scope_key: str) -> None:
-        """最终事件已经写定后 best-effort 唤醒；失败不得制造第二条 final。"""
-        try:
-            await self._wake_scope(scope_key)
-        except Exception as exc:
-            logger.warning(
-                "[reply_executor] wake after final failed for {}: {}",
-                scope_key,
-                exc,
-            )
 
     async def _preflight(
         self, messages: list[dict]
@@ -442,8 +425,7 @@ class ReplyExecutor:
         }
         if reason:
             payload["reason"] = _redact_runtime_value(reason)
-        await write_runtime_event(
-            self._session_factory,
+        await self._events.publish(
             event_type="runtime.reply_flushed",
             scope_key=task.scope_key,
             visibility="agent_visible",
@@ -457,8 +439,7 @@ class ReplyExecutor:
     async def _write_uncertain_recovery(
         self, task: ReplyTaskState, reason: str
     ) -> None:
-        await write_runtime_event(
-            self._session_factory,
+        await self._events.publish(
             event_type="runtime.reply_flushed",
             scope_key=task.scope_key,
             visibility="agent_visible",

@@ -23,8 +23,9 @@ asyncio.Event 本身已经能把"上一拍还在跑"期间的多次唤醒并成�
 没有什么可攒的，等窗口纯属白白加延迟。
 
 工具批次（tool_batch）：同一 tick 派发的全部 call_tool 属于同一个批次
-（tool_batch_id 复用 decision_id），批次收口时 ToolWorker 经 supervisor 批次级
-唤醒一次。2026-07-02 起**没有批次门闩**：批次进行期间的任何唤醒都随时开拍，
+（tool_batch_id 复用 decision_id），inline/worker 执行方共用收口器，经
+supervisor 批次级唤醒一次。2026-07-02 起**没有批次门闩**：批次进行期间
+的任何唤醒都随时开拍，
 模型自己看 <tool-call status="processing"> 行决定等还是先处理新事件——程序
 不替模型决定"何时可以思考"（模型+prompt 优先哲学）。
 
@@ -40,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import replace
+from datetime import datetime
 from typing import Any, Callable
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -50,21 +52,26 @@ from qqbot.core.time import china_now
 from qqbot.services.agent_loop.decision import (
     Action,
     CallToolAction,
-    CompleteTaskAction,
-    CreateTaskAction,
     DecisionContext,
     DecisionOutput,
-    FailTaskAction,
     IdleAction,
-    NoteTaskProgressAction,
     Planner,
 )
 from qqbot.services.agent_loop.event_writer import (
+    AgentEventWrite,
     write_agent_event,
+    write_agent_events,
     write_runtime_event,
 )
 from qqbot.services.agent_loop.projection import Projector
-from qqbot.services.agent_loop.tool_registry import ToolRegistry
+from qqbot.services.agent_loop.tool_batch import maybe_close_tool_batch
+from qqbot.services.agent_loop.tool_registry import (
+    Tool,
+    ToolOutcome,
+    ToolRegistry,
+    coerce_tool_outcome,
+    get_tool_execution_mode,
+)
 
 logger = get_logger(__name__)
 
@@ -87,24 +94,27 @@ class AgentLoop:
         supervisor: Any | None = None,
         bot_user_id_resolver: Callable[[], str | None] | None = None,
         tool_registry: ToolRegistry | None = None,
+        caption_image: Any | None = None,
     ) -> None:
         self._scope_key = scope_key
         self._planner = planner
         self._session_factory = session_factory
         self._projector = projector
         # supervisor 鸭子类型注入，规避 supervisor → loop 的循环 import。
-        # 唯一用到的接口：notify_tool_pending()（写完 tool_called 后叫醒
-        # ToolWorker 立即执行）。批次门闩相关接口已于 2026-07-02 随门闩拆除。
+        # 用到 notify_tool_pending()（worker 调用落库后叫醒 ToolWorker）以及
+        # notify_tool_batch_completed()（inline 批次收口通知）。批次门闩接口
+        # 已于 2026-07-02 随门闩拆除。
         self._supervisor = supervisor
         # bot_user_id 每 tick 重新 resolve —— bot 重连后 self_id 不变但实例
         # 会换；启动初期可能返回 None，prompt 渲染层接受 None 优雅降级。
         # None resolver 表示不注入（旧测试 / 早期骨架兼容）。
         self._bot_user_id_resolver = bot_user_id_resolver
-        # tool_registry 目前仅作为句柄保留：scope / 发起人 tier / bot 角色的
-        # **判定与解析**已全部下放到工具内 BaseTool.enforce_access，dispatch 路径
-        # 不再查它的元数据、不做任何权限/scope 闸门（catalog 可见性过滤在 planner
-        # 组装 prompt 时按 scope 做）。注入 None 亦可——旧测试 / 早期骨架兼容。
+        # registry 只参与通用 execution_mode 路由；权限/scope/role 判定仍全部
+        # 下放工具内 BaseTool.enforce_access。缺 registry 时任何调用都按 worker
+        # 模式派发，保持旧测试 / 早期骨架兼容。
         self._tool_registry = tool_registry
+        # 与 ToolWorker 相同的可选工具依赖；inline 工具也收到完整 context。
+        self._caption_image = caption_image
         self._wake = asyncio.Event()
         self._stopped = False
         self._tick_seq = 0
@@ -123,7 +133,9 @@ class AgentLoop:
     def start(self) -> None:
         if self._task is not None:
             return
-        self._task = asyncio.create_task(self._run(), name=f"agent_loop:{self._scope_key}")
+        self._task = asyncio.create_task(
+            self._run(), name=f"agent_loop:{self._scope_key}"
+        )
 
     async def stop(self) -> None:
         self._stopped = True
@@ -298,9 +310,7 @@ class AgentLoop:
                     correlation_id, tick_started_id, actions_count=0
                 )
                 return
-            validation_error = _validate_decision(
-                decision, scope_key=self._scope_key
-            )
+            validation_error = _validate_decision(decision)
             if validation_error is None:
                 break
             await write_runtime_event(
@@ -364,8 +374,9 @@ class AgentLoop:
     ) -> None:
         """Translate every action into agent.* events.
 
-        Maintains an in-tick task_ref → task_id map so a CallToolAction can
-        attach to a task created in the same actions list.
+        Planner action 只剩 idle / call_tool。task 是 execution_mode="inline"
+        的普通工具：当前 tick 内 await，结果里的 task_ref → task_id 映射可供
+        后续 CallToolAction 复用；系统不按工具名写任何特判。
 
         权限：loop **不做任何业务权限/scope/role 判定，也不解析触发用户 tier**——
         只把"谁触发"的 anchor（triggered_by_event_id）与已折好的 bot 角色
@@ -374,8 +385,6 @@ class AgentLoop:
         （BaseTool.enforce_access = enforce_scope + enforce_permission +
         enforce_bot_admin），失败由工具返回语义化 error_kind（见 §2.2、§7.2）。
 
-        在循环开始处 lazy 加载一次 SUPERUSERS（reading env file per-tick is
-        cheap but per-action is wasteful），同 tick 内复用。
         """
         ref_to_task_id: dict[str, str] = {}
 
@@ -390,7 +399,7 @@ class AgentLoop:
         # ─── 工具批次（tool_batch）───
         # 同一 tick 派发的全部 call_tool 属于同一批次：tool_batch_id 直接复用
         # decision_id（同拍唯一即可，不另造 ID 体系），tool_batch_size = 本
-        # actions 里 call_tool 的个数。ToolWorker 据 (id, size) 判定"整批全部
+        # actions 里 call_tool 的个数。共享收口器据 (id, size) 判定"整批全部
         # terminal"后写 runtime.tool_batch_completed 并批次级唤醒一次。批次
         # 只是"结果聚合 + 单次唤醒"的效率单位——没有门闩，期间任何唤醒随时开拍。
         tool_batch_size = sum(
@@ -408,149 +417,199 @@ class AgentLoop:
                     payload={"reason": action.reason},
                     occurred_at=now,
                 )
-
-            elif isinstance(action, CreateTaskAction):
-                task_id = new_event_id()
-                await write_agent_event(
-                    self._session_factory,
-                    event_type="agent.task_created",
-                    scope_key=self._scope_key,
+                continue
+            if isinstance(action, CallToolAction):
+                await self._dispatch_tool_call(
+                    action,
                     correlation_id=correlation_id,
-                    causation_id=decision_id,
+                    decision_id=decision_id,
+                    context=context,
+                    occurred_at=now,
+                    tool_batch_size=tool_batch_size,
+                    ref_to_task_id=ref_to_task_id,
+                )
+                continue
+            logger.warning(
+                "[loop {}] unknown action type: {}",
+                self._scope_key,
+                type(action).__name__,
+            )
+
+    async def _dispatch_tool_call(  # noqa: PLR0913
+        self,
+        action: CallToolAction,
+        *,
+        correlation_id: str,
+        decision_id: str,
+        context: DecisionContext,
+        occurred_at: datetime,
+        tool_batch_size: int,
+        ref_to_task_id: dict[str, str],
+    ) -> None:
+        """按工具声明的 execution_mode 选择当前 tick 或 ToolWorker 执行。"""
+        tool_call_id = new_event_id()
+        called_event_id = new_event_id()
+        task_id = action.task_id or (
+            ref_to_task_id.get(action.task_ref) if action.task_ref else None
+        )
+        triggered_event_id = action.triggered_by_event_id
+        if triggered_event_id is None and task_id is not None:
+            triggered_event_id = _find_task_anchor(context, task_id)
+
+        called_payload = {
+            "tool_call_id": tool_call_id,
+            "tool_name": action.tool_name,
+            "arguments": action.arguments,
+            "task_id": task_id,
+            "triggered_by_event_id": triggered_event_id,
+            "bot_role": context.bot_role,
+            "tool_batch_id": decision_id,
+            "tool_batch_size": tool_batch_size,
+        }
+        writes = [
+            AgentEventWrite(
+                event_type="agent.tool_called",
+                causation_id=decision_id,
+                payload=called_payload,
+                occurred_at=occurred_at,
+                event_id=called_event_id,
+            )
+        ]
+        if task_id is not None:
+            writes.append(
+                AgentEventWrite(
+                    event_type="agent.task_state_changed",
+                    causation_id=called_event_id,
                     payload={
                         "task_id": task_id,
-                        "description": action.description,
-                        "related_tools": action.related_tools,
-                        "parent_task_id": action.parent_task_id,
-                        "triggered_by_event_id": action.triggered_by_event_id,
+                        "from_state": "pending",
+                        "to_state": "running",
+                        "reason": None,
                     },
-                    occurred_at=now,
+                    occurred_at=occurred_at,
                 )
-                if action.task_ref:
-                    ref_to_task_id[action.task_ref] = task_id
+            )
 
-            elif isinstance(action, CallToolAction):
-                tool_call_id = new_event_id()
-                task_id = action.task_id or (
-                    ref_to_task_id.get(action.task_ref)
-                    if action.task_ref
-                    else None
-                )
-                # ─── 注入触发身份（不做任何 role/tier/scope 判定）───
-                # AgentLoop 把工具调用所需的"谁触发"线索原样注入，**不解析 tier、
-                # 不查角色、不拦 scope**：scope 由工具 enforce_scope 自判、发起人
-                # tier 与 bot 角色由工具 enforce_access 现场解析 + 自判（契约 §2.2、
-                # §7.2）。这里只确定 triggered_by_event_id（LLM 给的；缺则回退到 task
-                # 的 anchor 补全因果链），其余交给工具。
-                triggered_event_id = action.triggered_by_event_id
-                if triggered_event_id is None and task_id is not None:
-                    triggered_event_id = _find_task_anchor(context, task_id)
-                # ─── dispatch ───
-                called_event_id = await write_agent_event(
-                    self._session_factory,
-                    event_type="agent.tool_called",
-                    scope_key=self._scope_key,
-                    correlation_id=correlation_id,
-                    causation_id=decision_id,
-                    payload={
-                        "tool_call_id": tool_call_id,
-                        "tool_name": action.tool_name,
-                        "arguments": action.arguments,
-                        "task_id": task_id,
-                        # 注入工具自判所需的上下文：谁触发（工具据此现场解析发起人
-                        # tier）+ bot 自身角色。loop 自己不解析 tier、不写
-                        # triggered_by_user_id / triggered_by_user_tier。
-                        "triggered_by_event_id": triggered_event_id,
-                        "bot_role": context.bot_role,
-                        # 批次标记：ToolWorker 据此判定"同拍整批是否全部 terminal"
-                        # ——批次边界是编排层（loop/worker/supervisor）的职责，
-                        # 工具本身对批次一无所知（黑盒不变）。
-                        "tool_batch_id": decision_id,
-                        "tool_batch_size": tool_batch_size,
-                    },
-                    occurred_at=now,
-                )
-                # 叫醒 ToolWorker 立即执行（同 send_message 那条线的推+拉策略）
-                if self._supervisor is not None:
-                    try:
-                        self._supervisor.notify_tool_pending()
-                    except Exception as exc:
-                        logger.warning(
-                            "[loop {}] notify_tool_pending failed: {}",
-                            self._scope_key,
-                            exc,
-                        )
-                # Auto-advance task state pending → running on first tool_called
-                # (任务与决策契约 §4.1). The projection layer will skip the
-                # transition if the task is already running.
-                if task_id is not None:
-                    await write_agent_event(
-                        self._session_factory,
-                        event_type="agent.task_state_changed",
-                        scope_key=self._scope_key,
-                        correlation_id=correlation_id,
-                        causation_id=called_event_id,
-                        payload={
-                            "task_id": task_id,
-                            "from_state": "pending",
-                            "to_state": "running",
-                            "reason": None,
-                        },
-                        occurred_at=now,
-                    )
+        tool = (
+            self._tool_registry.get(action.tool_name)
+            if self._tool_registry is not None
+            else None
+        )
+        if tool is None or get_tool_execution_mode(tool) == "worker":
+            await write_agent_events(
+                self._session_factory,
+                scope_key=self._scope_key,
+                correlation_id=correlation_id,
+                events=writes,
+            )
+            self._notify_tool_worker()
+            return
 
-            elif isinstance(action, CompleteTaskAction):
-                await write_agent_event(
-                    self._session_factory,
-                    event_type="agent.task_state_changed",
-                    scope_key=self._scope_key,
-                    correlation_id=correlation_id,
-                    causation_id=decision_id,
-                    payload={
-                        "task_id": action.task_id,
-                        "to_state": "done",
-                        "reason": action.result_summary,
-                    },
-                    occurred_at=now,
-                )
+        outcome = await self._run_inline_tool(
+            tool,
+            action.arguments,
+            task_id=task_id,
+            correlation_id=correlation_id,
+            triggered_by_event_id=triggered_event_id,
+            bot_role=context.bot_role,
+            tool_call_event_id=called_event_id,
+        )
+        writes.extend(
+            AgentEventWrite(
+                event_type=generated.event_type,
+                causation_id=called_event_id,
+                payload=generated.payload,
+                occurred_at=generated.occurred_at or occurred_at,
+            )
+            for generated in outcome.emitted_events
+        )
+        writes.append(
+            _terminal_event_write(
+                outcome,
+                tool_call_id=tool_call_id,
+                tool_name=action.tool_name,
+                task_id=task_id,
+                called_event_id=called_event_id,
+            )
+        )
+        written_ids = await write_agent_events(
+            self._session_factory,
+            scope_key=self._scope_key,
+            correlation_id=correlation_id,
+            events=writes,
+        )
+        _remember_task_ref(outcome, ref_to_task_id)
+        try:
+            await maybe_close_tool_batch(
+                self._session_factory,
+                supervisor=self._supervisor,
+                scope_key=self._scope_key,
+                tool_batch_id=decision_id,
+                tool_batch_size=tool_batch_size,
+                terminal_event_id=written_ids[-1],
+                correlation_id=correlation_id,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[loop {}] inline batch close failed: batch={}: {}",
+                self._scope_key,
+                decision_id,
+                exc,
+            )
 
-            elif isinstance(action, FailTaskAction):
-                await write_agent_event(
-                    self._session_factory,
-                    event_type="agent.task_state_changed",
-                    scope_key=self._scope_key,
-                    correlation_id=correlation_id,
-                    causation_id=decision_id,
-                    payload={
-                        "task_id": action.task_id,
-                        "to_state": "failed",
-                        "reason": action.reason,
-                    },
-                    occurred_at=now,
-                )
+    async def _run_inline_tool(  # noqa: PLR0913
+        self,
+        tool: Tool,
+        arguments: dict,
+        *,
+        task_id: str | None,
+        correlation_id: str,
+        triggered_by_event_id: str | None,
+        bot_role: str | None,
+        tool_call_event_id: str,
+    ) -> ToolOutcome:
+        """在当前 tick await 工具；裸 stub 抛错也收敛成失败 outcome。"""
+        try:
+            raw = await tool.run(
+                arguments,
+                scope_key=self._scope_key,
+                task_id=task_id,
+                correlation_id=correlation_id,
+                session_factory=self._session_factory,
+                triggered_by_event_id=triggered_by_event_id,
+                triggered_by_user_tier=None,
+                bot_role=bot_role,
+                tool_call_event_id=tool_call_event_id,
+                wake_scope=getattr(self._supervisor, "wake", None),
+                caption_image=self._caption_image,
+                notify_reply_task=getattr(
+                    self._supervisor, "notify_reply_task", None
+                ),
+            )
+        except Exception as exc:
+            logger.exception(
+                "[loop {}] inline tool {} crashed: {}",
+                self._scope_key,
+                getattr(tool, "name", "?"),
+                exc,
+            )
+            return ToolOutcome.failure(
+                "internal_tool_error",
+                f"{type(exc).__name__}: {exc}",
+            )
+        return coerce_tool_outcome(raw)
 
-            elif isinstance(action, NoteTaskProgressAction):
-                # 进度笔记 — 不改 state，仅落事件供下一 tick 的 fold_tasks
-                # 取到尾部 N 条渲染进 TaskView.progress_notes。
-                await write_agent_event(
-                    self._session_factory,
-                    event_type="agent.task_progress_noted",
-                    scope_key=self._scope_key,
-                    correlation_id=correlation_id,
-                    causation_id=decision_id,
-                    payload={
-                        "task_id": action.task_id,
-                        "note": action.note,
-                    },
-                    occurred_at=now,
-                )
-
-            else:
-                logger.warning(
-                    "[loop {}] unknown action type: {}",
-                    self._scope_key,
-                    type(action).__name__,
-                )
+    def _notify_tool_worker(self) -> None:
+        if self._supervisor is None:
+            return
+        try:
+            self._supervisor.notify_tool_pending()
+        except Exception as exc:
+            logger.warning(
+                "[loop {}] notify_tool_pending failed: {}",
+                self._scope_key,
+                exc,
+            )
 
     async def _write_tick_ended(
         self,
@@ -572,13 +631,66 @@ class AgentLoop:
         )
 
 
+def _terminal_event_write(
+    outcome: ToolOutcome,
+    *,
+    tool_call_id: str,
+    tool_name: str,
+    task_id: str | None,
+    called_event_id: str,
+) -> AgentEventWrite:
+    if outcome.ok:
+        return AgentEventWrite(
+            event_type="agent.tool_result",
+            causation_id=called_event_id,
+            payload={
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "task_id": task_id,
+                "result": outcome.result,
+            },
+        )
+    payload = {
+        "tool_call_id": tool_call_id,
+        "tool_name": tool_name,
+        "task_id": task_id,
+        "error_kind": outcome.error_kind,
+        "error_message": outcome.error_message,
+    }
+    if isinstance(outcome.extra, dict):
+        payload.update(outcome.extra)
+    return AgentEventWrite(
+        event_type="agent.tool_failed",
+        causation_id=called_event_id,
+        payload=payload,
+    )
+
+
+def _remember_task_ref(
+    outcome: ToolOutcome,
+    ref_to_task_id: dict[str, str],
+) -> None:
+    """从任意 inline 成功结果学习同拍 task_ref，不按工具名特判。"""
+    if not outcome.ok or not isinstance(outcome.result, dict):
+        return
+    task_id = outcome.result.get("task_id")
+    task_ref = outcome.result.get("task_ref")
+    if (
+        isinstance(task_id, str)
+        and task_id
+        and isinstance(task_ref, str)
+        and task_ref
+    ):
+        ref_to_task_id[task_ref] = task_id
+
+
 def _find_task_anchor(
     context: DecisionContext, task_id: str
 ) -> str | None:
     """从 DecisionContext.active_tasks 里取 task 的 triggered_by_event_id。
 
     敏感工具调用没填 triggered_by_event_id 时，AgentLoop fall back 到
-    "调用挂的 task 是哪条消息触发的" 补全因果链 —— 这与 create_task 的 anchor
+    "调用挂的 task 是哪条消息触发的" 补全因果链 —— 这与 task(create) 的 anchor
     语义一致：task 是"我要给小王查天气"，那 task 内任何敏感操作都视作小王的指
     令。task 不存在或没填 anchor 时返回 None（工具内 enforce_permission 据此把
     发起人当 GUEST，敏感工具自然失败）。
@@ -589,16 +701,15 @@ def _find_task_anchor(
     return None
 
 
-def _validate_decision(decision: DecisionOutput, *, scope_key: str) -> str | None:
+def _validate_decision(decision: DecisionOutput) -> str | None:
     """Return a short error string on invalid output, or None if valid.
 
     Rules (任务与决策契约 §3.1, §3.2.3):
     - IdleAction never co-exists with another action.
 
-    Reply 校验下沉到 SendMessageTool.run() —— 由于发言现在是普通工具，
-    target.kind/group_id 与 scope_key 不匹配时 tool 自身返回失败 outcome，
-    ToolWorker 写 agent.tool_failed；"一 tick 多回复"的硬约束移除，
-    由 group_chat_rules.md 软规范引导（多发短消息有时是合理选择）。
+    工具自己的 arguments / scope / permission 校验全部留在工具边界；这里仅
+    校验跨 action 的组合约束。"一 tick 多回复"的旧硬约束已经移除，由
+    group_chat_rules.md 软规范引导。
     """
     actions = decision.actions
     if any(isinstance(a, IdleAction) for a in actions) and len(actions) > 1:

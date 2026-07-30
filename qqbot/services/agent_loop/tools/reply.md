@@ -110,11 +110,11 @@ resolved accurately. The Replyer reads the latest timeline, its own voice card
 and `<saved-memes>` to choose the natural visible form.
 
 One flush emits at most 4 bubbles (at most one of them a meme). Output the user
-explicitly wants in more parts than one flush can carry is a cross-tick task:
-keep that task open, authorize only the current installment, and on the wake
-that follows each flush (the `<my-reply>` row is already in the timeline)
-authorize the next installment — without waiting to be prompted — until the task
-completes.
+explicitly wants should be represented completely in the authorization and fit
+within that delivery envelope. A successful `reply` tool result completes your
+speaking action; do not keep a task open merely to wait for `<my-reply>`. The
+later `<my-reply>` row is delivery history and may arrive as new evidence, not
+the completion condition of the tool call.
 
 ## `action="cancel"` — drop the draft
 

@@ -31,13 +31,15 @@
   - BaseTool.run() 是统一出口（调用方只见它、永不 raise）：归一 execute 的返回；只
     兜底**预料外**的第三方异常（httpx / sqlalchemy / napcat 适配器 raise 的）→
     internal_tool_error。
-  - ToolWorker 只搬运 ToolOutcome → agent.tool_result / agent.tool_failed。
+  - 执行层只搬运 ToolOutcome → 领域事件 + agent.tool_result / agent.tool_failed。
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from datetime import datetime
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from qqbot.core.logging import get_logger
 from qqbot.core.permissions import (
@@ -52,18 +54,40 @@ logger = get_logger(__name__)
 # 让 bot 角色一次 execute() 内只实时查一次。
 _UNSET = object()
 
+ToolExecutionMode = Literal["worker", "inline"]
+
+
+@dataclass(frozen=True)
+class ToolGeneratedEvent:
+    """工具返回、由调度层随 terminal 一并落库的 agent 领域事件意图。
+
+    工具只描述 ``event_type`` / ``payload``，不自行决定 correlation、causation
+    或事务边界；执行层统一把 causation 指向本次 ``agent.tool_called``。当前
+    ``task`` inline 工具用它生成 ``agent.task_*``，以后其它工具也可复用。
+    """
+
+    event_type: str
+    payload: dict
+    occurred_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not self.event_type.startswith("agent."):
+            raise ValueError("ToolGeneratedEvent.event_type must start with 'agent.'")
+        if not isinstance(self.payload, dict):
+            raise TypeError("ToolGeneratedEvent.payload must be a dict")
+
 
 @dataclass(frozen=True)
 class ToolOutcome:
     """工具调用的结构化输出 —— 取代旧的"成功 return dict / 失败 raise 字符串"。
 
     工具直接产出 outcome（成功 → ``result``；失败 → ``error_kind`` /
-    ``error_message`` / ``extra``）。ToolWorker 只把它机械搬运成
+    ``error_message`` / ``extra``）。执行层只把它机械搬运成
     ``agent.tool_result`` / ``agent.tool_failed``，**不再 introspect 异常类型、不猜
     error_kind**（契约 §6/§7.2）；Projection 据这两类事件渲染 ``<tool-call>``
     （两态：complete + ``<result>`` / ``<error>``）。
 
-    ``error_kind`` 收敛成固定语义集（见 protocol.md §permissions、契约 §7.2）：
+    ``error_kind`` 收敛成固定语义集（见 envelope.md §<error>、契约 §7.2）：
       ``tool_unavailable_in_scope`` / ``invalid_arguments`` /
       ``permission_denied_user_tier`` / ``permission_denied_bot_role`` /
       ``no_bot_available`` / ``upstream_action_failed`` / ``internal_tool_error``。
@@ -76,15 +100,30 @@ class ToolOutcome:
     error_kind: str | None = None
     error_message: str | None = None
     extra: dict = field(default_factory=dict)
+    emitted_events: tuple[ToolGeneratedEvent, ...] = field(default_factory=tuple)
 
     @classmethod
-    def success(cls, result: Any = None, **fields: Any) -> "ToolOutcome":
+    def success(
+        cls,
+        result: Any = None,
+        *,
+        emitted_events: Iterable[ToolGeneratedEvent] = (),
+        **fields: Any,
+    ) -> "ToolOutcome":
         """成功 outcome。``result`` 传 dict 或用 kwargs 拼字段，二者可合并。"""
         if fields:
             merged = dict(result) if isinstance(result, dict) else {}
             merged.update(fields)
-            return cls(ok=True, result=merged)
-        return cls(ok=True, result={} if result is None else result)
+            return cls(
+                ok=True,
+                result=merged,
+                emitted_events=tuple(emitted_events),
+            )
+        return cls(
+            ok=True,
+            result={} if result is None else result,
+            emitted_events=tuple(emitted_events),
+        )
 
     @classmethod
     def failure(
@@ -97,6 +136,17 @@ class ToolOutcome:
             error_message=str(error_message)[:1000],
             extra=dict(extra),
         )
+
+
+def coerce_tool_outcome(raw: Any) -> ToolOutcome:
+    """把轻量工具/stub 的返回值归一成 ``ToolOutcome``。"""
+    if isinstance(raw, ToolOutcome):
+        return raw
+    if isinstance(raw, dict):
+        return ToolOutcome.success(raw)
+    if raw is None:
+        return ToolOutcome.success({})
+    return ToolOutcome.success({"value": raw})
 
 
 # 全链路**无 raise 控制流**：工具（含 enforce_* / coerce_int / require_group_scope /
@@ -112,6 +162,10 @@ class Tool(Protocol):
     name: str
     description: str
     arguments_schema: dict
+
+    # `execution_mode` 是可选调度元数据，故不声明为 Protocol 必填属性：
+    # 缺失默认 worker。inline 工具由 AgentLoop 在当前 tick 内 await，
+    # 不进入 ToolWorker；老 stub 可省略。
 
     # `usage_prompt` 不是必填——老工具或单测里的 stub 可以省略。
     # ToolRegistry.usage_docs() 用 getattr 兜底，缺失等同于空串。
@@ -150,8 +204,9 @@ class BaseTool:
     / `required_bot_role`（如踢人工具 = ADMIN + "admin"）。
 
     系统级依赖（session_factory 写/查 agent_events、触发身份 triggered_by_event_id
-    / bot_role 等）一律由 ToolWorker 在 run() 的 context 里统一注入，不走各工具的
-    __init__ —— build_default_registry 无参构造所有工具，系统也不必按名字特判。
+    / bot_role 等）一律由 AgentLoop/ToolWorker 执行层在 run() context 里统一注入，
+    不走各工具的 __init__ —— build_default_registry 无参构造所有工具，系统也不必
+    按名字特判。
 
     注：`get_tool_required_permission` / `get_tool_require_bot_admin` /
     `get_tool_required_bot_role` 仍保留为防御层 —— 测试 stub 或第三方工具不继承
@@ -159,6 +214,7 @@ class BaseTool:
     """
 
     usage_prompt: str = ""
+    execution_mode: ToolExecutionMode = "worker"
     required_permission: PermissionTier = PermissionTier.GUEST
     require_bot_admin: bool = False
     # None = 不限 scope（默认，所有 AgentLoop 可见可调）；非空 tuple 限定
@@ -169,9 +225,6 @@ class BaseTool:
     # "owner"=须群主。由 enforce_bot_admin 在工具内判——bot 角色经
     # _effective_bot_role **实时**查 napcat（查不到才回退 context.bot_role 快照）。
     required_bot_role: str | None = None
-    # ToolWorker terminal 后的 Planner 唤醒策略。普通工具恒唤醒；reply 这类
-    # “成功只落中间状态”的工具可设 on_failure，避免成功后自激活空拍。
-    wake_policy: str = "always"
 
     async def run(self, arguments: dict, **context: Any) -> "ToolOutcome":
         """工具统一出口：**无论成功还是失败都返回 ToolOutcome，永不 raise**。
@@ -184,8 +237,8 @@ class BaseTool:
           - ``ToolOutcome`` → 原样；``dict`` / 其它标量 → success（兼容轻量返回）；
           - ``execute`` 里若冒出**预料外**第三方异常（httpx / sqlalchemy / napcat
             适配器 raise 的）→ 收敛成 ``internal_tool_error``（并记 exception 日志）。
-        调用方（ToolWorker / 测试）拿到的永远是一个 ToolOutcome，不需要 try/except、
-        也不需要认得任何异常类型。
+        调用方（AgentLoop / ToolWorker / 测试）拿到的永远是一个 ToolOutcome，
+        不需要 try/except，也不需要认得任何异常类型。
         """
         try:
             result = await self.execute(arguments, **context)
@@ -198,13 +251,7 @@ class BaseTool:
             return ToolOutcome.failure(
                 "internal_tool_error", f"{type(exc).__name__}: {exc}"
             )
-        if isinstance(result, ToolOutcome):
-            return result
-        if isinstance(result, dict):
-            return ToolOutcome.success(result)
-        if result is None:
-            return ToolOutcome.success({})
-        return ToolOutcome.success({"value": result})
+        return coerce_tool_outcome(result)
 
     async def execute(self, arguments: dict, **context: Any) -> Any:
         """子类实现：跑工具逻辑，**返回** ToolOutcome（成功或失败），不 raise。
@@ -325,7 +372,7 @@ class BaseTool:
         "owner" 要求 owner。
 
         bot 角色经 ``_effective_bot_role`` **实时**向 napcat 查其当前群角色（与发起人
-        tier 同源，no_cache），查不到才回退 ToolWorker 透传的 ``context.bot_role``
+        tier 同源，no_cache），查不到才回退执行层透传的 ``context.bot_role``
         快照——这样 bot 刚被升/降权也能立刻反映，不再受投影层 sweep 时延影响。未知
         （实时+快照都拿不到）保守拒绝。
         """
@@ -416,6 +463,21 @@ def _group_id_from_scope_key(scope_key: Any) -> int | None:
         return None
 
 
+def get_tool_execution_mode(tool: Any) -> ToolExecutionMode:
+    """读取工具调度模式；老工具/stub 缺失时保持 ``worker``。
+
+    非法显式值直接报错，避免拼错 ``inline`` 后悄悄落到后台执行，破坏同拍
+    依赖语义。ToolRegistry.register() 会在注册期调用本 helper 提前失败。
+    """
+    raw = getattr(tool, "execution_mode", "worker")
+    if raw in ("worker", "inline"):
+        return raw
+    raise ValueError(
+        "tool.execution_mode must be 'worker' or 'inline'; "
+        f"got {raw!r}"
+    )
+
+
 def get_tool_required_permission(tool: Any) -> PermissionTier:
     """统一读 tool.required_permission 的兜底入口。
 
@@ -492,7 +554,7 @@ def _tool_visible_in_scope(tool: Any, scope: str | None) -> bool:
 
 
 class ToolRegistry:
-    """简单的 name → Tool 字典。后续如需作用域/scope 隔离再扩。"""
+    """name → Tool registry；注册期校验调度模式，渲染期按 scope 过滤。"""
 
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
@@ -503,6 +565,7 @@ class ToolRegistry:
             raise ValueError("tool.name must be a non-empty string")
         if name in self._tools:
             raise ValueError(f"tool already registered: {name}")
+        get_tool_execution_mode(tool)
         self._tools[name] = tool
 
     def get(self, name: str) -> Tool | None:
@@ -540,14 +603,14 @@ class ToolRegistry:
         ]
 
     def usage_docs(self, scope: str | None = None) -> str:
-        """汇总已注册工具的 usage_prompt，PromptRegistry 在 system prompt 里
+        """汇总已注册工具的 usage_prompt，提示词库在 system prompt 里
         作为一段注入。空 usage_prompt 的工具静默跳过 —— 不会出现孤儿
         `## Tool: foo` 标题。
 
         与 catalog() 对称地支持 per-scope 过滤：scope 给定时，allowed_scopes
         限定的工具的用法文档不进别的 scope 的 prompt（群专用工具的用法不泄漏进
         system loop 的 prompt，反之亦然）。**生产路径已带
-        scope**：LLMPlanner 把本方法作为 tools_usage section 注入，PromptRegistry
+        scope**：LLMPlanner 把本方法作为 tools_usage section 注入，PromptLibrary
         .render(scope=...) 在每个 tick 按 `context.scope_key` 的 scope 前缀求值
         （与 catalog(scope) 同一把尺子），所以群/‌system 专用工具的用法不再互相
         泄漏。scope=None（默认，旧调用 / 单测）= 不过滤，全部可见。
