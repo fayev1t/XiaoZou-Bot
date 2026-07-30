@@ -270,6 +270,7 @@ class Projector:
         # 表情包收藏夹注入：查 agent_memes 挂到 ctx.saved_memes，llm_planner
         # 渲染成 <saved-memes>（meme 工具凭 hash 操作收藏的选图目录）。同样
         # best-effort 降级——查不到收藏夹只影响本 tick 发不了表情包。
+        ctx = await self._augment_with_saved_memes(ctx, scope_key)
         # _augment_with_pending_reply 已于 2026-07-24 删除（待办#19）：它每拍
         # 多查一次 reply_task 事件、只为渲染 <pending-reply>，而那一段的每个
         # Planner 所需字段都被 timeline 上的 <tool-call name="reply"> 行覆盖
@@ -1011,7 +1012,7 @@ class Projector:
             attrs.append(f'sender_qq="{_esc_attr(str(qq))}"')
         # sender_role：发送者在本群的角色。只在 owner/admin 时渲染——napcat 的
         # sender.role 三值 owner/admin/member，member 是绝大多数，逐条渲染纯耗
-        # token；缺省语义（普通成员或未知）在 xml_format.md 里写死，无歧义。
+        # token；缺省语义（普通成员或未知）在 envelope.md 里写死，无歧义。
         role = str(sender.get("role") or "").strip().lower()
         if role in ("owner", "admin"):
             attrs.append(f'sender_role="{role}"')
@@ -1139,8 +1140,8 @@ class Projector:
     def _render_task_closed(ev: _EventSnapshot, outcome: str) -> str:
         """agent.task_state_changed(done|failed) → <task-closed> 行。
 
-        正文是模型自己写的 result_summary / 失败原因（complete_task.result_summary
-        / fail_task.reason 落进 payload.reason）——收束后 active_tasks 里不再有
+        正文是模型自己写的 result_summary / 失败原因（task 工具 complete / fail
+        分支落进 payload.reason）——收束后 active_tasks 里不再有
         这个任务，本行是"这事我已经办完了、结论是什么"的唯一事后记忆。防御性
         截 600 字（模型摘要正常远短于此）。
         """
@@ -1163,7 +1164,7 @@ class Projector:
         正文是模型当拍的 reasoning 原文，截 MAX_THOUGHT_CHARS 字防长独白
         挤占窗口。它是记忆不是指令——配套硬规则（念头≠动作：念头后没有对应
         tool-call 即那件事没发生；旧思考里的草稿措辞不得直接当消息发出）在
-        protocol.md §Reasoning 与 xml_format.md §<my-thought>。
+        planner.md §这个系统是这样运行的 与 envelope.md §<my-thought>。
         """
         reasoning = str((ev.payload or {}).get("reasoning") or "").strip()
         if len(reasoning) > Projector.MAX_THOUGHT_CHARS:
@@ -1201,7 +1202,7 @@ class Projector:
         if ev.type == "runtime.tool_batch_completed":
             # 批次收口标记（agent_visible）：让模型显式看到"上一批工具已
             # 整体到终态"的边界。payload 里的 tool_batch_id 是内部 ULID，
-            # 只服务于 ToolWorker 的收口查重，对模型零信息量——渲染时剔除，
+            # 只服务于共享工具批次收口查重，对模型零信息量——渲染时剔除，
             # 只留 tool_count / tool_batch_size。
             payload = {
                 k: v
@@ -1308,7 +1309,7 @@ def _safe_json(value) -> str:
 
 
 # agent.tool_failed.payload 顶层的"信封字段"——不属于结构化失败附加信息（extra）。
-# ToolWorker 把 payload 拼成 {tool_call_id, tool_name, task_id, error_kind,
+# 工具执行层把 payload 拼成 {tool_call_id, tool_name, task_id, error_kind,
 # error_message, **outcome.extra}，fold_tool_results 据此把其余键收进
 # ToolResultView.error_extra，再由 _render_error_element 透给 LLM。
 _TOOL_FAILED_ENVELOPE_KEYS = frozenset(
@@ -1352,7 +1353,7 @@ def _render_error_element(
     ``error_extra``（required_tier / actual_tier / required_bot_role /
     actual_bot_role / retcode / action / allowed_scopes ...）是工具失败时
     ``ToolOutcome.extra`` 平铺进 ``tool_failed.payload`` 的结构化字段。历史上这里
-    只渲染 kind+message，把它们丢了——protocol.md 承诺 payload 带
+    只渲染 kind+message，把它们丢了——envelope.md 承诺 payload 带
     required_tier/actual_tier，却从没真到模型。现在逐个作属性透出：标量原样、
     列表/字典 JSON 编码，让 LLM 精确解释"差在哪一级权限 / napcat 具体报了什么"。
 
@@ -1388,8 +1389,8 @@ def _render_segments(
 ) -> tuple[str, list[ImageRef]]:
     """把 OneBot V11 段数组翻译成内联 XML 标签 + 收集已落盘的 ImageRef。
 
-    支持的段类型 → 标签（属性一律"缺失=未知/不适用"，语义与 xml_format.md
-    §Inline segments 一一对应，两处必须同步改）：
+    支持的段类型 → 标签（属性一律"缺失=未知/不适用"，语义与 envelope.md
+    §内联段 一一对应，两处必须同步改）：
       text     → 原文（XML escape）
       at       → <at qq="..." name="..."/> 或 <at-all/>（qq= 与出站段
                  data.qq 同名同值，模型可直抄）

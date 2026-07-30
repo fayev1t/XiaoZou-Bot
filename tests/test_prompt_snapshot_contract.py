@@ -355,9 +355,9 @@ class PlannerSnapshotIntegrationTests(_SnapshotEnvTestCase):
         self.assertEqual(data["model"], "stub-model")
         self.assertEqual(data["outcome"], "parsed")
         # system prompt 分段统计（默认装配的 .md 段，group scope 至少含
-        # identity / xml_format / group_chat_rules / protocol）
+        # planner / envelope / group_chat_rules）
         section_names = [s["name"] for s in data["sections"]]
-        self.assertIn("identity", section_names)
+        self.assertIn("planner", section_names)
         self.assertIn("group_chat_rules", section_names)
         for sec in data["sections"]:
             self.assertGreater(sec["chars"], 0)

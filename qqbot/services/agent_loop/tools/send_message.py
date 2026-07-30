@@ -177,7 +177,7 @@ class SendMessageTool(BaseTool):
         # message_id + self_id 供投影 _build_author_index 折出"bot 自己的发言"，
         # 让别人 <reply to_message_id="..."> 引用 bot 时能标 from_self="true" +
         # from_qq=self_id。self_id 键名保留（napcat/OneBot 原词，且
-        # bot_role_observed 等多个生产方共用），xml_format.md 注明 = bot_qq。
+        # bot_role_observed 等多个生产方共用），envelope.md 注明 = bot_qq。
         return ToolOutcome.success(
             {
                 "message_id": message_id,

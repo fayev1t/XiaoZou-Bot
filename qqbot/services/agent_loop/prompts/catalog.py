@@ -1,227 +1,199 @@
-"""提示词资产目录 — 全部 LLM 消费者的段清单、装配单与越界红线（收口层）。
+"""提示词库 — 持有全部提示词文本，按名字取。
 
-2026-07-27 起，系统内四个 LLM 调用点（Planner / Replyer / meme caption /
-记忆压缩）的 system prompt 都从这里装配：`SECTIONS` 是段目录（每段一条元数据：文件、序、
-kind、required、适用 scope），`ASSEMBLY` 是每个消费者的有序装配单。改提示词
-= 改 `prompts/` 下对应 `.md`（render 时才读盘，改完即生效，无需重启）；给
-新消费者配 prompt = 在装配单里挑段。**本文件同时是提示词资产的地图——
-维护注记写在这里，不写进 `.md`（那些文件逐字节注入 prompt，放不了给人看
-的注释）。**
+系统里六个 LLM 调用点（Planner / Replyer / meme caption / image description /
+look_at_image / 记忆压缩）的 system prompt 都从这里装配：`_FILES` 是"段名 →
+文件名"的清单，`ASSEMBLY` 是"消费者 → 段名序列"，序列顺序就是拼接顺序。
+改提示词 = 改 `prompts/` 下对应 `.md`（render 时才读盘，改完即生效，无需重启）；
+给新消费者配 prompt = 在 `ASSEMBLY` 里列出它要哪几段。
 
-分层红线（`_FORBIDDEN_KINDS`，build 时结构性校验，契约测试钉死）：
-  - persona（voice）不进 Planner——整张角色卡是"说出来什么样"的权威，把
-    12KB 措辞/情绪/形态塞进一个输出 JSON 决策的层，`reasoning` 会开始演戏、
-    拿心情当调工具的理由；
-  - disposition（参与倾向）不进 Replyer / caption / 图片 / 记忆——它是同一
-    个人为"要不要开口"写的窄投影，组稿层已有 voice 这份更全的来源，两份
-    并存只会互相打架；
-  - policy（group_chat_rules）不进 Replyer——它握着 empty_reason 这个小
-    否决权，读了参与政策会二次审查已授权的回复，架空 Planner 的决定；
-  - protocol / tools 不进 Replyer——一个 prompt 里两套输出 JSON 规范必然
-    串台；组稿层也没有工具可调。
+**本文件同时是提示词资产的地图——维护注记写在这里，不写进 `.md`（那些文件逐
+字节注入 prompt，放不了给人看的注释）。**
 
-2026-07-29 起 Planner 六段：新增 disposition（`disposition.md`，kind 自成
-一类）。此前 identity.md 的开篇教义是"要不要说话是规则问题，不是性情问
-题"，group_chat_rules 因此是一份纯相关性闸门；但角色卡把这个人写成对关系
-与距离极其敏感，两者并不自洽，落地表现就是只有被点名才开口。现改为：性情
-只能**增加**开口的理由（且必须在 timeline 上指得出被拽住的那一处），负面
-清单一条都不因性情松动；"说出来什么样"仍然一个字都不进这一层。disposition
-与 voice 回答两个不相交的问题（要不要开口 / 说出来什么样），各自是各自那
-问的唯一权威，不得互相抄正文。
+资产分工（2026-07-30 重排：一个消费者一个职责页 + 一份共享世界文档）：
+  - `planner.md`  Planner 的职责页：机器身份与第三人称弱人格投影、系统机制、
+                  职责边界（为落笔那一环备料、不碰表达）、决策 JSON 输出契约。
+  - `replyer.md`  Replyer 的职责页，也是角色卡本身（2026-07-30 由维护者把
+                  `voice.md` 并入并删除后者）：她是谁、这一份要说什么的边界、
+                  输出格式。整份只进 Replyer。
+  - `envelope.md` 输入信封语法，**两个消费者共享同一份字节**：Replyer 的
+                  `<replyer-input>` 里 timeline 由同一个 `render_timeline_stream`
+                  渲染，与 Planner 逐字节同构；分成两份必然漂移。
+  - `group_chat_rules.md` 参与判断（把 timeline 当整体语境读、自主判断是否行动）。
+  - `tools/<name>.md` 逐工具用法，只进 Planner（Replyer 没有工具可调）。
 
-失败语义（待办#17 目标 2 前半）：目录内除 tools_usage 外全部 required——
-文件缺失/为空时 render 直接 raise（PromptSectionMissing），绝不静默拿残缺
-system prompt 继续跑。tools_usage 维持逐工具降级 + warning 的旧语义（单个
-工具 .md 缺失只该废那个工具的说明，不该炸整个 prompt）。
+装配单为什么这么分（历史故障，改动前先读）：
+  - **整张角色卡不进 Planner。** 把 8KB 措辞/情绪/形态塞进一个输出 JSON 的
+    决策层，`reasoning` 会开始用她的语气演戏，并拿心情当调工具的理由。Planner
+    要的人格只是"她会不会理这件事"的窄投影，写在 `planner.md` 里。
+  - **参与政策不进 Replyer。** Replyer 手上的稿子已经被授权了，让它重读一遍
+    "要不要开口"，它会二次审查并产出空回复，架空 Planner 的决定。
+  - **决策 JSON 契约与工具用法不进 Replyer。** 一个 prompt 两套输出规范必然
+    串台（`{"actions":[…]}` 对 `{"messages":[…]}`）；工具用法对它是噪音加诱惑。
+  - **纯记录/观察层（caption / image_description / image_look / memory）只读
+    自己那一段。** 它们的输出会被永久写进事件正文并被下游反复读取，掺进人格
+    或群规就等于污染所有下游语境，且无法回收。
+  以上四条 2026-07-30 之前由 `kind` + `_FORBIDDEN_KINDS` + `_validate_assembly`
+  做 build 期结构校验。已删除：它的粒度是"哪个文件进哪个消费者"，而真实发生过
+  的事故是"人格正文被抄进另一个文件"，那种它一声不响；`ASSEMBLY` 本身就是六行
+  字面量，改它的人正是知道这些规则的人。守这几条现在靠上面这段说明 + 契约测试
+  里的语义断言（`test_prompt_catalog_contract.LayerBoundaryTests`：锚点在运行时
+  从 replyer.md（角色卡现居所）/ group_chat_rules.md 现取，锚点没了会先失败而
+  不是假通过）——那才是唯一抓得到内容漂移的手段。
 
-voice 的读盘特例：字节仍由 `replyer._load_voice_text()` 负责（本目录的
-voice 段惰性委托过去）——`_VOICE_PATH` 是既有契约测试的 monkeypatch 锚点
-（test_reply_task_contract::test_missing_voice_file_fails_loudly），且其
-ReplyerError 语义要原样进入组稿失败路径。
+不变量（不靠任何 per-section 元数据）：
+  - 文件段读出来是空的 = 部署坏了，直接 raise `PromptSectionMissing`，绝不静默
+    拿残缺 system prompt 继续跑。
+  - 动态段（只剩 `tools_usage`）求值为空时跳过：未注入工具注册表的场景
+    （早期骨架 / 部分测试）本就不该有工具用法段。
 
-内容拆分的下一步（方向已定，见 2026-07-27 开发日志）：xml_format 将拆出
-Planner/Replyer 共享的世界文档（timeline_syntax / conversation_reading /
-envelope_semantics），届时只改本目录与装配单，消费方代码不动。
+角色卡的 fail-loudly 由上面第一条统一兜住：`replyer.md` 是文件段，缺失即
+read_text 抛 OSError、为空即 `PromptSectionMissing`，两者都被
+`reply_executor._compose_and_send` 的兜底捕获并记成 `<my-reply status="failed">`。
+2026-07-30 之前这条走 `replyer._load_voice_text()` 的 ReplyerError，随 voice.md
+删除一并退役。
 """
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
-
-from qqbot.services.agent_loop.prompt_registry import PromptRegistry
+from typing import Any, Callable, Sequence, Union
 
 _PROMPTS_DIR = Path(__file__).parent
 
+# 段间分隔符。公开导出：llm_planner 拿逐段结果后要用同一分隔符拼回完整
+# system prompt（与 render() 逐字节一致）。
+SECTION_SEP = "\n\n---\n\n"
 
-class PromptAssemblyError(RuntimeError):
-    """装配单越界（红线段进了禁入的消费者）或引用了未登记的段。"""
+# source 可以是纯字符串、无参 ``() -> str``、或接受一个 scope 位置参的
+# ``(scope) -> str``（如 ToolRegistry.usage_docs）。按 arity 决定是否传 scope。
+PromptSource = Union[str, Callable[..., str]]
+
+
+class PromptSectionMissing(RuntimeError):
+    """文件段缺失或为空：部署损坏，fail loudly。"""
 
 
 @dataclass(frozen=True)
-class SectionSpec:
-    """段目录条目。filename=None 表示动态段（source 在 build 时另行注入）。
-
-    scopes=None 表示各 scope 通用；否则 render(scope=...) 落在集合之外时该
-    段返回 None（主动跳过，不触发 required——registry 的条件装配通道）。
-    """
+class Section:
+    """求值后的单段产物：段名 + 正文（已 strip）。"""
 
     name: str
-    order: int
-    kind: str  # "doc" | "policy" | "protocol" | "tools" | "persona"
-    filename: str | None
-    required: bool = True
-    scopes: tuple[str, ...] | None = None
+    text: str
 
 
-SECTIONS: dict[str, SectionSpec] = {
-    spec.name: spec
-    for spec in (
-        # ── Planner 六段（order 沿用 llm_planner 的既有约定区间）──
-        SectionSpec("identity", 0, "doc", "identity.md"),
-        SectionSpec("xml_format", 50, "doc", "xml_format.md"),
-        SectionSpec(
-            "group_chat_rules",
-            100,
-            "policy",
-            "group_chat_rules.md",
-            scopes=("group", "private"),
-        ),
-        # 紧贴 group_chat_rules 之后：它调制的正是那份闸门，隔开会读成
-        # 两套无关的东西。scope 与闸门一致——system loop 没有聊天面，
-        # 参与倾向在那里是纯噪音。
-        SectionSpec(
-            "disposition",
-            120,
-            "disposition",
-            "disposition.md",
-            scopes=("group", "private"),
-        ),
-        SectionSpec("protocol", 150, "protocol", "protocol.md"),
-        SectionSpec("tools_usage", 300, "tools", None, required=False),
-        # ── Replyer 两段 ──
-        SectionSpec("replyer_composer", 0, "doc", "replyer.md"),
-        SectionSpec("voice", 100, "persona", None),
-        # ── meme caption 单段 ──
-        SectionSpec("meme_caption", 0, "doc", "meme_caption.md"),
-        # ── timeline 图片客观转录单段（2026-07-28）──
-        SectionSpec("image_description", 0, "doc", "image_description.md"),
-        # ── look_at_image 带问重看单段（2026-07-28）──
-        SectionSpec("image_look", 0, "doc", "image_look.md"),
-        # ── 记忆压缩单段（记忆系统契约 §5）──
-        SectionSpec("memory_compaction", 0, "doc", "memory_compaction.md"),
-    )
+# ── 段名 → 文件名。动态段（tools_usage）不在此表，见 build_library ──
+_FILES: dict[str, str] = {
+    "planner": "planner.md",
+    "replyer": "replyer.md",
+    "envelope": "envelope.md",
+    "group_chat_rules": "group_chat_rules.md",
+    "meme_caption": "meme_caption.md",
+    "image_description": "image_description.md",
+    "image_look": "image_look.md",
+    "memory_compaction": "memory_compaction.md",
 }
 
+# ── 消费者 → 段名序列。列出顺序 = 拼接顺序 ──
 ASSEMBLY: dict[str, tuple[str, ...]] = {
-    "planner": (
-        "identity",
-        "xml_format",
-        "group_chat_rules",
-        "disposition",
-        "protocol",
-        "tools_usage",
-    ),
-    "replyer": ("replyer_composer", "voice"),
+    "planner": ("planner", "envelope", "group_chat_rules", "tools_usage"),
+    "replyer": ("replyer", "envelope"),
     "caption": ("meme_caption",),
     "image_description": ("image_description",),
     "image_look": ("image_look",),
     "memory": ("memory_compaction",),
 }
 
-_FORBIDDEN_KINDS: dict[str, frozenset[str]] = {
-    # persona 仍然禁入：2026-07-29 放进来的是 disposition 那一窄段，不是
-    # 整张角色卡——红线的目的（措辞/情绪/形态不驱动规划）原样保住。
-    "planner": frozenset({"persona"}),
-    "replyer": frozenset({"disposition", "policy", "protocol", "tools"}),
-    "caption": frozenset(
-        {"persona", "disposition", "policy", "protocol", "tools"}
-    ),
-    # 图片转录是纯记录层：无人格、无群规、无工具。它的输出会被永久写进事件
-    # 正文，任何"这图适合怎么用"的判断都会污染下游模型自己的语境合成。
-    "image_description": frozenset(
-        {"persona", "disposition", "policy", "protocol", "tools"}
-    ),
-    # 带问重看同样是纯观察层：它只回答被问到的事，人格/群规/协议一律不进。
-    "image_look": frozenset(
-        {"persona", "disposition", "policy", "protocol", "tools"}
-    ),
-    # 记忆压缩是事实记录员：无人格、无群规、无工具（记忆系统契约 §5.1）。
-    "memory": frozenset(
-        {"persona", "disposition", "policy", "protocol", "tools"}
-    ),
-}
+
+class PromptLibrary:
+    """一组按名字取用的提示词段，顺序即拼接顺序。
+
+    段的来源可以是字符串字面量（测试注入）或 callable（读盘 / 遍历工具注册表，
+    render 时才求值，因此改 `.md` 立即生效）。
+    """
+
+    def __init__(
+        self, sections: Sequence[tuple[str, PromptSource]] | None = None
+    ) -> None:
+        self._sections: list[tuple[str, PromptSource]] = list(sections or ())
+
+    def add(self, name: str, source: PromptSource) -> None:
+        """追加一段；同名再 add 覆盖原位置的 source（方便测试替换某一段）。"""
+        if not name:
+            raise ValueError("section name required")
+        for index, (existing, _) in enumerate(self._sections):
+            if existing == name:
+                self._sections[index] = (name, source)
+                return
+        self._sections.append((name, source))
+
+    def remove(self, name: str) -> None:
+        self._sections = [(n, s) for n, s in self._sections if n != name]
+
+    def has(self, name: str) -> bool:
+        return any(n == name for n, _ in self._sections)
+
+    def section_names(self) -> list[str]:
+        return [name for name, _ in self._sections]
+
+    def get(self, name: str, *, scope: str | None = None) -> str:
+        """按名字取一段的正文。段不存在时 KeyError。"""
+        for existing, source in self._sections:
+            if existing == name:
+                return str(_resolve(source, scope) or "").strip()
+        raise KeyError(name)
+
+    def render_sections(self, *, scope: str | None = None) -> list[Section]:
+        """逐段求值，保留段边界（供 Prompt 快照统计每段体积）。
+
+        文件段为空即 raise；动态段为空跳过——两条规则见模块 docstring。
+        """
+        out: list[Section] = []
+        for name, source in self._sections:
+            text = str(_resolve(source, scope) or "").strip()
+            if not text:
+                if name in _FILES:
+                    raise PromptSectionMissing(
+                        f"prompt section {name!r} ({_FILES[name]}) is empty"
+                    )
+                continue
+            out.append(Section(name=name, text=text))
+        return out
+
+    def render(self, *, scope: str | None = None) -> str:
+        """按顺序拼出最终 system prompt。"""
+        return SECTION_SEP.join(
+            sec.text for sec in self.render_sections(scope=scope)
+        )
 
 
-def _validate_assembly(consumer: str, names: tuple[str, ...]) -> None:
-    """红线校验：未知消费者/未登记段/kind 越界一律 raise，build 期即炸。"""
-    forbidden = _FORBIDDEN_KINDS.get(consumer)
-    if forbidden is None:
-        raise PromptAssemblyError(f"unknown prompt consumer {consumer!r}")
-    for name in names:
-        spec = SECTIONS.get(name)
-        if spec is None:
-            raise PromptAssemblyError(
-                f"assembly for {consumer!r} references unknown section {name!r}"
-            )
-        if spec.kind in forbidden:
-            raise PromptAssemblyError(
-                f"section {name!r} (kind={spec.kind!r}) is forbidden in the "
-                f"{consumer!r} prompt"
-            )
+def _file_source(filename: str) -> Callable[[], str]:
+    """文件段的懒加载 source：render 时读盘（热更新）。读盘异常原样上抛。"""
 
-
-def _file_source(spec: SectionSpec) -> Callable[..., str | None]:
-    """文件段的懒加载 source：render 时读盘（热更新）、scope 之外返回 None。
-
-    读盘异常（缺失/权限）原样上抛，由 registry 按 required 分流。"""
-
-    def load(scope: str | None = None) -> str | None:
-        if (
-            spec.scopes is not None
-            and scope is not None
-            and scope not in spec.scopes
-        ):
-            return None
-        assert spec.filename is not None
-        return (_PROMPTS_DIR / spec.filename).read_text(encoding="utf-8")
+    def load() -> str:
+        return (_PROMPTS_DIR / filename).read_text(encoding="utf-8")
 
     return load
 
 
-def _voice_source() -> str:
-    # 惰性 import 避免 catalog ↔ replyer 的模块级环；读盘与 fail-loudly
-    # 语义（ReplyerError）保持在 replyer 侧，理由见模块 docstring。
-    from qqbot.services.agent_loop.replyer import _load_voice_text
-
-    return _load_voice_text()
-
-
-def build_registry(
+def build_library(
     consumer: str,
     *,
     tool_registry: Any | None = None,
-) -> PromptRegistry:
-    """按装配单构建某个消费者的 PromptRegistry（含红线校验）。
+) -> PromptLibrary:
+    """按 ASSEMBLY 组装某个消费者的提示词库。未登记的消费者 KeyError。
 
-    tools_usage 段仅在传入 tool_registry 时注册（与 llm_planner 旧行为一致：
-    未注入工具注册表的场景——早期骨架/部分测试——不渲染工具用法段）。"""
-    names = ASSEMBLY[consumer] if consumer in ASSEMBLY else ()
-    _validate_assembly(consumer, names)
-    registry = PromptRegistry()
-    for name in names:
-        spec = SECTIONS[name]
+    `tools_usage` 只在传入 tool_registry 时加入（未注入的场景不渲染工具用法段）。
+    """
+    library = PromptLibrary()
+    for name in ASSEMBLY[consumer]:
         if name == "tools_usage":
-            if tool_registry is None:
-                continue
-            source: Callable[..., str | None] = tool_registry.usage_docs
-        elif name == "voice":
-            source = _voice_source
+            if tool_registry is not None:
+                library.add(name, tool_registry.usage_docs)
         else:
-            source = _file_source(spec)
-        registry.register(name, spec.order, source, required=spec.required)
-    return registry
+            library.add(name, _file_source(_FILES[name]))
+    return library
 
 
 def render_system_prompt(
@@ -230,7 +202,34 @@ def render_system_prompt(
     scope: str | None = None,
     tool_registry: Any | None = None,
 ) -> str:
-    """一步到位：build + render。Replyer / caption 这类单 scope 消费者用。"""
-    return build_registry(consumer, tool_registry=tool_registry).render(
+    """一步到位：组装 + 拼接。Replyer / caption 这类单消费者调用点用。"""
+    return build_library(consumer, tool_registry=tool_registry).render(
         scope=scope
     )
+
+
+def _resolve(source: PromptSource, scope: str | None) -> str:
+    """求值一个 source。字符串原样返回；callable 按 arity 调用：接受位置参的
+    传 scope（如 ToolRegistry.usage_docs 按 scope 过滤工具），无参的直接调用。"""
+    if not callable(source):
+        return source
+    if _accepts_positional_arg(source):
+        return source(scope)
+    return source()
+
+
+def _accepts_positional_arg(fn: Callable[..., str]) -> bool:
+    """fn 是否接受至少一个位置参数（用来接收 scope）。无法内省（内置 / C 实现）
+    时保守当作"不接受"，按无参调用——绝不因内省失败而误传参把老 source 打挂。"""
+    try:
+        sig = inspect.signature(fn)
+    except (ValueError, TypeError):
+        return False
+    for p in sig.parameters.values():
+        if p.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.VAR_POSITIONAL,
+        ):
+            return True
+    return False

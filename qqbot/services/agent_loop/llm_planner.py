@@ -3,12 +3,11 @@
 复用 qqbot/core/llm.create_llm() 当 LLM 客户端工厂（纯基础设施层，
 不含 v1 业务）。Prompt 与解析逻辑均按 v2 任务与决策契约从零写。
 
-System prompt 不再硬编码 —— 完全交给 PromptRegistry 组装。默认 registry
-（build_default_prompt_registry）注册五段：identity / xml_format /
-group_chat_rules / protocol / tools usage。人格不再是独立段：决策层（规划、
-任务、工具选择、reasoning）无人格，角色卡只由 Replyer 在最终组稿时加载，
-不进入 Planner 的 tools_usage 段。需要迭代协议、
-参与规则或工具说明时直接改对应 .md 即可，不需要碰 planner。
+System prompt 不再硬编码 —— 完全交给 prompts/catalog.py 的提示词库装配。
+默认库（build_default_prompt_library）取四段：planner / envelope /
+group_chat_rules / tools usage；envelope.md 是与 Replyer 共享的同一份信封语法。
+整张角色卡不进决策层，只由 Replyer 在最终组稿时加载。需要迭代职责、参与规则
+或工具说明时直接改对应 .md 即可，不需要碰 planner。
 
 错误兜底：LLM 不可用 / 接口报错 / JSON 不可解析 / schema 不符
 一律 fallback 为单一 IdleAction，并把错误细节塞进 reasoning。
@@ -32,13 +31,9 @@ from qqbot.core.time import CHINA_TIMEZONE
 from qqbot.services.agent_loop.decision import (
     Action,
     CallToolAction,
-    CompleteTaskAction,
-    CreateTaskAction,
     DecisionContext,
     DecisionOutput,
-    FailTaskAction,
     IdleAction,
-    NoteTaskProgressAction,
 )
 from qqbot.services.agent_loop.projection import (
     _esc_attr,
@@ -46,9 +41,9 @@ from qqbot.services.agent_loop.projection import (
     _safe_json,
     render_timeline_stream,
 )
-from qqbot.services.agent_loop.prompt_registry import (
+from qqbot.services.agent_loop.prompts.catalog import (
     SECTION_SEP,
-    PromptRegistry,
+    PromptLibrary,
 )
 from qqbot.services.agent_loop.prompt_snapshot import (
     PromptSnapshot,
@@ -62,29 +57,25 @@ from qqbot.services.agent_loop.tool_registry import ToolRegistry
 logger = get_logger(__name__)
 
 
-# Planner 五段（identity / xml_format / group_chat_rules / protocol /
-# tools_usage）的段目录、order 约定与装配单 2026-07-27 起收口在
-# prompts/catalog.py —— 逻辑递进不变：你是什么 → 你怎么读输入 → 什么时候
-# 需要发言 → 你怎么决定 → 你能调什么工具。人格（小奏角色卡）不进 Planner，
-# 该红线在 catalog 里是结构性校验，不再只靠注释。
+# Planner 四段（planner / envelope / group_chat_rules / tools_usage）的清单
+# 与顺序收口在 prompts/catalog.py 的 ASSEMBLY —— 逻辑递进：你是什么+你要干
+# 什么 → 输入长什么样（与 Replyer 共享的 envelope）→ 什么时候需要发言 → 你能
+# 调什么工具。整张角色卡不进 Planner，理由与其余分工写在 catalog 的 docstring。
 
 
-def build_default_prompt_registry(
+def build_default_prompt_library(
     *,
     tool_registry: ToolRegistry | None = None,
-) -> PromptRegistry:
-    """v2 默认 system prompt 装配 —— 委托 prompts/catalog.py（2026-07-27 收口）。
+) -> PromptLibrary:
+    """v2 默认 system prompt 装配 —— 委托 prompts/catalog.py。
 
-    段目录、装配单、分层红线（persona 不进 Planner 等）与 required 失败
-    语义全部住在 catalog；这里只是 Planner 侧的兼容入口。各段仍是 render
-    时才读盘：改 .md 即生效、新增/下架工具立即反映，均与收口前一致。
-    关键段（identity / xml_format / group_chat_rules / protocol）缺失或为
-    空现在 fail loudly（待办#17 目标 2），不再静默跳过；逐工具 usage 文档
-    维持降级 + warning。
+    段清单与顺序住在 catalog 的 ASSEMBLY；这里只是 Planner 侧的入口。各段
+    render 时才读盘：改 .md 即生效、新增/下架工具立即反映。文件段读出来为空
+    直接 raise（部署坏了不静默跑残缺 prompt）；tools_usage 未注入注册表时跳过。
     """
-    from qqbot.services.agent_loop.prompts.catalog import build_registry
+    from qqbot.services.agent_loop.prompts.catalog import build_library
 
-    return build_registry("planner", tool_registry=tool_registry)
+    return build_library("planner", tool_registry=tool_registry)
 
 
 class LLMPlanner:
@@ -94,20 +85,20 @@ class LLMPlanner:
         self,
         llm_client: Any | None = None,
         tool_registry: ToolRegistry | None = None,
-        prompt_registry: PromptRegistry | None = None,
+        prompt_library: PromptLibrary | None = None,
     ) -> None:
         # 测试场景下可注入一个 stub client（提供 ainvoke(messages) 即可）；
         # 生产场景留 None，首次 decide() 时通过 create_llm() 建好缓存。
         self._llm = llm_client
         self._tool_registry = tool_registry
-        # prompt_registry 优先：调用方明确传入就用它；否则按 tool_registry
-        # 装配默认 registry（identity/xml_format/group_chat_rules/protocol/
-        # tools_usage 五段；角色卡只属于 Replyer）。
-        if prompt_registry is None:
-            prompt_registry = build_default_prompt_registry(
+        # prompt_library 优先：调用方明确传入就用它；否则按 tool_registry
+        # 装配默认库（planner/envelope/group_chat_rules/tools_usage 四段；
+        # 角色卡只属于 Replyer）。
+        if prompt_library is None:
+            prompt_library = build_default_prompt_library(
                 tool_registry=tool_registry
             )
-        self._prompt_registry = prompt_registry
+        self._prompt_library = prompt_library
         self._init_lock = asyncio.Lock()
 
     async def decide(self, context: DecisionContext) -> DecisionOutput:
@@ -120,7 +111,7 @@ class LLMPlanner:
 
         try:
             messages, snapshot = _build_messages(
-                context, self._tool_registry, self._prompt_registry
+                context, self._tool_registry, self._prompt_library
             )
             if snapshot is not None:
                 snapshot.model = _llm_model_name(llm)
@@ -238,14 +229,13 @@ class LLMPlanner:
 def _build_messages(
     context: DecisionContext,
     tool_registry: ToolRegistry | None,
-    prompt_registry: PromptRegistry,
+    prompt_library: PromptLibrary,
 ) -> tuple[list[Any], PromptSnapshot | None]:
     """构造 chat 输入 + 可选的 Prompt 快照（快照关闭 / scope 不在白名单时为
     None）。langchain_core.messages 在 langchain_openai 已是必依赖。
 
-    System prompt 完全由 PromptRegistry.render() 输出 —— 默认装配里包含
-    identity / xml_format / group_chat_rules / protocol / tools_usage 五段，
-    每段在自己的 .md 文件里独立维护。
+    System prompt 完全由提示词库输出 —— 默认装配是 planner / envelope /
+    group_chat_rules / tools_usage 四段，每段在自己的 .md 文件里独立维护。
 
     HumanMessage 的 text block 用 XML 信封而非 JSON 拼装：timeline 里每条
     item 的 render 字段本身就是 `<message ...>` / `<tool-call ...>` /
@@ -268,9 +258,9 @@ def _build_messages(
     # 到 system loop、system 专用工具的说明会泄漏到群 loop，徒增提示噪音与误判
     # （§2.2；catalog 与 usage 同一把 scope 尺子）。
     scope = context.scope_key.split(":", 1)[0]
-    # render_sections + SECTION_SEP join 与 render() 逐字节一致（registry 内
-    # render() 就是这么实现的）——多要一份分段统计给快照，不重复求值。
-    sections = prompt_registry.render_sections(scope=scope)
+    # render_sections + SECTION_SEP join 与 render() 逐字节一致（render() 就是
+    # 这么实现的）——多要一份分段统计给快照，不重复求值。
+    sections = prompt_library.render_sections(scope=scope)
     system_content = SECTION_SEP.join(sec.text for sec in sections)
     tool_catalog = (
         tool_registry.catalog(scope) if tool_registry is not None else []
@@ -332,17 +322,17 @@ def _render_input_xml(
             </progress-notes>
           </task>
         </active-tasks>
-        <current now="..." tick="N"/>
+        <current now="..."/>
         <validation-error>attempt N rejected: ...</validation-error>       (仅校验重试)
       </agent-input>
 
     缓存契约（2026-07-12）：OpenAI 系 API 的自动前缀缓存要求前缀**逐字节
-    一致**。now=/tick= 每拍必变，曾是 <agent-input> 的头属性，把可缓存前缀
+    一致**。now= 每拍必变，曾是 <agent-input> 的头属性，把可缓存前缀
     掐断在 system prompt 末尾——tool-catalog（部署内静态）和 timeline（追加
     为主，窗口起点锚定见 projection）每拍全价重计费。现按变化频率排序：
     头属性只留 scope/bot_qq/bot_role（稳定/极少变）；active-tasks 任务活跃期
     逐拍变（pending_tool_call_ids 随工具收口增删），排到 timeline 之后；
-    每拍必变的 now/tick 沉为尾部 <current/>；validation-error 只在同 tick
+    每拍必变的 now 沉为尾部 <current/>；validation-error 只在同 tick
     校验重试出现（契约 §7.1），放最尾——同拍重试可复用直到 <current/> 的
     前缀，且作为最后一行对模型最显著。timeline 仍然紧邻输出位置（其后只有
     寥寥数行），recency bias 不受影响。
@@ -374,7 +364,7 @@ def _render_input_xml(
         f' bot_role="{_esc_attr(context.bot_role)}"' if context.bot_role else ""
     )
     # 头属性只留稳定字段（scope 恒定 / bot_qq 启动后恒定 / bot_role 极少变）
-    # ——每拍必变的 now/tick 在尾部 <current/>，见本函数 docstring 的缓存契约。
+    # ——每拍必变的 now 在尾部 <current/>，见本函数 docstring 的缓存契约。
     parts.append(
         f'<agent-input scope="{_esc_attr(context.scope_key)}"'
         f"{bot_attr}{role_attr}>"
@@ -441,6 +431,17 @@ def _render_input_xml(
     # 从 </active-tasks> 到 <current/> 之间不再有抖动源。
 
     # ─── 每拍必变的时钟字段，沉底（缓存契约见本函数 docstring）───
+    # @tick 已于 2026-07-30 从信封删除（DecisionContext.tick_seq 本身保留——
+    # 事件 payload / 日志配对 / 快照文件名都还靠它）。删的理由不是"省字节"：
+    # 它与 now= 同处 <current/>，而 now 每拍必变且删不掉，所以 tick 从来没有
+    # 额外掐断过任何一段可缓存前缀，缓存收益恒为零。真正的问题是它对模型
+    # **无锚点**：全信封只有这一处出现拍号，timeline 的 <my-thought> 只带
+    # time=，模型既减不出步数也定位不了任何行；而进程重启后 _tick_seq 归零、
+    # timeline 却从库里重新折叠出满窗历史，tick="1" 配一整段往事是**误导**而
+    # 不只是噪音。Replyer 侧的 <current/> 本来就不带 @tick 且从未缺过什么，
+    # 是现成的反证。若将来要给模型"这是本轮连续推演第几步"的信号，应新增
+    # 带锚点的 burst_id/burst_step，不要把这个无锚点的绝对计数加回来。
+    #
     # 时区契约：所有暴露给 LLM 的时间都是北京时间（与数据库写入侧 china_now()
     # 一致）。caller 传错时区时 astimezone() 兜底，naive datetime 假设它就是
     # 北京时间。
@@ -449,10 +450,7 @@ def _render_input_xml(
         now = now.replace(tzinfo=CHINA_TIMEZONE)
     else:
         now = now.astimezone(CHINA_TIMEZONE)
-    parts.append(
-        f'<current now="{_esc_attr(now.isoformat())}" '
-        f'tick="{context.tick_seq}"/>'
-    )
+    parts.append(f'<current now="{_esc_attr(now.isoformat())}"/>')
 
     # ─── 同 tick 校验重试反馈（仅重试调用渲染，契约 §7.1）───
     validation_feedback = getattr(context, "validation_feedback", None)
@@ -493,8 +491,8 @@ def _render_task_xml(task: Any) -> str:
             )
         note_parts.append("</progress-notes>")
         inner.append("".join(note_parts))
-    # task_id= 而非裸 id=：与动作 JSON 里要回填的字段名（complete_task /
-    # call_tool 的 "task_id"）同名直抄，且与 message_id / event_id 空间区分。
+    # task_id= 而非裸 id=：与 call_tool 及 task 工具 arguments 里的字段名
+    # 同名直抄，且与 message_id / event_id 空间区分。
     return (
         f'<task task_id="{_esc_attr(task.task_id)}" '
         f'state="{_esc_attr(task.state)}" '
@@ -638,14 +636,6 @@ def _parse_action(raw: Any) -> Action | None:
     try:
         if t == "idle":
             return IdleAction(reason=str(raw.get("reason", "")))
-        if t == "create_task":
-            return CreateTaskAction(
-                description=str(raw.get("description", "")),
-                related_tools=_as_str_list(raw.get("related_tools")),
-                parent_task_id=raw.get("parent_task_id") or None,
-                task_ref=raw.get("task_ref") or None,
-                triggered_by_event_id=raw.get("triggered_by_event_id") or None,
-            )
         if t == "call_tool":
             args = raw.get("arguments") or {}
             return CallToolAction(
@@ -657,28 +647,6 @@ def _parse_action(raw: Any) -> Action | None:
             )
         # NOTE: t == "reply" 已弃用——发言现在是工具，走
         # {"type":"call_tool","tool_name":"reply","arguments":{...}}。
-        if t == "complete_task":
-            return CompleteTaskAction(
-                task_id=str(raw.get("task_id", "")),
-                result_summary=raw.get("result_summary") or None,
-            )
-        if t == "fail_task":
-            return FailTaskAction(
-                task_id=str(raw.get("task_id", "")),
-                reason=str(raw.get("reason", "")),
-            )
-        if t == "note_task_progress":
-            note = raw.get("note")
-            return NoteTaskProgressAction(
-                task_id=str(raw.get("task_id", "")),
-                note=str(note) if note is not None else "",
-            )
     except Exception:
         return None
     return None
-
-
-def _as_str_list(value: Any) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    return [str(x) for x in value]

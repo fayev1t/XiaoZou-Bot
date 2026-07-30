@@ -66,15 +66,15 @@ def _load_cases(args: argparse.Namespace) -> list[Path]:
 def _current_system_prompt(scope_key: str | None) -> str:
     """用当前代码 + 当前 .md 重新渲染 system prompt（与 planner 同一条路径）。"""
     from qqbot.services.agent_loop.llm_planner import (
-        build_default_prompt_registry,
+        build_default_prompt_library,
     )
     from qqbot.services.agent_loop.tools import build_default_registry
 
-    registry = build_default_prompt_registry(
+    library = build_default_prompt_library(
         tool_registry=build_default_registry()
     )
     scope = (scope_key or "group:0").split(":", 1)[0]
-    return registry.render(scope=scope)
+    return library.render(scope=scope)
 
 
 def _image_blocks(case: dict[str, Any]) -> tuple[list[dict], list[str]]:

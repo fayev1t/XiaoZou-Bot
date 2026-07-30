@@ -24,15 +24,11 @@ from qqbot.services.agent_loop import bot_registry
 from qqbot.services.agent_loop.decision import (
     Action,
     CallToolAction,
-    CompleteTaskAction,
-    CreateTaskAction,
     DecisionContext,
     DecisionOutput,
-    FailTaskAction,
     IdleAction,
     ImageRef,
     MemeView,
-    NoteTaskProgressAction,
     Planner,
     ProgressNote,
     TaskView,
@@ -43,11 +39,11 @@ from qqbot.services.agent_loop.decision import (
 # 重模块(拉 sqlalchemy / langchain)→ 惰性:公开名 → 所属子模块。
 _LAZY: dict[str, str] = {
     "LLMPlanner": "llm_planner",
-    "build_default_prompt_registry": "llm_planner",
+    "build_default_prompt_library": "llm_planner",
     "AgentLoop": "loop",
     "FakeIdlePlanner": "planner",
     "Projector": "projection",
-    "PromptRegistry": "prompt_registry",
+    "PromptLibrary": "prompts.catalog",
     "LoopSupervisor": "supervisor",
     "Tool": "tool_registry",
     "ToolRegistry": "tool_registry",
@@ -72,12 +68,12 @@ def __dir__() -> list[str]:
 if TYPE_CHECKING:  # 静态分析仍看得到惰性符号
     from qqbot.services.agent_loop.llm_planner import (
         LLMPlanner,
-        build_default_prompt_registry,
+        build_default_prompt_library,
     )
     from qqbot.services.agent_loop.loop import AgentLoop
     from qqbot.services.agent_loop.planner import FakeIdlePlanner
     from qqbot.services.agent_loop.projection import Projector
-    from qqbot.services.agent_loop.prompt_registry import PromptRegistry
+    from qqbot.services.agent_loop.prompts.catalog import PromptLibrary
     from qqbot.services.agent_loop.supervisor import LoopSupervisor
     from qqbot.services.agent_loop.tool_registry import Tool, ToolRegistry
     from qqbot.services.agent_loop.tool_worker import ToolWorker
@@ -86,21 +82,17 @@ __all__ = [
     "Action",
     "AgentLoop",
     "CallToolAction",
-    "CompleteTaskAction",
-    "CreateTaskAction",
     "DecisionContext",
     "DecisionOutput",
-    "FailTaskAction",
     "FakeIdlePlanner",
     "IdleAction",
     "ImageRef",
     "LLMPlanner",
     "LoopSupervisor",
     "MemeView",
-    "NoteTaskProgressAction",
     "Planner",
-    "PromptRegistry",
-    "build_default_prompt_registry",
+    "PromptLibrary",
+    "build_default_prompt_library",
     "ProgressNote",
     "Projector",
     "TaskView",

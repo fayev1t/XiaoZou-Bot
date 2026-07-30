@@ -69,7 +69,7 @@ _DEFAULT_MAX_RESULTS = 10
 _MAX_FETCH_TOP_N = 5  # 单次调用最多给前 N 条附正文，防爆
 _MAX_FETCHED_TEXT_CHARS = 8000  # 单条正文上限，避免一次塞爆 LLM context
 
-# 模块加载期一次性读 sibling .md；缺失时 usage_prompt 为空串，PromptRegistry
+# 模块加载期一次性读 sibling .md；缺失时 usage_prompt 为空串，PromptLibrary
 # 渲染时会跳过该 section 而不是注入空标题。
 _USAGE_PROMPT = load_sibling_md(__file__, "websearch.md")
 

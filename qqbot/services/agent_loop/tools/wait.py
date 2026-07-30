@@ -6,7 +6,7 @@
 
 职责收窄（2026-07-19，ReplyTask 换轨）："等他把话说完再回"的回复防抖已整体
 移交 reply 工具的维持窗口（局势变化时追加一份完整授权，最新 hold_seconds
-直接替换旧时机；见 group_chat_rules §对方还在说的时候）；wait 只保留自我提醒
+直接替换旧时机；见 group_chat_rules §时机）；wait 只保留自我提醒
 / 延迟执行其它动作的用途，description 与 wait.md 不得再引导用它等分条消息。
 
 执行语义（**绝不在工具内 sleep**——ToolWorker 串行跑工具，长眠会卡死整个

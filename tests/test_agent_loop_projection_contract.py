@@ -1259,7 +1259,7 @@ class BuildTimelineTests(unittest.TestCase):
 
     def test_sender_role_rendered_for_admin_and_owner_only(self) -> None:
         # sender_role=发送者在本群的角色；member 是绝大多数不渲染，
-        # 缺省语义（普通成员或未知）在 xml_format.md 写死。
+        # 缺省语义（普通成员或未知）在 envelope.md 写死。
         def _one(role: str | None) -> str:
             sender = {"nickname": "u", "user_id": 1}
             if role is not None:
@@ -2386,7 +2386,7 @@ class RecallRenderingNoteTests(unittest.TestCase):
         self.assertEqual(kinds, ["message", "notice"])
         self.assertIn('kind="group_recall"', items[1].render)
         # 必须透出被撤回的 message_id——没有它 LLM 不知道撤的是哪条，
-        # 会继续引用已撤回的内容（xml_format.md §notice 明细属性）。
+        # 会继续引用已撤回的内容（envelope.md §<notice> kind 专属属性）。
         self.assertIn('message_id="1234"', items[1].render)
 
 
@@ -2656,6 +2656,39 @@ class SavedMemesAugmentTests(unittest.IsolatedAsyncioTestCase):
             out = await proj._augment_with_saved_memes(ctx, "system")
         self.assertIs(out, ctx)
         loader.assert_not_awaited()  # system 没有收藏面，不查
+
+    async def test_build_context_wires_the_augment(self) -> None:
+        """build_context 必须真的调这一步——只测私有方法漏得掉接线。
+
+        2026-07-30 的实际故障：上下文投影重构把 build_context 里的调用删了，
+        注释和方法都还在，三条私有方法测试全绿，线上却是 ctx.saved_memes 恒
+        空：Planner/Replyer 都不再渲染 <saved-memes>，Replyer 从 timeline 里
+        照抄一个 hash 发图，被 _parse_output 判 unknown meme，整条回复失败。
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from qqbot.services.agent_loop.decision import MemeView
+
+        meme = MemeView(
+            file_hash="cd" * 32, description="猫猫震惊", saved_at=BASE_TIME
+        )
+        statements: list[Any] = []
+
+        def factory() -> _RecordingProjectionSession:
+            return _RecordingProjectionSession(statements)
+
+        proj = Projector(factory)
+        with patch(
+            "qqbot.services.agent_loop.meme_store.load_saved_memes",
+            new=AsyncMock(return_value=[meme]),
+        ):
+            ctx = await proj.build_context(
+                scope_key="group:999",
+                correlation_id="corr",
+                tick_seq=1,
+                now=BASE_TIME,
+            )
+        self.assertEqual(ctx.saved_memes, [meme])
 
 
 class HandledBoundaryByRowOrderTests(unittest.TestCase):

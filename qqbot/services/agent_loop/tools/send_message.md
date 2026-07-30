@@ -6,14 +6,15 @@
 
 **Whether to speak at all is a social decision — see §group_chat_rules for that judgment** (short version: most messages aren't for you; opt in only when someone actually addresses you, it's a DM, or you can genuinely answer an open question no one else has touched). This doc covers only the **mechanics**: how to build the `content` segments and `target` once you've decided to speak.
 
-**If you want the chat to actually see some words, those words must be encoded in `arguments.content`.** Text placed in `reasoning`, `note_task_progress.note`, `create_task.description`, `complete_task.result_summary`, `fail_task.reason`, or `idle.reason` does not go out to QQ and does not count as replying.
+**If you want the chat to actually see some words, those words must be encoded in `arguments.content`.** Text placed in `reasoning`, in the `task` tool's `description` / `note` / `result_summary` / `reason` fields, or in `idle.reason` does not go out to QQ and does not count as replying.
 
 ## Voice（已迁出）
 
-角色卡（小奏人格 + 字打出来的样子 + 特殊关系）已于 2026-07-19 整体迁至
-`qqbot/services/agent_loop/prompts/voice.md`，由 Replyer 组稿时独立加载
-（见 replyer.py `_load_voice_text`，缺失即组稿失败）。本文件不再承载人格
-内容——send_message 工具已下架，仅存段校验参考与历史实现。
+角色卡（小奏人格 + 字打出来的样子 + 特殊关系）已于 2026-07-19 整体迁出，
+2026-07-30 起住在 `qqbot/services/agent_loop/prompts/replyer.md`（职责页与
+角色卡同一份），由 Replyer 装配 system prompt 时读入，文件缺失或为空即组稿
+失败。本文件不再承载人格内容——send_message 工具已下架，仅存段校验参考与
+历史实现。
 
 ## Arguments
 

@@ -26,4 +26,4 @@ Same XML envelope as the normal timeline (`<message ...>`, `<notice ... />`, etc
 
 ## After the call
 
-The result appears on your `<tool-call name="search_history">` timeline row (status="complete") on the next tick. If it answers your current task, proceed to `reply` / `complete_task`. If it surfaced more questions, you may chain another `search_history` with tightened filters, but avoid loops — three searches without progress means the information probably isn't in the DB.
+The result appears on your `<tool-call name="search_history">` timeline row (status="complete") on the next tick. If it answers your current task, proceed to `reply` and/or `task(action="complete")`. If it surfaced more questions, you may chain another `search_history` with tightened filters, but avoid loops — three searches without progress means the information probably isn't in the DB.

@@ -80,20 +80,22 @@ class V2MainPluginContractTests(unittest.TestCase):
         # 2026-07-02 起决策层无人格：prompts/persona.md 删除，v2_main 的
         # persona 读取/注入链路一并移除。角色卡历经 tools/send_message.md
         # Voice 节，2026-07-19 随 ReplyTask 换轨迁至 prompts/voice.md，仅由
-        # Replyer 组稿时加载——Planner 六段 prompt 仍不含它（2026-07-29 收下
-        # 的是 disposition.md 那一窄段，不是角色卡；红线收窄见 catalog.py）。
+        # Replyer 组稿时加载——Planner 五段 prompt 仍不含它；参与倾向已并入
+        # group_chat_rules policy，整张角色卡的禁入红线不变。
         persona_path = (
             ROOT / "qqbot" / "services" / "agent_loop" / "prompts" / "persona.md"
         )
         self.assertFalse(persona_path.exists())
         self.assertNotIn("persona", self.plugin_text)
-        # 机器身份段（identity.md）与角色卡的现居所必须存在且非空
+        # 职责页（planner.md）与角色卡的现居所必须存在且非空
         prompts_dir = ROOT / "qqbot" / "services" / "agent_loop" / "prompts"
-        identity_text = (prompts_dir / "identity.md").read_text(encoding="utf-8")
-        self.assertIn("decision engine", identity_text)
-        voice_md = (prompts_dir / "voice.md").read_text(encoding="utf-8")
-        self.assertIn("小奏", voice_md)
-        self.assertIn("那个特殊的人", voice_md)
+        identity_text = (prompts_dir / "planner.md").read_text(encoding="utf-8")
+        self.assertIn("决策引擎", identity_text)
+        # 角色卡 2026-07-30 并入 replyer.md（voice.md 已删除）
+        self.assertFalse((prompts_dir / "voice.md").exists())
+        card = (prompts_dir / "replyer.md").read_text(encoding="utf-8")
+        self.assertIn("小奏", card)
+        self.assertIn("最重要的人", card)
         # 旧居所不得残留人格正文（防两处副本漂移）
         send_message_md = (
             ROOT

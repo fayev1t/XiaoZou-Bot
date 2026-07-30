@@ -32,14 +32,10 @@ def setUpModule() -> None:
 from qqbot.core.time import china_now
 from qqbot.services.agent_loop import (
     CallToolAction,
-    CompleteTaskAction,
-    CreateTaskAction,
     DecisionContext,
-    FailTaskAction,
     IdleAction,
     ImageRef,
     LLMPlanner,
-    NoteTaskProgressAction,
     TimelineItem,
 )
 
@@ -154,26 +150,50 @@ class LLMPlannerContractTest(unittest.TestCase):
             out.actions[0].reason, "llm_schema_error:bad_action"
         )
 
-    def test_all_action_types_parsed(self) -> None:
+    def test_task_lifecycle_parses_as_call_tool_actions(self) -> None:
         body = (
             "{"
             '"actions":['
-            '{"type":"create_task","description":"d","related_tools":["t"],"task_ref":"r1"},'
+            '{"type":"call_tool","tool_name":"task",'
+            '"arguments":{"action":"create","description":"d","task_ref":"r1"}},'
             '{"type":"call_tool","tool_name":"web","arguments":{"q":"x"},"task_ref":"r1"},'
-            '{"type":"complete_task","task_id":"T1","result_summary":"ok"},'
-            '{"type":"fail_task","task_id":"T2","reason":"err"}'
+            '{"type":"call_tool","tool_name":"task",'
+            '"arguments":{"action":"complete","task_id":"T1","result_summary":"ok"}},'
+            '{"type":"call_tool","tool_name":"task",'
+            '"arguments":{"action":"fail","task_id":"T2","reason":"err"}}'
             "]}"
         )
         llm = _StubLLM(response_content=body)
         planner = LLMPlanner(llm_client=llm)
         out = asyncio.run(planner.decide(_ctx()))
         self.assertEqual(len(out.actions), 4)
-        self.assertIsInstance(out.actions[0], CreateTaskAction)
-        self.assertIsInstance(out.actions[1], CallToolAction)
-        self.assertIsInstance(out.actions[2], CompleteTaskAction)
-        self.assertIsInstance(out.actions[3], FailTaskAction)
-        self.assertEqual(out.actions[0].task_ref, "r1")
+        for action in out.actions:
+            self.assertIsInstance(action, CallToolAction)
+        self.assertEqual(out.actions[0].tool_name, "task")
+        self.assertEqual(out.actions[0].arguments["task_ref"], "r1")
         self.assertEqual(out.actions[1].arguments, {"q": "x"})
+
+    def test_legacy_task_action_types_fall_back_to_idle(self) -> None:
+        for action_type in (
+            "create_task",
+            "complete_task",
+            "fail_task",
+            "note_task_progress",
+        ):
+            with self.subTest(action_type=action_type):
+                llm = _StubLLM(
+                    response_content=(
+                        '{"actions":[{"type":"'
+                        + action_type
+                        + '"}]}'
+                    )
+                )
+                out = asyncio.run(LLMPlanner(llm_client=llm).decide(_ctx()))
+                self.assertIsInstance(out.actions[0], IdleAction)
+                self.assertEqual(
+                    out.actions[0].reason,
+                    "llm_schema_error:bad_action",
+                )
 
     def test_empty_actions_becomes_single_idle(self) -> None:
         llm = _StubLLM(response_content='{"actions":[]}')
@@ -195,57 +215,74 @@ class LLMPlannerContractTest(unittest.TestCase):
         )
         self.assertEqual(out.reasoning, "oops")
 
-    def test_identity_section_opens_system_prompt(self) -> None:
-        """identity.md 打头：先立"决策引擎操作一个 QQ 账号"的机器视角。
-        决策层（规划/任务/工具选择/reasoning）无人格；协议段在其后。"""
+    def test_planner_section_opens_system_prompt(self) -> None:
+        """planner.md 打头：先立"决策引擎驱动一个 QQ 账号"的机器视角，
+        信封语法段（envelope）在其后。"""
         llm = _StubLLM(response_content='{"actions":[{"type":"idle","reason":"x"}]}')
         planner = LLMPlanner(llm_client=llm)
         asyncio.run(planner.decide(_ctx()))
         self.assertEqual(len(llm.invocations), 1)
         content = llm.invocations[0][0].content
-        self.assertIn("decision engine", content)
-        self.assertIn("tasks persist, conversation flows around them", content)
+        self.assertIn("决策引擎", content)
+        self.assertIn("输入信封格式规范", content)
         self.assertLess(
-            content.index("decision engine"),
-            content.index("tasks persist, conversation flows around them"),
+            content.index("决策引擎"),
+            content.index("输入信封格式规范"),
+        )
+
+    def test_planner_carries_system_mechanics_and_duty(self) -> None:
+        """planner.md 是"你是谁 + 你要干什么"的唯一出处：系统机制（念头≠
+        动作、任务带跨拍、一批工具不要重拨、落稿≠已发）与职责（为落笔那
+        一环备料、不碰措辞）都只在这里，没有第三处，掉了就是真没有了。"""
+        llm = _StubLLM(response_content='{"actions":[{"type":"idle","reason":"x"}]}')
+        planner = LLMPlanner(llm_client=llm)
+        rendered = planner._prompt_library.render(scope="group")
+        # 念头≠动作
+        self.assertIn("那件事就没发生过", rendered)
+        # 跨拍只能靠任务
+        self.assertIn("跨拍的事情只能靠任务活着", rendered)
+        # 一批工具 + 不要重拨
+        self.assertIn("不要因为它还没回来就再发一次", rendered)
+        # 落稿≠已发
+        self.assertIn("账号真的开口只体现为随后出现的 `<my-reply>` 行", rendered)
+        # 职责：给落笔那一环备它拿不到的东西，且不碰表达
+        self.assertIn("交出的是**结论**而不是线索", rendered)
+        self.assertIn("说出来什么样不归你管", rendered)
+        # system loop 同样要有（参与规则那段才是 scope 过滤的）
+        self.assertIn(
+            "跨拍的事情只能靠任务活着",
+            planner._prompt_library.render(scope="system"),
         )
 
     def test_no_persona_section_registered(self) -> None:
         """Planner 无 persona 段：整张角色卡仍只由独立 Replyer 消费。
 
-        2026-07-29 起 Planner 多了 disposition 段（参与倾向），但它是为
-        "要不要开口"单写的窄投影，不是 voice.md 的副本——红线从"人格
-        一律不进"收窄为"角色卡正文不进"，故这里同时钉两头：段名里没有
-        persona，渲染结果里也不得出现角色卡的形态/情绪正文。"""
+        参与倾向已并入 group_chat_rules policy；Planner 既没有独立
+        disposition 段，也没有 voice/persona 段（角色卡住在 replyer.md）。"""
         llm = _StubLLM(response_content='{"actions":[{"type":"idle","reason":"x"}]}')
         planner = LLMPlanner(llm_client=llm)
-        names = planner._prompt_registry.section_names()
-        self.assertIn("identity", names)
-        self.assertIn("disposition", names)
+        names = planner._prompt_library.section_names()
+        self.assertIn("planner", names)
+        self.assertIn("group_chat_rules", names)
+        self.assertNotIn("disposition", names)
         self.assertNotIn("persona", names)
         self.assertNotIn("voice", names)
-        rendered = planner._prompt_registry.render(scope="group")
-        # 角色卡的形态层与情绪层正文一个字都不许漏进规划层——漏进来
-        # `reasoning` 就会开始演戏、拿心情当调工具的理由。
-        self.assertNotIn("表情包对你不是装饰", rendered)
-        self.assertNotIn("你不会把喜欢说得很甜", rendered)
-        self.assertNotIn("字打出来的样子", rendered)
+        # 角色卡正文一个字都不许漏进规划层——漏进来 `reasoning` 就会开始演戏、
+        # 拿心情当调工具的理由。锚点从角色卡现居所 replyer.md 现取（写死原句
+        # 的话，卡片一改断言就变成假通过），逐句对账在
+        # test_prompt_catalog_contract.LayerBoundaryTests。
+        from qqbot.services.agent_loop.prompts.catalog import _PROMPTS_DIR
 
-    def test_disposition_can_only_widen_the_gate(self) -> None:
-        """性情只增加理由、不豁免禁止，且不碰"说出来什么样"。
-
-        这个不对称是整段的安全阀：少了它，参与倾向会被读成负面清单的
-        通用例外，闸门等于拆掉。"""
-        llm = _StubLLM(response_content='{"actions":[{"type":"idle","reason":"x"}]}')
-        planner = LLMPlanner(llm_client=llm)
-        rendered = planner._prompt_registry.render(scope="group")
-        self.assertIn("性情只能增加理由，不能豁免禁止", rendered)
-        self.assertIn("负面清单里的每一条都是硬的，性情不构成例外", rendered)
-        # 被拽住要在 timeline 上指得出来，否则就是"想说话"。
-        self.assertIn("指得出来", rendered)
-        # 旧教义不得残留：它与本段直接冲突，并存会互相抵消。
-        self.assertNotIn("This layer has no personality", rendered)
-        self.assertNotIn("not a temperament", rendered)
+        rendered = planner._prompt_library.render(scope="group")
+        card = (_PROMPTS_DIR / "replyer.md").read_text(encoding="utf-8")
+        anchors = [
+            line.strip()
+            for line in card.splitlines()
+            if len(line.strip()) > 24 and line.strip().startswith("你")
+        ]
+        self.assertTrue(anchors, "replyer.md 没有第二人称锚点，断言会假通过")
+        for line in anchors:
+            self.assertNotIn(line, rendered)
 
     def test_reply_usage_scoped_without_persona_card(self) -> None:
         """Planner 看 reply_task 机械契约，但不再携带最终措辞角色卡。"""
@@ -262,52 +299,57 @@ class LLMPlannerContractTest(unittest.TestCase):
 
     def test_group_chat_rules_skipped_in_system_scope(self) -> None:
         """参与规则段只对有聊天面的 scope 渲染；system loop 的 system prompt
-        不含 group_chat_rules（render(scope="system") 时该段返回空串）。
-        2026-07-29 起 disposition 跟着同一个 scope 走——system loop 没有
-        聊天面，参与倾向在那里是纯噪音。"""
+        不含 group_chat_rules（render(scope="system") 时该段返回空串）。"""
         llm = _StubLLM(response_content='{"actions":[{"type":"idle","reason":"x"}]}')
         planner = LLMPlanner(llm_client=llm)
-        rendered_group = planner._prompt_registry.render(scope="group")
-        rendered_system = planner._prompt_registry.render(scope="system")
-        self.assertIn("什么时候调用 reply", rendered_group)
-        self.assertNotIn("什么时候调用 reply", rendered_system)
-        # 锚点取 disposition.md 独有的正文——identity.md 里那句
-        # "(§参与倾向)" 交叉引用各 scope 都在，拿标题名会误判。
-        self.assertIn("这些规则落在谁身上", rendered_group)
-        self.assertNotIn("这些规则落在谁身上", rendered_system)
-        # 协议与身份段两个 scope 都在
-        self.assertIn("decision engine", rendered_system)
-        self.assertIn("tasks persist, conversation flows around them", rendered_system)
+        group_names = [
+            sec.name
+            for sec in planner._prompt_library.render_sections(scope="group")
+        ]
+        system_names = [
+            sec.name
+            for sec in planner._prompt_library.render_sections(scope="system")
+        ]
+        self.assertIn("group_chat_rules", group_names)
+        self.assertNotIn("group_chat_rules", system_names)
+        self.assertNotIn("disposition", group_names)
+        self.assertIn("planner", system_names)
+        self.assertIn("envelope", system_names)
 
-    def test_note_task_progress_action_parsed(self) -> None:
+    def test_task_note_branch_parsed_as_call_tool(self) -> None:
         body = (
-            '{"actions":[{"type":"note_task_progress",'
-            '"task_id":"T1","note":"need to recheck the log"}]}'
+            '{"actions":[{"type":"call_tool","tool_name":"task",'
+            '"arguments":{"action":"note","task_id":"T1",'
+            '"note":"need to recheck the log"}}]}'
         )
         llm = _StubLLM(response_content=body)
         planner = LLMPlanner(llm_client=llm)
         out = asyncio.run(planner.decide(_ctx()))
         self.assertEqual(len(out.actions), 1)
-        note_action = out.actions[0]
-        self.assertIsInstance(note_action, NoteTaskProgressAction)
-        self.assertEqual(note_action.task_id, "T1")
-        self.assertEqual(note_action.note, "need to recheck the log")
+        action = out.actions[0]
+        self.assertIsInstance(action, CallToolAction)
+        self.assertEqual(action.tool_name, "task")
+        self.assertEqual(action.arguments["action"], "note")
+        self.assertEqual(action.arguments["task_id"], "T1")
 
-    def test_create_task_with_triggered_by_event_id(self) -> None:
+    def test_task_create_uses_common_triggered_by_event_id(self) -> None:
         body = (
-            '{"actions":[{"type":"create_task","description":"d",'
+            '{"actions":[{"type":"call_tool","tool_name":"task",'
+            '"arguments":{"action":"create","description":"d"},'
             '"triggered_by_event_id":"MSG_42"}]}'
         )
         llm = _StubLLM(response_content=body)
         planner = LLMPlanner(llm_client=llm)
         out = asyncio.run(planner.decide(_ctx()))
-        ct = out.actions[0]
-        self.assertIsInstance(ct, CreateTaskAction)
-        self.assertEqual(ct.triggered_by_event_id, "MSG_42")
+        action = out.actions[0]
+        self.assertIsInstance(action, CallToolAction)
+        self.assertEqual(action.tool_name, "task")
+        self.assertEqual(action.triggered_by_event_id, "MSG_42")
 
-    def test_system_prompt_includes_xml_format_doc(self) -> None:
-        """xml_format.md 必须注入 system prompt —— LLM 据此读懂 <agent-input>
-        信封的标签语义。锚定文档头和几个关键概念即可，避免绑死文案。"""
+    def test_system_prompt_includes_envelope_syntax(self) -> None:
+        """信封语法必须注入 system prompt —— LLM 据此读懂 <agent-input> 的标签
+        语义。2026-07-30 起它是与 Replyer 共享的 envelope.md，本用例锚定
+        文档头和几个关键标签即可，避免绑死文案。"""
         llm = _StubLLM(
             response_content='{"actions":[{"type":"idle","reason":"x"}]}'
         )
@@ -315,25 +357,31 @@ class LLMPlannerContractTest(unittest.TestCase):
         asyncio.run(planner.decide(_ctx()))
         content = llm.invocations[0][0].content
 
-        # xml_format.md 文档头
-        self.assertIn("reading the `<agent-input>` envelope", content)
-        # 关键标签必须解释过
+        # envelope.md 文档头（信封语法的唯一出处）
+        self.assertIn("输入信封格式规范", content)
+        # 容器与事件行都必须逐个规定过
         self.assertIn("<tool-catalog>", content)
         self.assertIn("<active-tasks>", content)
         self.assertIn("<timeline>", content)
+        self.assertIn("<time>", content)
+        self.assertIn("<my-reply>", content)
         # 2026-07-02 起不再有 pending-tool-results 区（工具结果只在 timeline
-        # 单点呈现，防双重渲染诱发复读）——文档不得再教这个标签
+        # 单点呈现，防双重渲染诱发复读）——文档不得再登记这个标签
         self.assertNotIn("<pending-tool-results>", content)
         # 特殊标记
         self.assertIn("<truncated/>", content)
         self.assertIn("<processing/>", content)
-        # 两态语义必须教过：status 只有 processing / complete
-        self.assertIn('status="complete"', content)
-        self.assertIn('status="processing"', content)
+        # 两态语义：status 只表示是否结束，成败在子元素
+        self.assertIn("只表示该调用是否已结束", content)
+        # 输出侧的动作形状在 planner.md（代码不下发 schema，删了就没有第二处）
+        self.assertIn('"type":"call_tool"', content)
 
     def test_system_prompt_includes_group_chat_rules_doc(self) -> None:
         """group_chat_rules.md 必须注入 system prompt —— 规划层据此判断
-        "有没有一条消息构成发言理由"（规则判断，非人格判断）。"""
+        "这一拍该不该动、动什么"。2026-07-30 定稿后它是两句上位约束（把
+        timeline 当整体语境读 + 自主判断是否行动），不再是情形清单，因此这里
+        只钉那两条不可失守的语义：整体语境而非逐标签响应、以及 idle 与行动
+        同为正常结果（这是唯一防"为产出而输出"的闸门）。"""
         llm = _StubLLM(
             response_content='{"actions":[{"type":"idle","reason":"x"}]}'
         )
@@ -341,40 +389,45 @@ class LLMPlannerContractTest(unittest.TestCase):
         asyncio.run(planner.decide(_ctx()))
         content = llm.invocations[0][0].content
 
-        # 文档头
-        self.assertIn("什么时候调用 reply", content)
-        # 关键锚点：正反两张理由清单 + addressee 判别 + idle 常态
-        self.assertIn("构成发言理由", content)
-        self.assertIn("不构成发言理由", content)
-        self.assertIn("被提到不等于被叫到", content)
-        self.assertIn("`idle` 是常态结果", content)
-        # 行为约束里仍要涉及备选决策
-        self.assertIn("note_task_progress", content)
-        # reply 结果只是 pending，my-reply 才是已发送事实。
-        self.assertIn("Actual sent history exists only in `<my-reply>`", content)
-        self.assertIn("One tick, one tool batch", content)
+        # 整体语境，而不是逐个标签机械响应
+        self.assertIn("持续演变的整体语境", content)
+        self.assertIn("不要因单一信号机械响应", content)
+        # 不为产出而行动；idle 与行动同为正常结果
+        self.assertIn("不要为了产生输出而行动", content)
+        self.assertIn("采取行动与保持 idle 都是正常结果", content)
 
     def test_system_prompt_explicitly_forbids_bare_text_as_reply(self) -> None:
-        """Planner 只交接对话逻辑，最终可见表达属于 Replyer。"""
+        """Planner 只交接对话逻辑，最终可见表达属于 Replyer。
+
+        这条红线有两处正文：planner.md 的职责段（为什么不归你）与
+        tools/reply.md 的参数页（硬边界），后者随 tools_usage 段进
+        Planner prompt——所以本用例必须带工具注册表装配。"""
+        from qqbot.services.agent_loop.tools import build_default_registry
+
         llm = _StubLLM(
             response_content='{"actions":[{"type":"idle","reason":"x"}]}'
         )
-        planner = LLMPlanner(llm_client=llm)
+        planner = LLMPlanner(
+            llm_client=llm, tool_registry=build_default_registry()
+        )
         asyncio.run(planner.decide(_ctx()))
         content = llm.invocations[0][0].content
 
-        self.assertIn("Planner records a resolved conversation analysis", content)
-        self.assertIn("who is speaking to, quoting or @-ing whom", content)
-        self.assertIn("decisive timestamps/order", content)
-        self.assertIn("do **not** tell the Replyer what tone", content)
-        self.assertIn("do not choose a meme", content)
-        self.assertIn("Only successful children of `<my-reply>`", content)
+        # 措辞/语气/形态一律不由 Planner 指定（tools/reply.md）
+        self.assertIn("Never prescribe", content)
+        self.assertIn("The Replyer owns all of those through its own voice card.", content)
+        # reply 成功只是落稿，<my-reply> 才是已发送事实
+        self.assertIn("records words/images that really reached QQ.", content)
+        # 信封段这一侧只留客观定义：<my-reply> 的成功子元素即实际送达内容
+        self.assertIn("其中成功的子元素即实际到达 QQ 的内容", content)
+        # 职责段这一侧给出原因
+        self.assertIn("说出来什么样不归你管", content)
 
     def test_default_prompt_section_order(self) -> None:
-        """五段必须按 order 升序拼接：
-        identity < xml_format < group_chat_rules < protocol < tools_usage。
-        LLM 按"你是什么→怎么读输入→什么时候需要发言→怎么决定→工具"递进读。
-        人设不在 Planner prompt 中，由 Replyer 独立加载。"""
+        """四段必须按 order 升序拼接：
+        planner < envelope < group_chat_rules < tools_usage。
+        LLM 按"你是谁+你要干什么→输入长什么样→什么时候需要发言→工具"
+        递进读。人设不在 Planner prompt 中，由 Replyer 独立加载。"""
         from qqbot.services.agent_loop.tool_registry import ToolRegistry
 
         class _StubTool:
@@ -399,16 +452,18 @@ class LLMPlannerContractTest(unittest.TestCase):
         asyncio.run(planner.decide(_ctx()))
         content = llm.invocations[0][0].content
 
-        idx_identity = content.index("decision engine")
-        idx_xml = content.index("reading the `<agent-input>` envelope")
-        idx_protocol = content.index("tasks persist, conversation flows around them")
-        idx_group = content.index("什么时候调用 reply")
+        # 段序用 registry 直接对账：参与规则段的正文在迭代中，拿它的措辞当
+        # 锚点会让排序契约跟着文案一起红。
+        self.assertEqual(
+            planner._prompt_library.section_names(),
+            ["planner", "envelope", "group_chat_rules", "tools_usage"],
+        )
+        idx_identity = content.index("决策引擎")
+        idx_envelope = content.index("输入信封格式规范")
         idx_tools = content.index("STUB-TOOL-ORDER-MARKER")
 
-        self.assertLess(idx_identity, idx_xml)
-        self.assertLess(idx_xml, idx_group)
-        self.assertLess(idx_group, idx_protocol)
-        self.assertLess(idx_protocol, idx_tools)
+        self.assertLess(idx_identity, idx_envelope)
+        self.assertLess(idx_envelope, idx_tools)
 
     def test_reply_tool_usage_doc_renders_via_tool_registry(self) -> None:
         """ReplyTool.usage_prompt 必须随 registry 进入 Planner prompt。"""
@@ -486,19 +541,18 @@ class LLMPlannerContractTest(unittest.TestCase):
 
         self.assertNotIn("## Tool: no_usage_tool", content)
 
-    def test_custom_prompt_registry_overrides_default(self) -> None:
-        """传入自定义 PromptRegistry 时绕过默认装配 —— 调用方拥有最终拼接权。"""
-        from qqbot.services.agent_loop.prompt_registry import PromptRegistry
+    def test_custom_prompt_library_overrides_default(self) -> None:
+        """传入自定义提示词库时绕过默认装配 —— 调用方拥有最终拼接权。"""
+        from qqbot.services.agent_loop.prompts.catalog import PromptLibrary
 
-        custom = PromptRegistry()
-        custom.register("only-section", 0, "CUSTOM-ONLY-MARKER")
+        custom = PromptLibrary([("only-section", "CUSTOM-ONLY-MARKER")])
 
         llm = _StubLLM(
             response_content='{"actions":[{"type":"idle","reason":"x"}]}'
         )
         planner = LLMPlanner(
             llm_client=llm,
-            prompt_registry=custom,
+            prompt_library=custom,
         )
         asyncio.run(planner.decide(_ctx()))
         content = llm.invocations[0][0].content
@@ -506,26 +560,28 @@ class LLMPlannerContractTest(unittest.TestCase):
         self.assertEqual(content, "CUSTOM-ONLY-MARKER")
 
     def test_system_prompt_is_task_centric(self) -> None:
-        """新协议要求 LLM 围绕 active_tasks 决策；这里只验证关键约束词出现，
+        """新协议要求 LLM 围绕 active tasks 决策；这里只验证关键约束词出现，
         不绑定文案细节（避免无谓脆弱）。"""
+        from qqbot.services.agent_loop.tools import build_default_registry
+
         llm = _StubLLM(
             response_content='{"actions":[{"type":"idle","reason":"x"}]}'
         )
-        planner = LLMPlanner(llm_client=llm)
+        planner = LLMPlanner(
+            llm_client=llm,
+            tool_registry=build_default_registry(),
+        )
         asyncio.run(planner.decide(_ctx()))
         content = llm.invocations[0][0].content
 
-        # task 状态机词汇必须暴露给 LLM
-        self.assertIn("active_tasks", content)
-        self.assertIn("complete_task", content)
-        self.assertIn("fail_task", content)
-        # reasoning 必须以 active_tasks 为中心（把它当作 standing agenda 逐条评估）
-        self.assertIn("standing agenda", content)
+        self.assertIn("<active-tasks>", content)
+        self.assertIn("## Tool: task", content)
+        self.assertIn('action="complete"', content)
+        self.assertIn('action="fail"', content)
+        self.assertNotIn('"type":"complete_task"', content)
+        self.assertNotIn('"type":"fail_task"', content)
         # 必须明示"新消息不会自动取消 task"
-        self.assertTrue(
-            "do NOT cancel" in content or "does not implicitly close" in content,
-            "prompt should explicitly state that new messages do not cancel tasks",
-        )
+        self.assertIn("无关的新消息不会替你关掉它", content)
 
     def test_human_message_is_plain_text_never_multimodal(self) -> None:
         """2026-07-28：Planner 是纯文本模型。timeline 里带已落盘图片的消息
@@ -592,9 +648,9 @@ class LLMPlannerContractTest(unittest.TestCase):
         asyncio.run(planner.decide(ctx))
         human_text = llm.invocations[0][1].content
         self.assertIn('bot_qq="3167291813"', human_text)
-        # scope/now/tick 也仍在
+        # scope/now 也仍在（@tick 已于 2026-07-30 从信封删除）
         self.assertIn('scope="group:100"', human_text)
-        self.assertIn('tick="1"', human_text)
+        self.assertIn("<current now=", human_text)
 
     def test_no_bot_user_id_omits_attribute(self) -> None:
         """bot_user_id 为 None 时不渲染 bot_qq= 属性 —— prompt 体积稳定，
@@ -954,12 +1010,12 @@ class PendingReplySectionRemovedTests(unittest.TestCase):
 class EnvelopeCacheLayoutTests(unittest.TestCase):
     """信封段序与前缀稳定性契约（2026-07-12，前缀缓存）。
 
-    OpenAI 系 API 的自动前缀缓存要求前缀**逐字节一致**：每拍必变的 now/tick
+    OpenAI 系 API 的自动前缀缓存要求前缀**逐字节一致**：每拍必变的 now
     不得出现在信封头部（否则缓存前缀在 system prompt 末尾就断掉，timeline
     每拍全价重计费），段序按变化频率升序：tool-catalog → saved-memes →
     timeline → active-tasks → <current/> → validation-error。原
-    pending-reply 段已于 2026-07-24 删除。改动信封布局
-    前必须先想清对缓存前缀的影响——本类是回归防线。"""
+    pending-reply 段已于 2026-07-24 删除，@tick 已于 2026-07-30 删除。改动
+    信封布局前必须先想清对缓存前缀的影响——本类是回归防线。"""
 
     def _render(self, ctx: DecisionContext) -> str:
         llm = _StubLLM(
@@ -980,7 +1036,11 @@ class EnvelopeCacheLayoutTests(unittest.TestCase):
     def test_current_element_carries_clock_after_tasks(self) -> None:
         text = self._render(_ctx())
         self.assertIn("<current now=", text)
-        self.assertIn('tick="1"/>', text)
+        # @tick 于 2026-07-30 从信封删除（tick_seq 本身保留，见事件 payload /
+        # 日志 / 快照）：它与 now 同处 <current/>，缓存收益恒为零，而对模型
+        # 无锚点、重启后 tick="1" 配满窗历史属误导。这里断言**整个信封**都
+        # 不再出现拍号——加回来必须是带锚点的 burst_step，不是它。
+        self.assertNotIn("tick=", text)
         # 段序：timeline → active-tasks → <current/>
         self.assertLess(
             text.index("</timeline>"), text.index("<active-tasks>")
@@ -1000,8 +1060,9 @@ class EnvelopeCacheLayoutTests(unittest.TestCase):
         )
 
     def test_prefix_stable_across_ticks(self) -> None:
-        """同一 timeline、不同 now/tick 的两拍，<current/> 之前的信封文本
-        必须逐字节一致——这是前缀缓存能命中的直接判据。"""
+        """同一 timeline、不同 now 的两拍，<current/> 之前的信封文本必须逐
+        字节一致——这是前缀缓存能命中的直接判据。tick_seq 仍一并改动：@tick
+        已于 2026-07-30 从信封删除，这里顺带钉住它不会重新漏进前缀。"""
         from dataclasses import replace
         from datetime import timedelta
 

@@ -58,8 +58,8 @@ def _get_supervisor() -> LoopSupervisor:
         # LLMPlanner 对 LLM 不可用 / JSON 解析失败一律 fallback 为 IdleAction，
         # 不会让 supervisor 起不来。tool_registry 同时给 planner（prompt
         # tool_catalog）和 supervisor（ToolWorker 调度查找）共用。
-        # system prompt 由 planner 内部的默认 PromptRegistry 装配（identity /
-        # xml_format / group_chat_rules / protocol / tools_usage）；Planner 不再
+        # system prompt 由 planner 内部的默认提示词库装配（planner /
+        # envelope / group_chat_rules / tools_usage）；Planner 不再
         # 注入角色卡，最终措辞角色只由 Replyer 的独立 prompt 消费。
         _supervisor = LoopSupervisor(
             planner=LLMPlanner(

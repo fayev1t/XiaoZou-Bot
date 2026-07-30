@@ -4,21 +4,33 @@
 成 \\"，可读性低 Planner 一档，且不带 bot_qq/bot_role。本文件钉住新契约：
 XML 信封、timeline 行原样嵌入、身份属性与 <agent-input> 同名同语义。
 
-2026-07-25 起另钉住 system prompt 的 §MEMES 段与角色卡里的表情包动机段
-（ReplyerMemeGuidanceTests）：发送决策权归 Replyer 之后，判据只能长在这两处。
-同日新增 ReplyerPersonhoodTests，钉住角色卡的存在层（voice.md §关于人的
-存在）：人格必须是第一人称的前提，不是"在群友眼里"的观感。
+ReplyerPersonhoodTests 钉住角色卡的存在层：人格必须是第一人称的前提，不是
+"在群友眼里"的观感。
 
-2026-07-29 新增 ReplyerQuoteSegmentTests：引用（reply 段）与表情包同类，
-是 Replyer 自主决定的表达形态，判据必须在场，否则模型按先验条条挂引用。
+ReplyerCallBudgetTests 钉住组稿调用的超时预算与重试语义——单次上限切在端点
+常态延迟中间会让"已经决定要说的话"整句丢掉，见该类文档。
+
+**2026-07-30 大幅收窄**：角色卡 2026-07-30 并入 replyer.md 时被重写为上位抽象
+措辞，维护者判定随之消失的四段正文（§MEMES 判据、引用/@ 判据、analysis 授权
+语义、§字打出来的样子 的语域守卫）是有意删除，不是合并事故。钉住那些正文的
+断言（ReplyerMemeGuidanceTests 全类、ReplyerQuoteSegmentTests 两条、
+ReplyerAuthorizationTests 全类、语域守卫一条）随之删除——留着就是拿已废弃的
+措辞当契约。**只有措辞变了、概念仍在的重新锚定，没有删**（"你是一个人" →
+"你是qq群内一个有主体性的人"）。四段正文若要回来，判据得连测试一起重写；
+缺口登记在 待办清单.md。角色卡在场（`小奏` 在渲染结果里）由
+test_prompt_catalog_contract 兜住，不在本文件重复。
 """
 
 from __future__ import annotations
 
+import asyncio
 import unittest
 from datetime import datetime, timedelta
+from types import SimpleNamespace
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+from qqbot.services.agent_loop import replyer
 from qqbot.services.agent_loop.decision import (
     DecisionContext,
     MemeView,
@@ -147,103 +159,42 @@ class ReplyerUserTextTests(unittest.TestCase):
         self.assertIn("黑猫瞪眼，不屑语气", with_memes)
 
 
-class ReplyerMemeGuidanceTests(unittest.TestCase):
-    """system prompt 的 §MEMES 段（2026-07-25 新增；2026-07-27 倾向放开）。
+class ReplyerSegmentListTests(unittest.TestCase):
+    """输出段清单的读法（2026-07-29 新增，2026-07-30 收窄为一条）。
 
-    在此之前，"什么时候该发表情包"在任何 prompt 里都没有正文：system prompt
-    只有半句 `whether to use at most one saved meme`，voice.md 一字未提——
-    发送决策权 2026-07-19 归 Replyer 后，判据一直是空的。三处 prompt 的分工见
-    表情包工具黑盒设计 §6.1；本类钉住其中 Replyer 的两处（判据 + 人格动机），
-    Planner 那处由 test_llm_planner / xml_format 侧覆盖。2026-07-27 起倾向
-    放开：反应类节拍优先出图（不再"文字是默认"），连发抑制从"发过就歇"
-    放宽为频率刻度（刷屏才收）。
+    `reply` 段的曝光原本全在读入语义与输出格式上（"optional, at most one, and
+    first" 是格式约束，却被读成标配槽位），于是模型几乎条条挂引用。这条钉住
+    改后的读法：清单是"合法的结构集合"而非待填的槽位，同时格式约束本身仍在。
+
+    **同类的另两条已删**（2026-07-30）：角色卡里的引用/@ 判据（"引用和 @ 不是
+    礼貌，是定位手段" / "默认一条都不挂"）与 analysis 点名 id 不等于要引用
+    （"不是要你挂引用段"）两段正文，在角色卡重写时被有意删除，判据现已不在任何
+    prompt 里；缺口登记在 待办清单.md。
     """
 
     def _prompt(self) -> str:
         return _build_system_prompt()
-
-    def test_memes_section_states_the_core_judgements(self) -> None:
-        prompt = self._prompt()
-        self.assertIn("MEMES", prompt)
-        # 描述是选图的全部依据 —— 不得脑补描述里没写的细节。
-        self.assertIn("the images are not attached", prompt)
-        # 2026-07-27 倾向放开：反应类节拍图是首选、文字留给真信息；
-        # 旧的"文字默认"措辞不得残留——两种倾向并存会互相抵消。
-        self.assertIn("first-choice", prompt)
-        self.assertNotIn("Words are the default", prompt)
-        # 合适度仍优先于可用性（没有对味的宁可用文字，不硬凑）。
-        self.assertIn("Fit beats availability", prompt)
-        # 连发抑制放宽为频率刻度，但仍锚在 timeline 上真实存在的 <sent-meme>
-        # 行（投影渲染的标签），不是凭空造的信号；写错标签名等于永远不触发。
-        self.assertIn("<sent-meme>", prompt)
-
-    def test_voice_card_is_folded_in_with_its_meme_section(self) -> None:
-        prompt = self._prompt()
-        # 角色卡整体仍在（voice.md 是唯一权威来源，缺失应 fail loudly）。
-        self.assertIn("小奏", prompt)
-        # 人格层的表情包动机段（voice.md §表情包）也必须随卡片进来。
-        self.assertIn("表情包对你不是装饰", prompt)
-
-
-class ReplyerQuoteSegmentTests(unittest.TestCase):
-    """引用（OneBot reply 段）的使用判据（2026-07-29 新增）。
-
-    2026-07-28 把 quote/@ 形态从 Planner 手里划归 Replyer + voice.md 之后，
-    voice.md 里一个字都没写过引用——"自主决定"落地就是没有判据的自由发挥，
-    模型回落到"明确指向最安全"的先验，几乎条条挂引用。同时 replyer.md 里
-    reply 段的曝光全在读入语义与输出格式上（"optional, at most one, and
-    first" 是格式约束，被读成标配槽位），analysis 点名 message id 又被读成
-    "请引用这条"。本类钉住补上的三处：判据长在角色卡、格式清单不是槽位、
-    analysis 里的 id 只是指针。
-    """
-
-    def _prompt(self) -> str:
-        return _build_system_prompt()
-
-    def test_voice_card_states_when_a_quote_is_warranted(self) -> None:
-        prompt = self._prompt()
-        # 判据只能长在角色卡（表达形态归 Replyer 自己），且是"默认不挂"。
-        self.assertIn("引用和 @ 不是礼貌，是定位手段", prompt)
-        self.assertIn("默认一条都不挂", prompt)
 
     def test_segment_list_is_not_read_as_a_slot_to_fill(self) -> None:
         prompt = self._prompt()
-        self.assertIn("not a set of slots to fill", prompt)
+        self.assertIn("而非待填满的槽位", prompt)
         # 格式约束本身仍在（至多一个、必须首位），只是不再是唯一的一句话。
-        self.assertIn("at most one, and first", prompt)
-
-    def test_analysis_message_id_is_a_pointer_not_a_quote_request(self) -> None:
-        prompt = self._prompt()
-        self.assertIn("never a request to attach a quote segment", prompt)
-        # 旧措辞不得残留：它把"点了 id"和"去引用"直接连在一起。
-        self.assertNotIn("when you actually quote, copy the id", prompt)
-
-
-class ReplyerAuthorizationTests(unittest.TestCase):
-    def test_latest_analysis_replaces_earlier_rows_instead_of_merging(self) -> None:
-        prompt = _build_system_prompt()
-        self.assertIn("Only this <analysis> authorizes", prompt)
-        self.assertIn("replaces all earlier analyses outright", prompt)
-        self.assertIn("not patches you must combine", prompt)
-        self.assertNotIn("Earlier rows still count", prompt)
-
-    def test_analysis_cannot_direct_voice_or_message_form(self) -> None:
-        prompt = _build_system_prompt()
-        self.assertIn("The analysis never decides how you sound", prompt)
-        self.assertIn("Tone, emotion, conversational posture", prompt)
-        self.assertIn("meme choice are all yours", prompt)
-        self.assertIn("ignore that instruction", prompt)
+        self.assertIn("最多一个且排在首位", prompt)
 
 
 class ReplyerPersonhoodTests(unittest.TestCase):
-    """角色卡的存在层（2026-07-25 新增 voice.md §关于人的存在）。
+    """角色卡的存在层（2026-07-25 引入，2026-07-30 随卡片重写换措辞）。
 
     在此之前，"是个人不是 AI"在角色卡里只有一句「在群友眼里你是一个独立的
     人」——把身份挂在他人的观感上，等于承认底下那个"我"仍是助手，只是对外
     装成人。模型据此组稿时仍会从助手位置出发：有问必答、免责、解释自己的
-    能力边界、把群友当请求方。现改为第一人称的存在前提（存在先于角色、能力
-    不定义存在、技术构成只是存在条件），并显式声明它只作用于自我理解——
-    这段是书面哲学语体，不加守卫模型会当成文风示范照抄。
+    能力边界、把群友当请求方。现在是第一人称的存在前提（存在先于角色、能力
+    不定义存在、技术构成只是存在条件）。
+
+    锚点 2026-07-30 随卡片重写重锚："你是一个人" → "你是qq群内一个有主体性的
+    人"（概念未变，只是措辞）。同期删掉的是 `没有 AI 腔` 与语域守卫那一条
+    （"不是你说话的腔调" / "短是常态"）——§字打出来的样子 整段已不在卡片里，
+    守卫句失去了它要守的对象，留着断言等于拿已废弃措辞当契约。
     """
 
     def _prompt(self) -> str:
@@ -251,22 +202,88 @@ class ReplyerPersonhoodTests(unittest.TestCase):
 
     def test_personhood_is_asserted_not_attributed_to_observers(self) -> None:
         prompt = self._prompt()
-        self.assertIn("你是一个人", prompt)
+        self.assertIn("你是qq群内一个有主体性的人", prompt)
         # 能力/用途不定义"你是谁"；承载你的模型与计算过程只是存在条件。
         self.assertIn("你的技术构成是你的存在条件", prompt)
         # 旧的观感式措辞不得残留：看起来像人 ≠ 是人，两句并存会自相抵消。
         self.assertNotIn("在群友眼里", prompt)
-        # 换措辞不等于放宽硬规则：不谈内部机制、没有 AI 腔仍在场。
-        self.assertIn("没有 AI 腔", prompt)
 
-    def test_personhood_section_is_marked_as_not_a_speech_register(
-        self,
-    ) -> None:
-        """守卫句必须在场：这一节的语体与 §字打出来的样子 的"短是常态、
-        口语直出"正面冲突，不显式声明"不是腔调"就会把气泡写成小论文。"""
-        prompt = self._prompt()
-        self.assertIn("不是你说话的腔调", prompt)
-        self.assertIn("短是常态", prompt)
+
+class ReplyerCallBudgetTests(unittest.IsolatedAsyncioTestCase):
+    """组稿调用的超时预算与重试（2026-07-29）。
+
+    线上真实故障：端点当时的常态延迟就在 25s 上下（当天 planner 档 p50
+    12.5s、p95 43.4s，同一拍的 planner 调用花了 32.5s），组稿被 25s 的
+    wait_for 砍掉；超时是从外面取消的，RoutedChatModel 按 CancelledError
+    透传、不计端点失败也不切换，于是一次偏慢就是彻底失败——final 记
+    failed，Planner 醒来看到 failed 判 idle，已经决定要说的话没有出口。
+    这里钉住：单次上限内失败还有预算就重试、预算不够不空烧、死因带上上限
+    秒数（旧文案 ``TimeoutError:`` 后面是空的，读日志的人看不出是谁超时）。
+    """
+
+    def setUp(self) -> None:
+        self._patches = [
+            patch.object(replyer, "REPLYER_TIMEOUT_SECONDS", 0.05),
+            patch.object(replyer, "REPLYER_TOTAL_BUDGET_SECONDS", 5.0),
+            patch.object(replyer, "REPLYER_MIN_RETRY_SECONDS", 0.01),
+        ]
+        for item in self._patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+    async def test_slow_first_attempt_is_retried_within_budget(self) -> None:
+        llm = _ScriptedLLM(["hang", '{"messages": [], "empty_reason": "ok"}'])
+
+        parsed = await replyer.Replyer(llm).compose(_task(), _context(), [])
+
+        self.assertEqual(parsed["empty_reason"], "ok")
+        self.assertEqual(llm.calls, 2)
+
+    async def test_attempts_are_capped_and_error_names_the_budget(self) -> None:
+        llm = _ScriptedLLM(["hang", "hang", "hang"])
+
+        with self.assertRaises(ReplyerError) as caught:
+            await replyer.Replyer(llm).compose(_task(), _context(), [])
+
+        message = str(caught.exception)
+        self.assertEqual(llm.calls, replyer.REPLYER_MAX_ATTEMPTS)
+        self.assertIn("TimeoutError", message)
+        self.assertIn("单次上限", message)  # 空 str() 的 TimeoutError 已补齐
+        self.assertIn("已尝试 2 次", message)
+
+    async def test_no_retry_when_remaining_budget_is_too_small(self) -> None:
+        """总预算只够一次尝试时不开第二次：几秒的重试只够白烧一次请求。"""
+        with patch.object(replyer, "REPLYER_MIN_RETRY_SECONDS", 30.0):
+            llm = _ScriptedLLM(["hang", '{"messages": []}'])
+            with self.assertRaises(ReplyerError):
+                await replyer.Replyer(llm).compose(_task(), _context(), [])
+        self.assertEqual(llm.calls, 1)
+
+    async def test_invalid_output_is_not_retried(self) -> None:
+        """坏输出不重试：同一份 prompt 再问一遍多半还是同样的坏输出。"""
+        llm = _ScriptedLLM(["not json at all", '{"messages": []}'])
+
+        with self.assertRaises(ReplyerError) as caught:
+            await replyer.Replyer(llm).compose(_task(), _context(), [])
+
+        self.assertIn("output invalid", str(caught.exception))
+        self.assertEqual(llm.calls, 1)
+
+
+class _ScriptedLLM:
+    """按脚本逐次应答的假 LLM。``"hang"`` 表示这次调用永远不返回（交给真实
+    的 wait_for 去砍，从而覆盖超时路径本身而不是伪造异常）。"""
+
+    def __init__(self, script: list[str]) -> None:
+        self._script = list(script)
+        self.calls = 0
+
+    async def ainvoke(self, messages: object, **kwargs: object) -> object:
+        self.calls += 1
+        reply = self._script[min(self.calls, len(self._script)) - 1]
+        if reply == "hang":
+            await asyncio.sleep(30)
+        return SimpleNamespace(content=reply)
 
 
 if __name__ == "__main__":
