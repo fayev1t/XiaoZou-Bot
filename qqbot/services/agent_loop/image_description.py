@@ -70,9 +70,6 @@ MAX_DESCRIPTION_CHARS = 1200
 # tool_result 进事件流并在窗口期内每拍重复渲染，放太宽等于把省下的 token 吐回去。
 MAX_ANSWER_CHARS = 600
 
-# 低温：同一张图的客观描述应当稳定，不需要发散（与 meme_caption 同理）。
-_DESCRIBE_TEMPERATURE = 0.2
-
 # 供应商单模型的并发上限。一条消息里的 9 图相册、以及几乎同时到达的多条图片
 # 消息，都会并发打到同一个 role="vision" 路由上；round_robin 只是把请求摊到多个
 # 端点、并不限制在飞数量，所以这里再压一道全局闸。超出的调用排队等待——ingest
@@ -257,9 +254,9 @@ async def _invoke_vision(
     """一次看图调用（描述与带问重看共用）。返回 (文本, 端点 spec)；任何失败
     → (None, None)。调用方负责持 `_semaphore`——所有 vision 调用共享同一道
     并发闸，不因为走了不同入口就绕开供应商的并发上限。"""
-    llm = await create_llm(
-        temperature=_DESCRIBE_TEMPERATURE, role="vision", require=("vision",)
-    )
+    # 温度在 roles.vision.temperature 配（建议低温 0.2：同一张图的客观描述
+    # 应当稳定，不需要发散；与 caption 同理），见 LLM 路由契约 §2。
+    llm = await create_llm(role="vision", require=("vision",))
     if llm is None:
         logger.warning(
             "[image_description] no vision-capable LLM configured "

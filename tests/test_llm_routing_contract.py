@@ -2,6 +2,11 @@
 
 冻结的契约（详见 开发文档/v2.0/20-横切契约/LLM路由契约.md）：
 - config/model_providers.json 文档格式（providers / roles / settings 三段）与校验错误；
+  roles 对象形态单目标 model 与多目标 targets 互斥（2026-07-29 起 targets 让
+  「回退链 + strategy/require/temperature 覆写」可同时表达）；per-role
+  temperature 与 settings 全局采样缺省（temperature / max_tokens）、
+  settings 路由旋钮（max_attempts_per_call / cooldown_max_multiplier）
+  均收拢在本文件——LLM 参数在 .env 与调用点代码里没有任何残留；
 - 按模型名路由：model= 命中所有持有该模型的服务商，缺省策略 random；
   model+provider 显式钉死，无视策略与冷却；
 - role 规则解析顺序：精确命中 → "default" → 内置兜底（每服务商首模型）；
@@ -62,10 +67,27 @@ _CONFIG_JSON = json.dumps(
         ],
         "roles": {
             "planner": "deepseek-chat",
+            "replyer": {"model": "deepseek-chat", "temperature": 0.3},
+            "vision": {
+                "targets": [
+                    "gpt-4o",
+                    {"model": "deepseek-chat", "provider": "relay"},
+                ],
+                "strategy": "round_robin",
+                "require": ["vision"],
+                "temperature": 0.2,
+            },
             "caption": {"model": "gpt-4o", "require": ["vision"]},
             "default": ["deepseek-chat", {"model": "gpt-4o", "provider": "relay"}],
         },
-        "settings": {"strategy": "primary_failover", "cooldown_seconds": 30},
+        "settings": {
+            "strategy": "primary_failover",
+            "cooldown_seconds": 30,
+            "cooldown_max_multiplier": 8,
+            "max_attempts_per_call": 2,
+            "temperature": 0.6,
+            "max_tokens": 512,
+        },
     }
 )
 
@@ -104,6 +126,10 @@ class ParseConfigTests(unittest.TestCase):
         )
         self.assertEqual(config.default_strategy, STRATEGY_PRIMARY_FAILOVER)
         self.assertEqual(config.cooldown_seconds, 30.0)
+        self.assertEqual(config.cooldown_max_multiplier, 8.0)
+        self.assertEqual(config.max_attempts_per_call, 2)
+        self.assertEqual(config.temperature, 0.6)
+        self.assertEqual(config.max_tokens, 512)
 
         ds = config.endpoints[0]
         self.assertTrue(ds.streaming)  # 缺省 True
@@ -124,7 +150,9 @@ class ParseConfigTests(unittest.TestCase):
             roles["planner"].targets, (RoleTarget(model="deepseek-chat"),)
         )
         self.assertIsNone(roles["planner"].strategy)
+        self.assertIsNone(roles["planner"].temperature)
         self.assertEqual(roles["caption"].require, frozenset({"vision"}))
+        self.assertIsNone(roles["caption"].temperature)
         self.assertEqual(
             roles["default"].targets,
             (
@@ -132,6 +160,48 @@ class ParseConfigTests(unittest.TestCase):
                 RoleTarget(model="gpt-4o", provider="relay"),
             ),
         )
+
+    def test_role_object_form_carries_temperature(self) -> None:
+        replyer = parse_config(_CONFIG_JSON).roles["replyer"]
+
+        self.assertEqual(replyer.targets, (RoleTarget(model="deepseek-chat"),))
+        self.assertEqual(replyer.temperature, 0.3)
+
+    def test_role_object_form_with_targets_fallback_chain(self) -> None:
+        """对象形态多目标：回退链 + strategy/require/temperature 覆写同时表达
+        ——纯数组形态带不了覆写字段，此前这个组合（契约推荐的 vision 配法）
+        写不出来。"""
+        vision = parse_config(_CONFIG_JSON).roles["vision"]
+
+        self.assertEqual(
+            vision.targets,
+            (
+                RoleTarget(model="gpt-4o"),
+                RoleTarget(model="deepseek-chat", provider="relay"),
+            ),
+        )
+        self.assertEqual(vision.strategy, STRATEGY_ROUND_ROBIN)
+        self.assertEqual(vision.require, frozenset({"vision"}))
+        self.assertEqual(vision.temperature, 0.2)
+
+    def test_role_temperature_zero_is_valid(self) -> None:
+        raw = json.dumps(
+            {
+                "providers": [
+                    {
+                        "name": "p",
+                        "base_url": "https://p/v1",
+                        "api_key": "k",
+                        "models": ["m"],
+                    }
+                ],
+                "roles": {"planner": {"model": "m", "temperature": 0}},
+                "settings": {"temperature": 0},
+            }
+        )
+        config = parse_config(raw)
+        self.assertEqual(config.roles["planner"].temperature, 0.0)
+        self.assertEqual(config.temperature, 0.0)
 
     def test_settings_defaults(self) -> None:
         raw = _providers_only(
@@ -148,6 +218,10 @@ class ParseConfigTests(unittest.TestCase):
         self.assertEqual(config.default_strategy, DEFAULT_STRATEGY)
         self.assertEqual(config.default_strategy, STRATEGY_RANDOM)
         self.assertEqual(config.cooldown_seconds, 60.0)
+        self.assertEqual(config.cooldown_max_multiplier, 16.0)
+        self.assertEqual(config.max_attempts_per_call, 3)
+        self.assertEqual(config.temperature, 0.7)
+        self.assertIsNone(config.max_tokens)
         self.assertEqual(config.roles, {})
 
     def test_model_capabilities_normalized_lowercase(self) -> None:
@@ -226,6 +300,37 @@ class ParseConfigTests(unittest.TestCase):
             "role 对象缺 model": json.dumps(
                 {"providers": [provider], "roles": {"planner": {"provider": "p"}}}
             ),
+            "role 对象 model 与 targets 并存": json.dumps(
+                {
+                    "providers": [provider],
+                    "roles": {"planner": {"model": "m", "targets": ["m"]}},
+                }
+            ),
+            "role 对象 targets 空数组": json.dumps(
+                {"providers": [provider], "roles": {"planner": {"targets": []}}}
+            ),
+            "role 对象 targets 与顶层 provider 并存": json.dumps(
+                {
+                    "providers": [provider],
+                    "roles": {"planner": {"targets": ["m"], "provider": "p"}},
+                }
+            ),
+            "role 对象 targets 内钉死未知服务商": json.dumps(
+                {
+                    "providers": [provider],
+                    "roles": {
+                        "planner": {
+                            "targets": [{"model": "m", "provider": "ghost"}]
+                        }
+                    },
+                }
+            ),
+            "role 温度为负": json.dumps(
+                {
+                    "providers": [provider],
+                    "roles": {"planner": {"model": "m", "temperature": -0.1}},
+                }
+            ),
             "role 空数组": json.dumps(
                 {"providers": [provider], "roles": {"planner": []}}
             ),
@@ -249,6 +354,21 @@ class ParseConfigTests(unittest.TestCase):
             ),
             "cooldown 非正数": json.dumps(
                 {"providers": [provider], "settings": {"cooldown_seconds": -1}}
+            ),
+            "settings 温度为负": json.dumps(
+                {"providers": [provider], "settings": {"temperature": -1}}
+            ),
+            "settings max_tokens 非正整数": json.dumps(
+                {"providers": [provider], "settings": {"max_tokens": 0}}
+            ),
+            "settings max_attempts_per_call 非正整数": json.dumps(
+                {"providers": [provider], "settings": {"max_attempts_per_call": 0}}
+            ),
+            "settings cooldown_max_multiplier 非正数": json.dumps(
+                {
+                    "providers": [provider],
+                    "settings": {"cooldown_max_multiplier": 0},
+                }
             ),
         }
         for label, raw in cases.items():
@@ -447,6 +567,42 @@ class RouterRoleResolutionTests(unittest.TestCase):
 
         self.assertEqual([e.spec for e in router.resolve("planner")], ["a/m1"])
         self.assertTrue(any("ghost" in w for w in warnings))
+
+    def test_role_temperature_follows_rule_lookup_chain(self) -> None:
+        """role 温度跟路由同一条规则查找链：精确命中 → default；实际用于
+        路由的那条规则没配温度 → None（settings 兜底在 llm.py 胶水层）。"""
+        endpoints = [_endpoint("a", "m1"), _endpoint("b", "m2")]
+        roles = {
+            "replyer": RoleRule(targets=(RoleTarget(model="m2"),), temperature=0.3),
+            "default": RoleRule(targets=(RoleTarget(model="m1"),), temperature=0.5),
+        }
+        router, _, _ = _router(endpoints, roles)
+
+        self.assertEqual(router.role_temperature("replyer"), 0.3)
+        self.assertEqual(router.role_temperature("planner"), 0.5)  # 回落 default
+
+    def test_role_temperature_none_when_unconfigured(self) -> None:
+        # 内置兜底规则不带温度
+        bare, _, _ = _router([_endpoint("a", "m")])
+        self.assertIsNone(bare.role_temperature("anything"))
+        # 精确命中但规则没配温度：不越过它去别的规则找
+        roles = {
+            "planner": RoleRule(targets=(RoleTarget(model="m"),)),
+            "default": RoleRule(targets=(RoleTarget(model="m"),), temperature=0.5),
+        }
+        router, _, _ = _router([_endpoint("a", "m")], roles)
+        self.assertIsNone(router.role_temperature("planner"))
+
+    def test_role_temperature_survives_unknown_target_pruning(self) -> None:
+        roles = {
+            "planner": RoleRule(
+                targets=(RoleTarget(model="ghost"), RoleTarget(model="m")),
+                temperature=0.1,
+            )
+        }
+        router, _, _ = _router([_endpoint("a", "m")], roles)
+
+        self.assertEqual(router.role_temperature("planner"), 0.1)
 
     def test_duplicate_endpoint_across_targets_deduped(self) -> None:
         endpoints = [_endpoint("a", "m"), _endpoint("b", "m")]
@@ -733,7 +889,12 @@ class RoutedChatModelTests(unittest.IsolatedAsyncioTestCase):
             await model.ainvoke(["msg"])
 
         self.assertEqual(untouched.calls, [])
-        self.assertEqual(events, [])  # 不计失败：无 call_failed 事件
+        # 不计失败（无 call_failed、不切下一个端点、不进冷却），但必须留一条
+        # 观测事件：调用方 wait_for 超时在这一层只表现为取消，不留痕就查不到
+        # 是哪个端点跑了多久被砍掉。
+        self.assertEqual([kind for kind, _ in events], ["call_cancelled"])
+        self.assertEqual(events[0][1]["endpoint"], "a/m")
+        self.assertIn("latency_ms", events[0][1])
         self.assertEqual(
             [e.spec for e in router.resolve(model="m")], ["a/m", "b/m"]
         )  # 也不进冷却

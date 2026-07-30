@@ -9,7 +9,8 @@ ChatOpenAI 客户端（streaming / stream_usage 探测 / max_tokens / timeout）
 ``MODEL_PROVIDERS_PATH`` 覆写；模板见 ``config/model_providers.example.json``，
 真实文件含 api_key、已被 .gitignore 排除）。三段：``providers``（服务商注册表：
 名称 / base_url / api_key / 持有的模型）+ ``roles``（用途 → 模型名，可选钉死
-服务商）+ ``settings``（全局策略缺省 random、冷却秒数）。调用方只给模型名即可，
+服务商、可配 per-role 温度）+ ``settings``（全局策略缺省 random、冷却秒数、
+全局采样缺省 temperature/max_tokens）。调用方只给模型名即可，
 路由器在持有该模型的服务商里按策略挑选。文件缺失或解析失败 → LLM 整体不可用
 （fail loudly：``create_llm`` 返回 None，各调用方按自己的降级语义处理），
 **绝不静默回落到别处的配置**。
@@ -20,15 +21,18 @@ LLM_BASE_URL``）。它当年是单服务商时代的向后兼容层，留着有
 二是它把那个唯一端点硬标成 ``capabilities={"vision"}``（"旧配置视为天然
 多模态"），于是配一个纯文本模型时，图片描述与表情包收藏会去调它然后失败——
 而 Planner/Replyer 去多模态化之后，"planner 用纯文本模型"恰恰成了常态配置。
-``LLM_TEMPERATURE / LLM_MAX_TOKENS`` 保留，它们是全局缺省、与服务商无关。
+
+2026-07-29 采样参数同样收拢：``LLM_TEMPERATURE / LLM_MAX_TOKENS`` 从 .env
+删除，改在 ``settings`` 段配 ``temperature`` / ``max_tokens``；per-role 温度
+（原散落在 replyer / image_description / meme_caption 的常量）改在 ``roles``
+里配。温度解析链：调用方显式传参（测试注入用）> role 规则的 ``temperature``
+> ``settings.temperature`` > 内置 0.7。.env 里不再有任何 LLM 键。
 
 配置在首次 ``create_llm()`` 时读取并缓存为进程级单例——冷却/熔断状态必须跨
 调用方（planner / replyer / vision / caption）共享；改配置需重启生效。
 """
 
 from typing import Any
-
-from pydantic_settings import BaseSettings
 
 from qqbot.core.llm_routing import (
     DEFAULT_ROLE,
@@ -39,30 +43,16 @@ from qqbot.core.llm_routing import (
     parse_config,
 )
 from qqbot.core.logging import get_logger
-from qqbot.core.settings import get_model_providers_path, get_settings_env_files
+from qqbot.core.settings import get_model_providers_path
 
 logger = get_logger(__name__)
-
-
-class LLMConfig(BaseSettings):
-    # 全局缺省，与服务商无关：调用方不显式传 temperature 时用 llm_temperature，
-    # 端点自身没配 max_tokens 时用 llm_max_tokens。服务商/模型/密钥/base_url
-    # 一律只从 config/model_providers.json 读（2026-07-28 起扁平键已删除）。
-    llm_temperature: float = 0.7
-    llm_max_tokens: int | None = None
-
-    class Config:
-        env_file = get_settings_env_files()
-        env_file_encoding = "utf-8"
-        case_sensitive = False
-        extra = "ignore"
 
 
 class _LLMRuntime:
     """配置 + 路由器 + ChatOpenAI 客户端缓存的进程级单例载体。"""
 
-    def __init__(self, config: LLMConfig, router: EndpointRouter) -> None:
-        self.config = config
+    def __init__(self, routing: RoutingConfig, router: EndpointRouter) -> None:
+        self.routing = routing
         self.router = router
         # (spec, temperature) → ChatOpenAI。端点数 x 少数几档温度，有界。
         self.clients: dict[tuple[str, float | None], Any] = {}
@@ -90,8 +80,6 @@ def _load_routing_config() -> RoutingConfig | None:
 
 
 def _build_runtime() -> _LLMRuntime | None:
-    config = LLMConfig()
-
     try:
         routing = _load_routing_config()
     except (OSError, ValueError) as exc:
@@ -122,6 +110,8 @@ def _build_runtime() -> _LLMRuntime | None:
         roles,
         default_strategy=default_strategy,
         cooldown_base_seconds=cooldown,
+        cooldown_max_multiplier=routing.cooldown_max_multiplier,
+        max_attempts_per_call=routing.max_attempts_per_call,
         on_warning=lambda message: logger.warning(f"[llm] {message}"),
     )
     logger.info(
@@ -135,9 +125,12 @@ def _build_runtime() -> _LLMRuntime | None:
             },
             "default_strategy": default_strategy,
             "cooldown_base_seconds": cooldown,
+            "max_attempts_per_call": routing.max_attempts_per_call,
+            "temperature": routing.temperature,
+            "max_tokens": routing.max_tokens,
         },
     )
-    return _LLMRuntime(config, router)
+    return _LLMRuntime(routing, router)
 
 
 def _get_runtime() -> _LLMRuntime | None:
@@ -187,7 +180,7 @@ def _chat_client_for(
     max_tokens = (
         endpoint.max_tokens
         if endpoint.max_tokens is not None
-        else runtime.config.llm_max_tokens
+        else runtime.routing.max_tokens
     )
     if max_tokens is not None:
         llm_kwargs["max_tokens"] = max_tokens
@@ -215,6 +208,15 @@ def _log_route_event(kind: str, **info: Any) -> None:
     if kind == "call_ok":
         logger.info(
             "[llm] call ok endpoint={} role={} latency_ms={}".format(
+                info.get("endpoint"), info.get("role"), info.get("latency_ms")
+            )
+        )
+    elif kind == "call_cancelled":
+        # 取消（绝大多数是调用方 wait_for 超时，少数是停机）不计端点失败、不
+        # 进冷却，但必须留痕：否则被砍掉的慢调用在 [llm] 日志里完全不存在，
+        # 按 latency_ms 做的延迟统计就只剩幸存者。
+        logger.warning(
+            "[llm] call cancelled endpoint={} role={} latency_ms={}".format(
                 info.get("endpoint"), info.get("role"), info.get("latency_ms")
             )
         )
@@ -253,6 +255,10 @@ async def create_llm(
     已有 None 分支）。``require`` 是能力硬要求（如 caption 传
     ("vision",)）；显式配置的 role 候选不满足时警告放行，其余入口严格
     过滤（见 llm_routing 文档）。
+
+    温度解析链（2026-07-29 收拢）：``temperature`` 显式传参（测试注入用，
+    生产调用点不传）> role 规则配置的 ``temperature``（走 role 路由时）>
+    ``settings.temperature`` 全局缺省。
     """
     runtime = _get_runtime()
     if runtime is None:
@@ -273,7 +279,11 @@ async def create_llm(
         )
         return None
 
-    temp = temperature if temperature is not None else runtime.config.llm_temperature
+    temp = temperature
+    if temp is None and model is None:
+        temp = runtime.router.role_temperature(role)
+    if temp is None:
+        temp = runtime.routing.temperature
     return RoutedChatModel(
         runtime.router,
         client_factory=lambda endpoint, t: _chat_client_for(runtime, endpoint, t),

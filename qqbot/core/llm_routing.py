@@ -7,8 +7,9 @@
 
 - ``parse_config``：解析 ``config/model_providers.json`` 配置文档（格式见
   `config/model_providers.example.json` 与 `开发文档/v2.0/20-横切契约/LLM路由契约.md`）：
-  ``providers``（服务商注册表）+ ``roles``（用途 → 模型名）+ ``settings``
-  （全局策略/冷却）。
+  ``providers``（服务商注册表）+ ``roles``（用途 → 模型名，可带 per-role
+  ``temperature``）+ ``settings``（全局策略/冷却/采样缺省——2026-07-29 起
+  ``temperature``/``max_tokens`` 全局缺省也在这里配，.env 不再有 LLM 键）。
 - ``EndpointRouter``：模型名索引 + role 解析 + 三策略（random /
   primary_failover / round_robin）+ 被动熔断（失败进冷却、连续失败指数
   退避、成功清零；不做主动探活）。
@@ -54,6 +55,10 @@ COOLDOWN_MAX_MULTIPLIER = 16.0
 # 单次 ainvoke 至多尝试的端点数：防止主端点"慢失败"时把整条候选链的
 # 延迟全叠上去（快失败场景 3 个已足够覆盖双备份）。
 DEFAULT_MAX_ATTEMPTS_PER_CALL = 3
+# 全局采样温度缺省（2026-07-29 自 .env 的 LLM_TEMPERATURE 收拢进
+# settings.temperature；解析链见 llm.create_llm：显式传参 > role 配置 >
+# settings.temperature > 本缺省）。
+DEFAULT_TEMPERATURE = 0.7
 
 
 @dataclass(frozen=True)
@@ -84,16 +89,19 @@ class RoleTarget:
 
 @dataclass(frozen=True)
 class RoleRule:
-    """一个用途（role）的路由规则：目标序列 + 策略覆写 + 能力硬要求。
+    """一个用途（role）的路由规则：目标序列 + 策略覆写 + 能力硬要求 + 采样温度。
 
     ``targets`` 是优先级递减的回退链：先在 targets[0] 的服务商里选，
     全部不可用才轮到 targets[1]，以此类推。``strategy=None`` 表示用
-    Router 的全局缺省策略。
+    Router 的全局缺省策略。``temperature=None`` 表示未配置，由调用侧
+    回落到 settings 全局缺省——per-role 温度是配置的一部分，不再散落
+    在各调用点的常量里（2026-07-29 收拢）。
     """
 
     targets: tuple[RoleTarget, ...]
     strategy: str | None = None
     require: frozenset[str] = frozenset()
+    temperature: float | None = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +112,13 @@ class RoutingConfig:
     roles: dict[str, RoleRule]
     default_strategy: str = DEFAULT_STRATEGY
     cooldown_seconds: float = DEFAULT_COOLDOWN_BASE_SECONDS
+    cooldown_max_multiplier: float = COOLDOWN_MAX_MULTIPLIER
+    max_attempts_per_call: int = DEFAULT_MAX_ATTEMPTS_PER_CALL
+    # 全局采样缺省（原 .env 的 LLM_TEMPERATURE / LLM_MAX_TOKENS）：
+    # temperature 是调用方与 role 都没配温度时的兜底；max_tokens 是端点
+    # 自身没配 max_tokens 时的兜底（None = 不限制）。
+    temperature: float = DEFAULT_TEMPERATURE
+    max_tokens: int | None = None
 
 
 # ────────────────────────── 配置解析 ──────────────────────────
@@ -143,6 +158,18 @@ def _optional_positive_number(
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
         raise ValueError(f"{ctx}.{key} 必须是正数")
+    return float(value)
+
+
+def _optional_non_negative_number(
+    obj: Mapping[str, Any], key: str, ctx: str
+) -> float | None:
+    """温度专用：0 是合法采样温度，不能复用「正数」校验。"""
+    value = obj.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise ValueError(f"{ctx}.{key} 必须是非负数")
     return float(value)
 
 
@@ -269,9 +296,10 @@ def _parse_roles_value(value: Any) -> dict[str, RoleRule]:
             rule = RoleRule(targets=(_parse_role_target(entry, ctx),))
         elif isinstance(entry, dict):
             rule = RoleRule(
-                targets=(_parse_role_target(entry, ctx),),
+                targets=_parse_role_object_targets(entry, ctx),
                 strategy=_optional_strategy(entry, "strategy", ctx),
                 require=_parse_capabilities(entry.get("require"), ctx),
+                temperature=_optional_non_negative_number(entry, "temperature", ctx),
             )
         elif isinstance(entry, list):
             if not entry:
@@ -286,6 +314,35 @@ def _parse_roles_value(value: Any) -> dict[str, RoleRule]:
             raise ValueError(f"{ctx} 必须是字符串、对象或数组")
         roles[role.strip()] = rule
     return roles
+
+
+def _parse_role_object_targets(
+    entry: Mapping[str, Any], ctx: str
+) -> tuple[RoleTarget, ...]:
+    """role 对象形态的目标：单目标 ``model``(+``provider``) 或多目标 ``targets``。
+
+    ``targets`` 让「回退链 + strategy/require/temperature 覆写」可以同时表达
+    ——纯数组形态带不了覆写字段，此前这个组合（契约推荐的 vision 配法）
+    根本写不出来（2026-07-29 修复，example.json 一直按此形态写但解析不过）。
+    """
+    has_model = "model" in entry
+    has_targets = "targets" in entry
+    if has_model and has_targets:
+        raise ValueError(f"{ctx} 的 model 与 targets 互斥，只能配一个")
+    if not has_targets:
+        return (_parse_role_target(entry, ctx),)  # 缺 model 时在这里报错
+    if "provider" in entry:
+        raise ValueError(
+            f"{ctx}.provider 只能与 model 搭配"
+            "（targets 元素内用 {model, provider} 钉死）"
+        )
+    targets = entry["targets"]
+    if not isinstance(targets, list) or not targets:
+        raise ValueError(f"{ctx}.targets 必须是非空数组")
+    return tuple(
+        _parse_role_target(item, f"{ctx}.targets[{i}]")
+        for i, item in enumerate(targets)
+    )
 
 
 def parse_config(raw: str) -> RoutingConfig:
@@ -327,12 +384,28 @@ def parse_config(raw: str) -> RoutingConfig:
         _optional_positive_number(settings, "cooldown_seconds", "settings")
         or DEFAULT_COOLDOWN_BASE_SECONDS
     )
+    cooldown_cap = (
+        _optional_positive_number(settings, "cooldown_max_multiplier", "settings")
+        or COOLDOWN_MAX_MULTIPLIER
+    )
+    max_attempts = (
+        _optional_positive_int(settings, "max_attempts_per_call", "settings")
+        or DEFAULT_MAX_ATTEMPTS_PER_CALL
+    )
+    temperature = _optional_non_negative_number(settings, "temperature", "settings")
+    if temperature is None:  # 0 是合法温度，不能用 or 链
+        temperature = DEFAULT_TEMPERATURE
+    max_tokens = _optional_positive_int(settings, "max_tokens", "settings")
 
     return RoutingConfig(
         endpoints=endpoints,
         roles=roles,
         default_strategy=strategy,
         cooldown_seconds=cooldown,
+        cooldown_max_multiplier=cooldown_cap,
+        max_attempts_per_call=max_attempts,
+        temperature=temperature,
+        max_tokens=max_tokens,
     )
 
 
@@ -438,7 +511,10 @@ class EndpointRouter:
             if not kept:
                 self._warn(f"role {role!r} 剔除未知目标后没有任何候选")
             self._roles[role] = RoleRule(
-                targets=tuple(kept), strategy=rule.strategy, require=rule.require
+                targets=tuple(kept),
+                strategy=rule.strategy,
+                require=rule.require,
+                temperature=rule.temperature,
             )
 
         self._default_strategy = default_strategy
@@ -466,6 +542,14 @@ class EndpointRouter:
     ) -> bool:
         groups, _ = self._target_groups(role, model, provider, require)
         return any(groups)
+
+    def role_temperature(self, role: str) -> float | None:
+        """按 role 解析配置温度：跟路由同一条规则查找链（精确命中 →
+        ``"default"`` → 内置兜底），返回**实际用于路由的那条规则**上配的
+        温度；规则没配温度返回 None，由调用侧回落 settings 全局缺省。
+        无副作用。"""
+        rule, _ = self._rule_for(role)
+        return rule.temperature
 
     def primary_model_name(
         self,
@@ -649,7 +733,10 @@ class RoutedChatModel:
 
     ``asyncio.CancelledError`` 立即透传且不计失败：取消不是端点的错；
     外层 ``asyncio.wait_for`` 的超时预算覆盖的是整条切换链（Replyer 的
-    12s 内切不完就整体超时，不会偷偷延长）。
+    单次上限内切不完就整体超时，不会偷偷延长）。透传前发一条
+    ``call_cancelled`` 观测事件——调用方的超时在这一层只表现为取消，不留痕
+    就没有任何地方记得下"是哪个端点、跑了多久被砍掉"，延迟统计里也只剩下
+    活着回来的那些（2026-07-29 排查 Replyer 超时时正是卡在这里）。
 
     ``model_name`` 是 best-effort 观测标注（prompt 快照 / 日志用）：
     有过成功调用后是最近一次实际使用的模型，否则是首选端点的模型。
@@ -718,6 +805,12 @@ class RoutedChatModel:
                 client = self._client_factory(endpoint, self._temperature)
                 result = await client.ainvoke(messages, **kwargs)
             except asyncio.CancelledError:
+                self._emit(
+                    "call_cancelled",
+                    endpoint=endpoint.spec,
+                    role=self._role,
+                    latency_ms=self._elapsed_ms(started),
+                )
                 raise
             except Exception as exc:
                 cooldown = self._router.mark_failure(endpoint.spec)

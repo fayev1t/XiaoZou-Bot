@@ -73,18 +73,19 @@ class EnvCentralizationContractTests(unittest.TestCase):
 
         # 扁平 LLM 服务商配置已于 2026-07-28 删除：两个真相源会让"改了 .env
         # 不生效"要靠记优先级才能解释，且那条路径把唯一端点硬标成 vision，
-        # 与 planner/replyer 改用纯文本模型直接冲突。防回潮。
+        # 与 planner/replyer 改用纯文本模型直接冲突。2026-07-29 全局采样缺省
+        # （LLM_TEMPERATURE / LLM_MAX_TOKENS）也收进 model_providers.json 的
+        # settings 段——.env 里不再有任何 LLM 键。防回潮。
         for retired in (
             "LLM_PROVIDER=",
             "LLM_API_KEY=",
             "LLM_MODEL=",
             "LLM_BASE_URL=",
+            "LLM_TEMPERATURE=",
+            "LLM_MAX_TOKENS=",
         ):
             with self.subTest(retired=retired):
                 self.assertNotIn(retired, env_example)
-        # 全局缺省两项保留（与服务商无关）
-        self.assertIn("LLM_TEMPERATURE=", env_example)
-        self.assertIn("LLM_MAX_TOKENS=", env_example)
 
         # websearch 的 SearXNG + Crawl4AI 容器方案已下线（2026-07-18 Tavily
         # 化），env 模板不应再出现两者的配置（防回潮，同 sqlite 断言风格）。

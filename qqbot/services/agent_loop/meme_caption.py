@@ -50,10 +50,6 @@ def _load_caption_prompt() -> str:
 
     return render_system_prompt("caption")
 
-# caption 用低温：同一张图的描述应当稳定，不需要发散。
-_CAPTION_TEMPERATURE = 0.2
-
-
 class CaptionError(RuntimeError):
     """caption 生成失败（LLM 未配置 / 调用异常 / 空输出）。"""
 
@@ -75,9 +71,9 @@ async def caption_image(
             f"caption image conversion failed: {type(exc).__name__}: {exc}"
         ) from exc
 
-    llm = await create_llm(
-        temperature=_CAPTION_TEMPERATURE, role="caption", require=("vision",)
-    )
+    # 温度在 roles.caption.temperature 配（建议低温 0.2：同一张图的描述应当
+    # 稳定，不需要发散），见 LLM 路由契约 §2。
+    llm = await create_llm(role="caption", require=("vision",))
     if llm is None:
         raise CaptionError(
             "caption LLM not configured "

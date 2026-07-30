@@ -31,7 +31,10 @@
   ],
   "roles": {
     "planner": "deepseek-chat",
-    "replyer": "deepseek-chat",
+    "replyer": {
+      "model": "deepseek-chat",
+      "temperature": 0.3
+    },
     "vision": {
       "targets": [
         "gpt-4o",
@@ -40,14 +43,20 @@
       "strategy": "round_robin",
       "require": [
         "vision"
-      ]
+      ],
+      "temperature": 0.2
     },
-    "caption": "gpt-4o",
+    "caption": {
+      "model": "gpt-4o",
+      "temperature": 0.2
+    },
     "memory": "deepseek-chat",
     "default": "deepseek-chat"
   },
   "settings": {
     "strategy": "random",
-    "cooldown_seconds": 60
+    "cooldown_seconds": 60,
+    "temperature": 0.7,
+    "max_tokens": 500
   }
 }
