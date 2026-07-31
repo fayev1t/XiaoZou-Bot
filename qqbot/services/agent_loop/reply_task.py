@@ -3,17 +3,32 @@
 ReplyTask 是 scope 内唯一、最长只存活几十秒的待发聚合，不使用读模型表。
 
 2026-07-24（待办#19）起**内容不再合并**：每次 upsert 事件记录的是那一次调用
-自己的授权原文（analysis / verbatim_messages），不是与历史的合并态。
+自己的授权原文（analysis），不是与历史的合并态。
 
 2026-07-25 的补强把“完整、自足”落实为明确的 **latest-revision-wins**：
 折叠出的 ``ReplyTaskState`` 同时携带最新一条 upsert 的调度字段与完整
-``analysis``。
-旧 revision 仍留在 append-only 事件流供审计与 Planner 回看，但不再由 Replyer
-做“未冲突部分继续生效”的隐式语义合并。把当前 analysis 放在折叠态还有一个运行时
-必要性：Replyer 不能依赖通用 timeline 上的 tool-call 行——``hold_seconds=0`` 时
-对应 ``agent.tool_result`` 可能尚未落库，活跃群里该行也可能被窗口裁掉。
-``verbatim_messages`` 同理是执行器真正要照着发送的最新内容。cancel/claim/flush
-把状态推进到非 open。
+``analysis``。旧 revision 仍留在 append-only 事件流供审计与 Planner 回看。
+
+**2026-07-31 删除 Replyer 后的状态机**（重构提案-删除Replyer.md §1）：
+
+    open ──flush_at 到达──→ completed        （runtime.reply_task_completed）
+      └──reply(action="cancel")──→ cancelled  （agent.reply_task_cancelled）
+
+只有这三个状态；completed / cancelled 都是 terminal。到点由 ReplyExecutor
+写一条 ``runtime.reply_task_completed``（携带完整 analysis）并立即唤醒
+Planner——发不发、发什么由 Planner 那一拍自己决定（``send_messages`` 工具），
+ReplyTask 的生命周期到完成事件为止。新链路**不再写** ``runtime.reply_flush_
+claimed`` / ``reply_flushed``（发送事实活在 ``send_messages`` 的 tool
+terminal 里）；升级前的旧 claim/flush 事件仍被识别，只用于把升级前的任务
+折成历史 terminal。
+
+折叠对过期完成事件的拒绝规则（§1.5，写入侧之外的第二道防线）：更低
+revision 的 completed 不折（已有更新的 upsert 在场）；已 cancelled 的任务
+不被迟到的 completed 复活。
+
+2026-07-30 删除 ``mode`` 与 ``verbatim_messages``：逐字直发（``action=
+"verbatim"``）整条下线后留下的两个键在折叠时被直接忽略；旧 verbatim 事件的
+``analysis`` 恒为空串。
 """
 
 from __future__ import annotations
@@ -57,9 +72,7 @@ class ReplyTaskState:
     updated_at: datetime
     flush_at: datetime
     hard_deadline: datetime
-    mode: str
     analysis: str
-    verbatim_messages: list[dict]
     latest_event_id: str
     source_tool_call_event_id: str | None
     correlation_id: str | None
@@ -146,6 +159,26 @@ async def find_cancel_for_tool_call(
     return dict(row.payload or {}) if row is not None else None
 
 
+async def find_completed_for_upsert(
+    session_factory: SessionFactory,
+    upsert_event_id: str,
+) -> str | None:
+    """按去重键（type + causation_id=该 revision 的 upsert）查既有完成事件。
+
+    并发定时器回调 / 重启 rescan 重入时，同一个最新 revision 只允许产生一条
+    ``runtime.reply_task_completed``；已存在则返回既有 event_id，调用方不再写。
+    """
+    stmt = (
+        select(AgentEvent.event_id)
+        .where(AgentEvent.type == "runtime.reply_task_completed")
+        .where(AgentEvent.causation_id == upsert_event_id)
+        .limit(1)
+    )
+    async with session_factory() as session:
+        row = (await session.execute(stmt)).scalars().first()
+    return row
+
+
 async def append_upsert(
     session_factory: SessionFactory,
     *,
@@ -194,15 +227,15 @@ def build_upsert_payload(
     updated_at: datetime,
     flush_at: datetime,
     hard_deadline: datetime,
-    mode: str,
     analysis: str,
-    verbatim_messages: list[dict],
 ) -> dict:
-    """一次授权的领域事件 payload。
+    """一次追加的领域事件 payload。
 
-    ``analysis`` 是 compose 授权的对话分析交接（verbatim 恒为空串）。每次事件
-    仍原样留档；折叠态只取最新 revision 的完整 analysis，作为 Replyer 不受
-    timeline 终态竞态与窗口裁剪影响的当前授权。
+    ``analysis`` 是 Planner 对局势的解析备忘（谁对谁说话、话题线、决定性时
+    序、待解决内容、已核实事实与存疑处），**不是**最终可见文案。每次事件原样
+    留档；折叠态只取最新 revision 的完整 analysis，到点后随
+    ``runtime.reply_task_completed`` 自包含地回到时间线——Planner 不必从旧
+    tool-call 行里猜哪次 revision 才是当前事实。
     """
     return {
         "reply_task_id": reply_task_id,
@@ -212,9 +245,7 @@ def build_upsert_payload(
         "updated_at": updated_at.isoformat(),
         "flush_at": flush_at.isoformat(),
         "hard_deadline": hard_deadline.isoformat(),
-        "mode": mode,
         "analysis": analysis,
-        "verbatim_messages": verbatim_messages,
     }
 
 
@@ -231,6 +262,9 @@ def build_upsert_payload(
 _REPLY_EVENT_TYPES = (
     "agent.reply_task_upserted",
     "agent.reply_task_cancelled",
+    "runtime.reply_task_completed",
+    # 升级兼容：旧链路的 claim/flush 只用于把升级前的任务折成历史 terminal，
+    # 新链路不再写它们（发送事实活在 send_messages 的 tool terminal 里）。
     "runtime.reply_flush_claimed",
     "runtime.reply_flushed",
 )
@@ -284,12 +318,11 @@ def _fold_rows(rows: Any) -> dict[str, ReplyTaskState]:
                 hard_deadline=_parse_dt(
                     payload.get("hard_deadline"), row.occurred_at
                 ),
-                mode=str(payload.get("mode") or "compose"),
                 # 领域事件正常只可能来自 ReplyTool 的严格校验；若旧库/损坏事件
-                # 仍塞入非字符串，折成空授权让 Replyer fail loudly，绝不能把
-                # list/dict 的 repr 当成一份可发送授权。
+                # 仍塞入非字符串，折成空 analysis——绝不能把 list/dict 的 repr
+                # 当成一份对话解析。旧 verbatim 事件的 analysis 恒为空串
+                # （2026-07-30）。
                 analysis=raw_analysis if isinstance(raw_analysis, str) else "",
-                verbatim_messages=list(payload.get("verbatim_messages") or []),
                 latest_event_id=row.event_id,
                 source_tool_call_event_id=row.causation_id,
                 correlation_id=row.correlation_id,
@@ -297,6 +330,19 @@ def _fold_rows(rows: Any) -> dict[str, ReplyTaskState]:
             continue
         task = tasks.get(task_id)
         if task is None:
+            continue
+        if row.type == "runtime.reply_task_completed":
+            # 过期完成事件拒绝（§1.5）：更低 revision 的 completed 说明它输给
+            # 了并发追加的新 upsert，不折；cancelled 是 terminal，迟到的
+            # completed 不复活它。
+            revision = payload.get("revision")
+            if isinstance(revision, int) and revision != task.revision:
+                continue
+            if task.state == "cancelled":
+                continue
+            tasks[task_id] = ReplyTaskState(
+                **{**task.__dict__, "state": "completed"}
+            )
             continue
         state = {
             "agent.reply_task_cancelled": "cancelled",

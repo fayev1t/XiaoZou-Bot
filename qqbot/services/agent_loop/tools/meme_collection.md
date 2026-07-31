@@ -1,15 +1,14 @@
 # Tool: meme_collection
 
 `meme_collection` curates the shared saved-meme collection. **It never sends
-anything, and there is no send action to look for.** When a `reply_task` is
-flushed, the reply composer sees `<saved-memes>` and decides on its own whether
-the reply should carry one saved meme, which one fits, and where it belongs
-among the text messages.
+anything, and there is no send action to look for.** Sending happens only in
+`send_messages`: when you compose a reply there, `<saved-memes>` is your menu,
+and one bubble may carry one saved meme by its hash.
 
-So what this tool controls is not *whether a meme gets sent* — it is **what the
-composer will have to choose from**. An image that never gets saved can never be
-used later; a collection that is thin, stale, or badly described is what makes
-replies fall flat. Curating it is the point.
+So what this tool controls is not *whether a meme gets sent* — it is **what
+there will be to choose from at that moment**. An image that never gets saved
+can never be used later; a collection that is thin, stale, or badly described
+is what makes replies fall flat. Curating it is the point.
 
 ## When to save
 
@@ -49,10 +48,11 @@ Collect an image already present in the timeline. The system reads the image
 and writes its searchable Chinese description. Use `context_note` only when
 conversation context materially changes the image's meaning.
 
-That description is the **only** thing the composer sees when choosing later —
-the pixels are not attached to it. Hence you do not write it yourself, and hence
-`context_note` earns its place whenever the image's meaning in this group is not
-on its face (whose reaction face it is, what running joke it belongs to).
+That description is the **only** thing visible when choosing from
+`<saved-memes>` later — the pixels are not attached to it. Hence you do not
+write it yourself, and hence `context_note` earns its place whenever the
+image's meaning in this group is not on its face (whose reaction face it is,
+what running joke it belongs to).
 
 ### `delete`
 
@@ -70,9 +70,9 @@ is the only way to fix it.
 
 ## Speaking boundary
 
-Do not look for a meme-send action and do not choose a send hash. You cannot
-send an image from here, and picking one is not your call. Do not steer a
-particular reply toward or away from memes through `reply.analysis` either:
-that field is only for people/topic/time/content analysis. The composer reads
-the latest timeline, its voice card and the collection, then independently
-decides whether a meme is the natural reply when the task flushes.
+Do not look for a meme-send action here. This tool only curates; the moment a
+meme actually goes out is a `send_messages` call, chosen against the latest
+timeline. Do not steer future replies toward or away from memes through
+`reply.analysis` either: that field is only for people/topic/time/content
+analysis — whether a meme is the natural reply is decided at sending time,
+with the collection in front of you, not committed in advance.

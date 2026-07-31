@@ -47,6 +47,7 @@ from qqbot.services.agent_loop.tools.respond_to_group_join_request import (
     RespondToGroupJoinRequestTool,
 )
 from qqbot.services.agent_loop.tools.search_history import SearchHistoryTool
+from qqbot.services.agent_loop.tools.send_messages import SendMessagesTool
 from qqbot.services.agent_loop.tools.set_admin import SetAdminTool
 from qqbot.services.agent_loop.tools.set_card import SetCardTool
 from qqbot.services.agent_loop.tools.set_essence import SetEssenceTool
@@ -72,11 +73,16 @@ def build_default_registry() -> ToolRegistry:
     # AgentLoop 在当前拍 await 并原子写 called + task 事件 + terminal；create
     # 结果里的 task_ref 可供同拍后续 call_tool 解析。
     registry.register(TaskTool())
-    # reply：唯一发言入口。2026-07-28 参数收敛成 analysis + hold_seconds，撤稿与
-    # 逐字直发留在 action 分支里——曾评估拆成三个工具，因每个工具都要占一条
-    # catalog 条目 + 整段 usage 文档，会把"Replyer 挂了才走"的 verbatim 逃生
-    # 路径抬到与日常发言同等显著，故否决（见 reply.py docstring）。
+    # reply：发言的第一步——保存对局势的解析并启动等待。2026-07-28 参数收敛成
+    # analysis + hold_seconds；撤稿留在 action 分支里（曾评估拆成独立工具，因
+    # 每个工具都要占一条 catalog 条目 + 整段 usage 文档而否决）。
     registry.register(ReplyTool())
+    # send_messages：发言的第二步（2026-07-31 删除 Replyer）——等待到点、
+    # runtime.reply_task_completed 唤醒后，Planner 用它把最终措辞真正发出去。
+    # 普通 worker 工具：始终可调（"完成事件之后才发言"是提示词纪律，不是
+    # 权限），发送事实与时间线记录 = 它自己的 tool terminal receipts（调用行
+    # 即发言记录，不派生 <my-reply>），见 send_messages.py docstring。
+    registry.register(SendMessagesTool())
     # wait：模型的时间自主权（自我延迟唤醒），2026-07-02 新增。
     registry.register(WaitTool())
     # 入群申请审批（2026-07-03 拆分自已删除的 respond_to_request）：group.add
@@ -170,6 +176,7 @@ __all__ = [
     "RespondToGroupJoinRequestTool",
     "SearchHistoryTool",
     "ReplyTool",
+    "SendMessagesTool",
     "SetAdminTool",
     "SetCardTool",
     "SetEssenceTool",

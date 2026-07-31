@@ -1,9 +1,13 @@
 # Tool: reply
 
-`reply` is the only ordinary chat-speaking entry point. Each call appends **one
-self-contained authorization** to the current scope's short-lived draft; a
-successful result means **pending**, not sent. Only a later
-`<my-reply status="sent|partial">` records words/images that really reached QQ.
+`reply` is step one of speaking: it stores your resolved analysis of the
+situation and starts a wait. Each call appends **one self-contained
+revision** to the current scope's short-lived draft; a successful result
+means **waiting**, not sent. When the wait ends, the analysis returns to the
+timeline as `<reply-task-completed>` and wakes you — that tick you re-read
+the latest timeline and either stay silent, investigate first, or put the
+final wording into `send_messages`; only that call's per-bubble receipts
+record words/images that really reached QQ.
 
 Ordinary speech is two arguments and nothing else:
 
@@ -17,21 +21,25 @@ Ordinary speech is two arguments and nothing else:
 **Every call stands alone.** You never pass a task id, never copy a revision,
 and nothing you wrote before is merged into what you write now. Hand over the
 complete analysis *as of this tick*, and how long to hold it. When you call
-again on a later tick, that new call is the complete replacement authorization:
-repeat anything that must remain and omit anything you are withdrawing.
+again on a later tick, that new call is the complete replacement: repeat
+anything that must remain and omit anything you are withdrawing.
 
 There is no `upsert` — appending is what happens when you don't say otherwise.
-`action` exists only for the two rare branches at the bottom of this page.
+`action` exists only for the one rare branch at the bottom of this page.
 
-## `analysis` — resolve the conversation before handoff
+This call carries no message text. Wording that has to land exactly still
+gets described in `analysis`; you will write the actual words later, in
+`send_messages`, with the freshest timeline in front of you.
+
+## `analysis` — resolve the conversation for your later self
 
 Free text. No fixed shape, no field list, no length target — one line when one
 line is all there is, several sentences when the situation is tangled.
 
-Write the resolved map of the situation, which the Replyer should not have to
-derive again. It sees the same raw timeline, but you must
-synthesize the tangled logic instead of merely pointing it back at those rows.
-Include whichever of these dimensions actually matter:
+Write the resolved map of the situation, which your later tick should not
+have to derive again. It will see the same raw timeline, but you must
+synthesize the tangled logic now instead of pointing your future self back at
+those rows. Include whichever of these dimensions actually matter:
 
 - who is speaking to, quoting or @-ing whom; mention a social relationship only
   when the timeline or memory actually supports it
@@ -44,29 +52,19 @@ Include whichever of these dimensions actually matter:
 - verified facts and tool results that must stay exact, uncertainty that must
   remain uncertain, and unrelated/already-settled threads to leave alone
 
-This is a concise handoff, not raw transcript duplication or step-by-step private
-reasoning. But do include the conclusions of your content analysis even when the
-underlying messages are visible; the whole point is that the Replyer should not
-have to reconstruct the group-chat topology and chronology itself.
+This is a concise memo, not raw transcript duplication. It is analysis, not a
+draft of the reply: conclusions like “the claim is false; the verified value
+is X” belong here; the sentence you will actually type does not — by the time
+you send, the chat may have moved and the wording should be chosen then.
 
-The expressive boundary is hard. Never prescribe **tone, emotion, persona,
-conversational posture, warmth, bluntness, humor, wording, length, bubble count,
-quote/@ style, meme use, opening or ending shape**. Do not write “say it
-teasingly”, “be apologetic”, “one sharp sentence”, “use a meme”, or equivalent
-instructions. The Replyer owns all of those through its own voice card. A
-logical content conclusion such as “the claim is false; the verified value is
-X” belongs here; a performance instruction for how to deliver that conclusion
-does not.
-
-There is no dedicated message-id field. The Replyer copies real ids off the
-timeline itself. If you need to pin down exactly which message is being
-answered, name it in the analysis — `待回答的是 MSG_42`.
+There is no dedicated message-id field. If you need to pin down exactly which
+message is being answered, name it in the analysis — `待回答的是 MSG_42`.
 
 ## `hold_seconds` — how long to hold it
 
-**Required; there is no default.** It is the wait before the draft is composed
-and sent, and the **newest call replaces it outright** — later or earlier, your
-call.
+**Required; there is no default.** It is the wait before the draft completes
+and comes back to you, and the **newest call replaces it outright** — later or
+earlier, your call.
 
 You are choosing it from what the tail of the timeline looks like:
 
@@ -79,42 +77,38 @@ You are choosing it from what the tail of the timeline looks like:
 
 These are starting points, not rules; pick what the moment actually calls for.
 Maximum is 90, and the draft's hard deadline is fixed 90s from when it was first
-created — holding again never pushes that back.
+created — holding again never pushes that back. The deadline bounds the
+**wait**, not the send: when it forces completion you are woken to decide,
+nothing goes out by itself.
 
 To work out where you stand, subtract what you can already see:
 `<current now>` minus the `when=` of the `<time>` block holding that row is how long you have been holding;
 `<result>.flush_at` minus `<current now>` is how long is left.
 
-## What happens to several authorizations
+## What happens to several revisions
 
 The scope holds one pending draft. Your calls remain visible as
-`<tool-call name="reply">` history in the timeline, while the current draft
-folds to the newest complete analysis for the Replyer.
+`<tool-call name="reply">` history in the timeline, while the draft folds to
+the newest complete analysis — that folded version is what
+`<reply-task-completed>` will carry.
 
 - **The newest row replaces every older row outright.** Changed your read of the
   situation, corrected a fact, decided a thread should not be answered after all?
-  Write the complete desired authorization in a new call. Nothing omitted from
-  it remains authorized merely because an older row mentioned it.
-- Older rows are history for you; the Replyer never merges them as patches.
+  Write the complete desired analysis in a new call. Nothing omitted from
+  it remains in force merely because an older row mentioned it.
+- Older rows are history; nothing merges them as patches.
 - To abandon the whole draft, `action="cancel"`.
-- Don't re-authorize with nothing new to add. A tick that starts is not a reason
+- Don't re-append with nothing new to add. A tick that starts is not a reason
   to call again.
 
-## Presentation belongs entirely to the Replyer
+## After the wait
 
-Words versus a saved meme, one bubble or three, quote versus plain text, and how
-the reply emotionally lands are all the Replyer's decisions. Do not encode a
-preference for any of them in `analysis`, and never put a meme hash in this
-call. Your responsibility ends after the people/topic/time/content logic is
-resolved accurately. The Replyer reads the latest timeline, its own voice card
-and `<saved-memes>` to choose the natural visible form.
-
-One flush emits at most 4 bubbles (at most one of them a meme). Output the user
-explicitly wants should be represented completely in the authorization and fit
-within that delivery envelope. A successful `reply` tool result completes your
-speaking action; do not keep a task open merely to wait for `<my-reply>`. The
-later `<my-reply>` row is delivery history and may arrive as new evidence, not
-the completion condition of the tool call.
+`<reply-task-completed>` says the wait is over — nothing more. It is not an
+order to speak: silence is a normal ending, and needs no cancel or any other
+call. If you do speak, one `send_messages` call holds the complete utterance
+(up to 4 bubbles, at most one meme); a successful `reply` earlier does not
+oblige you to. Do not keep a task open merely to wait for the completion row
+— the wake is automatic.
 
 ## `action="cancel"` — drop the draft
 
@@ -126,54 +120,24 @@ Nothing else needed: there is at most one pending draft per scope. Pass
 `reply_task_id` only to assert *which* draft you mean; if it doesn't match the
 open one the call fails instead of silently cancelling a different draft.
 
-Use it only when the reply should not happen at all — the moment passed, someone
-else answered it, you misread who was being addressed, or a
-`<system-hint kind="reply_task_overdue">` points at a draft no longer worth
-sending. **To change what gets said, don't cancel — just call `reply` again**;
-the newest complete authorization replaces the old one. Cancel is only for
-deciding that the draft should not be sent at all.
-
-## `action="verbatim"` — exact bytes, no Replyer
-
-```json
-{
-  "action": "verbatim",
-  "messages": [
-    {"content": [{"type": "text", "data": {"text": "exact text"}}]}
-  ]
-}
-```
-
-This bypasses the Replyer completely, so **you** are writing the account's
-visible words — voice, length, punctuation, all of it lands exactly as typed.
-1-4 messages sent in order, strict OneBot v11 segments only (`text` / `at` /
-`reply` / `face`, every field inside `data`, at most one `reply` segment and it
-must come first).
-
-Two narrow cases, and no others: wording that must land
-character-for-character (echoing an id or a command someone must retype, a fixed
-notice), or the escape hatch when repeated `<my-reply status="failed">` shows the
-Replyer itself is broken. Ordinary conversation written by hand comes out
-flatter and more assistant-shaped than the account is supposed to sound, and you
-lose the Replyer's read of everything that arrived after you decided what to say.
-
-`hold_seconds` is optional here and defaults to 0 — holding exists so the
-Replyer can fold in what arrives while it waits, and nothing here goes through
-the Replyer. A verbatim draft is **exclusive**: it fails while any draft is
-pending, and while it is pending an ordinary `reply` fails the same way
-(`reply_task_locked`). Cancel first.
+Use it only when the wait itself should end with no completion at all — the
+moment passed, someone else answered it, you misread who was being addressed.
+**To change the analysis, don't cancel — just call `reply` again**; the newest
+complete revision replaces the old one. And once `<reply-task-completed>` has
+appeared, there is nothing left to cancel — simply decide not to send.
 
 ## Failures worth recognising
 
 - `invalid_arguments` with `reason_code="brief_renamed_to_analysis"` /
-  `"targets_gist_replaced_by_analysis"` / `"mode_replaced_by_action"` /
-  `"upsert_removed"` — you sent an old argument shape. Conversation topology,
-  topics, chronology and content conclusions now go into `analysis`; old
-  tone/guidance slots are deliberately gone. `mode` is now
-  `action="verbatim"`; appending needs no action at all.
-- `reply_task_locked` — a verbatim draft is pending, or you tried to send
-  verbatim bytes onto an existing draft. Cancel first.
+  `"targets_gist_replaced_by_analysis"` / `"mode_removed"` / `"upsert_removed"`
+  — you sent an old argument shape. Conversation topology, topics, chronology
+  and content conclusions now go into `analysis`. Appending needs no action at
+  all.
+- `invalid_arguments` with `reason_code="verbatim_removed"` — you passed
+  `messages` or `action="verbatim"`. This tool never carries final text;
+  store the analysis here, then write the words in `send_messages` after
+  `<reply-task-completed>`.
 
 Never treat `<tool-call name="reply"><result>...</result>` as speech — it is a
-recorded intention. Success returns `reply_task_id`, `revision`, `state`,
+stored wait. Success returns `reply_task_id`, `revision`, `state`,
 `flush_at` and `hard_deadline`; it never returns a sent `message_id`.

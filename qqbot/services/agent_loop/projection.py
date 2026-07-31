@@ -780,6 +780,10 @@ class Projector:
         # 你说话）的根因修复。覆盖外部消息 + bot 自己已投递的发言（后者标
         # from_self="true"，无需比对 bot_qq 即知"别人引用的是你自己"）。
         author_by_msg_id = _build_author_index(events)
+        # 过期完成事件的渲染守卫（重构提案-删除Replyer.md §1.5）：写入侧已在
+        # scope 锁内复核，这里是投影侧的第二道防线——更低 revision 的
+        # completed、以及 cancelled 任务上迟到的 completed 不渲染。
+        reply_task_guard = _build_reply_task_guard(events)
 
         # ─── 思考轨迹内联（2026-07-06，待办清单#4）───
         # 预扫出要渲染成 <my-thought> 行的决策事件：只保留最近
@@ -838,7 +842,12 @@ class Projector:
                 # folded into active_tasks
                 continue
             if ev.type in ("agent.tool_result", "agent.tool_failed"):
-                # rendered alongside the matching tool_called row
+                # rendered alongside the matching tool_called row。
+                # send_messages 也不例外（2026-07-31 实施后调整，维护者拍板）：
+                # 调用行的 <args> + <result> 逐条回执就是发言记录，不派生
+                # 第二行 <my-reply>——同一句话两处渲染是复读诱饵。终态
+                # receipts 仍被 _build_author_index 消费（别人引用 bot 时标
+                # from_self）。
                 continue
             if ev.type in (
                 "agent.reply_task_upserted",
@@ -880,12 +889,13 @@ class Projector:
                 tc_id = ev.payload.get("tool_call_id")
                 tv = tool_view_by_id.get(tc_id)
                 # 2026-07-24（待办#19）起 reply 的成功行**不再折叠**：它是
-                # Planner 回看每次授权尝试的时间线记录——<args> 是该次原文
+                # Planner 回看每次解析的时间线记录——<args> 是该次原文
                 # （analysis/hold_seconds），<result> 是它落成的调度事实
                 # （reply_task_id/revision/flush_at/hard_deadline）。折叠是为
                 # 了避免与 <pending-reply> 双重渲染，而那一段已随本次改动删除，
-                # Planner 内容留在 timeline，不另立状态区。Replyer 的当前授权
-                # 另从 reply_task 折叠态注入，不依赖这行是否 terminal/仍在窗口。
+                # Planner 内容留在 timeline，不另立状态区。到点后的当前
+                # analysis 由 <reply-task-completed> 行自包含送达，不依赖这行
+                # 是否 terminal/仍在窗口。
                 items.append(
                     TimelineItem(
                         event_id=ev.event_id,
@@ -931,12 +941,25 @@ class Projector:
                     )
                 )
             elif ev.type == "runtime.reply_flushed":
+                # 旧链路历史事件（2026-07-31 起新链路不写 flushed；现役发言
+                # 记录是 send_messages 的 <tool-call> 行）。
                 items.append(
                     TimelineItem(
                         event_id=ev.event_id,
                         occurred_at=ev.occurred_at,
                         kind="my_reply",
                         render=Projector._render_reply_flushed(ev),
+                    )
+                )
+            elif ev.type == "runtime.reply_task_completed":
+                if _completed_is_stale(ev, reply_task_guard):
+                    continue
+                items.append(
+                    TimelineItem(
+                        event_id=ev.event_id,
+                        occurred_at=ev.occurred_at,
+                        kind="reply_task_completed",
+                        render=Projector._render_reply_task_completed(ev),
                     )
                 )
             elif ev.type == "runtime.context_compacted":
@@ -1216,12 +1239,40 @@ class Projector:
         )
 
     @staticmethod
-    def _render_reply_flushed(ev: _EventSnapshot) -> str:
+    def _render_reply_task_completed(ev: _EventSnapshot) -> str:
+        """runtime.reply_task_completed → <reply-task-completed> 行。
+
+        只陈述"这份稿的等待阶段结束了"与最终 analysis 原文；没有授权 ID、
+        unseen、consumed 或 expires_at——元素命名刻意不表达任何发言权限
+        （重构提案-删除Replyer.md §5.4）。
+        """
         payload = ev.payload or {}
         attrs = [
             f'reply_task_id="{_esc_attr(str(payload.get("reply_task_id") or ""))}"',
-            f'status="{_esc_attr(str(payload.get("status") or "unknown"))}"',
+            f'revision="{_esc_attr(str(payload.get("revision") or ""))}"',
         ]
+        analysis = str(payload.get("analysis") or "").strip()
+        return (
+            f"<reply-task-completed {' '.join(attrs)}>"
+            f"<analysis>{_esc_text(analysis)}</analysis>"
+            "</reply-task-completed>"
+        )
+
+    @staticmethod
+    def _render_reply_flushed(ev: _EventSnapshot) -> str:
+        """旧链路 runtime.reply_flushed → <my-reply>（仅历史兼容渲染）。
+
+        现役发言不产生本行：一次发送的记录就是它的
+        `<tool-call name="send_messages">` 行（args + 结果回执）。
+        """
+        payload = ev.payload or {}
+        attrs = []
+        task_id = payload.get("reply_task_id")
+        if task_id:
+            attrs.append(f'reply_task_id="{_esc_attr(str(task_id))}"')
+        attrs.append(
+            f'status="{_esc_attr(str(payload.get("status") or "unknown"))}"'
+        )
         parts = [f"<my-reply {' '.join(attrs)}>"]
         for item in payload.get("sent_messages") or []:
             if not isinstance(item, dict):
@@ -1263,8 +1314,9 @@ def render_timeline_stream(items: Sequence[TimelineItem]) -> list[str]:
     这些"。属性名取 when= 而非 at=——at 与 <at>（@人）标签撞词是已知的
     模型混淆源。
 
-    Planner 与 Replyer 两个信封组装层都必须经由本函数渲染 timeline，
-    保证两边看到的时间轴逐字节同构。前缀缓存：新秒的行整块追加；同秒
+    信封组装层必须经由本函数渲染 timeline（历史上 Planner 与 Replyer 两个
+    组装层靠它保证逐字节同构；2026-07-31 删除 Replyer 后只剩 Planner 一个
+    消费者，单一入口的约定保留）。前缀缓存：新秒的行整块追加；同秒
     追加只重写上一个 ``</time>`` 闭合位置——破坏面与旧的逐行追加持平。
     """
     parts: list[str] = []
@@ -2002,6 +2054,57 @@ def _gloss_segments(segments: Iterable) -> str:
     return excerpt
 
 
+def _build_reply_task_guard(
+    events: Iterable[_EventSnapshot],
+) -> dict[str, dict]:
+    """reply_task_id → {"max_revision": int, "cancelled": bool} 预扫索引。
+
+    供 ``_completed_is_stale`` 判定过期完成事件（§1.5）：窗口内可见的最高
+    upsert revision 与 cancel 事实。窗口外的更早历史不参与——守卫是防御层，
+    写入侧的 scope 锁复核才是主防线。
+    """
+    guard: dict[str, dict] = {}
+    for ev in events:
+        if ev.type == "agent.reply_task_upserted":
+            task_id = str((ev.payload or {}).get("reply_task_id") or "")
+            if not task_id:
+                continue
+            revision = (ev.payload or {}).get("revision")
+            entry = guard.setdefault(
+                task_id, {"max_revision": 0, "cancelled": False}
+            )
+            if isinstance(revision, int) and revision > entry["max_revision"]:
+                entry["max_revision"] = revision
+        elif ev.type == "agent.reply_task_cancelled":
+            task_id = str((ev.payload or {}).get("reply_task_id") or "")
+            if not task_id:
+                continue
+            entry = guard.setdefault(
+                task_id, {"max_revision": 0, "cancelled": False}
+            )
+            entry["cancelled"] = True
+    return guard
+
+
+def _completed_is_stale(
+    ev: _EventSnapshot, guard: dict[str, dict]
+) -> bool:
+    """过期完成事件判定：revision 低于窗口内最高 upsert，或任务已 cancel。"""
+    payload = ev.payload or {}
+    task_id = str(payload.get("reply_task_id") or "")
+    entry = guard.get(task_id)
+    if entry is None:
+        return False
+    if entry["cancelled"]:
+        return True
+    revision = payload.get("revision")
+    return (
+        isinstance(revision, int)
+        and entry["max_revision"] > 0
+        and revision < entry["max_revision"]
+    )
+
+
 def _build_excerpt_index(events: Iterable[_EventSnapshot]) -> dict[str, str]:
     """timeline 内 onebot_message_id → 摘要（前 40 字）。
 
@@ -2066,55 +2169,69 @@ def _build_author_index(
     覆盖两类来源：
     - 外部消息：作者 = sender 的 card/nickname + user_id。别人引用某人时，
       LLM 据此判断被引用的是谁（含群主自己）——而不是误以为那人在发言。
-    - bot 自己现役发出的消息：``is_self=True``，message_id + self_id 取自
-      runtime.reply_flushed 的成功 sent item。别人引用 bot 时渲染
-      `from_self="true"`（且 from_qq 命中 bot_qq）。
+    - bot 自己发出的消息：``is_self=True``。现役来源是 ``send_messages``
+      终态里 confirmed-sent 的逐条 receipt（tool_result 的 result 或
+      tool_failed 平铺 payload 里的 ``sent_messages``，partial 时只收
+      status="sent" 项）；历史来源是旧链路 runtime.reply_flushed 的成功
+      sent item。别人引用 bot 时渲染 `from_self="true"`。
 
-    工具结果分支只作 append-only 历史兼容：旧 reply/send_message 与旧
-    meme.send/send_meme 的 tool_result 仍可恢复 from_self；现役 reply tool_result
-    不含 message_id，会被下方门槛自然滤掉。下面名字元组里的 ``meme`` 同样是
-    **历史名**——该工具 2026-07-25 改名 ``meme_collection`` 且早在 2026-07-19
-    就没有 send 动作，新名的 tool_result 永远不带 message_id，故不必加进来。
+    单值 ``result.message_id`` 分支只作 append-only 历史兼容：旧
+    send_message 与旧 meme.send/send_meme 的 tool_result 仍可恢复
+    from_self；现役 reply tool_result 不含 message_id，被门槛自然滤掉。
+    名字元组里的 ``meme`` 同样是**历史名**（2026-07-25 改名
+    ``meme_collection`` 且无 send 动作）。
     """
     out: dict[str, _AuthorRef] = {}
-    # 收集历史发言工具调用 id；现役发送直接从 reply_flushed 分支进入。
+    # 收集发言工具调用 id（现役 send_messages + 历史名）。
     send_call_ids: set[str] = set()
     for ev in events:
         if ev.type == "agent.tool_called" and (
             (ev.payload or {}).get("tool_name")
-            in ("send_message", "meme", "send_meme", "reply")
+            in ("send_messages", "send_message", "meme", "send_meme", "reply")
         ):
             tc_id = (ev.payload or {}).get("tool_call_id")
             if tc_id is not None:
                 send_call_ids.add(str(tc_id))
+
+    def _harvest_sent_items(source: dict) -> None:
+        for item in source.get("sent_messages") or []:
+            if not isinstance(item, dict) or item.get("status") != "sent":
+                continue
+            mid = item.get("message_id")
+            if mid is None:
+                continue
+            self_id = item.get("self_id")
+            out[str(mid)] = _AuthorRef(
+                name=None,
+                user_id=str(self_id) if self_id else None,
+                is_self=True,
+            )
+
     for ev in events:
         if ev.type == "runtime.reply_flushed":
-            for item in (ev.payload or {}).get("sent_messages") or []:
-                if not isinstance(item, dict) or item.get("status") != "sent":
-                    continue
-                mid = item.get("message_id")
-                if mid is None:
-                    continue
-                self_id = item.get("self_id")
-                out[str(mid)] = _AuthorRef(
-                    name=None,
-                    user_id=str(self_id) if self_id else None,
-                    is_self=True,
-                )
-        # bot 自己同步发出的消息：从其 tool_result 取 message_id + self_id。
-        if ev.type == "agent.tool_result":
+            _harvest_sent_items(ev.payload or {})
+        # bot 自己经工具发出的消息：从终态取 message_id + self_id。
+        # tool_result → receipts 在 result（send_messages）或单值
+        # message_id（历史工具）；tool_failed → partial 的 receipts 经
+        # extra 平铺在 payload 顶层。
+        if ev.type in ("agent.tool_result", "agent.tool_failed"):
             payload = ev.payload or {}
             tc_id = payload.get("tool_call_id")
             if tc_id is not None and str(tc_id) in send_call_ids:
-                result = payload.get("result") or {}
-                mid = result.get("message_id")
-                if mid is not None:
-                    self_id = result.get("self_id")
-                    out[str(mid)] = _AuthorRef(
-                        name=None,
-                        user_id=str(self_id) if self_id else None,
-                        is_self=True,
-                    )
+                if ev.type == "agent.tool_result":
+                    result = payload.get("result") or {}
+                    if isinstance(result, dict):
+                        _harvest_sent_items(result)
+                        mid = result.get("message_id")
+                        if mid is not None:
+                            self_id = result.get("self_id")
+                            out[str(mid)] = _AuthorRef(
+                                name=None,
+                                user_id=str(self_id) if self_id else None,
+                                is_self=True,
+                            )
+                else:
+                    _harvest_sent_items(payload)
         # 外部消息作者。
         if not ev.type.startswith("external.message."):
             continue

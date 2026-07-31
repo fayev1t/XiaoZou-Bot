@@ -53,8 +53,8 @@ delete_meme / recaption_meme 合并而来（应用户拍板"能力全集合在�
   internal_tool_error  session_factory / caption_image 未接线。
   另沿用 tool_unavailable_in_scope。
 
-发送不属于本工具：reply_task 到点后由 Replyer 从收藏夹中选择 0..1 张，
-ReplyExecutor 与文本一起按序发送。
+发送不属于本工具：Planner 在 send_messages 的 messages 里放一个
+`{"kind":"meme","image_hash":…}` 气泡（每次至多一张），与文本一起按序发送。
 
 依赖注入：session_factory / caption_image / tool_call_event_id 全部来自
 ToolWorker 统一注入的 run() context，无构造依赖。

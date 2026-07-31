@@ -1,38 +1,44 @@
-"""ReplyTask 到点后的单次组稿与逐条发送执行器。"""
+"""ReplyTask 到点后的生命周期完成执行器。
+
+2026-07-31 删除 Replyer（重构提案-删除Replyer.md）：到点不再组稿、不再碰
+OneBot。执行器只做一件事——在 scope 锁内复核最新 revision 仍 open 且已到期，
+append 一条 ``runtime.reply_task_completed``（once，去重键 = 该 revision 的
+upsert event_id），提交成功后经注入的 publisher 通知唤醒 Planner（supervisor
+装配时注入的 notifier wrapper 内部执行 ``wake(scope, immediate=True)``，
+publisher 协议本身不变，§3.1）。发不发、发什么由 Planner 醒来那一拍结合最新
+时间流自己决定（``send_messages`` 工具）；完成事件只表达"等待阶段结束了"，
+**不是**发言授权，也没有消费/TTL 概念（§0.4）。
+
+通知沿用现网 best-effort 语义（§3.2）：notifier 失败只记日志，不建消费审计
+或 rescan outbox；极端 commit/notify 缝隙由后续任一正常 scope wake 兜底
+（完成事件仍在窗口内即会被投影读到）。
+
+启动 rescan 两件事：
+- 重挂 open 任务的定时器；已过 flush_at 的立即触发，照常走完成路径（完成
+  没有聊天副作用，重启后直接补上是安全的——旧链路的 reply_task_overdue
+  提示事件随组稿路径一并退役）；
+- 升级期旧 flush 恢复：旧链路 claimed 态 / 已有 durable ``reply_flush``
+  claim 的任务补一条 uncertain flushed（保留一个版本周期后删除）。
+"""
 
 from __future__ import annotations
 
 import asyncio
-import base64
-from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
 from qqbot.core.ids import new_event_id
 from qqbot.core.logging import get_logger
 from qqbot.core.time import china_now
-from qqbot.services.agent_loop.delivery_claims import (
-    has_delivery_claim,
-    try_claim_once_strict,
-)
-from qqbot.services.agent_loop.event_writer import (
-    RuntimeEventPublisher,
-    parse_scope_key,
-)
-from qqbot.services.agent_loop.meme_store import get_meme
+from qqbot.services.agent_loop.delivery_claims import has_delivery_claim
+from qqbot.services.agent_loop.event_writer import RuntimeEventPublisher
 from qqbot.services.agent_loop.reply_task import (
     ReplyTaskState,
+    find_completed_for_upsert,
     load_open_reply_task,
     load_open_reply_tasks,
     load_recent_reply_tasks,
     scope_lock,
-)
-from qqbot.services.agent_loop.replyer import Replyer, ReplyerError
-from qqbot.services.agent_loop.tools._meme_common import media_path_for_hash
-from qqbot.services.agent_loop.tools._onebot_common import call_action, get_bot
-from qqbot.services.agent_loop.tools.send_message import (
-    _extract_message_id,
-    _validate_content,
 )
 
 logger = get_logger(__name__)
@@ -43,18 +49,10 @@ class ReplyExecutor:
         self,
         *,
         session_factory: Any,
-        projector: Any,
         event_publisher: RuntimeEventPublisher | None = None,
-        replyer: Replyer | None = None,
-        bot_user_id_resolver: Callable[[], str | None] | None = None,
     ) -> None:
         self._session_factory = session_factory
-        self._projector = projector
         self._events = event_publisher or RuntimeEventPublisher(session_factory)
-        self._replyer = replyer or Replyer()
-        # 与 AgentLoop 同一把 resolver（supervisor 注入）：组稿 context 也带
-        # bot_qq/bot_role，Replyer 判"谁在对谁说话"的输入不再低 Planner 一等。
-        self._bot_user_id_resolver = bot_user_id_resolver
         self._handles: dict[str, asyncio.TimerHandle] = {}
         self._running: set[asyncio.Task[None]] = set()
         self._stopped = False
@@ -63,6 +61,9 @@ class ReplyExecutor:
         self._stopped = False
         recent = await load_recent_reply_tasks(self._session_factory)
         recovered: set[str] = set()
+        # ── 升级期旧 flush 恢复（§3.4）：旧链路"已 claim、尚未 final"的任务
+        # 不能静默消失，补 uncertain。新链路的 open 任务只走 completed，不再
+        # claim reply_flush，这段命中不了它们。
         for task in recent:
             claimed_without_event = task.state == "open" and await has_delivery_claim(
                 self._session_factory, task.latest_event_id, "reply_flush"
@@ -77,26 +78,13 @@ class ReplyExecutor:
                 )
             await self._write_uncertain_recovery(task, reason)
             recovered.add(task.reply_task_id)
+        # ── open 任务重挂定时器：已过期的 delay=0 立即触发，走正常完成路径。
         for task in (
             task
             for task in recent
             if task.state == "open" and task.reply_task_id not in recovered
         ):
-            if task.flush_at <= china_now():
-                await self._events.publish(
-                    event_type="runtime.reply_task_overdue",
-                    scope_key=task.scope_key,
-                    visibility="agent_visible",
-                    correlation_id=task.correlation_id or new_event_id(),
-                    causation_id=task.latest_event_id,
-                    payload={
-                        "reply_task_id": task.reply_task_id,
-                        "revision": task.revision,
-                        "flush_at": task.flush_at.isoformat(),
-                    },
-                )
-            else:
-                self._schedule(task.reply_task_id, task.revision, task.flush_at)
+            self._schedule(task.reply_task_id, task.revision, task.flush_at)
 
     async def stop(self) -> None:
         self._stopped = True
@@ -140,7 +128,7 @@ class ReplyExecutor:
             return
         task = asyncio.create_task(
             self._fire(reply_task_id, revision),
-            name=f"reply_flush:{reply_task_id}:{revision}",
+            name=f"reply_complete:{reply_task_id}:{revision}",
         )
         self._running.add(task)
         task.add_done_callback(self._fire_done)
@@ -151,13 +139,15 @@ class ReplyExecutor:
             return
         error = task.exception()
         if error is not None:
-            logger.error("[reply_executor] flush task crashed: {}", error)
+            logger.error("[reply_executor] complete task crashed: {}", error)
 
     async def _fire(self, reply_task_id: str, revision: int) -> None:
         self._handles.pop(reply_task_id, None)
         task = await self._find_open(reply_task_id)
         if task is None:
             return
+        # 进程内 scope 锁串行化同 scope 的 upsert/cancel/complete。DB 级
+        # advisory 锁（多实例串行）属于推迟的底层加固，当前部署为单实例。
         async with scope_lock(task.scope_key):
             current = await load_open_reply_task(
                 self._session_factory, task.scope_key
@@ -174,24 +164,14 @@ class ReplyExecutor:
                     current.reply_task_id, current.revision, current.flush_at
                 )
                 return
-            if not await try_claim_once_strict(
-                self._session_factory, current.latest_event_id, "reply_flush"
-            ):
-                return
-            correlation_id = current.correlation_id or new_event_id()
-            claimed_id = await self._events.publish(
-                event_type="runtime.reply_flush_claimed",
-                scope_key=current.scope_key,
-                visibility="runtime_only",
-                correlation_id=correlation_id,
-                causation_id=current.latest_event_id,
-                payload={
-                    "reply_task_id": current.reply_task_id,
-                    "revision": current.revision,
-                    "claimed_at": china_now().isoformat(),
-                },
+            # once：同一最新 revision 只产生一条完成事件（并发回调 / rescan
+            # 重入时读到既有事件即返回，不再写）。
+            existing = await find_completed_for_upsert(
+                self._session_factory, current.latest_event_id
             )
-        await self._compose_and_send(current, claimed_id, correlation_id)
+            if existing is not None:
+                return
+            await self._write_completed(current)
 
     async def _find_open(self, reply_task_id: str) -> ReplyTaskState | None:
         for task in await load_open_reply_tasks(self._session_factory):
@@ -199,246 +179,40 @@ class ReplyExecutor:
                 return task
         return None
 
-    async def _compose_and_send(
-        self, task: ReplyTaskState, claimed_id: str, correlation_id: str
-    ) -> None:
-        cutoff_event_id: str | None = None
-        status = "failed"
-        sent_messages: list[dict] = []
-        reason: str | None = None
-        try:
-            # resolve 失败降级 None（与 loop.py 同款兜底）：Replyer 输入少
-            # bot_qq 属性但仍可组稿，绝不让 flush 因此翻车。
-            bot_user_id: str | None = None
-            if self._bot_user_id_resolver is not None:
-                try:
-                    resolved = self._bot_user_id_resolver()
-                    if resolved:
-                        bot_user_id = str(resolved)
-                except Exception as exc:
-                    logger.warning(
-                        "[reply_executor] bot_user_id_resolver failed: {}", exc
-                    )
-            context = await self._projector.build_context(
-                scope_key=task.scope_key,
-                correlation_id=correlation_id,
-                tick_seq=0,
-                now=china_now(),
-                bot_user_id=bot_user_id,
-            )
-            if context.timeline:
-                cutoff_event_id = context.timeline[-1].event_id
-            if task.mode == "verbatim":
-                plan = {
-                    "messages": [
-                        {"kind": "chat", "content": item["content"]}
-                        for item in task.verbatim_messages
-                    ],
-                    "empty_reason": None,
-                }
-            else:
-                plan = await self._replyer.compose(
-                    task, context, context.saved_memes
-                )
-            messages = plan.get("messages") or []
-            if not messages:
-                status = "empty"
-                reason = str(plan.get("empty_reason") or "empty reply")
-            else:
-                prepared, error = await self._preflight(messages)
-                if error:
-                    raise ReplyerError(error)
-                sent_messages = await self._send_all(task.scope_key, prepared)
-                status = _delivery_status(sent_messages)
-        except Exception as exc:
-            logger.warning(
-                "[reply_executor] task {} failed: {}", task.reply_task_id, exc
-            )
-            status = "failed"
-            sent_messages = []
-            reason = f"{type(exc).__name__}: {exc}"[:500]
+    async def _write_completed(self, task: ReplyTaskState) -> None:
+        """append 完成事件，persist-then-notify（§3.1）。
 
-        # 无论组稿/发送结果如何，只尝试写一次 final。若持久化本身处在“已提交但
-        # 调用方收到异常”的不确定区，第二次写会制造两个相互冲突的最终事实；留给
-        # 启动恢复从 durable claim 补 uncertain 才符合 at-most-once。
-        try:
-            await self._write_flushed(
-                task,
-                claimed_id,
-                correlation_id,
-                status=status,
-                sent_messages=sent_messages,
-                cutoff_event_id=cutoff_event_id,
-                reason=reason,
-            )
-        except Exception as exc:
-            logger.error(
-                "[reply_executor] final persistence failed for {}: {}",
-                task.reply_task_id,
-                exc,
-            )
-            return
-
-    async def _preflight(
-        self, messages: list[dict]
-    ) -> tuple[list[dict], str | None]:
-        if len(messages) > 4:
-            return [], "replyer returned more than 4 messages"
-        prepared: list[dict] = []
-        meme_count = 0
-        for index, item in enumerate(messages):
-            kind = item.get("kind")
-            if kind == "chat":
-                content = item.get("content")
-                if fail := _validate_content(content):
-                    return [], f"chat[{index}] invalid: {fail.error_message}"
-                prepared.append({"kind": "chat", "content": content})
-            elif kind == "meme":
-                meme_count += 1
-                if meme_count > 1:
-                    return [], "at most one meme is allowed"
-                image_hash = item.get("image_hash")
-                if not isinstance(image_hash, str):
-                    return [], f"meme[{index}] image_hash is invalid"
-                meme = await get_meme(self._session_factory, image_hash)
-                if meme is None:
-                    return [], f"meme[{index}] is no longer saved"
-                try:
-                    data = media_path_for_hash(image_hash).read_bytes()
-                except OSError as exc:
-                    return [], f"meme[{index}] media missing: {exc}"
-                prepared.append(
-                    {"kind": "meme", "image_hash": image_hash, "data": data}
-                )
-            else:
-                return [], f"messages[{index}] has unknown kind"
-        return prepared, None
-
-    async def _send_all(
-        self, scope_key: str, prepared: list[dict]
-    ) -> list[dict]:
-        scope, group_id, user_id = parse_scope_key(scope_key)
-        bot, fail = get_bot()
-        if fail:
-            return [
-                _failed_receipt(index, item, fail.error_kind, fail.error_message)
-                for index, item in enumerate(prepared)
-            ]
-        receipts: list[dict] = []
-        for index, item in enumerate(prepared):
-            if item["kind"] == "chat":
-                content = item["content"]
-            else:
-                content = [
-                    {
-                        "type": "image",
-                        "data": {
-                            "file": "base64://"
-                            + base64.b64encode(item["data"]).decode("ascii")
-                        },
-                    }
-                ]
-            public_item = {k: v for k, v in item.items() if k != "data"}
-            try:
-                if scope == "group":
-                    result, action_fail = await call_action(
-                        bot,
-                        "send_group_msg",
-                        group_id=int(group_id),
-                        message=content,
-                    )
-                else:
-                    result, action_fail = await call_action(
-                        bot,
-                        "send_private_msg",
-                        user_id=int(user_id),
-                        message=content,
-                    )
-            except Exception as exc:
-                receipts.append(
-                    _uncertain_receipt(
-                        index,
-                        public_item,
-                        "upstream_delivery_uncertain",
-                        f"{type(exc).__name__}: {exc}"[:500],
-                    )
-                )
-                continue
-            if action_fail:
-                receipts.append(
-                    _failed_receipt(
-                        index,
-                        public_item,
-                        action_fail.error_kind,
-                        action_fail.error_message,
-                        action_fail.extra,
-                    )
-                )
-                continue
-            message_id = _extract_message_id(result)
-            if message_id is None:
-                receipts.append(
-                    _uncertain_receipt(
-                        index,
-                        public_item,
-                        "missing_message_id",
-                        "upstream returned ok but no message_id",
-                        result,
-                    )
-                )
-                continue
-            receipts.append(
-                {
-                    "index": index,
-                    **public_item,
-                    "status": "sent",
-                    "message_id": message_id,
-                    "self_id": str(getattr(bot, "self_id", "") or "") or None,
-                    "receipt": _public_receipt(result),
-                }
-            )
-        return receipts
-
-    async def _write_flushed(
-        self,
-        task: ReplyTaskState,
-        claimed_id: str,
-        correlation_id: str,
-        *,
-        status: str,
-        sent_messages: list[dict],
-        cutoff_event_id: str | None,
-        reason: str | None = None,
-    ) -> None:
-        public_messages = _redact_runtime_value(sent_messages)
-        payload: dict[str, Any] = {
-            "reply_task_id": task.reply_task_id,
-            "revision": task.revision,
-            "status": status,
-            "timeline_cutoff_event_id": cutoff_event_id,
-            "message_ids": [
-                item["message_id"]
-                for item in public_messages
-                if item.get("status") == "sent" and item.get("message_id") is not None
-            ],
-            "sent_messages": public_messages,
-        }
-        if reason:
-            payload["reason"] = _redact_runtime_value(reason)
+        payload 携带完整 analysis，使到期交接自包含；没有授权 ID、可用次数、
+        消费状态或 TTL（§0.4/§1.3）。publisher 先 commit 再调注入的 notifier
+        （supervisor 的 immediate-wake wrapper），wake 到达时投影必然读得到
+        完成事件；通知失败不回滚事件（best-effort，后续自然 wake 兜底）。
+        """
+        correlation_id = task.correlation_id or new_event_id()
         await self._events.publish(
-            event_type="runtime.reply_flushed",
+            event_type="runtime.reply_task_completed",
             scope_key=task.scope_key,
             visibility="agent_visible",
             correlation_id=correlation_id,
-            # agent-visible 最终事实直接锚到最后一次授权 tool_called；
-            # runtime-only claim 只是去重协调，不应成为模型可见因果链的入口。
-            causation_id=task.source_tool_call_event_id or claimed_id,
-            payload=payload,
+            causation_id=task.latest_event_id,
+            payload={
+                "reply_task_id": task.reply_task_id,
+                "revision": task.revision,
+                "analysis": task.analysis,
+                "flush_at": task.flush_at.isoformat(),
+                "hard_deadline": task.hard_deadline.isoformat(),
+                "completed_at": china_now().isoformat(),
+                "source_tool_call_event_id": task.source_tool_call_event_id,
+            },
         )
 
     async def _write_uncertain_recovery(
         self, task: ReplyTaskState, reason: str
     ) -> None:
+        """升级期旧链路恢复：把"已 claim、结果不明"的旧任务收敛为 uncertain。
+
+        新链路不产生 claimed 态；本方法保留一个版本周期后随旧事件类型一并
+        删除（§3.4）。
+        """
         await self._events.publish(
             event_type="runtime.reply_flushed",
             scope_key=task.scope_key,
@@ -456,80 +230,3 @@ class ReplyExecutor:
                 "reason": reason,
             },
         )
-
-
-def _failed_receipt(
-    index: int,
-    item: dict,
-    error_kind: str | None,
-    error_message: str | None,
-    extra: dict | None = None,
-) -> dict:
-    return {
-        "index": index,
-        **{k: v for k, v in item.items() if k != "data"},
-        "status": "failed",
-        "error": {
-            "kind": error_kind,
-            "message": _redact_runtime_value(error_message),
-            **_public_receipt(extra),
-        },
-    }
-
-
-def _uncertain_receipt(
-    index: int,
-    item: dict,
-    error_kind: str,
-    error_message: str,
-    receipt: Any = None,
-) -> dict:
-    return {
-        "index": index,
-        **{k: v for k, v in item.items() if k != "data"},
-        "status": "uncertain",
-        "receipt": _public_receipt(receipt),
-        "error": {
-            "kind": error_kind,
-            "message": _redact_runtime_value(error_message),
-        },
-    }
-
-
-def _delivery_status(receipts: list[dict]) -> str:
-    statuses = [item.get("status") for item in receipts]
-    if statuses and all(status == "sent" for status in statuses):
-        return "sent"
-    if any(status == "sent" for status in statuses):
-        return "partial"
-    if any(status == "uncertain" for status in statuses):
-        return "uncertain"
-    return "failed"
-
-
-def _public_receipt(value: Any) -> dict:
-    """保留可审计回执，但禁止 OneBot 回显的图片正文进入事件流。"""
-    if not isinstance(value, dict):
-        return {}
-    return {
-        str(key): _redact_runtime_value(item) for key, item in value.items()
-    }
-
-
-def _redact_runtime_value(value: Any) -> Any:
-    if isinstance(value, str):
-        if "base64://" in value:
-            return "<base64-redacted>"
-        return value
-    if isinstance(value, bytes):
-        return "<binary-redacted>"
-    if isinstance(value, dict):
-        return {
-            str(key): _redact_runtime_value(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, (list, tuple)):
-        return [_redact_runtime_value(item) for item in value]
-    if value is None or isinstance(value, (bool, int, float)):
-        return value
-    return str(value)

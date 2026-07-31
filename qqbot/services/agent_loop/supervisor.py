@@ -37,7 +37,6 @@ from qqbot.services.agent_loop.event_writer import RuntimeEventPublisher
 from qqbot.services.agent_loop.loop import AgentLoop
 from qqbot.services.agent_loop.projection import Projector
 from qqbot.services.agent_loop.reply_executor import ReplyExecutor
-from qqbot.services.agent_loop.replyer import Replyer
 from qqbot.services.agent_loop.tool_registry import ToolRegistry
 from qqbot.services.agent_loop.tool_worker import ToolWorker
 
@@ -54,7 +53,6 @@ class LoopSupervisor:
         projector: Projector | None = None,
         tool_registry: ToolRegistry | None = None,
         caption_image: Any | None = None,
-        replyer: Replyer | None = None,
     ) -> None:
         self._planner = planner
         self._session_factory = session_factory
@@ -63,7 +61,6 @@ class LoopSupervisor:
         # 看图写描述回调（生产 = meme_caption.caption_image，由 v2_main 注入）：
         # 原样转发给 ToolWorker，进工具 run() context 供 meme 工具用。
         self._caption_image = caption_image
-        self._replyer = replyer
         self._loops: dict[str, AgentLoop] = {}
         self._lock = asyncio.Lock()
         self._started = False
@@ -105,34 +102,30 @@ class LoopSupervisor:
         # 自己注入进去让 worker 在**整批工具收口后**（写完 runtime.
         # tool_batch_completed）经 notify_tool_batch_completed 批次级唤醒对应
         # scope 的 AgentLoop——不再是每 drain 一轮就按 scope wake 一次。
-        # ReplyExecutor 独立负责 reply_task 的到点组稿与发送；它只向通用
-        # RuntimeEventPublisher 发布事件，不直接持有 wake 接口。
+        # ReplyExecutor 独立负责 reply_task 的到点生命周期完成（2026-07-31 起
+        # 不再组稿发送）：completed 事件经其**专用** RuntimeEventPublisher 落库
+        # 后，由这里注入的 wrapper 直接 immediate 唤醒——完成事实已落库、没有
+        # 可攒的新消息，等攒批窗口只是白加延迟。publisher 协议本身不变。
         if self._tool_registry is not None:
-            if self._projector is not None:
-                self._reply_executor = ReplyExecutor(
-                    session_factory=self._session_factory,
-                    projector=self._projector,
-                    event_publisher=RuntimeEventPublisher(
-                        self._session_factory,
-                        notify_event_available=self.wake,
-                    ),
-                    replyer=self._replyer,
-                    # 与 AgentLoop 同一把 resolver：Replyer 的组稿 context 同样
-                    # 带 bot_qq/bot_role（输入权重与 Planner 对齐，2026-07-22）。
-                    bot_user_id_resolver=_default_bot_user_id_resolver,
+            self._reply_executor = ReplyExecutor(
+                session_factory=self._session_factory,
+                event_publisher=RuntimeEventPublisher(
+                    self._session_factory,
+                    notify_event_available=self._wake_immediate,
+                ),
+            )
+            # rescan 与上面的任务回填同属恢复性动作，best-effort：失败只
+            # 损失"重挂定时器 / 补 uncertain / 补 wake"，模型侧仍有
+            # timeline 上的 <tool-call name="reply"> 行作证据链可自愈
+            # （再落一次稿即重新挂表），不挡启动。
+            try:
+                await self._reply_executor.start()
+            except Exception as exc:
+                logger.warning(
+                    "[supervisor] reply executor rescan failed "
+                    "(continuing): {}",
+                    exc,
                 )
-                # rescan 与上面的任务回填同属恢复性动作，best-effort：失败只
-                # 损失"重挂定时器 / 补 uncertain / overdue hint"，模型侧仍有
-                # timeline 上的 <tool-call name="reply"> 行作证据链可自愈
-                # （再落一次稿即重新挂表），不挡启动。
-                try:
-                    await self._reply_executor.start()
-                except Exception as exc:
-                    logger.warning(
-                        "[supervisor] reply executor rescan failed "
-                        "(continuing): {}",
-                        exc,
-                    )
             self._tool_worker = ToolWorker(
                 session_factory=self._session_factory,
                 registry=self._tool_registry,
@@ -199,6 +192,10 @@ class LoopSupervisor:
             finally:
                 self._memory_compactor = None
         logger.info("[supervisor] stopped, {} loops drained", len(loops))
+
+    async def _wake_immediate(self, scope_key: str) -> None:
+        """ReplyExecutor 专用 publisher 的 notifier：落库后直接开拍。"""
+        await self.wake(scope_key, immediate=True)
 
     async def wake(self, scope_key: str, *, immediate: bool = False) -> None:
         """唤醒某个 scope 的 loop。

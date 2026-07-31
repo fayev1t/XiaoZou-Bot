@@ -91,7 +91,7 @@ class MemeView:
     Projector 经 meme_store.load_saved_memes 挂到 DecisionContext.saved_memes，
     llm_planner 渲染成 <saved-memes> 里的一行 <meme hash="..." saved_at="...">
     描述</meme>。description 由收录（meme.save）时的 caption LLM 调用生成，
-    是 Replyer 在 flush 时选图的唯一依据；hash 与 timeline
+    是 Planner 经 send_messages 发图时选图的唯一依据；hash 与 timeline
     <image hash="..."/> 同一值空间。
 
     context_note 是收录时留档的聊天语境（表情包工具黑盒设计.md §2"留档备将来
@@ -108,8 +108,8 @@ class MemeView:
 # PendingReplyView 已于 2026-07-24 删除（待办#19）：它是 <pending-reply> 段的
 # 载体，而 Planner 所需的每个字段都被 timeline 上的
 # <tool-call name="reply"> 行覆盖（调度字段在 <result>、内容在 <args>）。
-# Replyer 不复用这个有界投影视图取当前授权；ReplyExecutor 另把 reply_task
-# 折叠出的最新 analysis 注入其专用信封。
+# 到点交接不复用这个有界投影视图：ReplyExecutor 从 reply_task 折叠态取最新
+# analysis 写进 runtime.reply_task_completed（2026-07-31 起）。
 
 
 @dataclass(frozen=True)
@@ -198,14 +198,14 @@ class DecisionContext:
     timeline: list[TimelineItem] = field(default_factory=list)
     active_tasks: list[TaskView] = field(default_factory=list)
     # 2026-07-24 起 Planner context 没有 pending_reply 字段（待办#19）：待发稿
-    # 的调度状态与历史调用都在 timeline 的 <tool-call name="reply"> 行上。
-    # Replyer 的当前 analysis 来自独立 ReplyTaskState，不经过 DecisionContext 字段。
+    # 的调度状态与历史调用都在 timeline 的 <tool-call name="reply"> 行上；
+    # 到点后的完整 analysis 以 <reply-task-completed> 行回到 timeline。
 
-    # ─── 表情包收藏夹（meme 管收藏；Replyer 在 flush 时决定是否发送）───
+    # ─── 表情包收藏夹（meme_collection 管收藏；send_messages 发送）───
     # 全局共享的 agent_memes（2026-07-06 起全 bot 一份，created_at 倒序、
     # 封顶 meme_store.MAX_SAVED_MEMES 条），由 Projector.
     # _augment_with_saved_memes 注入；渲染成 <saved-memes>，meme 工具凭
-    # 其中的 hash 精确删除/换描述，并供 Replyer 选图。空 = 不渲染。
+    # 其中的 hash 精确删除/换描述，并供发言时选图。空 = 不渲染。
     saved_memes: list[MemeView] = field(default_factory=list)
     # 2026-07-02 起不再有独立的 pending_tool_results 字段：工具结果只在
     # timeline 的 <tool-call status="complete"> 行呈现一次（单一事实源）。

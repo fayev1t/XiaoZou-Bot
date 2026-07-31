@@ -29,7 +29,9 @@ LLM_BASE_URL``）。它当年是单服务商时代的向后兼容层，留着有
 > ``settings.temperature`` > 内置 0.7。.env 里不再有任何 LLM 键。
 
 配置在首次 ``create_llm()`` 时读取并缓存为进程级单例——冷却/熔断状态必须跨
-调用方（planner / replyer / vision / caption）共享；改配置需重启生效。
+调用方（planner / vision / caption / memory）共享；改配置需重启生效。
+（``roles.replyer`` 随 2026-07-31 删除 Replyer 一并退役，见
+重构提案-删除Replyer.md §5.5。）
 """
 
 from typing import Any
@@ -89,7 +91,7 @@ def _build_runtime() -> _LLMRuntime | None:
     if routing is None:
         # 2026-07-28 起没有扁平 env 回落：这里是唯一的配置来源，缺了就是
         # 部署没配好，必须是 error 而不是 warning——LLM 全线不可用（Planner
-        # 每拍降级 idle、Replyer/caption raise、图片不描述），排查时第一眼
+        # 每拍降级 idle、caption raise、图片不描述），排查时第一眼
         # 就要看到这行。
         logger.error(
             "[llm] 未找到模型配置文件 {}：LLM 全部不可用。"
@@ -249,7 +251,7 @@ async def create_llm(
       （缺省随机）挑一个——调用方只需要知道模型名；
     - ``model=... , provider=...``：显式钉死某服务商的某模型；
     - ``role="planner"``：按 ``config/model_providers.json`` 的 roles 表解析
-      （planner / replyer / caption / default）。
+      （planner / caption / default）。
 
     配置缺失 / 解析失败 / 候选为空时返回 None（与旧版语义一致，调用方
     已有 None 分支）。``require`` 是能力硬要求（如 caption 传

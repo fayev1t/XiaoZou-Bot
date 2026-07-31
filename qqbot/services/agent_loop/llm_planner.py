@@ -3,11 +3,14 @@
 复用 qqbot/core/llm.create_llm() 当 LLM 客户端工厂（纯基础设施层，
 不含 v1 业务）。Prompt 与解析逻辑均按 v2 任务与决策契约从零写。
 
-System prompt 不再硬编码 —— 完全交给 prompts/catalog.py 的提示词库装配。
-默认库（build_default_prompt_library）取四段：planner / envelope /
-group_chat_rules / tools usage；envelope.md 是与 Replyer 共享的同一份信封语法。
-整张角色卡不进决策层，只由 Replyer 在最终组稿时加载。需要迭代职责、参与规则
-或工具说明时直接改对应 .md 即可，不需要碰 planner。
+System prompt 不再硬编码 —— 完全交给 prompts/catalog.py 装配。默认库
+（build_default_prompt_library）取根页 `planner.md`，它在正文里用 `{{persona}}` /
+`{{system}}` / `{{envelope}}` / `{{group_chat_rules}}` / `{{tools_usage}}` 把共享
+资产拼在自己选定的位置（2026-07-30 起只有槽这一种装配机制，`ASSEMBLY` 与段间
+分隔符都已删除——分隔线现在是页正文里的字符）。2026-07-31 删除 Replyer 后
+Planner 是唯一的对话消费者：角色卡放在页首（那就是她自己），分析与最终措辞
+同归一层。需要迭代职责、参与规则或工具说明时直接改对应 .md 即可，不需要碰
+planner。
 
 错误兜底：LLM 不可用 / 接口报错 / JSON 不可解析 / schema 不符
 一律 fallback 为单一 IdleAction，并把错误细节塞进 reasoning。
@@ -41,10 +44,7 @@ from qqbot.services.agent_loop.projection import (
     _safe_json,
     render_timeline_stream,
 )
-from qqbot.services.agent_loop.prompts.catalog import (
-    SECTION_SEP,
-    PromptLibrary,
-)
+from qqbot.services.agent_loop.prompts.catalog import PromptLibrary
 from qqbot.services.agent_loop.prompt_snapshot import (
     PromptSnapshot,
     extract_usage,
@@ -57,10 +57,10 @@ from qqbot.services.agent_loop.tool_registry import ToolRegistry
 logger = get_logger(__name__)
 
 
-# Planner 四段（planner / envelope / group_chat_rules / tools_usage）的清单
-# 与顺序收口在 prompts/catalog.py 的 ASSEMBLY —— 逻辑递进：你是什么+你要干
-# 什么 → 输入长什么样（与 Replyer 共享的 envelope）→ 什么时候需要发言 → 你能
-# 调什么工具。整张角色卡不进 Planner，理由与其余分工写在 catalog 的 docstring。
+# Planner 的段清单与顺序全部写在根页 planner.md 的 {{槽}} 里 —— 逻辑递进：
+# 你是谁（persona）→ 怎么运行与输出什么 → 机器事实（system）→ 输入长什么样
+# （envelope）→ 什么时候需要发言（group_chat_rules）→ 你能调什么工具。
+# 分工理由写在 catalog 的 docstring。
 
 
 def build_default_prompt_library(
@@ -69,9 +69,10 @@ def build_default_prompt_library(
 ) -> PromptLibrary:
     """v2 默认 system prompt 装配 —— 委托 prompts/catalog.py。
 
-    段清单与顺序住在 catalog 的 ASSEMBLY；这里只是 Planner 侧的入口。各段
-    render 时才读盘：改 .md 即生效、新增/下架工具立即反映。文件段读出来为空
-    直接 raise（部署坏了不静默跑残缺 prompt）；tools_usage 未注入注册表时跳过。
+    要哪几段、什么顺序、怎么分隔，全写在根页 `planner.md` 的 `{{槽}}` 里；
+    这里只是 Planner 侧的入口。页与槽都在 render 时才读盘：改 .md 即生效、
+    新增/下架工具立即反映。根页或文件槽读出来为空、槽名未登记都直接 raise
+    （部署坏了不静默跑残缺 prompt）；tools_usage 未注入注册表时整槽跳过。
     """
     from qqbot.services.agent_loop.prompts.catalog import build_library
 
@@ -92,8 +93,8 @@ class LLMPlanner:
         self._llm = llm_client
         self._tool_registry = tool_registry
         # prompt_library 优先：调用方明确传入就用它；否则按 tool_registry
-        # 装配默认库（planner/envelope/group_chat_rules/tools_usage 四段；
-        # 角色卡只属于 Replyer）。
+        # 装配默认库（planner 根页 + persona/system/envelope/
+        # group_chat_rules/tools_usage 槽）。
         if prompt_library is None:
             prompt_library = build_default_prompt_library(
                 tool_registry=tool_registry
@@ -258,10 +259,11 @@ def _build_messages(
     # 到 system loop、system 专用工具的说明会泄漏到群 loop，徒增提示噪音与误判
     # （§2.2；catalog 与 usage 同一把 scope 尺子）。
     scope = context.scope_key.split(":", 1)[0]
-    # render_sections + SECTION_SEP join 与 render() 逐字节一致（render() 就是
-    # 这么实现的）——多要一份分段统计给快照，不重复求值。
+    # 片段直接拼起来与 render() 逐字节一致（render() 就是这么实现的）——多要
+    # 一份分段统计给快照，不重复求值。片段之间没有额外分隔符：分隔线是根页
+    # 正文里的字符。
     sections = prompt_library.render_sections(scope=scope)
-    system_content = SECTION_SEP.join(sec.text for sec in sections)
+    system_content = "".join(sec.text for sec in sections)
     tool_catalog = (
         tool_registry.catalog(scope) if tool_registry is not None else []
     )
@@ -438,8 +440,8 @@ def _render_input_xml(
     # **无锚点**：全信封只有这一处出现拍号，timeline 的 <my-thought> 只带
     # time=，模型既减不出步数也定位不了任何行；而进程重启后 _tick_seq 归零、
     # timeline 却从库里重新折叠出满窗历史，tick="1" 配一整段往事是**误导**而
-    # 不只是噪音。Replyer 侧的 <current/> 本来就不带 @tick 且从未缺过什么，
-    # 是现成的反证。若将来要给模型"这是本轮连续推演第几步"的信号，应新增
+    # 不只是噪音。（历史反证：Replyer 侧的 <current/> 从来不带 @tick 且从未
+    # 缺过什么。）若将来要给模型"这是本轮连续推演第几步"的信号，应新增
     # 带锚点的 burst_id/burst_step，不要把这个无锚点的绝对计数加回来。
     #
     # 时区契约：所有暴露给 LLM 的时间都是北京时间（与数据库写入侧 china_now()

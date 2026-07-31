@@ -4,9 +4,6 @@
 记法：<x> 元素，@a 属性，a|b 取值枚举，? 表示可选出现，* 表示可重复。
 通则：属性缺失一律表示"未知或不适用"，绝不表示"否"。正文与属性值均已 XML 转义。
 
-信封有两种根元素，取决于本次运行处在哪一环：决策时收到 <agent-input>，
-落笔时收到 <replyer-input>。<timeline> 及其内部的一切在两者中逐字节相同。
-
 结构总览：<agent-input>
 
 <agent-input @scope @bot_qq? @bot_role?>
@@ -17,24 +14,12 @@
     <meme @hash @saved_at>*
   <timeline>
     <time @when>*
-      <message> | <my-reply> | <tool-call> | <my-thought> | <task-closed> | <notice> | <request> | <system-hint>
+      <message> | <my-reply> | <tool-call> | <my-thought> | <task-closed> | <reply-task-completed> | <notice> | <request> | <system-hint>
   <active-tasks>
     <task @task_id @state @description>*
       <related-tools>? <triggered-by @event_id>? <pending-tool-call-ids>? <progress-notes>?
   <current @now>
   <validation-error>?
-
-结构总览：<replyer-input>
-
-<replyer-input @scope @bot_qq? @bot_role?>
-  <saved-memes>?
-    <meme @hash>*
-  <timeline>
-    <time @when>*
-      （事件行与 <agent-input> 完全一致）
-  <reply-task @reply_task_id @revision>
-    <analysis>
-  <current @now>
 
 ID 空间：后缀标识值域，各空间互不通用，也不可互相推导
   *_qq        QQ 用户号。sender_qq / from_qq / user_qq / operator_qq / target_qq / bot_qq / <at @qq>
@@ -52,7 +37,7 @@ ID 空间：后缀标识值域，各空间互不通用，也不可互相推导
 ═══ 信封元素 ═══
 
 <agent-input>
-  决策时的根元素，每拍一份。子元素按上述总览的顺序出现。
+  根元素，每拍一份。子元素按上述总览的顺序出现。
   @scope      group:<群号> | private:<QQ号> | system
               group 群聊，private 一对一私聊，system 无聊天面的系统 loop。
               运行时内部标识，不属于对外可见信息。
@@ -61,13 +46,8 @@ ID 空间：后缀标识值域，各空间互不通用，也不可互相推导
   @bot_role   owner | admin | member。本账号自己在本群的角色，仅 group scope 渲染。
               它是折叠快照，可能滞后于真实角色；工具在调用时另行实时复查。
 
-<replyer-input>
-  落笔时的根元素，每次投递一份。@scope / @bot_qq / @bot_role 与 <agent-input> 同名同义。
-  它没有 <tool-catalog>、<active-tasks> 与 <validation-error>，多一个 <reply-task>；
-  其 <meme> 不带 @saved_at。
-
 <tool-catalog>
-  仅 <agent-input>。本次可调用的工具全集，不在其中的工具本次不存在。
+  本次可调用的工具全集，不在其中的工具本次不存在。
 
 <tool>  父 <tool-catalog>
   一个可调用的工具。
@@ -90,15 +70,15 @@ ID 空间：后缀标识值域，各空间互不通用，也不可互相推导
   正文为 JSON Schema 文本。call_tool.arguments 必须满足它。
 
 <saved-memes>
-  表情包收藏目录，两种根元素下都可能出现，空收藏时整段不渲染。
-  它是可选清单而不是待发送队列：发不发、发哪一张，在落笔那一步决定。
+  表情包收藏目录，空收藏时整段不渲染。
+  它是可选清单而不是待发送队列。
 
 <meme>  父 <saved-memes>
   一张已收藏的表情包，最新在前。
   正文 = 系统生成的图片描述（画面内容、图上文字、情绪、适用情形）。
   该描述是选图时能看到的全部信息，像素不随之传递。
-  @hash      该图内容的 sha256。meme_collection 以此定位一张收藏。
-  @saved_at  收藏时刻。仅 <agent-input> 渲染该属性。
+  @hash      该图内容的 sha256。meme_collection 与 send_messages 以此定位一张收藏。
+  @saved_at  收藏时刻。
 
 <timeline>
   按时间升序排列的事件流。直接子元素只有 <time>。
@@ -124,11 +104,14 @@ ID 空间：后缀标识值域，各空间互不通用，也不可互相推导
                  缺失 = 它至少经历过一次决策。
 
 <my-reply>  父 <time>
-  一次回复投递的最终结果。其中成功的子元素即实际到达 QQ 的内容。
-  @reply_task_id  本次投递对应的草稿 ID，与 <tool-call name="reply"> 结果中的同名字段同值。
+  仅旧记录：历史链路中一次回复投递的最终结果，
+  其中成功的子元素即实际到达 QQ 的内容。现行发送不产生本行——
+  一次发送的记录是它自己的 <tool-call name="send_messages"> 行，
+  其 <result> 正文的逐条回执给出每个气泡的送达状态与 message_id。
+  @reply_task_id  该次投递对应的草稿 ID。
   @status         sent | partial | failed | empty | uncertain
                   sent 全部送达；partial 部分送达；failed 全部失败；
-                  empty 组稿后无内容可发；uncertain 送达与否无法确认。
+                  empty 当时无内容可发；uncertain 送达与否无法确认。
 
 <sent-message>  父 <my-reply>
   一条实际发出的文本气泡。正文 = 实际送出的内容（同样使用内联段）。
@@ -177,7 +160,6 @@ ID 空间：后缀标识值域，各空间互不通用，也不可互相推导
          target_scope_mismatch        目标与当前 scope 不符
                                       附带 @expected_scope @actual_target_kind @actual_target_id
          unknown_tool                 该名字不在注册表中
-         reply_task_locked            存在互斥的逐字草稿
          no_bot_available             临时基础设施故障
          upstream_action_failed       平台拒绝该动作
                                       附带 @retcode @action @upstream_wording
@@ -199,6 +181,16 @@ ID 空间：后缀标识值域，各空间互不通用，也不可互相推导
   正文 = 当时写下的 result_summary 或失败原因。收束后该任务不再出现在 <active-tasks>。
   @task_id  被关闭的任务 ID。
   @outcome  done | failed
+
+<reply-task-completed>  父 <time>
+  一份回复草稿的等待阶段结束的记录，出现在其 flush_at 到达的时刻。
+  该草稿自此为 terminal；此行只陈述等待结束这一事实。
+  @reply_task_id  该草稿的 ID，与 <tool-call name="reply"> 结果中的同名字段同值。
+  @revision       结束时生效的修订序号，即最后一次 reply 调用落下的那份。
+
+<analysis>  父 <reply-task-completed>
+  正文 = 该草稿最终修订的完整局势解析原文。它已是最新一份完整内容，
+  时间线中更早修订的 <tool-call name="reply"> 行是历史。
 
 <notice>  父 <time>
   群内发生的一个事件的记录，不是发给本账号的消息。
@@ -235,7 +227,8 @@ ID 空间：后缀标识值域，各空间互不通用，也不可互相推导
     @action @action_suffix       poke。拍一拍文案，语序为 action + 目标 + action_suffix。
     @message_id                  emoji_like / essence / group_recall / friend_recall。
                                  被贴表情 / 被设精华 / 被撤回的那条消息，
-                                 对应时间线上同 ID 的 <message> 或 <my-reply> 子元素。
+                                 对应时间线上同 ID 的 <message>、send_messages
+                                 结果回执中的同名字段，或旧记录 <my-reply> 的子元素。
                                  被撤回的内容已从平台消失。
     @likes                       emoji_like。逗号分隔的"表情×人数"。
                                  表情为字面 emoji 字符，或 face:N（与 <face @face_id> 同域）。
@@ -258,7 +251,6 @@ ID 空间：后缀标识值域，各空间互不通用，也不可互相推导
                           与实时对话冲突时以实时对话为准。
     tool_batch_completed  批次边界：更早某拍分发的整批工具已全部到达终态。
     wait_elapsed          此前调度的 wait 已到点，正文含当时留下的 note 原文。
-    reply_task_overdue    启动恢复时发现一份已过 flush_at 仍未发出的草稿。
     llm_invalid_output    此前某次输出被校验拒绝，正文含原因与尝试序号。
     bot_role_observed     系统观测到本账号的群角色。
     napcat_unknown_event  平台推送了运行时没有解析器的事件类型，原始报文原样附上。
@@ -344,7 +336,7 @@ ID 空间：后缀标识值域，各空间互不通用，也不可互相推导
 ═══ 任务与时钟元素 ═══
 
 <active-tasks>
-  仅 <agent-input>。当前未收束的任务集合，位于 <timeline> 之后。
+  当前未收束的任务集合，位于 <timeline> 之后。
 
 <task>  父 <active-tasks>
   一个未收束的任务。
@@ -368,19 +360,10 @@ ID 空间：后缀标识值域，各空间互不通用，也不可互相推导
   一条进度笔记，正文 = 某一拍 task 工具 note 分支写下的内容。
   @time  写下该笔记的时刻。
 
-<reply-task>
-  仅 <replyer-input>，紧邻文档末尾。本次投递采用的那份分析。
-  @reply_task_id  本次投递的稿件 ID，与时间线中 <tool-call name="reply"> 结果里的同名字段同值。
-  @revision       该稿件的修订序号。时间线里可能留有更早的修订，那些是历史，不参与本次投递。
-
-<analysis>  父 <reply-task>
-  正文 = 本次投递采用的那一份局势梳理：参与者与指向关系、话题线、决定性时序、
-  未决内容、已核实的事实与仍存疑处。它已折叠为最新一份完整内容，无需与更早的修订合并。
-
 <current/>
-  本次运行的时钟，位于信封末尾附近。两个根元素同形。
+  本次运行的时钟，位于信封末尾附近。
   @now   当前墙上时间。判定 <time @when> 的新旧以此为基准。
 
 <validation-error>
-  仅 <agent-input>。当同一拍的上一次输出被运行时拒绝时出现，是信封的最后一个元素，位于 <current/> 之后。
+  当同一拍的上一次输出被运行时拒绝时出现，是信封的最后一个元素，位于 <current/> 之后。
   正文 = 被拒的原因。该往返不进入任何对外可见记录。

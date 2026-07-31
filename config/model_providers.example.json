@@ -31,10 +31,6 @@
   ],
   "roles": {
     "planner": "deepseek-chat",
-    "replyer": {
-      "model": "deepseek-chat",
-      "temperature": 0.3
-    },
     "vision": {
       "targets": [
         "gpt-4o",
