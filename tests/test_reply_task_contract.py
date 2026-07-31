@@ -1,36 +1,22 @@
-"""ReplyTask / Replyer 的核心合同测试。
+"""ReplyTask 的核心合同测试。
 
-钉住五个边界：reply 取代 send_message；**普通发言的参数只剩 analysis +
-hold_seconds，`action` 省略即追加**（2026-07-25，撤稿/逐字直发仍留在同一个工具
-的 action 分支里）；草稿折叠与最终事实分离；授权 append-only、最新一次获胜
-（2026-07-24 待办#19 取代原"合稿去重"）；Replyer 一次输出可含多条文本和至多
-一张已收藏 meme。
+钉住五个边界：发言分两步（reply 存解析并等待，send_messages 发送——
+2026-07-31 删除 Replyer）；**追加的参数只剩 analysis + hold_seconds，
+`action` 省略即追加**（2026-07-25，撤稿留在同一个工具的 action 分支里）；
+草稿折叠与最终事实分离；append-only、最新一次获胜（2026-07-24 待办#19）；
+状态机 open → completed | cancelled，过期完成事件被折叠层拒绝。
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
-import sys
-import types
 import unittest
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
-from qqbot.services.agent_loop.decision import (
-    DecisionContext,
-    ImageRef,
-    TimelineItem,
-)
 from qqbot.services.agent_loop import reply_task as reply_task_module
 from qqbot.services.agent_loop.reply_task import ReplyTaskState, _fold_rows
-from qqbot.services.agent_loop.replyer import (
-    Replyer,
-    _build_system_prompt,
-    _parse_output,
-)
 from qqbot.services.agent_loop.tools import build_default_registry
 from qqbot.services.agent_loop.tools.reply import ReplyTool
 
@@ -70,16 +56,17 @@ def _upsert_payload(revision: int = 1) -> dict:
         "updated_at": NOW.isoformat(),
         "flush_at": (NOW + timedelta(seconds=10)).isoformat(),
         "hard_deadline": (NOW + timedelta(seconds=90)).isoformat(),
-        "mode": "compose",
         "analysis": "李四单独@我提出问题；相关事实 A 已核实",
-        "verbatim_messages": [],
     }
 
 
 class RegistryBoundaryTests(unittest.TestCase):
-    def test_reply_replaces_send_message_and_meme_send_is_removed(self) -> None:
+    def test_speaking_is_reply_plus_send_messages(self) -> None:
+        """发言两步各占一个工具（2026-07-31 删除 Replyer）：reply 存解析并
+        等待，send_messages 发送；退役的单数 send_message 不得复活。"""
         registry = build_default_registry()
         self.assertIn("reply", registry.names())
+        self.assertIn("send_messages", registry.names())
         self.assertNotIn("send_message", registry.names())
         # reply 不再覆盖工具批次的统一唤醒语义。
         self.assertFalse(hasattr(registry.get("reply"), "wake_policy"))
@@ -92,13 +79,13 @@ class RegistryBoundaryTests(unittest.TestCase):
             ["save", "delete", "recaption"],
         )
 
-    def test_speaking_surface_stays_one_tool(self) -> None:
-        """撤稿与逐字直发**不拆成独立工具**（2026-07-25 评估后否决）。
+    def test_cancel_stays_a_branch_not_a_tool(self) -> None:
+        """撤稿**不拆成独立工具**（2026-07-25 评估后否决）：工具是目录级的
+        东西，每注册一个，Planner 每拍都要读它的 catalog 条目和整段 usage
+        文档，而撤稿的使用频率远撑不起那份显著性。
 
-        工具是目录级的东西：每注册一个，Planner 每拍都要读它的 catalog 条目
-        和整段 usage 文档。代价不只是 prompt 体积——verbatim 本该是"Replyer
-        挂了才走"的逃生路径，升格成与 reply 平级的工具就把它的显著性抬到与
-        日常发言同等，等于邀请模型绕过 Replyer 和角色卡说话。
+        `say_verbatim` 同样不得作为工具出现——逐字直发 2026-07-30 已整条
+        删除；最终字句的唯一出口是 send_messages。
         """
         names = build_default_registry().names()
         self.assertIn("reply", names)
@@ -108,19 +95,21 @@ class RegistryBoundaryTests(unittest.TestCase):
     def test_ordinary_speech_needs_only_analysis_and_hold(self) -> None:
         """字段收敛的硬钉子：targets/gist 九个槽位没有独立程序语义，却用
         additionalProperties:false 把 Planner 能表达的辅助维度封死，还诱导
-        它把一段判读切成七份填。收敛成一个自由文本 analysis 后，折叠态把最新
-        完整 analysis 直送 Replyer；语气、情感和消息形态留给 Replyer。
+        它把一段判读切成七份填。收敛成一个自由文本 analysis 后，折叠态的最新
+        完整 analysis 随完成事件自包含地回到时间线；措辞在 send_messages
+        那一步现场决定。
 
         `action` 仍在，但**省略即追加**——`upsert` 这个取值取消了，普通发言
-        不必先声明一遍状态机操作。
+        不必先声明一遍状态机操作。2026-07-30 起 `verbatim` 也不在取值里，
+        `messages` 字段一并删除：这个工具没有任何承载最终字句的参数。
         """
         schema = ReplyTool.arguments_schema
         self.assertEqual(
             sorted(schema["properties"]),
-            ["action", "analysis", "hold_seconds", "messages", "reply_task_id"],
+            ["action", "analysis", "hold_seconds", "reply_task_id"],
         )
         self.assertEqual(schema["required"], [])
-        self.assertEqual(schema["properties"]["action"]["enum"], ["cancel", "verbatim"])
+        self.assertEqual(schema["properties"]["action"]["enum"], ["cancel"])
         # 省略 action 时 analysis + hold_seconds 才是必填（allOf 第一条分支）。
         self.assertEqual(
             schema["allOf"][0],
@@ -128,22 +117,18 @@ class RegistryBoundaryTests(unittest.TestCase):
                 "if": {"not": {"required": ["action"]}},
                 "then": {
                     "required": ["analysis", "hold_seconds"],
-                    "not": {
-                        "anyOf": [
-                            {"required": ["messages"]},
-                            {"required": ["reply_task_id"]},
-                        ]
-                    },
+                    "not": {"required": ["reply_task_id"]},
                 },
             },
         )
-        self.assertEqual(len(schema["allOf"]), 3)
+        self.assertEqual(len(schema["allOf"]), 2)
         description = schema["properties"]["analysis"]["description"]
         self.assertIn("topic threads", description)
         self.assertIn("time/order", description)
         self.assertIn("unresolved", description)
-        self.assertIn("Do not prescribe final wording", description)
-        self.assertIn("conversational posture", description)
+        # analysis 是解析不是草稿正文；措辞在 send_messages 那一步现场决定。
+        self.assertIn("not draft text", description)
+        self.assertIn("send_messages", description)
 
 
 class ReplyToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
@@ -196,7 +181,6 @@ class ReplyToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("message_id", outcome.result)
         payload = append.await_args.kwargs["payload"]
         self.assertEqual(payload["flush_at"], (NOW + timedelta(seconds=8)).isoformat())
-        self.assertEqual(payload["mode"], "compose")
         self.assertEqual(
             payload["analysis"],
             "李四在 MSG_1 单独@我提问；事实 A 已由工具核实，另一条话题与我无关",
@@ -206,7 +190,6 @@ class ReplyToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _open_task(
         *,
-        mode: str = "compose",
         flush_offset: int = 40,
         deadline_offset: int = 60,
     ) -> ReplyTaskState:
@@ -219,9 +202,7 @@ class ReplyToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
             updated_at=NOW - timedelta(seconds=5),
             flush_at=NOW + timedelta(seconds=flush_offset),
             hard_deadline=NOW + timedelta(seconds=deadline_offset),
-            mode=mode,
-            analysis="" if mode == "verbatim" else "旧判读",
-            verbatim_messages=[],
+            analysis="旧判读",
             latest_event_id="E1",
             source_tool_call_event_id="TC1",
             correlation_id="CID",
@@ -312,52 +293,31 @@ class ReplyToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
         )
         append.assert_not_awaited()
 
-    async def test_verbatim_draft_is_exclusive(self) -> None:
-        """verbatim 绕过 Replyer 直发，没有"综合多条授权"可言：挂着一份就
-        拒绝后续追加，只能先 cancel。"""
+    async def test_appending_onto_an_open_draft_is_never_locked(self) -> None:
+        """scope 内只剩一种稿，独占约束与 reply_task_locked 随逐字直发一并
+        删除（2026-07-30）：挂着一份 open 稿时继续追授权必须照常成功。"""
         outcome, append = await self._append(
-            {"analysis": "判读", "hold_seconds": 5},
-            self._open_task(mode="verbatim"),
-        )
-        self.assertFalse(outcome.ok)
-        self.assertEqual(outcome.error_kind, "reply_task_locked")
-        append.assert_not_awaited()
-
-    async def test_verbatim_cannot_join_a_pending_compose_draft(self) -> None:
-        """反方向同样拦：逐字语义不该被别的授权改写，也不该改写别人的。"""
-        outcome, append = await self._append(
-            {"action": "verbatim", "messages": [{"content": _CHAT}]},
-            self._open_task(),
-        )
-        self.assertFalse(outcome.ok)
-        self.assertEqual(outcome.error_kind, "reply_task_locked")
-        append.assert_not_awaited()
-
-    async def test_verbatim_creates_a_fresh_draft_flushing_now(self) -> None:
-        """hold 在 verbatim 上可省、默认 0：等待窗口的用处是让 Replyer 在
-        flush 时折进新消息，而逐字直发不经 Replyer、字节已定死。"""
-        outcome, append = await self._append(
-            {"action": "verbatim", "messages": [{"content": _CHAT}]}, None
+            {"analysis": "补一条新判读", "hold_seconds": 5}, self._open_task()
         )
         self.assertTrue(outcome.ok)
-        payload = append.await_args.kwargs["payload"]
-        self.assertEqual(payload["mode"], "verbatim")
-        self.assertEqual(payload["flush_at"], NOW.isoformat())
-        self.assertEqual(payload["verbatim_messages"], [{"content": _CHAT}])
-        self.assertEqual(payload["analysis"], "")
+        append.assert_awaited_once()
 
-    async def test_verbatim_rejects_empty_and_oversized_batches(self) -> None:
-        outcome, append = await self._append(
-            {"action": "verbatim", "messages": []}, None
-        )
-        self.assertFalse(outcome.ok)
-        self.assertEqual(outcome.extra.get("reason_code"), "empty_messages")
-        outcome, append = await self._append(
-            {"action": "verbatim", "messages": [{"content": _CHAT}] * 5}, None
-        )
-        self.assertFalse(outcome.ok)
-        self.assertEqual(outcome.extra.get("reason_code"), "too_many_messages")
-        append.assert_not_awaited()
+    async def test_verbatim_action_no_longer_exists(self) -> None:
+        """逐字直发 2026-07-30 删除：Planner 不再有任何写出可见字句的通路。
+        旧调用不得静默降级成一条普通授权——那会让它以为自己定死的字节发出去
+        了，实际是 Replyer 拿着空判读组稿。"""
+        for arguments in (
+            {"action": "verbatim", "messages": [{"content": _CHAT}]},
+            {"action": "verbatim", "analysis": "判读", "hold_seconds": 5},
+        ):
+            with self.subTest(arguments=sorted(arguments)):
+                outcome, append = await self._append(arguments, None)
+                self.assertFalse(outcome.ok)
+                self.assertEqual(outcome.error_kind, "invalid_arguments")
+                self.assertEqual(
+                    outcome.extra.get("reason_code"), "verbatim_removed"
+                )
+                append.assert_not_awaited()
 
 
 def _tool_context() -> dict:
@@ -388,8 +348,11 @@ class ReplyArgumentSurfaceTests(unittest.IsolatedAsyncioTestCase):
             "targets": "targets_gist_replaced_by_analysis",
             "gist": "targets_gist_replaced_by_analysis",
             "points": "targets_gist_replaced_by_analysis",
-            "mode": "mode_replaced_by_action",
-            "verbatim_messages": "verbatim_messages_renamed_to_messages",
+            "mode": "mode_removed",
+            # 2026-07-30 逐字直发下线：两个载荷字段都指向同一条迁移说明，
+            # 让模型看出是"这条路没有了"而不是字段名拼错了。
+            "messages": "verbatim_removed",
+            "verbatim_messages": "verbatim_removed",
             "expected_revision": "expected_revision_removed",
         }
         for key, reason_code in cases.items():
@@ -421,20 +384,9 @@ class ReplyArgumentSurfaceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(outcome.ok)
                 self.assertEqual(outcome.extra.get("reason_code"), "bad_analysis")
 
-    async def test_analysis_and_messages_do_not_cross_branches(self) -> None:
-        """两条分支的字段互不容忍：verbatim 绕过 Replyer，写了 analysis 也没有
-        任何读者，静默丢掉正是最难被发现的坏法。"""
-        outcome = await self._run(
-            {
-                "action": "verbatim",
-                "analysis": "判读",
-                "messages": [{"content": _CHAT}],
-            }
-        )
-        self.assertFalse(outcome.ok)
-        self.assertEqual(
-            outcome.extra.get("reason_code"), "analysis_not_applicable"
-        )
+    async def test_messages_alongside_analysis_still_fails(self) -> None:
+        """`messages` 已随逐字直发删除，但一份合法的普通授权里混进它不能被
+        静默忽略——那等于 Planner 以为自己定死的字句发出去了。"""
         outcome = await self._run(
             {
                 "analysis": "判读",
@@ -443,9 +395,7 @@ class ReplyArgumentSurfaceTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         self.assertFalse(outcome.ok)
-        self.assertEqual(
-            outcome.extra.get("reason_code"), "messages_need_verbatim"
-        )
+        self.assertEqual(outcome.extra.get("reason_code"), "verbatim_removed")
 
     async def test_reply_task_id_outside_cancel_is_rejected(self) -> None:
         """带 id 来追加 = 还在用旧的"指名改某一份稿"心智模型。静默忽略会让它
@@ -487,7 +437,6 @@ class ReplyArgumentSurfaceTests(unittest.IsolatedAsyncioTestCase):
         cases = {
             "analysis": "判读",
             "hold_seconds": 5,
-            "messages": [{"content": _CHAT}],
         }
         for key, value in cases.items():
             with self.subTest(key=key):
@@ -497,19 +446,6 @@ class ReplyArgumentSurfaceTests(unittest.IsolatedAsyncioTestCase):
                     outcome.extra.get("reason_code"),
                     "cancel_arguments_not_applicable",
                 )
-
-    async def test_verbatim_message_rejects_extra_fields(self) -> None:
-        outcome = await self._run(
-            {
-                "action": "verbatim",
-                "messages": [{"content": _CHAT, "caption": "ignored before"}],
-            }
-        )
-        self.assertFalse(outcome.ok)
-        self.assertEqual(
-            outcome.extra.get("reason_code"),
-            "unexpected_message_argument",
-        )
 
 
 class ReplyCancelActionTests(unittest.IsolatedAsyncioTestCase):
@@ -526,9 +462,7 @@ class ReplyCancelActionTests(unittest.IsolatedAsyncioTestCase):
             updated_at=NOW,
             flush_at=NOW + timedelta(seconds=10),
             hard_deadline=NOW + timedelta(seconds=90),
-            mode="compose",
             analysis="待撤稿",
-            verbatim_messages=[],
             latest_event_id="E1",
             source_tool_call_event_id="TC1",
             correlation_id="CID",
@@ -583,7 +517,81 @@ class ReplyCancelActionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReplyTaskFoldTests(unittest.TestCase):
-    def test_pending_claim_and_flush_are_distinct_states(self) -> None:
+    def test_completed_event_folds_open_task_terminal(self) -> None:
+        """新链路状态机：flush_at 到达 → runtime.reply_task_completed 把
+        open 折成 completed（terminal）。"""
+        upsert = _event(
+            "E_UPSERT",
+            "agent.reply_task_upserted",
+            _upsert_payload(),
+            causation_id="E_TOOL_CALL",
+        )
+        completed = _event(
+            "E_DONE",
+            "runtime.reply_task_completed",
+            {"reply_task_id": "R1", "revision": 1, "analysis": "……"},
+            causation_id="E_UPSERT",
+            seconds=1,
+        )
+        pending = _fold_rows([upsert])["R1"]
+        self.assertEqual(pending.state, "open")
+        self.assertEqual(
+            pending.analysis, "李四单独@我提出问题；相关事实 A 已核实"
+        )
+        self.assertEqual(pending.latest_event_id, "E_UPSERT")
+        self.assertEqual(pending.source_tool_call_event_id, "E_TOOL_CALL")
+        self.assertEqual(
+            _fold_rows([upsert, completed])["R1"].state, "completed"
+        )
+
+    def test_stale_completed_is_rejected_by_the_fold(self) -> None:
+        """§1.5：更低 revision 的 completed 输给了并发追加的新 upsert，不得
+        把任务折成 completed；任务保持 open 等新 revision 自己的完成事件。"""
+        first = _event(
+            "E1", "agent.reply_task_upserted", _upsert_payload(), causation_id="TC1"
+        )
+        second = _event(
+            "E2",
+            "agent.reply_task_upserted",
+            _upsert_payload(2),
+            causation_id="TC2",
+            seconds=1,
+        )
+        stale_completed = _event(
+            "E_DONE",
+            "runtime.reply_task_completed",
+            {"reply_task_id": "R1", "revision": 1, "analysis": "……"},
+            causation_id="E1",
+            seconds=2,
+        )
+        state = _fold_rows([first, second, stale_completed])["R1"]
+        self.assertEqual(state.state, "open")
+        self.assertEqual(state.revision, 2)
+
+    def test_late_completed_does_not_resurrect_a_cancelled_task(self) -> None:
+        upsert = _event(
+            "E1", "agent.reply_task_upserted", _upsert_payload(), causation_id="TC1"
+        )
+        cancelled = _event(
+            "E_CANCEL",
+            "agent.reply_task_cancelled",
+            {"reply_task_id": "R1", "revision": 1, "state": "cancelled"},
+            seconds=1,
+        )
+        late_completed = _event(
+            "E_DONE",
+            "runtime.reply_task_completed",
+            {"reply_task_id": "R1", "revision": 1, "analysis": "……"},
+            causation_id="E1",
+            seconds=2,
+        )
+        state = _fold_rows([upsert, cancelled, late_completed])["R1"]
+        self.assertEqual(state.state, "cancelled")
+
+    def test_legacy_claim_and_flush_still_fold_for_upgrade(self) -> None:
+        """升级兼容：旧链路的 claim/flush 只用于把升级前的任务折成历史
+        terminal（新链路不写它们）；缺 reply_task_id 的 flushed（防御）
+        不改任何任务状态。"""
         upsert = _event(
             "E_UPSERT",
             "agent.reply_task_upserted",
@@ -607,17 +615,20 @@ class ReplyTaskFoldTests(unittest.TestCase):
             },
             seconds=2,
         )
-
-        pending = _fold_rows([upsert])["R1"]
-        self.assertEqual(pending.state, "open")
-        self.assertEqual(
-            pending.analysis, "李四单独@我提出问题；相关事实 A 已核实"
+        taskless_flushed = _event(
+            "E_TASKLESS_FLUSH",
+            "runtime.reply_flushed",
+            {"status": "sent", "message_ids": [456], "sent_messages": []},
+            causation_id="E_SEND_TOOL_CALL",
+            seconds=3,
         )
-        self.assertEqual(pending.latest_event_id, "E_UPSERT")
-        self.assertEqual(pending.source_tool_call_event_id, "E_TOOL_CALL")
         self.assertEqual(_fold_rows([upsert, claimed])["R1"].state, "claimed")
         self.assertEqual(
             _fold_rows([upsert, claimed, flushed])["R1"].state, "sent"
+        )
+        # 无 reply_task_id 的 flushed（防御）→ 不改任何任务状态。
+        self.assertEqual(
+            _fold_rows([upsert, taskless_flushed])["R1"].state, "open"
         )
 
     def test_new_revision_reopens_same_task_with_latest_source(self) -> None:
@@ -702,278 +713,51 @@ class LatestAuthorizationContractTests(unittest.TestCase):
         self.assertFalse(hasattr(state, "gist"))
 
 
-class ReplyerOutputTests(unittest.TestCase):
-    def test_allows_ordered_chat_and_one_saved_meme(self) -> None:
-        value = {
-            "messages": [
-                {
-                    "kind": "chat",
-                    "content": [{"type": "text", "data": {"text": "先说一句"}}],
-                },
-                {"kind": "meme", "image_hash": HASH_A},
-                {
-                    "kind": "chat",
-                    "content": [{"type": "text", "data": {"text": "再补一句"}}],
-                },
-            ],
-            "empty_reason": None,
-        }
-        parsed = _parse_output(json.dumps(value, ensure_ascii=False), {HASH_A})
-        self.assertEqual(
-            [item["kind"] for item in parsed["messages"]],
-            ["chat", "meme", "chat"],
+class PersonaCardHomeTests(unittest.TestCase):
+    """角色卡的居所与注入路径（2026-07-31 删除 Replyer 后重锚）。
+
+    卡片唯一真相源是 prompts/persona.md，经 planner.md 页首的 {{persona}} 槽
+    进入 Planner render；历史居所（tools/send_message.md Voice 节 →
+    prompts/voice.md → prompts/replyer.md）全部不复存在。工具用法文档不得再
+    承载人格正文——两处副本必然漂移。
+    """
+
+    def test_card_reaches_planner_but_not_tool_docs(self) -> None:
+        from qqbot.services.agent_loop.prompts.catalog import (
+            render_system_prompt,
         )
 
-    def test_normalizes_flat_segments_and_code_fence(self) -> None:
-        """Gemini 系模型的真实漂移形态（2026-07-22 线上快照）：输出包 ```json
-        围栏 + 段字段拍平到顶层。解析层无损归一成 OneBot data 包装，执行器
-        preflight 的严格校验保持不变。"""
-        raw = (
-            "```json\n"
-            '{"messages":[{"kind":"chat","content":['
-            '{"type":"reply","id":"1115629605"},'
-            '{"type":"text","text":"在呢，有事就直接说"}]}],"empty_reason":null}\n'
-            "```"
-        )
-        parsed = _parse_output(raw, set())
-        self.assertEqual(
-            parsed["messages"][0]["content"],
-            [
-                {"type": "reply", "data": {"id": "1115629605"}},
-                {"type": "text", "data": {"text": "在呢，有事就直接说"}},
-            ],
-        )
-
-    def test_normalizes_reply_message_id_alias(self) -> None:
-        value = {
-            "messages": [
-                {
-                    "kind": "chat",
-                    "content": [
-                        {"type": "reply", "data": {"message_id": "840063058"}},
-                        {"type": "at", "qq": "10001"},
-                    ],
-                }
-            ],
-            "empty_reason": None,
-        }
-        parsed = _parse_output(json.dumps(value, ensure_ascii=False), set())
-        self.assertEqual(
-            parsed["messages"][0]["content"],
-            [
-                {"type": "reply", "data": {"id": "840063058"}},
-                {"type": "at", "data": {"qq": "10001"}},
-            ],
-        )
-
-    def test_fence_without_closing_line_still_parses(self) -> None:
-        raw = (
-            "```json\n"
-            '{"messages":[{"kind":"chat","content":'
-            '[{"type":"text","data":{"text":"好"}}]}],"empty_reason":null}'
-        )
-        parsed = _parse_output(raw, set())
-        self.assertEqual(
-            parsed["messages"][0]["content"],
-            [{"type": "text", "data": {"text": "好"}}],
-        )
-
-    def test_unrecognized_segment_shapes_pass_through_untouched(self) -> None:
-        """归一只处理已知漂移；其余坏形态原样透传，由执行器严格校验
-        fail loudly，不在解析层静默吞掉。"""
-        content = [
-            {"type": "image", "data": {"file": "x"}},
-            {"type": "text", "data": "hello"},
-        ]
-        value = {
-            "messages": [{"kind": "chat", "content": content}],
-            "empty_reason": None,
-        }
-        parsed = _parse_output(json.dumps(value), set())
-        self.assertEqual(parsed["messages"][0]["content"], content)
-
-    def test_rejects_unknown_or_second_meme(self) -> None:
-        unknown = {
-            "messages": [{"kind": "meme", "image_hash": "cd" * 32}],
-            "empty_reason": None,
-        }
-        with self.assertRaisesRegex(ValueError, "unknown meme"):
-            _parse_output(json.dumps(unknown), {HASH_A})
-
-        duplicate = {
-            "messages": [
-                {"kind": "meme", "image_hash": HASH_A},
-                {"kind": "meme", "image_hash": HASH_A},
-            ],
-            "empty_reason": None,
-        }
-        with self.assertRaisesRegex(ValueError, "at most one meme"):
-            _parse_output(json.dumps(duplicate), {HASH_A})
-
-    def test_empty_reply_requires_reason(self) -> None:
-        with self.assertRaisesRegex(ValueError, "empty output requires"):
-            _parse_output('{"messages":[],"empty_reason":null}', set())
-
-    def test_voice_lives_in_replyer_not_registered_tool_docs(self) -> None:
-        prompt = _build_system_prompt()
+        prompt = render_system_prompt("planner", scope="group")
         self.assertIn("小奏", prompt)
         self.assertNotIn("小奏", build_default_registry().usage_docs("group"))
 
-    def test_voice_card_home_is_prompts_replyer_md(self) -> None:
-        """角色卡的居所：2026-07-19 自已下架的 send_message.md 迁到
-        prompts/voice.md，2026-07-30 又并入 prompts/replyer.md（职责页与
-        角色卡同一份）。旧居所都不得再承载人格，防两处副本漂移。"""
+    def test_card_home_is_prompts_persona_md(self) -> None:
+        """旧居所都不得复活：replyer.md / voice.md / send_message.md 已随各自
+        宿主删除，卡片只住 persona.md。"""
         from qqbot.services.agent_loop.prompts.catalog import _PROMPTS_DIR
 
-        card = (_PROMPTS_DIR / "replyer.md").read_text(encoding="utf-8")
+        card = (_PROMPTS_DIR / "persona.md").read_text(encoding="utf-8")
         self.assertIn("小奏", card)
         self.assertIn("最重要的人", card)
         self.assertFalse((_PROMPTS_DIR / "voice.md").exists())
-        legacy = (
-            _PROMPTS_DIR.parent / "tools" / "send_message.md"
-        ).read_text(encoding="utf-8")
-        self.assertNotIn("你叫小奏", legacy)
+        self.assertFalse((_PROMPTS_DIR / "replyer.md").exists())
+        self.assertFalse(
+            (_PROMPTS_DIR.parent / "tools" / "send_message.md").exists()
+        )
 
     def test_missing_card_file_fails_loudly(self) -> None:
-        """角色卡所在文件缺失 = 部署损坏：组稿必须失败（final 记 failed 并
-        回注时间线），绝不静默降级成无人格腔——那是最难被发现的坏法。
-        2026-07-30 起这条由 catalog 的文件段不变量兜住（缺失 OSError /
-        为空 PromptSectionMissing），_build_system_prompt 统一转 ReplyerError。"""
-        from qqbot.services.agent_loop import replyer as replyer_mod
+        """角色卡所在文件缺失 = 部署损坏：Planner 的 prompt 装配必须失败
+        （llm_planner 兜底降级 idle），绝不静默渲染无人格腔——那是最难被
+        发现的坏法。"""
         from qqbot.services.agent_loop.prompts import catalog
 
-        original = catalog._FILES["replyer"]
-        catalog._FILES["replyer"] = "__no_such_replyer_card__.md"
+        original = catalog._FILES["persona"]
+        catalog._FILES["persona"] = "__no_such_persona_card__.md"
         try:
-            with self.assertRaises(replyer_mod.ReplyerError):
-                _build_system_prompt()
+            with self.assertRaises(Exception):
+                catalog.render_system_prompt("planner", scope="group")
         finally:
-            catalog._FILES["replyer"] = original
-
-
-class _CapturingLLM:
-    """记录 ainvoke 收到的 messages，返回最小合法组稿 JSON。"""
-
-    def __init__(self) -> None:
-        self.messages: list | None = None
-
-    async def ainvoke(self, messages: list) -> SimpleNamespace:
-        self.messages = messages
-        return SimpleNamespace(
-            content=json.dumps(
-                {
-                    "messages": [
-                        {
-                            "kind": "chat",
-                            "content": [
-                                {"type": "text", "data": {"text": "好"}}
-                            ],
-                        }
-                    ],
-                    "empty_reason": None,
-                }
-            )
-        )
-
-
-class ReplyerMultimodalTests(unittest.TestCase):
-    """compose 的多模态 content 合同（2026-07-22 Replyer 与 Planner 同等看图）：
-    有图 → content 为 [文本块, *图块] 且文本块即 XML 信封（replyer-input）；
-    无图 → content 保持纯字符串。"""
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        # 本地无 langchain 时桩替 message 类；服务器上真模块存在则原样使用。
-        try:
-            import langchain_core.messages  # noqa: F401
-        except Exception:
-            messages_mod = types.ModuleType("langchain_core.messages")
-
-            class _Message:
-                def __init__(self, content: object) -> None:
-                    self.content = content
-
-            messages_mod.SystemMessage = _Message  # type: ignore[attr-defined]
-            messages_mod.HumanMessage = _Message  # type: ignore[attr-defined]
-            root = sys.modules.setdefault(
-                "langchain_core", types.ModuleType("langchain_core")
-            )
-            root.messages = messages_mod  # type: ignore[attr-defined]
-            sys.modules["langchain_core.messages"] = messages_mod
-
-    @staticmethod
-    def _compose_task() -> ReplyTaskState:
-        return ReplyTaskState(
-            reply_task_id="R1",
-            scope_key="group:100",
-            revision=1,
-            state="claimed",
-            created_at=NOW,
-            updated_at=NOW,
-            flush_at=NOW,
-            hard_deadline=NOW + timedelta(seconds=90),
-            mode="compose",
-            analysis="李四单独@我提问；问题尚未被回答",
-            verbatim_messages=[],
-            latest_event_id="E1",
-            source_tool_call_event_id="TC1",
-            correlation_id="CID",
-        )
-
-    def _run_compose(self, timeline: list[TimelineItem]) -> _CapturingLLM:
-        llm = _CapturingLLM()
-        context = DecisionContext(
-            scope_key="group:100",
-            correlation_id="CID",
-            tick_seq=0,
-            now=NOW,
-            timeline=timeline,
-        )
-        with patch(
-            "qqbot.services.agent_loop.replyer.should_snapshot",
-            return_value=False,
-        ):
-            result = asyncio.run(
-                Replyer(llm_client=llm).compose(
-                    self._compose_task(), context, []
-                )
-            )
-        self.assertEqual(result["messages"][0]["kind"], "chat")
-        return llm
-
-    def test_compose_never_attaches_image_blocks(self) -> None:
-        """2026-07-28：Replyer 降级为纯文本模型。timeline 里带已落盘图片的
-        消息**不再**让 content 变成多模态数组——图片内容以 ingest 期写好的
-        desc= 属性随 render 文本进 prompt（见 image_description 模块）。"""
-        item = TimelineItem(
-            event_id="E1",
-            occurred_at=NOW,
-            kind="message",
-            render=f'<message><image hash="{HASH_A}" desc="一只猫"/></message>',
-            images=[
-                ImageRef(
-                    file_hash=HASH_A,
-                    local_path="/nonexistent/never-read",
-                    mime="image/png",
-                )
-            ],
-        )
-        llm = self._run_compose([item])
-        assert llm.messages is not None
-        content = llm.messages[1].content
-        self.assertIsInstance(content, str)
-        self.assertTrue(content.startswith("<replyer-input "))
-        # 图片语义只经 render 文本抵达，且没有任何 base64 载荷。
-        self.assertIn('desc="一只猫"', content)
-        self.assertNotIn("base64", content)
-
-    def test_compose_without_images_keeps_plain_text_content(self) -> None:
-        llm = self._run_compose([])
-        assert llm.messages is not None
-        content = llm.messages[1].content
-        self.assertIsInstance(content, str)
-        self.assertTrue(content.startswith("<replyer-input "))
-        self.assertIn('reply_task_id="R1"', content)
+            catalog._FILES["persona"] = original
 
 
 if __name__ == "__main__":

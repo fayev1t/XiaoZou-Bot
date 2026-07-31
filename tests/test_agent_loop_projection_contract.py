@@ -2393,9 +2393,9 @@ class RecallRenderingNoteTests(unittest.TestCase):
 class ReplyFlushedProjectionTests(unittest.TestCase):
     def test_successful_reply_tool_row_is_rendered_as_authorization(self) -> None:
         """2026-07-24（待办#19）起 reply 成功行**不再折叠**：它是 append-only
-        规划历史的一部分——<args> 是这次授权原文（含 hold_seconds），<result>
-        是它落成的调度事实。Replyer 的当前唯一授权另由 ReplyTaskState 中最新
-        完整 analysis 提供；这里不做历史合并。"""
+        规划历史的一部分——<args> 是这次解析原文（含 hold_seconds），<result>
+        是它落成的调度事实。到点后的当前完整 analysis 另由
+        <reply-task-completed> 行自包含地送达；这里不做历史合并。"""
         called = _snap(
             type="agent.tool_called",
             event_id="TC_EVENT",
@@ -2426,8 +2426,8 @@ class ReplyFlushedProjectionTests(unittest.TestCase):
         self.assertEqual([it.kind for it in items], ["tool_call"])
         render = items[0].render
         self.assertIn('<tool-call name="reply" status="complete"', render)
-        # 授权原文（<args>）与调度事实（<result>）都在同一行上，Planner 据此
-        # 回看"我当时授权了什么、什么时候发"；Replyer 不依赖这行取当前 analysis。
+        # 解析原文（<args>）与调度事实（<result>）都在同一行上，Planner 据此
+        # 回看"我当时写了什么、什么时候到点"；当前 analysis 不依赖这行送达。
         self.assertIn("hold_seconds", render)
         self.assertIn("回答", render)
         self.assertIn("R1", render)
@@ -2488,6 +2488,217 @@ class ReplyFlushedProjectionTests(unittest.TestCase):
         self.assertIn("第一句", rendered)
         self.assertIn('message_id="102"', rendered)
         self.assertIn(f'hash="{"ab" * 32}"', rendered)
+
+    def test_send_messages_terminal_renders_on_the_tool_row_only(self) -> None:
+        """2026-07-31 实施后调整（维护者拍板）：现役发言**不派生** <my-reply>
+        行——`<tool-call name="send_messages">` 行的 args + 结果回执就是发言
+        记录，同一句话两处渲染是复读诱饵。sent 与 partial（tool_failed 平铺
+        receipts）一视同仁。"""
+        called = _snap(
+            type="agent.tool_called",
+            event_id="TC_SEND_EVENT",
+            payload={
+                "tool_call_id": "TC_SEND",
+                "tool_name": "send_messages",
+                "arguments": {"messages": []},
+            },
+        )
+        result = _snap(
+            type="agent.tool_result",
+            event_id="TC_SEND_TERMINAL",
+            payload={
+                "tool_call_id": "TC_SEND",
+                "tool_name": "send_messages",
+                "result": {
+                    "status": "sent",
+                    "message_ids": [201],
+                    "sent_messages": [
+                        {
+                            "index": 0,
+                            "kind": "chat",
+                            "content": [
+                                {"type": "text", "data": {"text": "新链路"}}
+                            ],
+                            "status": "sent",
+                            "message_id": 201,
+                            "self_id": "10001",
+                        }
+                    ],
+                },
+            },
+            seconds_offset=1,
+        )
+        views = Projector.fold_tool_results([called, result])
+        items = Projector.build_timeline([called, result], tool_views=views)
+        self.assertEqual([item.kind for item in items], ["tool_call"])
+        rendered = items[0].render
+        # 回执（status + message_id + 正文）都在这一行的 <result> 里。
+        self.assertIn("sent", rendered)
+        self.assertIn("201", rendered)
+        self.assertIn("新链路", rendered)
+        self.assertNotIn("<my-reply", rendered)
+
+        partial_failed = _snap(
+            type="agent.tool_failed",
+            event_id="TC_SEND_FAIL",
+            payload={
+                "tool_call_id": "TC_SEND2",
+                "tool_name": "send_messages",
+                "error_kind": "upstream_action_failed",
+                "error_message": "第二条被拒",
+                "status": "partial",
+                "sent_messages": [
+                    {"index": 0, "status": "sent", "message_id": 301},
+                    {"index": 1, "status": "failed"},
+                ],
+            },
+        )
+        self.assertEqual(
+            [
+                item.kind
+                for item in Projector.build_timeline(
+                    [partial_failed], tool_views=[]
+                )
+            ],
+            [],
+        )
+
+    def test_send_messages_receipts_mark_quotes_as_from_self(self) -> None:
+        """终态回执仍喂 author index：别人引用 bot 经 send_messages 发出的
+        消息时，reply 段照标 from_self="true"（这是归属折叠，与是否渲染
+        <my-reply> 无关）。partial 的 tool_failed 平铺回执同样命中。"""
+        called = _snap(
+            type="agent.tool_called",
+            event_id="TC_SEND_EVENT",
+            payload={
+                "tool_call_id": "TC_SEND",
+                "tool_name": "send_messages",
+                "arguments": {"messages": []},
+            },
+        )
+        failed_partial = _snap(
+            type="agent.tool_failed",
+            event_id="TC_SEND_TERMINAL",
+            payload={
+                "tool_call_id": "TC_SEND",
+                "tool_name": "send_messages",
+                "error_kind": "upstream_action_failed",
+                "error_message": "第二条被拒",
+                "status": "partial",
+                "sent_messages": [
+                    {
+                        "index": 0,
+                        "kind": "chat",
+                        "content": [
+                            {"type": "text", "data": {"text": "先出的"}}
+                        ],
+                        "status": "sent",
+                        "message_id": 301,
+                        "self_id": "10001",
+                    },
+                    {"index": 1, "status": "failed"},
+                ],
+            },
+            seconds_offset=1,
+        )
+        quoting = _snap(
+            type="external.message.group",
+            event_id="E_QUOTE",
+            payload={
+                "onebot_message_id": "M_QUOTE",
+                "sender": {"user_id": 222, "nickname": "李四"},
+                "segments": [
+                    {"type": "reply", "data": {"id": "301"}},
+                    {"type": "text", "data": {"text": "你说啥"}},
+                ],
+            },
+            seconds_offset=2,
+        )
+        events = [called, failed_partial, quoting]
+        views = Projector.fold_tool_results(events)
+        items = Projector.build_timeline(events, tool_views=views)
+        message_rows = [item for item in items if item.kind == "message"]
+        self.assertEqual(len(message_rows), 1)
+        self.assertIn('to_message_id="301"', message_rows[0].render)
+        self.assertIn('from_self="true"', message_rows[0].render)
+        self.assertIn('from_qq="10001"', message_rows[0].render)
+
+    def test_reply_task_completed_renders_analysis_row(self) -> None:
+        """runtime.reply_task_completed → <reply-task-completed> 行：只陈述
+        等待结束与最终 analysis，没有授权/unseen/consumed/expires 语义。"""
+        completed = _snap(
+            type="runtime.reply_task_completed",
+            event_id="DONE",
+            payload={
+                "reply_task_id": "R1",
+                "revision": 3,
+                "analysis": "李四在问营业时间；需要说明周日提前关门 & 别接价格线",
+                "completed_at": "2026-07-31T20:30:08+08:00",
+            },
+        )
+        items = Projector.build_timeline([completed], tool_views=[])
+        self.assertEqual(
+            [item.kind for item in items], ["reply_task_completed"]
+        )
+        rendered = items[0].render
+        self.assertIn(
+            '<reply-task-completed reply_task_id="R1" revision="3">', rendered
+        )
+        self.assertIn(
+            "<analysis>李四在问营业时间；需要说明周日提前关门 &amp; "
+            "别接价格线</analysis>",
+            rendered,
+        )
+        for forbidden in ("authorization", "unseen", "consumed", "expires"):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_stale_completed_is_not_rendered(self) -> None:
+        """§1.5 投影守卫：窗口内已有更高 revision 的 upsert → 更低 revision
+        的 completed 不渲染；cancelled 任务上迟到的 completed 也不渲染。"""
+        upsert_v2 = _snap(
+            type="agent.reply_task_upserted",
+            event_id="UP2",
+            payload={"reply_task_id": "R1", "revision": 2},
+        )
+        stale = _snap(
+            type="runtime.reply_task_completed",
+            event_id="DONE_V1",
+            payload={"reply_task_id": "R1", "revision": 1, "analysis": "旧"},
+            seconds_offset=1,
+        )
+        self.assertEqual(
+            Projector.build_timeline([upsert_v2, stale], tool_views=[]), []
+        )
+        cancel = _snap(
+            type="agent.reply_task_cancelled",
+            event_id="CANCEL",
+            payload={"reply_task_id": "R2", "revision": 1},
+        )
+        late = _snap(
+            type="runtime.reply_task_completed",
+            event_id="DONE_R2",
+            payload={"reply_task_id": "R2", "revision": 1, "analysis": "迟"},
+            seconds_offset=1,
+        )
+        self.assertEqual(
+            Projector.build_timeline([cancel, late], tool_views=[]), []
+        )
+        # 正常路径不受守卫误伤：同 revision 的 upsert + completed 照常渲染。
+        upsert = _snap(
+            type="agent.reply_task_upserted",
+            event_id="UP_OK",
+            payload={"reply_task_id": "R3", "revision": 1},
+        )
+        done = _snap(
+            type="runtime.reply_task_completed",
+            event_id="DONE_OK",
+            payload={"reply_task_id": "R3", "revision": 1, "analysis": "现行"},
+            seconds_offset=1,
+        )
+        items = Projector.build_timeline([upsert, done], tool_views=[])
+        self.assertEqual(
+            [item.kind for item in items], ["reply_task_completed"]
+        )
 
     def test_reply_to_flushed_message_is_marked_from_self(self) -> None:
         flushed = _snap(

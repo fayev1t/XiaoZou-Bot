@@ -23,8 +23,8 @@ test_recaption_meme_tool_contract.py，均已删除）。工具名 2026-07-25 �
   承担（逐张走单张流程、逐项回执 results）；≥1 张成功 → success（batch:
   true + 三计数），无一成功 → batch_save_failed（retryable=任一项
   retryable）；单 string 输入结果形态不变（不包 batch 壳）。
-- send 已从 meme 工具面移除；最终是否发 meme、发哪张及排序由 reply_task
-  到点后的 Replyer 决定。
+- send 已从 meme 工具面移除；最终是否发 meme、发哪张及排序在 send_messages
+  调用时决定。
 - delete：未收录 → unknown_meme 不发 DELETE；命中 → 删元数据并回执被删条目
   描述（确认话术点名绑定对象）；并发删除（rowcount=0）结果状态一致照常
   success。
@@ -212,7 +212,7 @@ class _MemeToolTestBase(unittest.IsolatedAsyncioTestCase):
 
 class ToolIdentityTests(unittest.TestCase):
     """工具身份：2026-07-25 改名 `meme` → `meme_collection`，且工具面上
-    不得再出现任何"发送"入口（发送 2026-07-19 起归 Replyer，黑盒设计 §1）。"""
+    不得再出现任何"发送"入口（发送归 send_messages，黑盒设计 §1）。"""
 
     def test_tool_name_is_meme_collection(self) -> None:
         self.assertEqual(MemeCollectionTool.name, "meme_collection")
@@ -241,11 +241,11 @@ class ToolIdentityTests(unittest.TestCase):
         usage = MemeCollectionTool.usage_prompt or ""
         self.assertIn("meme_collection", usage)
         self.assertIn("never sends", usage)
-        # 2026-07-28 起 Planner 连“这次用不用图”也不再指导：analysis 只交接
-        # 人物/话题/时间/内容，最终形态完全归 Replyer。
+        # 发不发图在 send_messages 那一步现场决定（2026-07-31 删除 Replyer）；
+        # analysis 只交接人物/话题/时间/内容，不预先绑定表达形态。
         self.assertIn("Do not steer", usage)
         self.assertIn("`reply.analysis`", usage)
-        self.assertIn("composer", usage)
+        self.assertIn("send_messages", usage)
         self.assertNotIn("gist", usage)
 
 

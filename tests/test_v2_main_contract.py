@@ -77,35 +77,33 @@ class V2MainPluginContractTests(unittest.TestCase):
         self.assertIn("swallowed", self.plugin_text)
 
     def test_plugin_has_no_persona_plumbing(self) -> None:
-        # 2026-07-02 起决策层无人格：prompts/persona.md 删除，v2_main 的
-        # persona 读取/注入链路一并移除。角色卡历经 tools/send_message.md
-        # Voice 节，2026-07-19 随 ReplyTask 换轨迁至 prompts/voice.md，仅由
-        # Replyer 组稿时加载——Planner 五段 prompt 仍不含它；参与倾向已并入
-        # group_chat_rules policy，整张角色卡的禁入红线不变。
-        persona_path = (
-            ROOT / "qqbot" / "services" / "agent_loop" / "prompts" / "persona.md"
-        )
-        self.assertFalse(persona_path.exists())
+        # 钉的是 **plugin 层**没有人格管线：角色卡的装配全部由
+        # prompts/catalog.py 负责（planner.md 页首的人格槽），插件不碰——
+        # plugin_text 里出现 persona 字样依然是接线倒退。角色卡历经
+        # tools/send_message.md Voice 节、prompts/voice.md、prompts/replyer.md
+        # （三者均已删除），2026-07-30 定居 prompts/persona.md。
         self.assertNotIn("persona", self.plugin_text)
         # 职责页（planner.md）与角色卡的现居所必须存在且非空
         prompts_dir = ROOT / "qqbot" / "services" / "agent_loop" / "prompts"
         identity_text = (prompts_dir / "planner.md").read_text(encoding="utf-8")
-        self.assertIn("决策引擎", identity_text)
-        # 角色卡 2026-07-30 并入 replyer.md（voice.md 已删除）
-        self.assertFalse((prompts_dir / "voice.md").exists())
-        card = (prompts_dir / "replyer.md").read_text(encoding="utf-8")
+        self.assertIn("# 你在怎样运行", identity_text)
+        card = (prompts_dir / "persona.md").read_text(encoding="utf-8")
         self.assertIn("小奏", card)
         self.assertIn("最重要的人", card)
-        # 旧居所不得残留人格正文（防两处副本漂移）
-        send_message_md = (
-            ROOT
-            / "qqbot"
-            / "services"
-            / "agent_loop"
-            / "tools"
-            / "send_message.md"
-        ).read_text(encoding="utf-8")
-        self.assertNotIn("你叫小奏", send_message_md)
+        # 旧居所不得复活（防两处副本漂移；send_message.md / replyer.md 随
+        # 2026-07-31 删除 Replyer 一并删除）
+        self.assertFalse((prompts_dir / "voice.md").exists())
+        self.assertFalse((prompts_dir / "replyer.md").exists())
+        self.assertFalse(
+            (
+                ROOT
+                / "qqbot"
+                / "services"
+                / "agent_loop"
+                / "tools"
+                / "send_message.md"
+            ).exists()
+        )
 
     def test_request_handler_wires_auto_approval(self) -> None:
         # 2026-07-03 拆分：request handler 在 ingest 返回后调自动审批（好友申请 /

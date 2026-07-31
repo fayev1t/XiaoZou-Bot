@@ -216,90 +216,107 @@ class LLMPlannerContractTest(unittest.TestCase):
         self.assertEqual(out.reasoning, "oops")
 
     def test_planner_section_opens_system_prompt(self) -> None:
-        """planner.md 打头：先立"决策引擎驱动一个 QQ 账号"的机器视角，
-        信封语法段（envelope）在其后。"""
+        """planner.md 打头（页首即人格，随后是运行方式）：信封语法段
+        （envelope）在其后。"决策引擎"的机器视角开场随 2026-07-31 删除
+        Replyer 一并退役——Planner 就是她自己。"""
         llm = _StubLLM(response_content='{"actions":[{"type":"idle","reason":"x"}]}')
         planner = LLMPlanner(llm_client=llm)
         asyncio.run(planner.decide(_ctx()))
         self.assertEqual(len(llm.invocations), 1)
         content = llm.invocations[0][0].content
-        self.assertIn("决策引擎", content)
+        self.assertNotIn("决策引擎", content)
+        self.assertIn("# 你在怎样运行", content)
         self.assertIn("输入信封格式规范", content)
         self.assertLess(
-            content.index("决策引擎"),
+            content.index("# 你在怎样运行"),
             content.index("输入信封格式规范"),
         )
 
-    def test_planner_carries_system_mechanics_and_duty(self) -> None:
-        """planner.md 是"你是谁 + 你要干什么"的唯一出处：系统机制（念头≠
-        动作、任务带跨拍、一批工具不要重拨、落稿≠已发）与职责（为落笔那
-        一环备料、不碰措辞）都只在这里，没有第三处，掉了就是真没有了。"""
+    def test_planner_carries_the_rules_of_its_own_layer(self) -> None:
+        """决策这一环独有的三条纪律只住在 planner.md，没有第三处，掉了就是真
+        没有了：念头≠动作、跨拍只能靠任务、一批工具不要重拨。"""
         llm = _StubLLM(response_content='{"actions":[{"type":"idle","reason":"x"}]}')
         planner = LLMPlanner(llm_client=llm)
         rendered = planner._prompt_library.render(scope="group")
-        # 念头≠动作
         self.assertIn("那件事就没发生过", rendered)
-        # 跨拍只能靠任务
         self.assertIn("跨拍的事情只能靠任务活着", rendered)
-        # 一批工具 + 不要重拨
         self.assertIn("不要因为它还没回来就再发一次", rendered)
-        # 落稿≠已发
-        self.assertIn("账号真的开口只体现为随后出现的 `<my-reply>` 行", rendered)
-        # 职责：给落笔那一环备它拿不到的东西，且不碰表达
-        self.assertIn("交出的是**结论**而不是线索", rendered)
-        self.assertIn("说出来什么样不归你管", rendered)
         # system loop 同样要有（参与规则那段才是 scope 过滤的）
         self.assertIn(
             "跨拍的事情只能靠任务活着",
             planner._prompt_library.render(scope="system"),
         )
 
-    def test_no_persona_section_registered(self) -> None:
-        """Planner 无 persona 段：整张角色卡仍只由独立 Replyer 消费。
+    def test_system_mechanics_reach_the_planner(self) -> None:
+        """`system.md` 是"这台机器怎么转"的唯一出处，客观语域描述运行事实，
+        经 planner.md 的 {{system}} 槽进入 Planner prompt。"""
+        from qqbot.services.agent_loop.prompts.catalog import build_library
 
-        参与倾向已并入 group_chat_rules policy；Planner 既没有独立
-        disposition 段，也没有 voice/persona 段（角色卡住在 replyer.md）。"""
+        planner_text = build_library("planner").render(scope="group")
+        for anchor in (
+            "时间线运行的系统",  # 时间线是唯一真相源
+            "运行以拍为单位",  # 按拍运行、留不下来的真留不下来
+        ):
+            with self.subTest(anchor=anchor):
+                self.assertIn(anchor, planner_text)
+
+    def test_persona_card_rides_the_planner_section(self) -> None:
+        """角色卡由 planner.md 的 `{{persona}}` 槽在 render 时填入，不是另起
+        一个消费者段——所以 `voice` / `disposition` 这些历史段名都不该存在。
+
+        2026-07-31 删除 Replyer 后 Planner 是卡片唯一的消费者：卡片正文必须
+        在。锚点从卡片现取（写死原句的话，卡片一改断言就变成假通过），逐句对账
+        在 test_prompt_catalog_contract.LayerBoundaryTests。"""
         llm = _StubLLM(response_content='{"actions":[{"type":"idle","reason":"x"}]}')
         planner = LLMPlanner(llm_client=llm)
-        names = planner._prompt_library.section_names()
-        self.assertIn("planner", names)
-        self.assertIn("group_chat_rules", names)
-        self.assertNotIn("disposition", names)
-        self.assertNotIn("persona", names)
-        self.assertNotIn("voice", names)
-        # 角色卡正文一个字都不许漏进规划层——漏进来 `reasoning` 就会开始演戏、
-        # 拿心情当调工具的理由。锚点从角色卡现居所 replyer.md 现取（写死原句
-        # 的话，卡片一改断言就变成假通过），逐句对账在
-        # test_prompt_catalog_contract.LayerBoundaryTests。
-        from qqbot.services.agent_loop.prompts.catalog import _PROMPTS_DIR
+        slots = planner._prompt_library.slot_names()
+        self.assertIn("persona", slots)
+        self.assertIn("group_chat_rules", slots)
+        # 历史段名不得复活成槽
+        self.assertNotIn("disposition", slots)
+        self.assertNotIn("voice", slots)
+        from qqbot.services.agent_loop.prompts.catalog import (
+            SLOT_PATTERN,
+            _PROMPTS_DIR,
+        )
 
         rendered = planner._prompt_library.render(scope="group")
-        card = (_PROMPTS_DIR / "replyer.md").read_text(encoding="utf-8")
+        card = (_PROMPTS_DIR / "persona.md").read_text(encoding="utf-8")
         anchors = [
             line.strip()
             for line in card.splitlines()
             if len(line.strip()) > 24 and line.strip().startswith("你")
         ]
-        self.assertTrue(anchors, "replyer.md 没有第二人称锚点，断言会假通过")
+        self.assertTrue(anchors, "persona.md 没有第二人称锚点，断言会假通过")
         for line in anchors:
-            self.assertNotIn(line, rendered)
+            self.assertIn(line, rendered)
+        self.assertIsNone(SLOT_PATTERN.search(rendered))
 
     def test_reply_usage_scoped_without_persona_card(self) -> None:
-        """Planner 看 reply_task 机械契约，但不再携带最终措辞角色卡。"""
+        """**工具用法文档**里不得抄角色卡正文——卡片 2026-07-30 起确实进
+        Planner，但走的是 planner.md 的人格槽这一条路；`tools/*.md` 里再抄一份
+        就是第二个真相源，改一处忘另一处当场自相矛盾。"""
         from qqbot.services.agent_loop.tools import build_default_registry
 
         reg = build_default_registry()
         group_docs = reg.usage_docs("group")
         self.assertIn("## Tool: reply", group_docs)
-        self.assertNotIn("## Tool: send_message", group_docs)
+        self.assertIn("## Tool: send_messages", group_docs)
+        # 退役的单数工具没有自己的分段（它是复数名的前缀，按标题行精确匹配）。
+        self.assertNotIn("## Tool: send_message\n", group_docs)
         self.assertNotIn("小奏", group_docs)
         system_docs = reg.usage_docs("system")
         self.assertNotIn("## Tool: reply", system_docs)
+        self.assertNotIn("## Tool: send_messages", system_docs)
         self.assertNotIn("小奏", system_docs)
 
-    def test_group_chat_rules_skipped_in_system_scope(self) -> None:
-        """参与规则段只对有聊天面的 scope 渲染；system loop 的 system prompt
-        不含 group_chat_rules（render(scope="system") 时该段返回空串）。"""
+    def test_only_tools_usage_is_scope_filtered(self) -> None:
+        """scope 这把尺子只作用在 `tools_usage` 上：工具按 allowed_scopes 过滤，
+        群专用工具的用法不该泄漏进 system loop。
+
+        `group_chat_rules` **不**按 scope 过滤（任务与决策契约 §prompt 装配）：
+        定稿后它是两句 scope 无关的上位约束，system loop 读到也成立。此前这里
+        断言它在 system scope 被跳过，是早于该定稿的旧契约。"""
         llm = _StubLLM(response_content='{"actions":[{"type":"idle","reason":"x"}]}')
         planner = LLMPlanner(llm_client=llm)
         group_names = [
@@ -310,11 +327,11 @@ class LLMPlannerContractTest(unittest.TestCase):
             sec.name
             for sec in planner._prompt_library.render_sections(scope="system")
         ]
-        self.assertIn("group_chat_rules", group_names)
-        self.assertNotIn("group_chat_rules", system_names)
+        for name in ("planner", "persona", "system", "envelope", "group_chat_rules"):
+            with self.subTest(name=name):
+                self.assertIn(name, group_names)
+                self.assertIn(name, system_names)
         self.assertNotIn("disposition", group_names)
-        self.assertIn("planner", system_names)
-        self.assertIn("envelope", system_names)
 
     def test_task_note_branch_parsed_as_call_tool(self) -> None:
         body = (
@@ -348,7 +365,7 @@ class LLMPlannerContractTest(unittest.TestCase):
 
     def test_system_prompt_includes_envelope_syntax(self) -> None:
         """信封语法必须注入 system prompt —— LLM 据此读懂 <agent-input> 的标签
-        语义。2026-07-30 起它是与 Replyer 共享的 envelope.md，本用例锚定
+        语义。信封语法的唯一出处是 envelope.md，本用例锚定
         文档头和几个关键标签即可，避免绑死文案。"""
         llm = _StubLLM(
             response_content='{"actions":[{"type":"idle","reason":"x"}]}'
@@ -396,12 +413,12 @@ class LLMPlannerContractTest(unittest.TestCase):
         self.assertIn("不要为了产生输出而行动", content)
         self.assertIn("采取行动与保持 idle 都是正常结果", content)
 
-    def test_system_prompt_explicitly_forbids_bare_text_as_reply(self) -> None:
-        """Planner 只交接对话逻辑，最终可见表达属于 Replyer。
-
-        这条红线有两处正文：planner.md 的职责段（为什么不归你）与
-        tools/reply.md 的参数页（硬边界），后者随 tools_usage 段进
-        Planner prompt——所以本用例必须带工具注册表装配。"""
+    def test_system_prompt_teaches_two_step_speaking(self) -> None:
+        """发言两步的红线（2026-07-31 删除 Replyer）：reply 不承载最终字句、
+        只存解析并等待；措辞发生在 send_messages；只有 <my-reply> 是已发送
+        事实。三处正文各钉一句——planner.md 的运行段、tools/reply.md 与
+        tools/send_messages.md 的参数页（后两者随 tools_usage 段进
+        Planner prompt，所以本用例必须带工具注册表装配）。"""
         from qqbot.services.agent_loop.tools import build_default_registry
 
         llm = _StubLLM(
@@ -413,21 +430,23 @@ class LLMPlannerContractTest(unittest.TestCase):
         asyncio.run(planner.decide(_ctx()))
         content = llm.invocations[0][0].content
 
-        # 措辞/语气/形态一律不由 Planner 指定（tools/reply.md）
-        self.assertIn("Never prescribe", content)
-        self.assertIn("The Replyer owns all of those through its own voice card.", content)
-        # reply 成功只是落稿，<my-reply> 才是已发送事实
-        self.assertIn("records words/images that really reached QQ.", content)
-        # 信封段这一侧只留客观定义：<my-reply> 的成功子元素即实际送达内容
+        # planner.md：开口分两步、完成事件不是命令也不是许可
+        self.assertIn("开口分两步", content)
+        self.assertIn("它不是必须说话的命令，也不是发言许可", content)
+        # tools/reply.md：reply 不承载消息正文，发言事实在 send_messages 的
+        # 逐条回执上（2026-07-31 实施后调整：不派生 <my-reply>）
+        self.assertIn("This call carries no message text", content)
+        self.assertIn("record words/images that really reached QQ.", content)
+        # tools/send_messages.md：uncertain 禁止"保险再发一遍"
+        self.assertIn("may already be out", content)
+        # 信封段这一侧只留客观定义（<my-reply> 现为仅旧记录的行）
         self.assertIn("其中成功的子元素即实际到达 QQ 的内容", content)
-        # 职责段这一侧给出原因
-        self.assertIn("说出来什么样不归你管", content)
 
     def test_default_prompt_section_order(self) -> None:
-        """四段必须按 order 升序拼接：
-        planner < envelope < group_chat_rules < tools_usage。
-        LLM 按"你是谁+你要干什么→输入长什么样→什么时候需要发言→工具"
-        递进读。人设不在 Planner prompt 中，由 Replyer 独立加载。"""
+        """段序必须按根页写定的顺序拼接：
+        persona < planner 正文 < system < envelope < group_chat_rules <
+        tools_usage。LLM 按"你是谁→怎么运行→输入长什么样→什么时候需要发言
+        →工具"递进读。"""
         from qqbot.services.agent_loop.tool_registry import ToolRegistry
 
         class _StubTool:
@@ -452,13 +471,13 @@ class LLMPlannerContractTest(unittest.TestCase):
         asyncio.run(planner.decide(_ctx()))
         content = llm.invocations[0][0].content
 
-        # 段序用 registry 直接对账：参与规则段的正文在迭代中，拿它的措辞当
+        # 段序用根页的槽序列直接对账：参与规则段的正文在迭代中，拿它的措辞当
         # 锚点会让排序契约跟着文案一起红。
         self.assertEqual(
-            planner._prompt_library.section_names(),
-            ["planner", "envelope", "group_chat_rules", "tools_usage"],
+            planner._prompt_library.slot_names(),
+            ["persona", "system", "envelope", "group_chat_rules", "tools_usage"],
         )
-        idx_identity = content.index("决策引擎")
+        idx_identity = content.index("# 你在怎样运行")
         idx_envelope = content.index("输入信封格式规范")
         idx_tools = content.index("STUB-TOOL-ORDER-MARKER")
 
@@ -479,14 +498,16 @@ class LLMPlannerContractTest(unittest.TestCase):
         asyncio.run(planner.decide(_ctx()))
         content = llm.invocations[0][0].content
 
-        # 按工具名分段的标题
+        # 按工具名分段的标题：发言两步各一段
         self.assertIn("## Tool: reply", content)
-        # 锚点随 reply.md 的现行措辞（f46aa3c 参数收敛时改写了原
-        # "short-lived `reply_task`; a successful tool result means…" 一句，
-        # 本测试当时漏更，2026-07-27 补上）：
-        self.assertIn("short-lived draft", content)
-        self.assertIn("successful result means **pending**, not sent", content)
-        self.assertNotIn("## Tool: send_message", content)
+        self.assertIn("## Tool: send_messages", content)
+        # 锚点随 reply.md 的现行措辞（2026-07-31 删除 Replyer 后 pending →
+        # waiting）：
+        self.assertIn("short-lived", content)
+        self.assertIn("means **waiting**, not sent", content)
+        # 退役的单数 send_message 不得再有自己的分段（注意它是复数名的前缀，
+        # 用段标题加换行精确匹配）。
+        self.assertNotIn("## Tool: send_message\n", content)
 
     def test_system_prompt_includes_tool_usage_docs(self) -> None:
         """Tool 的 sibling .md 必须按工具名分段注入 system prompt，
@@ -545,7 +566,7 @@ class LLMPlannerContractTest(unittest.TestCase):
         """传入自定义提示词库时绕过默认装配 —— 调用方拥有最终拼接权。"""
         from qqbot.services.agent_loop.prompts.catalog import PromptLibrary
 
-        custom = PromptLibrary([("only-section", "CUSTOM-ONLY-MARKER")])
+        custom = PromptLibrary("CUSTOM-ONLY-MARKER")
 
         llm = _StubLLM(
             response_content='{"actions":[{"type":"idle","reason":"x"}]}'
