@@ -1,143 +1,58 @@
-# Tool: reply
+# 工具：`reply`
 
-`reply` is step one of speaking: it stores your resolved analysis of the
-situation and starts a wait. Each call appends **one self-contained
-revision** to the current scope's short-lived draft; a successful result
-means **waiting**, not sent. When the wait ends, the analysis returns to the
-timeline as `<reply-task-completed>` and wakes you — that tick you re-read
-the latest timeline and either stay silent, investigate first, or put the
-final wording into `send_messages`; only that call's per-bubble receipts
-record words/images that really reached QQ.
+## 功能
 
-Ordinary speech is two arguments and nothing else:
+`reply` 为当前 scope 起一段短时等待，表示**你要开口了，但字还没发出去**。
+该工具不发送消息，也不保存任何内容。
+
+这段等待同时覆盖两件事：把这些字打出来本来就需要时间；而这段时间里对方可能
+还在往下说。等待结束时系统写入 `<reply-task-completed>` 并唤醒当前 scope，
+那一拍你面对的是**到那一刻为止的完整时间线**——说什么、还说不说，都在那时
+决定。可见消息由 `send_messages` 单独发送。
+
+## 普通分支
+
+普通分支只接收一个参数：
 
 ```json
-{
-  "analysis": "20:30 李四在与张三讨论火锅；20:31 他在 MSG_42 单独@我问明天天气，因此真正指向我的只有天气线，火锅线仍是李四与张三之间的对话。天气工具随后确认明天有雨，气温未知。待解决内容是李四的天气问题；不要把未知气温当成已知事实。",
-  "hold_seconds": 8
-}
+{"hold_seconds": 8}
 ```
 
-**Every call stands alone.** You never pass a task id, never copy a revision,
-and nothing you wrote before is merged into what you write now. Hand over the
-complete analysis *as of this tick*, and how long to hold it. When you call
-again on a later tick, that new call is the complete replacement: repeat
-anything that must remain and omit anything you are withdrawing.
+- `hold_seconds`：必填整数，范围为 0–90，无默认值。
 
-There is no `upsert` — appending is what happens when you don't say otherwise.
-`action` exists only for the one rare branch at the bottom of this page.
+等多久是每次都要现场判断的事：估一下这句话你要打多久，再想想对方是已经说完
+了、还是话才说到一半。没有内容参数——想说的话不写在这里，也不需要在这里先
+把局势想透，那正是等待结束后那一拍要做的事。
 
-This call carries no message text. Wording that has to land exactly still
-gets described in `analysis`; you will write the actual words later, in
-`send_messages`, with the freshest timeline in front of you.
+## 修订语义
 
-## `analysis` — resolve the conversation for your later self
+当前 scope 同时最多存在一段等待。每次普通调用都会追加一条修订：
 
-Free text. No fixed shape, no field list, no length target — one line when one
-line is all there is, several sentences when the situation is tangled.
+- 最新修订的 `hold_seconds` 完整替换旧值，因此可以延长，也可以缩短。
+- 旧修订仍作为 `<tool-call name="reply">` 历史记录保留在时间线上，你能看见
+  自己已经续过几次。
+- 硬截止时间固定为首次创建后的 90 秒；后续修订不延长该硬截止时间。
+- 等待结束只生成 `<reply-task-completed>` 和新 tick，不触发消息发送。
 
-Write the resolved map of the situation, which your later tick should not
-have to derive again. It will see the same raw timeline, but you must
-synthesize the tangled logic now instead of pointing your future self back at
-those rows. Include whichever of these dimensions actually matter:
+普通分支不接收 `reply_task_id`，也不存在 `upsert` action。
 
-- who is speaking to, quoting or @-ing whom; mention a social relationship only
-  when the timeline or memory actually supports it
-- the active topic threads, what each contribution means inside its own thread,
-  and which thread contains the unresolved matter
-- decisive times/order: when a thread started, what arrived later, and which new
-  message or tool result changed the interpretation
-- the exact question, claim or request still needing an answer, plus the logical
-  conclusion the available evidence supports
-- verified facts and tool results that must stay exact, uncertainty that must
-  remain uncertain, and unrelated/already-settled threads to leave alone
-
-This is a concise memo, not raw transcript duplication. It is analysis, not a
-draft of the reply: conclusions like “the claim is false; the verified value
-is X” belong here; the sentence you will actually type does not — by the time
-you send, the chat may have moved and the wording should be chosen then.
-
-There is no dedicated message-id field. If you need to pin down exactly which
-message is being answered, name it in the analysis — `待回答的是 MSG_42`.
-
-## `hold_seconds` — how long to hold it
-
-**Required; there is no default.** It is the wait before the draft completes
-and comes back to you, and the **newest call replaces it outright** — later or
-earlier, your call.
-
-You are choosing it from what the tail of the timeline looks like:
-
-| The person looks like they are… | hold_seconds |
-|---|---|
-| mid-sentence — half a line, "我想问一下", clearly not finished | ~15 |
-| pasting something long in parts, several messages back to back | ~30 |
-| done — a complete question that has been sitting there | ~8 |
-| not waiting on anyone — next installment of an agreed multi-part answer | 0 |
-
-These are starting points, not rules; pick what the moment actually calls for.
-Maximum is 90, and the draft's hard deadline is fixed 90s from when it was first
-created — holding again never pushes that back. The deadline bounds the
-**wait**, not the send: when it forces completion you are woken to decide,
-nothing goes out by itself.
-
-To work out where you stand, subtract what you can already see:
-`<current now>` minus the `when=` of the `<time>` block holding that row is how long you have been holding;
-`<result>.flush_at` minus `<current now>` is how long is left.
-
-## What happens to several revisions
-
-The scope holds one pending draft. Your calls remain visible as
-`<tool-call name="reply">` history in the timeline, while the draft folds to
-the newest complete analysis — that folded version is what
-`<reply-task-completed>` will carry.
-
-- **The newest row replaces every older row outright.** Changed your read of the
-  situation, corrected a fact, decided a thread should not be answered after all?
-  Write the complete desired analysis in a new call. Nothing omitted from
-  it remains in force merely because an older row mentioned it.
-- Older rows are history; nothing merges them as patches.
-- To abandon the whole draft, `action="cancel"`.
-- Don't re-append with nothing new to add. A tick that starts is not a reason
-  to call again.
-
-## After the wait
-
-`<reply-task-completed>` says the wait is over — nothing more. It is not an
-order to speak: silence is a normal ending, and needs no cancel or any other
-call. If you do speak, one `send_messages` call holds the complete utterance
-(up to 4 bubbles, at most one meme); a successful `reply` earlier does not
-oblige you to. Do not keep a task open merely to wait for the completion row
-— the wake is automatic.
-
-## `action="cancel"` — drop the draft
+## 取消分支
 
 ```json
 {"action": "cancel"}
 ```
 
-Nothing else needed: there is at most one pending draft per scope. Pass
-`reply_task_id` only to assert *which* draft you mean; if it doesn't match the
-open one the call fails instead of silently cancelling a different draft.
+`action="cancel"` 撤销当前 scope 的等待。`reply_task_id` 为可选断言：提供时
+必须与当前等待的 ID 一致；省略时撤销当前 scope 中存在的那一段等待。取消分支
+不接收 `hold_seconds`。已经结束的等待不能再取消。
 
-Use it only when the wait itself should end with no completion at all — the
-moment passed, someone else answered it, you misread who was being addressed.
-**To change the analysis, don't cancel — just call `reply` again**; the newest
-complete revision replaces the old one. And once `<reply-task-completed>` has
-appeared, there is nothing left to cancel — simply decide not to send.
+## 返回
 
-## Failures worth recognising
+普通分支成功返回 `reply_task_id`、`revision`、`state`、`flush_at` 和
+`hard_deadline`。成功仅表示等待已开始，不表示任何消息已发送，也不包含
+`message_id`。
 
-- `invalid_arguments` with `reason_code="brief_renamed_to_analysis"` /
-  `"targets_gist_replaced_by_analysis"` / `"mode_removed"` / `"upsert_removed"`
-  — you sent an old argument shape. Conversation topology, topics, chronology
-  and content conclusions now go into `analysis`. Appending needs no action at
-  all.
-- `invalid_arguments` with `reason_code="verbatim_removed"` — you passed
-  `messages` or `action="verbatim"`. This tool never carries final text;
-  store the analysis here, then write the words in `send_messages` after
-  `<reply-task-completed>`.
-
-Never treat `<tool-call name="reply"><result>...</result>` as speech — it is a
-stored wait. Success returns `reply_task_id`, `revision`, `state`,
-`flush_at` and `hard_deadline`; it never returns a sent `message_id`.
+取消分支成功返回被撤销等待的标识与状态。参数形状错误会返回
+`invalid_arguments`；旧字段 `analysis`、`brief`、`targets`、`gist`、
+`points`、`mode`、`messages`、`verbatim_messages` 和 `expected_revision`
+会返回对应的迁移 `reason_code`。

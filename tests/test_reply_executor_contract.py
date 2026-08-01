@@ -36,7 +36,6 @@ def _task(**overrides: object) -> ReplyTaskState:
         updated_at=NOW - timedelta(seconds=5),
         flush_at=NOW - timedelta(seconds=1),
         hard_deadline=NOW + timedelta(seconds=60),
-        analysis="当前完整对话分析",
         latest_event_id="E_UPSERT",
         source_tool_call_event_id="E_TOOL_CALL",
         correlation_id="CID",
@@ -100,7 +99,7 @@ class ReplyExecutorCompletionTests(unittest.TestCase):
         asyncio.run(run())
         return find_completed
 
-    def test_due_task_completes_with_full_analysis_payload(self) -> None:
+    def test_due_task_completes_with_schedule_only_payload(self) -> None:
         notify = AsyncMock()
         write = AsyncMock(return_value="E_COMPLETED")
         executor = self._executor(notify, write)
@@ -115,7 +114,6 @@ class ReplyExecutorCompletionTests(unittest.TestCase):
         payload = kwargs["payload"]
         self.assertEqual(payload["reply_task_id"], "R1")
         self.assertEqual(payload["revision"], 2)
-        self.assertEqual(payload["analysis"], "当前完整对话分析")
         self.assertEqual(
             payload["source_tool_call_event_id"], "E_TOOL_CALL"
         )
@@ -125,6 +123,10 @@ class ReplyExecutorCompletionTests(unittest.TestCase):
         # 完成事件不是授权：没有任何 token/消费/TTL 语义的字段。
         for forbidden in ("authorization_id", "consumed", "expires_at", "ttl"):
             self.assertNotIn(forbidden, payload)
+        # 2026-08-01 起也**不携带任何内容**：这条事件只是一次到点叫醒，说什么
+        # 由醒来那一拍读当时的时间线决定。
+        for gone in ("analysis", "brief", "targets", "gist"):
+            self.assertNotIn(gone, payload)
 
     def test_notify_happens_after_persist(self) -> None:
         """persist-then-notify：wake 到达时投影必然读得到完成事件。immediate

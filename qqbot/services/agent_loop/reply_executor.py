@@ -9,6 +9,9 @@ publisher 协议本身不变，§3.1）。发不发、发什么由 Planner 醒�
 时间流自己决定（``send_messages`` 工具）；完成事件只表达"等待阶段结束了"，
 **不是**发言授权，也没有消费/TTL 概念（§0.4）。
 
+2026-08-01 删除 analysis 后完成事件不再携带任何内容，这条链路上执行器要搬运
+的东西也就只剩 reply_task_id/revision 与两个时刻——它是一次纯粹的到点通知。
+
 通知沿用现网 best-effort 语义（§3.2）：notifier 失败只记日志，不建消费审计
 或 rescan outbox；极端 commit/notify 缝隙由后续任一正常 scope wake 兜底
 （完成事件仍在窗口内即会被投影读到）。
@@ -182,10 +185,12 @@ class ReplyExecutor:
     async def _write_completed(self, task: ReplyTaskState) -> None:
         """append 完成事件，persist-then-notify（§3.1）。
 
-        payload 携带完整 analysis，使到期交接自包含；没有授权 ID、可用次数、
-        消费状态或 TTL（§0.4/§1.3）。publisher 先 commit 再调注入的 notifier
-        （supervisor 的 immediate-wake wrapper），wake 到达时投影必然读得到
-        完成事件；通知失败不回滚事件（best-effort，后续自然 wake 兜底）。
+        payload **只有调度事实**：2026-08-01 删除 analysis 后，这条事件表达的
+        全部意思就是"这段等待结束了"。它不带内容、也不带授权 ID、可用次数、
+        消费状态或 TTL（§0.4/§1.3）——醒来那一拍该说什么，由那时的时间线决
+        定。publisher 先 commit 再调注入的 notifier（supervisor 的
+        immediate-wake wrapper），wake 到达时投影必然读得到完成事件；通知失败
+        不回滚事件（best-effort，后续自然 wake 兜底）。
         """
         correlation_id = task.correlation_id or new_event_id()
         await self._events.publish(
@@ -197,7 +202,6 @@ class ReplyExecutor:
             payload={
                 "reply_task_id": task.reply_task_id,
                 "revision": task.revision,
-                "analysis": task.analysis,
                 "flush_at": task.flush_at.isoformat(),
                 "hard_deadline": task.hard_deadline.isoformat(),
                 "completed_at": china_now().isoformat(),

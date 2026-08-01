@@ -73,9 +73,10 @@ def build_default_registry() -> ToolRegistry:
     # AgentLoop 在当前拍 await 并原子写 called + task 事件 + terminal；create
     # 结果里的 task_ref 可供同拍后续 call_tool 解析。
     registry.register(TaskTool())
-    # reply：发言的第一步——保存对局势的解析并启动等待。2026-07-28 参数收敛成
-    # analysis + hold_seconds；撤稿留在 action 分支里（曾评估拆成独立工具，因
-    # 每个工具都要占一条 catalog 条目 + 整段 usage 文档而否决）。
+    # reply：发言的第一步——纯粹起一段等待（"我在输入，字还没发出去"）。
+    # 2026-08-01 删除内容参数后普通分支只剩 hold_seconds；撤稿留在 action 分支
+    # 里（曾评估拆成独立工具，因每个工具都要占一条 catalog 条目 + 整段 usage
+    # 文档而否决）。
     registry.register(ReplyTool())
     # send_messages：发言的第二步（2026-07-31 删除 Replyer）——等待到点、
     # runtime.reply_task_completed 唤醒后，Planner 用它把最终措辞真正发出去。

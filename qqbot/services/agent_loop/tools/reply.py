@@ -1,31 +1,32 @@
-"""reply 工具：发言两步中的第一步——保存局势解析并启动等待。
+"""reply 工具：发言两步中的第一步——纯粹地起一段等待，不承载任何内容。
 
-**2026-07-31 删除 Replyer**（重构提案-删除Replyer.md）：本工具的参数与存储
-语义不变（append-only、latest-revision-wins、find-open-or-create、
-hard_deadline、cancel），但下游换了人。等待到点后 ReplyExecutor 不再组稿发
-送，而是写一条 ``runtime.reply_task_completed``（携带完整 analysis）并立即
-唤醒 Planner；那一拍由 Planner 自己结合最新时间流决定是否调 ``send_messages``
-以及最终措辞。analysis 从"跨模型交接"变成 Planner 跨拍保存的自我备忘，字段
-含义不变：它是对人物指向、话题线、时间节点、待回答内容与可靠事实的解析结果，
-不是最终可见文案，也不承载 messages。
+**语义**：调用它表示"我要开口了，但字还没发出去"。等待窗口同时覆盖两件事：
+我把这些字打出来本来就需要时间；而这段时间里对方可能还在往下说。所以到点那
+一刻的时间线才是落笔依据——这正是把开口拆成两步的全部理由。
 
-**2026-07-28 分工收敛**：追加只收一个自由文本 ``analysis`` 加一个
-``hold_seconds``。
+**2026-08-01 删除 ``analysis``**：本工具从此**没有任何内容参数**，普通分支
+只剩一个 ``hold_seconds``。调用这个动作本身就是意图，不需要第二个字段再承载
+一遍。
 
-砍掉的是 `targets[] {message_id, sender_qq, context, guidance}` +
-`gist {situation, intent, facts, avoid, tone}` 那套结构化槽位。它们**从来不
-是机器契约**——程序侧除了一条"不能为空"的兜底之外一个字段都不消费；到点
-交接需要的是完整判读，而不是固定槽位。既然只是提示词交接形状，
-就该按"能不能把局势讲清楚"评判，而九个槽位在这上面是负分：
-  - `additionalProperties: false` 把辅助维度封死——人物之间的引用/@关系、并行
-    话题和关键先后顺序没有稳定槽位，只能被硬塞进 context/gist，语义降级；
-  - 槽位诱导填充——`gist.situation` 与 `targets[].context` 天然重叠、
-    `intent` 与 `guidance` 天然重叠，一个两句话的判读被切成七份写；
-  - 与 append-only 语义打架——授权是追加的、最新一条为准，但结构化槽位一追加
-    就有"第二条的空 facts 是不是撤销了第一条的"这种歧义，只能靠文档打补丁。
-一段自然语言没有这三个问题：想说几个维度写几个维度，"最新一条为准"也天然成立。
-被回应消息的 message_id 不再单列字段（需要消歧时直接写进 analysis；落笔那一拍
-从同一份 timeline 复制真实 id）。
+analysis（更早叫 brief）原本是**双模型交接**的产物——Replyer 要有一份判读才
+能组稿。2026-07-31 Replyer 删除后它就没有第二个读者了，降级成"Planner 写给
+Planner 自己的备忘"，而 Planner 每一拍本来就要重读整条时间线。留着它有三个
+实际害处：
+  - **同一段话在时间线上渲染两次以上**：reply 的成功行不折叠（projection
+    的 <args> 里一份），到点 ``<reply-task-completed>`` 里又一份，续期 N 次
+    就是 N+1 份。这与 2026-07-31 删除派生 ``<my-reply>`` 行的理由是同一条
+    ——同样的话渲染两次是复读诱导。
+  - **陈旧判读恰好在最坏的时刻被送回**：analysis 写在 T，落笔在 T+hold，而
+    这段窗口按设计就是"对方可能还在说"的窗口。它最可能过期的时刻，正好是它
+    以"你自己的判断"这种高可信度姿态摆回模型面前的时刻。
+  - **与两步走自相矛盾**：要求在"决定要不要等"的那一刻就把局势想透，等于把
+    第二步的判断提前钉死在第一步。
+
+砍掉的历史形状依次是：`targets[] {message_id, sender_qq, context, guidance}`
++ `gist {situation, intent, facts, avoid, tone}` 九槽位（2026-07-28，槽位诱导
+填充、与 append-only 语义打架）→ 单个自由文本 `brief` → `analysis` → 无。
+被回应消息的 message_id 从来不单列字段：落笔那一拍从同一份 timeline 复制真实
+id。
 
 **`action` 保留，但改成可选**：省略 = 追加一条授权（普通发言的唯一形态），
 `"cancel"` 撤稿。取消的是 `"upsert"` 这个取值——2026-07-24 改 append-only 之后
@@ -35,17 +36,16 @@ CAS 合并），留着只是让每次正常发言都先声明一遍状态机操�
 
 **`action="verbatim"` 已于 2026-07-30 删除**：当时的理由是双模型分工不该留
 后门。2026-07-31 删除 Replyer 后"绕过谁"已无从谈起，但**本工具仍然不承载
-最终字句**——它的产出是解析与等待，可见文字只经 ``send_messages`` 发出；
+最终字句**——它的产出只是一段等待，可见文字只经 ``send_messages`` 发出；
 `messages` / `verbatim_messages` 等旧载荷字段继续按迁移 reason_code 拒绝，
 不静默降级。
 
 追加仍是 **append-only**（2026-07-24，待办#19）：每次调用都是完整、自足的一
-条，不引用上一次、程序也不做任何字段合并。scope 内仍只有一份 open reply_task；
-后续调用 append 新 revision，并让最新 revision 的完整 analysis 与 flush_at 直接
-获胜（能延长也能缩短）。旧 revision 留在事件流供审计与回看；到点交接只携带折叠
-态里的最新 analysis，不做“旧内容未冲突部分继续生效”的隐式语义合并。历史
-``brief`` 领域事件由折叠层兼容读取，但旧工具参数会 fail loudly，促使 Planner
-按新边界重发。
+条，不引用上一次。scope 内仍只有一份 open reply_task；后续调用 append 新
+revision，并让最新 revision 的 flush_at 直接获胜（能延长也能缩短）。删掉
+analysis 之后 latest-revision-wins 只作用于"等到什么时候"这一件事，反而更好
+讲。旧 revision 留在事件流供审计与回看——**一串 ``<tool-call name="reply">``
+行本身就是可见的自我约束信号**：模型看得见自己已经续了几次。
 """
 
 from __future__ import annotations
@@ -75,27 +75,28 @@ logger = get_logger(__name__)
 # 退役字段：旧形态的调用不静默吃掉，按字段给可读 reason_code，让 Planner 下一
 # 拍照错误自纠（沿用 2026-07-22 `points_replaced_by_context` 的先例）。静默忽略
 # 是最坏的处理——模型会以为那套判读已经存进了草稿，而从 <result> 上看不出异常。
-_ANALYSIS_HINT = (
-    "targets/gist are retired: synthesize the participants and addressee "
-    "relationships, topic threads, decisive time/order changes, unresolved "
-    "content, verified facts and uncertainty as one plain-language `analysis`"
+# 内容通道整条删除（2026-08-01，见模块 docstring）。analysis / brief /
+# targets / gist / points 是同一条通道先后几代的形状，共用一个 reason_code：
+# 它们的问题不是字段名写错了，而是这个工具已经不收任何内容。
+_CONTENT_GONE = (
+    "content_removed",
+    "reply carries no content at all — it only starts the wait. Pass just "
+    "hold_seconds; when <reply-task-completed> wakes you, read the timeline "
+    "as it stands then and choose the wording with the send_messages tool",
 )
 # 逐字直发（action="verbatim" + messages）2026-07-30 整条删除，见模块 docstring。
 _VERBATIM_GONE = (
     "verbatim_removed",
-    "this tool never carries final message text: store the `analysis` and "
-    "wait; when <reply-task-completed> returns, choose the wording and send "
-    "it with the send_messages tool",
+    "this tool never carries final message text: start the wait, and when "
+    "<reply-task-completed> returns, choose the wording and send it with the "
+    "send_messages tool",
 )
 _RETIRED_KEYS: dict[str, tuple[str, str]] = {
-    "brief": (
-        "brief_renamed_to_analysis",
-        "brief was renamed to analysis and its old style-steering semantics "
-        "were removed",
-    ),
-    "targets": ("targets_gist_replaced_by_analysis", _ANALYSIS_HINT),
-    "gist": ("targets_gist_replaced_by_analysis", _ANALYSIS_HINT),
-    "points": ("targets_gist_replaced_by_analysis", _ANALYSIS_HINT),
+    "analysis": _CONTENT_GONE,
+    "brief": _CONTENT_GONE,
+    "targets": _CONTENT_GONE,
+    "gist": _CONTENT_GONE,
+    "points": _CONTENT_GONE,
     "mode": (
         "mode_removed",
         "there is no mode; ordinary speech needs no action at all and "
@@ -117,64 +118,38 @@ class ReplyTool(BaseTool):
     name = "reply"
     allowed_scopes = ("group", "private")
     description = (
-        "Step one of speaking: store your resolved map of the situation and "
-        "start waiting. Normally you pass exactly `analysis` — participants "
-        "and addressee relationships, topic threads, decisive chronology, "
-        "unresolved content and reliable facts — plus `hold_seconds`. That "
-        "appends one self-contained revision to this scope's pending draft; "
-        "each call stands alone and the newest analysis and hold_seconds "
-        "replace the previous revision outright. This call sends NOTHING and "
-        "carries no message text. When the wait ends, the analysis returns to "
-        "the timeline as <reply-task-completed> and wakes you; that tick you "
-        "re-read the latest timeline and decide the actual wording with "
-        "send_messages — or decide the moment has passed and stay silent. "
-        'One rare branch: action="cancel" withdraws the pending draft.'
+        "为当前 scope 起一段短时等待，表示正在输入、字尚未发出，不发送消息，也"
+        "不保存任何内容。普通分支只接收 hold_seconds；每次调用追加一条修订，"
+        "最新修订的等待时长完整替换旧值。等待结束后，系统写入 "
+        "<reply-task-completed> 并唤醒对应 scope，由那一拍结合最新时间线决定说"
+        "什么、还说不说。action=cancel 用于撤销当前等待。"
     )
     usage_prompt = _USAGE_PROMPT
     arguments_schema = {
         "type": "object",
         "properties": {
-            "analysis": {
-                "type": "string",
-                "description": (
-                    "Free-text resolved conversation analysis — a memo your "
-                    "later self reads inside <reply-task-completed>: who is "
-                    "talking to/quoting/@-ing whom, the relevant social "
-                    "relationship when evidenced, active topic threads, "
-                    "decisive time/order changes, the exact unresolved "
-                    "question/claim/request, verified facts and uncertainty, "
-                    "plus unrelated or already-resolved threads to exclude. "
-                    "Synthesize conclusions instead of merely pointing at the "
-                    "timeline. It is analysis, not draft text — final wording "
-                    "is chosen later in send_messages."
-                ),
-            },
             "hold_seconds": {
                 "type": "integer",
                 "minimum": 0,
                 "maximum": MAX_HOLD_SECONDS,
                 "description": (
-                    "Required when appending — there is no default. How long "
-                    "to hold this draft before the wait completes and the "
-                    "analysis returns as <reply-task-completed>. The newest "
-                    "call wins outright: it may shorten as well as extend."
+                    "普通分支必填，表示等待结束前的秒数，无默认值。该时长同时覆盖"
+                    "两件事：把这些字打出来本来就需要时间，以及这段时间里对方可能"
+                    "继续发言。最新修订中的值完整替换旧值，因此可以缩短或延长等待。"
                 ),
             },
             "action": {
                 "type": "string",
                 "enum": ["cancel"],
                 "description": (
-                    "Omit it for ordinary speech — that is what this tool "
-                    "does. `cancel` withdraws the pending draft entirely."
+                    "省略时进入普通等待分支；取值 cancel 时撤销当前等待。"
                 ),
             },
             "reply_task_id": {
                 "type": "string",
                 "description": (
-                    'action="cancel" only, and optional even there: omit to '
-                    "withdraw whatever draft is pending. If given it must "
-                    "match, so a stale id fails loudly instead of silently "
-                    "cancelling a different draft."
+                    "仅用于 action=cancel，且为可选。提供时必须与当前等待的 "
+                    "reply_task_id 一致；省略时撤销当前 scope 中的等待。"
                 ),
             },
         },
@@ -184,7 +159,7 @@ class ReplyTool(BaseTool):
             {
                 "if": {"not": {"required": ["action"]}},
                 "then": {
-                    "required": ["analysis", "hold_seconds"],
+                    "required": ["hold_seconds"],
                     "not": {"required": ["reply_task_id"]},
                 },
             },
@@ -193,14 +168,7 @@ class ReplyTool(BaseTool):
                     "properties": {"action": {"const": "cancel"}},
                     "required": ["action"],
                 },
-                "then": {
-                    "not": {
-                        "anyOf": [
-                            {"required": ["analysis"]},
-                            {"required": ["hold_seconds"]},
-                        ]
-                    }
-                },
+                "then": {"not": {"required": ["hold_seconds"]}},
             },
         ],
     }
@@ -291,19 +259,18 @@ class ReplyTool(BaseTool):
         if existing_payload is not None:
             return ToolOutcome.success(_result_from_payload(existing_payload))
 
-        analysis, hold, fail = _validate_append(arguments)
+        hold, fail = _validate_append(arguments)
         if fail:
             return fail
 
         # ─── append-only（2026-07-24，待办#19）───
-        # 每次调用就是一条完整、自足的解析，不引用上一次、不做字段合并：
-        # 模型不再抄 reply_task_id/expected_revision，程序也不再 merge 内容
-        # （旧 merge 只增不删，撤不掉写错的判读与事实）。scope 内仍只有一份
-        # open reply_task 承载"等到什么时候"，后续调用 append 上去、把
-        # flush_at 换成自己的——**最新一次调用直接获胜，能延长也能缩短**。
-        # 旧 revision 仍以 <tool-call name="reply"> 留在 timeline 供回看；到点
-        # 交接从 ReplyTaskState 折叠态直接拿最新 analysis 写进完成事件，避免
-        # tool_result 终态竞态与窗口裁剪。
+        # 每次调用都是完整、自足的一条，不引用上一次：模型不再抄
+        # reply_task_id/expected_revision。scope 内只有一份 open reply_task
+        # 承载"等到什么时候"，后续调用 append 上去、把 flush_at 换成自己的
+        # ——**最新一次调用直接获胜，能延长也能缩短**。删掉 analysis 之后
+        # （2026-08-01）这条任务只剩调度事实，latest-revision-wins 也只关乎
+        # 时机一件事。旧 revision 仍以 <tool-call name="reply"> 留在 timeline
+        # 供回看。
         now = china_now()
         current = await load_open_reply_task(session_factory, scope_key)
         if current is None:
@@ -327,7 +294,6 @@ class ReplyTool(BaseTool):
             updated_at=now,
             flush_at=flush_at,
             hard_deadline=hard_deadline,
-            analysis=analysis,
         )
         event_id = await append_upsert(
             session_factory,
@@ -404,26 +370,17 @@ class ReplyTool(BaseTool):
         )
 
 
-def _validate_append(arguments: dict) -> tuple[str, int, ToolOutcome | None]:
-    """append 路径的参数校验：一段非空 analysis + 一个 hold_seconds，没有别的
-    形态（逐字直发 2026-07-30 删除，`messages` 走 _RETIRED_KEYS 拒绝）。"""
-    analysis = arguments.get("analysis")
-    if not isinstance(analysis, str) or not analysis.strip():
-        return (
-            "",
-            0,
-            _invalid(
-                "bad_analysis",
-                "analysis must be a non-empty string — resolve who is talking "
-                "to whom, the topic and chronology, and what remains to answer",
-            ),
-        )
+def _validate_append(arguments: dict) -> tuple[int, ToolOutcome | None]:
+    """append 路径的参数校验：只有一个 hold_seconds，没有别的形态。
+
+    内容参数 2026-08-01 整条删除（analysis/brief/targets/gist/points 走
+    _RETIRED_KEYS 拒绝）；逐字直发 2026-07-30 删除（`messages` 同样在那里）。
+    """
     # hold_seconds 无默认值（2026-07-24，待办#19）：等多久是每次调用都要现场
-    # 判断的语义（"这个人说完了没"），给默认值等于替模型做决定——曾经的
-    # default 0 就把合并窗口整个关掉了。
+    # 判断的语义（我打这几个字要多久、这个人说完了没），给默认值等于替模型做
+    # 决定——曾经的 default 0 就把等待窗口整个关掉了。
     if "hold_seconds" not in arguments:
         return (
-            "",
             0,
             _invalid(
                 "missing_hold_seconds",
@@ -432,8 +389,8 @@ def _validate_append(arguments: dict) -> tuple[str, int, ToolOutcome | None]:
         )
     hold = _coerce_hold(arguments.get("hold_seconds"))
     if hold is None:
-        return "", 0, _bad_hold()
-    return analysis.strip(), hold, None
+        return 0, _bad_hold()
+    return hold, None
 
 
 def _reject_retired(arguments: dict) -> ToolOutcome | None:
@@ -444,7 +401,7 @@ def _reject_retired(arguments: dict) -> ToolOutcome | None:
 
 
 def _reject_unknown(arguments: dict) -> ToolOutcome | None:
-    known = {"action", "analysis", "hold_seconds", "reply_task_id"}
+    known = {"action", "hold_seconds", "reply_task_id"}
     extras = sorted(set(arguments) - known)
     if not extras:
         return None
@@ -484,8 +441,8 @@ def _invalid(reason_code: str, message: str) -> ToolOutcome:
 
 
 def _result_from_payload(payload: dict) -> dict:
-    """成功结果 = 这份稿的身份与调度事实。**永远没有 message_id**——落稿不是
-    发言；到点后它折成 <reply-task-completed>，真发出去了只体现在后续
+    """成功结果 = 这次等待的身份与调度事实。**永远没有 message_id**——起一段
+    等待不是发言；到点后它折成 <reply-task-completed>，真发出去了只体现在后续
     send_messages 调用行的逐条回执上。"""
     return {
         "reply_task_id": payload.get("reply_task_id"),

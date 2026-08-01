@@ -1,13 +1,17 @@
 """ReplyTask 的 append-only 写入与折叠。
 
-ReplyTask 是 scope 内唯一、最长只存活几十秒的待发聚合，不使用读模型表。
+ReplyTask 是 scope 内唯一、最长只存活几十秒的等待聚合，不使用读模型表。
 
-2026-07-24（待办#19）起**内容不再合并**：每次 upsert 事件记录的是那一次调用
-自己的授权原文（analysis），不是与历史的合并态。
+**2026-08-01 删除 ``analysis``**：这份聚合从此**只承载调度事实**——等到什么
+时候、硬上界在哪、当前第几修订。内容通道（analysis，更早叫 brief）随本次改动
+整条删除，理由见 ``tools/reply.py`` 模块 docstring：Replyer 一走它就没有第二
+个读者，只剩下"在时间线上把同一段话渲染两遍"和"把 T 时刻的判读摆到 T+hold
+的落笔现场"两个害处。折叠层不再读 ``analysis`` / ``brief``，升级前的旧事件
+里那两个键被直接忽略（事件本身留在 append-only 流里，不改不删）。
 
-2026-07-25 的补强把“完整、自足”落实为明确的 **latest-revision-wins**：
-折叠出的 ``ReplyTaskState`` 同时携带最新一条 upsert 的调度字段与完整
-``analysis``。旧 revision 仍留在 append-only 事件流供审计与 Planner 回看。
+**latest-revision-wins** 依然成立（2026-07-25 定），但删掉内容之后它只作用于
+一件事：最新一条 upsert 的 flush_at 直接获胜，能延长也能缩短。旧 revision 仍
+留在 append-only 事件流供审计与 Planner 回看。
 
 **2026-07-31 删除 Replyer 后的状态机**（重构提案-删除Replyer.md §1）：
 
@@ -15,8 +19,8 @@ ReplyTask 是 scope 内唯一、最长只存活几十秒的待发聚合，不使
       └──reply(action="cancel")──→ cancelled  （agent.reply_task_cancelled）
 
 只有这三个状态；completed / cancelled 都是 terminal。到点由 ReplyExecutor
-写一条 ``runtime.reply_task_completed``（携带完整 analysis）并立即唤醒
-Planner——发不发、发什么由 Planner 那一拍自己决定（``send_messages`` 工具），
+写一条 ``runtime.reply_task_completed`` 并立即唤醒 Planner——发不发、发什么
+由 Planner 那一拍结合最新时间线自己决定（``send_messages`` 工具），
 ReplyTask 的生命周期到完成事件为止。新链路**不再写** ``runtime.reply_flush_
 claimed`` / ``reply_flushed``（发送事实活在 ``send_messages`` 的 tool
 terminal 里）；升级前的旧 claim/flush 事件仍被识别，只用于把升级前的任务
@@ -27,8 +31,7 @@ revision 的 completed 不折（已有更新的 upsert 在场）；已 cancelled
 不被迟到的 completed 复活。
 
 2026-07-30 删除 ``mode`` 与 ``verbatim_messages``：逐字直发（``action=
-"verbatim"``）整条下线后留下的两个键在折叠时被直接忽略；旧 verbatim 事件的
-``analysis`` 恒为空串。
+"verbatim"``）整条下线后留下的两个键在折叠时被直接忽略。
 """
 
 from __future__ import annotations
@@ -72,7 +75,6 @@ class ReplyTaskState:
     updated_at: datetime
     flush_at: datetime
     hard_deadline: datetime
-    analysis: str
     latest_event_id: str
     source_tool_call_event_id: str | None
     correlation_id: str | None
@@ -227,15 +229,12 @@ def build_upsert_payload(
     updated_at: datetime,
     flush_at: datetime,
     hard_deadline: datetime,
-    analysis: str,
 ) -> dict:
-    """一次追加的领域事件 payload。
+    """一次追加的领域事件 payload：**只有调度事实，没有任何内容**。
 
-    ``analysis`` 是 Planner 对局势的解析备忘（谁对谁说话、话题线、决定性时
-    序、待解决内容、已核实事实与存疑处），**不是**最终可见文案。每次事件原样
-    留档；折叠态只取最新 revision 的完整 analysis，到点后随
-    ``runtime.reply_task_completed`` 自包含地回到时间线——Planner 不必从旧
-    tool-call 行里猜哪次 revision 才是当前事实。
+    2026-08-01 起本 payload 不再带 ``analysis``——这次调用表达的全部意思就是
+    "我要开口了，先等到 flush_at"。到点那一拍该说什么，由那时的时间线决定，
+    不由这一刻留下的判读决定。
     """
     return {
         "reply_task_id": reply_task_id,
@@ -245,18 +244,16 @@ def build_upsert_payload(
         "updated_at": updated_at.isoformat(),
         "flush_at": flush_at.isoformat(),
         "hard_deadline": hard_deadline.isoformat(),
-        "analysis": analysis,
     }
 
 
 # merge_targets / merge_gist / _dedupe_strings 已于 2026-07-24 删除（待办#19）。
-# 它们做的是"把新授权并进旧授权"，而两者都只增不减：merge_targets 无法撤掉
-# 一个已授权的 target，merge_gist 的 facts/avoid 是并集去重、写错的事实撤不
+# 它们做的是"把新内容并进旧内容"，而两者都只增不减：merge_targets 无法撤掉
+# 一个已写下的 target，merge_gist 的 facts/avoid 是并集去重、写错的事实撤不
 # 回来，模型只能往 avoid 里塞反向指令去抵消，让 gist 自相矛盾。改成 append-
-# only 之后不存在"合并"这件事——每条授权原样入库，折叠态只取最新 revision
-# 的完整 analysis；旧 revision 不再作为补丁参与组稿。targets/gist 本身随后于
-# 2026-07-25 被单个自由文本字段取代；2026-07-28 该字段进一步明确为 analysis，
-# 专门承载人物/话题/时序与事实判读，省略旧内容即撤回旧内容。
+# only 之后不存在"合并"这件事。此后这条内容通道一路收敛：targets/gist 2026-
+# 07-25 被单个自由文本取代 → 2026-07-28 改名 analysis → 2026-08-01 整条删除。
+# 现在没有内容可合并，也没有内容可撤回——这个聚合只剩调度事实。
 
 
 _REPLY_EVENT_TYPES = (
@@ -300,13 +297,9 @@ def _fold_rows(rows: Any) -> dict[str, ReplyTaskState]:
         if not task_id:
             continue
         if row.type == "agent.reply_task_upserted":
-            # 2026-07-28 工具与领域事件改名为 analysis。升级前已经持久化的事件
-            # 仍使用 brief；只在新键完全不存在时读取旧键，避免损坏的新事件被旧值
-            # 悄悄掩盖。
-            if "analysis" in payload:
-                raw_analysis = payload.get("analysis")
-            else:
-                raw_analysis = payload.get("brief")
+            # 内容通道 2026-08-01 整条删除：升级前事件里的 analysis / brief 两
+            # 个键在这里被直接忽略（事件本身留在 append-only 流里不改不删）。
+            # 折叠态只出调度事实，因此新旧事件在这一层是同形的，不需要兼容分支。
             tasks[task_id] = ReplyTaskState(
                 reply_task_id=task_id,
                 scope_key=_scope_key(row),
@@ -318,11 +311,6 @@ def _fold_rows(rows: Any) -> dict[str, ReplyTaskState]:
                 hard_deadline=_parse_dt(
                     payload.get("hard_deadline"), row.occurred_at
                 ),
-                # 领域事件正常只可能来自 ReplyTool 的严格校验；若旧库/损坏事件
-                # 仍塞入非字符串，折成空 analysis——绝不能把 list/dict 的 repr
-                # 当成一份对话解析。旧 verbatim 事件的 analysis 恒为空串
-                # （2026-07-30）。
-                analysis=raw_analysis if isinstance(raw_analysis, str) else "",
                 latest_event_id=row.event_id,
                 source_tool_call_event_id=row.causation_id,
                 correlation_id=row.correlation_id,

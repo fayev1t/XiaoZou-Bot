@@ -211,7 +211,7 @@ class _SlowCallToolPlanner:
                 ),
                 CallToolAction(
                     tool_name="reply",
-                    arguments={"analysis": "x", "hold_seconds": 0},
+                    arguments={"hold_seconds": 0},
                     task_ref="ref-1",
                 ),
             ]

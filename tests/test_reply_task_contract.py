@@ -1,10 +1,10 @@
 """ReplyTask 的核心合同测试。
 
-钉住五个边界：发言分两步（reply 存解析并等待，send_messages 发送——
-2026-07-31 删除 Replyer）；**追加的参数只剩 analysis + hold_seconds，
-`action` 省略即追加**（2026-07-25，撤稿留在同一个工具的 action 分支里）；
-草稿折叠与最终事实分离；append-only、最新一次获胜（2026-07-24 待办#19）；
-状态机 open → completed | cancelled，过期完成事件被折叠层拒绝。
+钉住五个边界：发言分两步（reply 起一段等待，send_messages 发送——2026-07-31
+删除 Replyer）；**追加的参数只剩 hold_seconds 一个，`action` 省略即追加**
+（2026-08-01 删除内容通道，撤稿仍留在同一个工具的 action 分支里）；等待折叠
+与最终事实分离；append-only、最新一次获胜（2026-07-24 待办#19）；状态机
+open → completed | cancelled，过期完成事件被折叠层拒绝。
 """
 
 from __future__ import annotations
@@ -56,13 +56,12 @@ def _upsert_payload(revision: int = 1) -> dict:
         "updated_at": NOW.isoformat(),
         "flush_at": (NOW + timedelta(seconds=10)).isoformat(),
         "hard_deadline": (NOW + timedelta(seconds=90)).isoformat(),
-        "analysis": "李四单独@我提出问题；相关事实 A 已核实",
     }
 
 
 class RegistryBoundaryTests(unittest.TestCase):
     def test_speaking_is_reply_plus_send_messages(self) -> None:
-        """发言两步各占一个工具（2026-07-31 删除 Replyer）：reply 存解析并
+        """发言两步各占一个工具（2026-07-31 删除 Replyer）：reply 起一段
         等待，send_messages 发送；退役的单数 send_message 不得复活。"""
         registry = build_default_registry()
         self.assertIn("reply", registry.names())
@@ -92,43 +91,43 @@ class RegistryBoundaryTests(unittest.TestCase):
         for retired in ("cancel_reply", "say_verbatim"):
             self.assertNotIn(retired, names)
 
-    def test_ordinary_speech_needs_only_analysis_and_hold(self) -> None:
-        """字段收敛的硬钉子：targets/gist 九个槽位没有独立程序语义，却用
-        additionalProperties:false 把 Planner 能表达的辅助维度封死，还诱导
-        它把一段判读切成七份填。收敛成一个自由文本 analysis 后，折叠态的最新
-        完整 analysis 随完成事件自包含地回到时间线；措辞在 send_messages
-        那一步现场决定。
+    def test_ordinary_speech_needs_only_hold_seconds(self) -> None:
+        """2026-08-01 内容通道整条删除：普通分支**只剩 hold_seconds 一个
+        参数**，工具面上不存在任何承载内容的字段。
 
-        `action` 仍在，但**省略即追加**——`upsert` 这个取值取消了，普通发言
-        不必先声明一遍状态机操作。2026-07-30 起 `verbatim` 也不在取值里，
-        `messages` 字段一并删除：这个工具没有任何承载最终字句的参数。
+        这条通道曾是 targets/gist 九槽位 → 自由文本 brief → analysis，一路
+        收敛到无。删干净的理由是它已经没有第二个读者（Replyer 2026-07-31
+        删除），留着只会把同一段话在时间线上渲染两遍，并且把 T 时刻的判读
+        摆到 T+hold 的落笔现场——而那段窗口按设计就是局势还会变的窗口。
+
+        `action` 仍在，但**省略即追加**——`upsert` 取值取消了，普通发言不必
+        先声明一遍状态机操作；`verbatim` 也不在取值里（2026-07-30）。
         """
         schema = ReplyTool.arguments_schema
         self.assertEqual(
             sorted(schema["properties"]),
-            ["action", "analysis", "hold_seconds", "reply_task_id"],
+            ["action", "hold_seconds", "reply_task_id"],
         )
         self.assertEqual(schema["required"], [])
         self.assertEqual(schema["properties"]["action"]["enum"], ["cancel"])
-        # 省略 action 时 analysis + hold_seconds 才是必填（allOf 第一条分支）。
+        # 省略 action 时只有 hold_seconds 必填（allOf 第一条分支）。
         self.assertEqual(
             schema["allOf"][0],
             {
                 "if": {"not": {"required": ["action"]}},
                 "then": {
-                    "required": ["analysis", "hold_seconds"],
+                    "required": ["hold_seconds"],
                     "not": {"required": ["reply_task_id"]},
                 },
             },
         )
         self.assertEqual(len(schema["allOf"]), 2)
-        description = schema["properties"]["analysis"]["description"]
-        self.assertIn("topic threads", description)
-        self.assertIn("time/order", description)
-        self.assertIn("unresolved", description)
-        # analysis 是解析不是草稿正文；措辞在 send_messages 那一步现场决定。
-        self.assertIn("not draft text", description)
-        self.assertIn("send_messages", description)
+        # hold_seconds 的说明必须交代这段等待覆盖什么——它是这个工具现在
+        # 唯一的判断点：我打这些字要多久 + 对方可能还没说完。
+        description = schema["properties"]["hold_seconds"]["description"]
+        self.assertIn("打出来", description)
+        self.assertIn("继续发言", description)
+        self.assertIn("无默认值", description)
 
 
 class ReplyToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
@@ -166,14 +165,7 @@ class ReplyToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             outcome = await ReplyTool().run(
-                {
-                    "analysis": (
-                        "李四在 MSG_1 单独@我提问；事实 A 已由工具核实，"
-                        "另一条话题与我无关"
-                    ),
-                    "hold_seconds": 8,
-                },
-                **self._context(notify),
+                {"hold_seconds": 8}, **self._context(notify)
             )
         self.assertTrue(outcome.ok)
         self.assertEqual(outcome.result["reply_task_id"], "R1")
@@ -181,10 +173,10 @@ class ReplyToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("message_id", outcome.result)
         payload = append.await_args.kwargs["payload"]
         self.assertEqual(payload["flush_at"], (NOW + timedelta(seconds=8)).isoformat())
-        self.assertEqual(
-            payload["analysis"],
-            "李四在 MSG_1 单独@我提问；事实 A 已由工具核实，另一条话题与我无关",
-        )
+        # 领域事件只有调度事实：内容通道 2026-08-01 整条删除，写入侧不得
+        # 再悄悄留一个空字段占位。
+        self.assertNotIn("analysis", payload)
+        self.assertNotIn("brief", payload)
         notify.assert_awaited_once()
 
     @staticmethod
@@ -202,7 +194,6 @@ class ReplyToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
             updated_at=NOW - timedelta(seconds=5),
             flush_at=NOW + timedelta(seconds=flush_offset),
             hard_deadline=NOW + timedelta(seconds=deadline_offset),
-            analysis="旧判读",
             latest_event_id="E1",
             source_tool_call_event_id="TC1",
             correlation_id="CID",
@@ -233,31 +224,26 @@ class ReplyToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
             outcome = await ReplyTool().run(arguments, **self._context(notify))
         return outcome, append
 
-    async def test_append_needs_no_id_and_does_not_merge_old_content(self) -> None:
+    async def test_append_needs_no_id_and_reuses_the_open_task(self) -> None:
         """append-only（待办#19）：不传 reply_task_id / expected_revision 也
-        能续在同一份稿上，且事件里只留**本次授权原文**——旧判读不再被并进来
-        （旧 merge 只增不减，撤不掉写错的判读与事实）。"""
+        能续在同一段等待上，revision 自增。删掉内容通道之后这条追加只剩
+        "把等待时机换成新的"这一件事。"""
         outcome, append = await self._append(
-            {
-                "analysis": "新消息纠正了旧事实：F2 才是对的；F1 已失效",
-                "hold_seconds": 10,
-            },
-            self._open_task(),
+            {"hold_seconds": 10}, self._open_task()
         )
         self.assertTrue(outcome.ok)
         payload = append.await_args.kwargs["payload"]
         self.assertEqual(payload["reply_task_id"], "R1")
         self.assertEqual(payload["revision"], 2)
         self.assertEqual(
-            payload["analysis"], "新消息纠正了旧事实：F2 才是对的；F1 已失效"
+            payload["flush_at"], (NOW + timedelta(seconds=10)).isoformat()
         )
 
     async def test_newest_hold_wins_and_may_shorten(self) -> None:
         """最新一次调用的 hold 直接获胜——旧实现的 max() 只能延长，模型
         发现"他说完了"也收不回来。"""
         outcome, append = await self._append(
-            {"analysis": "对方的问题已经完整，没有后续补充", "hold_seconds": 3},
-            self._open_task(flush_offset=40),
+            {"hold_seconds": 3}, self._open_task(flush_offset=40)
         )
         self.assertTrue(outcome.ok)
         payload = append.await_args.kwargs["payload"]
@@ -269,13 +255,7 @@ class ReplyToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
         """hard_deadline 自首次创建起算、不随 append 滑动，且是 flush_at 的
         硬上界。"""
         current = self._open_task(flush_offset=2, deadline_offset=5)
-        outcome, append = await self._append(
-            {
-                "analysis": "对方连续发送同一问题的分段内容，目前尚未完整",
-                "hold_seconds": 90,
-            },
-            current,
-        )
+        outcome, append = await self._append({"hold_seconds": 90}, current)
         self.assertTrue(outcome.ok)
         payload = append.await_args.kwargs["payload"]
         self.assertEqual(payload["hard_deadline"], current.hard_deadline.isoformat())
@@ -284,8 +264,9 @@ class ReplyToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_hold_seconds_is_required_with_no_default(self) -> None:
         """等多久是每拍现场判断的语义，没有默认值——旧的 default 0 等于把
-        合并窗口整个关掉。"""
-        outcome, append = await self._append({"analysis": "判读"}, None)
+        等待窗口整个关掉。删掉内容通道后它是唯一的参数，空调用也必须失败，
+        不能退化成"随便等一下"。"""
+        outcome, append = await self._append({}, None)
         self.assertFalse(outcome.ok)
         self.assertEqual(outcome.error_kind, "invalid_arguments")
         self.assertEqual(
@@ -293,22 +274,20 @@ class ReplyToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
         )
         append.assert_not_awaited()
 
-    async def test_appending_onto_an_open_draft_is_never_locked(self) -> None:
-        """scope 内只剩一种稿，独占约束与 reply_task_locked 随逐字直发一并
-        删除（2026-07-30）：挂着一份 open 稿时继续追授权必须照常成功。"""
-        outcome, append = await self._append(
-            {"analysis": "补一条新判读", "hold_seconds": 5}, self._open_task()
-        )
+    async def test_appending_onto_an_open_wait_is_never_locked(self) -> None:
+        """scope 内只剩一段等待，独占约束与 reply_task_locked 随逐字直发一并
+        删除（2026-07-30）：已有一段 open 等待时继续续期必须照常成功。"""
+        outcome, append = await self._append({"hold_seconds": 5}, self._open_task())
         self.assertTrue(outcome.ok)
         append.assert_awaited_once()
 
     async def test_verbatim_action_no_longer_exists(self) -> None:
         """逐字直发 2026-07-30 删除：Planner 不再有任何写出可见字句的通路。
-        旧调用不得静默降级成一条普通授权——那会让它以为自己定死的字节发出去
-        了，实际是 Replyer 拿着空判读组稿。"""
+        旧调用不得静默降级成一次普通等待——那会让它以为自己定死的字句发出去
+        了。"""
         for arguments in (
             {"action": "verbatim", "messages": [{"content": _CHAT}]},
-            {"action": "verbatim", "analysis": "判读", "hold_seconds": 5},
+            {"action": "verbatim", "hold_seconds": 5},
         ):
             with self.subTest(arguments=sorted(arguments)):
                 outcome, append = await self._append(arguments, None)
@@ -330,10 +309,11 @@ def _tool_context() -> dict:
 
 
 class ReplyArgumentSurfaceTests(unittest.IsolatedAsyncioTestCase):
-    """2026-07-28 字段收敛：analysis 自由文本承载对话逻辑解析，
-    `action` 从必填判别式变成可选分支（省略即追加，`upsert` 取值取消）。
-    旧形态 fail loudly，不静默丢弃——静默是最坏的：Planner 会以为判读送到了
-    Replyer，而从 <result> 上看不出任何异常。"""
+    """2026-08-01 内容通道整条删除，只剩 hold_seconds；`action` 是可选分支
+    （省略即追加，`upsert` 取值取消）。
+
+    旧形态一律 fail loudly，不静默丢弃——静默是最坏的：Planner 会以为那段
+    判读已经存进去了，而从 <result> 上看不出任何异常。"""
 
     async def _run(self, arguments: dict) -> object:
         with patch(
@@ -344,10 +324,13 @@ class ReplyArgumentSurfaceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_retired_argument_shapes_fail_with_migration_hint(self) -> None:
         cases = {
-            "brief": "brief_renamed_to_analysis",
-            "targets": "targets_gist_replaced_by_analysis",
-            "gist": "targets_gist_replaced_by_analysis",
-            "points": "targets_gist_replaced_by_analysis",
+            # 内容通道的历代形状（2026-08-01 整条删除）共用一个 reason_code：
+            # 问题不是字段名写错了，是这个工具已经不收任何内容。
+            "analysis": "content_removed",
+            "brief": "content_removed",
+            "targets": "content_removed",
+            "gist": "content_removed",
+            "points": "content_removed",
             "mode": "mode_removed",
             # 2026-07-30 逐字直发下线：两个载荷字段都指向同一条迁移说明，
             # 让模型看出是"这条路没有了"而不是字段名拼错了。
@@ -357,67 +340,54 @@ class ReplyArgumentSurfaceTests(unittest.IsolatedAsyncioTestCase):
         }
         for key, reason_code in cases.items():
             with self.subTest(key=key):
-                outcome = await self._run(
-                    {"analysis": "判读", "hold_seconds": 5, key: "whatever"}
-                )
+                outcome = await self._run({"hold_seconds": 5, key: "whatever"})
                 self.assertFalse(outcome.ok)
                 self.assertEqual(outcome.error_kind, "invalid_arguments")
                 self.assertEqual(outcome.extra.get("reason_code"), reason_code)
+
+    async def test_content_rejection_points_at_the_two_step_flow(self) -> None:
+        """迁移说明必须把人推回正确流程，而不只是说"这个字段没了"：只传
+        hold_seconds，等到点了再用 send_messages 现场定措辞。"""
+        outcome = await self._run({"analysis": "判读", "hold_seconds": 5})
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.extra.get("reason_code"), "content_removed")
+        self.assertIn("hold_seconds", outcome.error_message)
+        self.assertIn("send_messages", outcome.error_message)
 
     async def test_upsert_action_is_gone_with_a_pointed_hint(self) -> None:
         """2026-07-24 改 append-only 之后 upsert 就名不副实了（那之前它真是
         upsert：带 id + expected_revision 做 CAS 合并）。留着只是让每次正常
         发言都先声明一遍状态机操作。"""
-        outcome = await self._run(
-            {"action": "upsert", "analysis": "判读", "hold_seconds": 5}
-        )
+        outcome = await self._run({"action": "upsert", "hold_seconds": 5})
         self.assertFalse(outcome.ok)
         self.assertEqual(outcome.extra.get("reason_code"), "upsert_removed")
 
-    async def test_analysis_must_be_a_nonempty_string(self) -> None:
-        for analysis in (None, "", "   ", ["判读"]):
-            with self.subTest(analysis=analysis):
-                arguments: dict = {"hold_seconds": 5}
-                if analysis is not None:
-                    arguments["analysis"] = analysis
-                outcome = await self._run(arguments)
-                self.assertFalse(outcome.ok)
-                self.assertEqual(outcome.extra.get("reason_code"), "bad_analysis")
-
-    async def test_messages_alongside_analysis_still_fails(self) -> None:
-        """`messages` 已随逐字直发删除，但一份合法的普通授权里混进它不能被
-        静默忽略——那等于 Planner 以为自己定死的字句发出去了。"""
+    async def test_messages_still_fails_on_an_otherwise_valid_call(self) -> None:
+        """`messages` 已随逐字直发删除，混进一次合法的等待调用里也不能被静默
+        忽略——那等于 Planner 以为自己定死的字句发出去了。"""
         outcome = await self._run(
-            {
-                "analysis": "判读",
-                "hold_seconds": 5,
-                "messages": [{"content": _CHAT}],
-            }
+            {"hold_seconds": 5, "messages": [{"content": _CHAT}]}
         )
         self.assertFalse(outcome.ok)
         self.assertEqual(outcome.extra.get("reason_code"), "verbatim_removed")
 
     async def test_reply_task_id_outside_cancel_is_rejected(self) -> None:
         """带 id 来追加 = 还在用旧的"指名改某一份稿"心智模型。静默忽略会让它
-        以为精确命中了某份稿，实际是往当前 open 的那份上追加。"""
-        outcome = await self._run(
-            {"analysis": "判读", "hold_seconds": 5, "reply_task_id": "R1"}
-        )
+        以为精确命中了某一份，实际是往当前 open 的那段等待上追加。"""
+        outcome = await self._run({"hold_seconds": 5, "reply_task_id": "R1"})
         self.assertFalse(outcome.ok)
         self.assertEqual(
             outcome.extra.get("reason_code"), "reply_task_id_needs_cancel"
         )
 
     async def test_explicit_null_action_is_not_treated_as_omission(self) -> None:
-        outcome = await self._run(
-            {"action": None, "analysis": "判读", "hold_seconds": 5}
-        )
+        outcome = await self._run({"action": None, "hold_seconds": 5})
         self.assertFalse(outcome.ok)
         self.assertEqual(outcome.extra.get("reason_code"), "bad_action")
 
     async def test_non_object_arguments_fail_loudly(self) -> None:
         outcome = await ReplyTool().run(  # type: ignore[arg-type]
-            ["analysis", "判读"], **_tool_context()
+            ["hold_seconds", 5], **_tool_context()
         )
         self.assertFalse(outcome.ok)
         self.assertEqual(
@@ -425,31 +395,23 @@ class ReplyArgumentSurfaceTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_unknown_top_level_argument_fails_loudly(self) -> None:
-        outcome = await self._run(
-            {"analysis": "判读", "hold_seconds": 5, "hold_second": 5}
-        )
+        outcome = await self._run({"hold_seconds": 5, "hold_second": 5})
         self.assertFalse(outcome.ok)
         self.assertEqual(
             outcome.extra.get("reason_code"), "unexpected_argument"
         )
 
     async def test_cancel_rejects_fields_from_other_branches(self) -> None:
-        cases = {
-            "analysis": "判读",
-            "hold_seconds": 5,
-        }
-        for key, value in cases.items():
-            with self.subTest(key=key):
-                outcome = await self._run({"action": "cancel", key: value})
-                self.assertFalse(outcome.ok)
-                self.assertEqual(
-                    outcome.extra.get("reason_code"),
-                    "cancel_arguments_not_applicable",
-                )
+        outcome = await self._run({"action": "cancel", "hold_seconds": 5})
+        self.assertFalse(outcome.ok)
+        self.assertEqual(
+            outcome.extra.get("reason_code"),
+            "cancel_arguments_not_applicable",
+        )
 
 
 class ReplyCancelActionTests(unittest.IsolatedAsyncioTestCase):
-    """`action="cancel"` 撤掉待发的那份稿，通常无其它参数。"""
+    """`action="cancel"` 撤掉当前那段等待，通常无其它参数。"""
 
     @staticmethod
     def _open_task() -> ReplyTaskState:
@@ -462,7 +424,6 @@ class ReplyCancelActionTests(unittest.IsolatedAsyncioTestCase):
             updated_at=NOW,
             flush_at=NOW + timedelta(seconds=10),
             hard_deadline=NOW + timedelta(seconds=90),
-            analysis="待撤稿",
             latest_event_id="E1",
             source_tool_call_event_id="TC1",
             correlation_id="CID",
@@ -488,7 +449,7 @@ class ReplyCancelActionTests(unittest.IsolatedAsyncioTestCase):
             outcome = await ReplyTool().run(arguments, **_tool_context())
         return outcome, cancel
 
-    async def test_bare_cancel_withdraws_the_pending_draft(self) -> None:
+    async def test_bare_cancel_withdraws_the_pending_wait(self) -> None:
         outcome, cancel = await self._run(
             {"action": "cancel"}, self._open_task()
         )
@@ -529,15 +490,13 @@ class ReplyTaskFoldTests(unittest.TestCase):
         completed = _event(
             "E_DONE",
             "runtime.reply_task_completed",
-            {"reply_task_id": "R1", "revision": 1, "analysis": "……"},
+            {"reply_task_id": "R1", "revision": 1},
             causation_id="E_UPSERT",
             seconds=1,
         )
         pending = _fold_rows([upsert])["R1"]
         self.assertEqual(pending.state, "open")
-        self.assertEqual(
-            pending.analysis, "李四单独@我提出问题；相关事实 A 已核实"
-        )
+        self.assertEqual(pending.flush_at, NOW + timedelta(seconds=10))
         self.assertEqual(pending.latest_event_id, "E_UPSERT")
         self.assertEqual(pending.source_tool_call_event_id, "E_TOOL_CALL")
         self.assertEqual(
@@ -560,7 +519,7 @@ class ReplyTaskFoldTests(unittest.TestCase):
         stale_completed = _event(
             "E_DONE",
             "runtime.reply_task_completed",
-            {"reply_task_id": "R1", "revision": 1, "analysis": "……"},
+            {"reply_task_id": "R1", "revision": 1},
             causation_id="E1",
             seconds=2,
         )
@@ -581,7 +540,7 @@ class ReplyTaskFoldTests(unittest.TestCase):
         late_completed = _event(
             "E_DONE",
             "runtime.reply_task_completed",
-            {"reply_task_id": "R1", "revision": 1, "analysis": "……"},
+            {"reply_task_id": "R1", "revision": 1},
             causation_id="E1",
             seconds=2,
         )
@@ -639,7 +598,7 @@ class ReplyTaskFoldTests(unittest.TestCase):
             causation_id="TC1",
         )
         second_payload = _upsert_payload(2)
-        second_payload["analysis"] = "补一个事实 B"
+        second_payload["flush_at"] = (NOW + timedelta(seconds=25)).isoformat()
         second = _event(
             "E2",
             "agent.reply_task_upserted",
@@ -650,34 +609,41 @@ class ReplyTaskFoldTests(unittest.TestCase):
         state = _fold_rows([first, second])["R1"]
         self.assertEqual(state.state, "open")
         self.assertEqual(state.revision, 2)
-        self.assertEqual(state.analysis, "补一个事实 B")
+        self.assertEqual(state.flush_at, NOW + timedelta(seconds=25))
         self.assertEqual(state.source_tool_call_event_id, "TC2")
 
-    def test_malformed_analysis_is_not_stringified_into_authorization(self) -> None:
-        payload = _upsert_payload()
-        payload["analysis"] = ["不能把 repr 当授权"]
+    def test_fold_state_carries_no_content_field(self) -> None:
+        """2026-08-01 内容通道删除后，折叠态上不得再出现任何内容字段——留一
+        个空字符串占位就等于给下游一条"这里本来该有话"的错误暗示。"""
         state = _fold_rows(
-            [_event("E_BAD", "agent.reply_task_upserted", payload)]
+            [_event("E1", "agent.reply_task_upserted", _upsert_payload())]
         )["R1"]
-        self.assertEqual(state.analysis, "")
+        for gone in ("analysis", "brief", "targets", "gist"):
+            self.assertFalse(hasattr(state, gone), gone)
 
-    def test_legacy_brief_event_is_folded_during_upgrade(self) -> None:
-        payload = _upsert_payload()
-        payload.pop("analysis")
-        payload["brief"] = "升级前已经落库的判读"
-        state = _fold_rows(
-            [_event("E_LEGACY", "agent.reply_task_upserted", payload)]
-        )["R1"]
-        self.assertEqual(state.analysis, "升级前已经落库的判读")
+    def test_legacy_content_keys_are_ignored_not_folded(self) -> None:
+        """升级前落库的事件里还带着 analysis / brief。它们留在 append-only
+        流里不改不删，但折叠层直接忽略——调度事实照常折出来，内容不复活。"""
+        for legacy_key in ("analysis", "brief"):
+            with self.subTest(legacy_key=legacy_key):
+                payload = _upsert_payload()
+                payload[legacy_key] = "升级前已经落库的判读"
+                state = _fold_rows(
+                    [_event("E_LEGACY", "agent.reply_task_upserted", payload)]
+                )["R1"]
+                self.assertEqual(state.state, "open")
+                self.assertEqual(state.revision, 1)
+                self.assertEqual(state.flush_at, NOW + timedelta(seconds=10))
+                self.assertFalse(hasattr(state, legacy_key))
 
 
-class LatestAuthorizationContractTests(unittest.TestCase):
+class LatestRevisionContractTests(unittest.TestCase):
     """程序侧不再做任何合并计算（2026-07-24，待办#19）。
 
     原 MergeContractTests 钉的是 merge_targets/merge_gist 的并集语义，而那
-    正是"撤不掉已授权的 target / 写错的 fact"的来源。事件仍逐条原样入库，
-    但当前有效授权明确折叠为最新 revision 的完整 analysis；旧 revision 只供审计，
-    Replyer 不再做隐式语义 merge。
+    正是"撤不掉已写下的 target / 写错的 fact"的来源。2026-08-01 删掉内容通道
+    之后，连"要不要合并"这个问题都不存在了——latest-revision-wins 只作用于
+    等到什么时候这一件事。
     """
 
     def test_merge_helpers_are_gone(self) -> None:
@@ -685,17 +651,12 @@ class LatestAuthorizationContractTests(unittest.TestCase):
         self.assertFalse(hasattr(reply_task_module, "merge_gist"))
         self.assertFalse(hasattr(reply_task_module, "_dedupe_strings"))
 
-    def test_fold_takes_schedule_and_complete_analysis_from_latest_upsert(self) -> None:
-        """最新 revision 同时决定调度与完整授权；省略旧内容就是撤回旧内容。
-
-        analysis 必须随折叠态进入 Replyer，不能只存在于有终态竞态、且会被裁剪的
-        通用 timeline tool-call 行。
-        """
+    def test_fold_takes_schedule_from_latest_upsert(self) -> None:
+        """最新 revision 决定调度，且能缩短——不是取 max。"""
         first = _event(
             "E1", "agent.reply_task_upserted", _upsert_payload(), causation_id="TC1"
         )
         second_payload = _upsert_payload(2)
-        second_payload["analysis"] = "新证据改变结论，改走另一条话题线"
         second_payload["flush_at"] = (NOW + timedelta(seconds=3)).isoformat()
         second = _event(
             "E2",
@@ -707,8 +668,6 @@ class LatestAuthorizationContractTests(unittest.TestCase):
         state = _fold_rows([first, second])["R1"]
         self.assertEqual(state.revision, 2)
         self.assertEqual(state.flush_at, NOW + timedelta(seconds=3))
-        self.assertEqual(state.analysis, "新证据改变结论，改走另一条话题线")
-        self.assertNotIn("事实 A", state.analysis)
         self.assertFalse(hasattr(state, "targets"))
         self.assertFalse(hasattr(state, "gist"))
 
@@ -716,9 +675,10 @@ class LatestAuthorizationContractTests(unittest.TestCase):
 class PersonaCardHomeTests(unittest.TestCase):
     """角色卡的居所与注入路径（2026-07-31 删除 Replyer 后重锚）。
 
-    卡片唯一真相源是 prompts/persona.md，经 planner.md 页首的 {{persona}} 槽
-    进入 Planner render；历史居所（tools/send_message.md Voice 节 →
-    prompts/voice.md → prompts/replyer.md）全部不复存在。工具用法文档不得再
+    卡片唯一真相源是 prompts/planner.md 的 §你是谁 段（同日由 persona.md 并回
+    根页——删除 Replyer 之后它只剩 Planner 一个消费者，切文件已无收益）；历史
+    居所（tools/send_message.md Voice 节 → prompts/voice.md →
+    prompts/replyer.md → prompts/persona.md）全部不复存在。工具用法文档不得再
     承载人格正文——两处副本必然漂移。
     """
 
@@ -731,33 +691,35 @@ class PersonaCardHomeTests(unittest.TestCase):
         self.assertIn("小奏", prompt)
         self.assertNotIn("小奏", build_default_registry().usage_docs("group"))
 
-    def test_card_home_is_prompts_persona_md(self) -> None:
+    def test_card_home_is_the_planner_page(self) -> None:
         """旧居所都不得复活：replyer.md / voice.md / send_message.md 已随各自
-        宿主删除，卡片只住 persona.md。"""
+        宿主删除，persona.md 并回根页，卡片只住 planner.md 页首。"""
         from qqbot.services.agent_loop.prompts.catalog import _PROMPTS_DIR
 
-        card = (_PROMPTS_DIR / "persona.md").read_text(encoding="utf-8")
-        self.assertIn("小奏", card)
-        self.assertIn("最重要的人", card)
+        page = (_PROMPTS_DIR / "planner.md").read_text(encoding="utf-8")
+        self.assertIn("# 你是谁", page)
+        self.assertIn("小奏", page)
+        self.assertIn("最重要的人", page)
         self.assertFalse((_PROMPTS_DIR / "voice.md").exists())
         self.assertFalse((_PROMPTS_DIR / "replyer.md").exists())
+        self.assertFalse((_PROMPTS_DIR / "persona.md").exists())
         self.assertFalse(
             (_PROMPTS_DIR.parent / "tools" / "send_message.md").exists()
         )
 
     def test_missing_card_file_fails_loudly(self) -> None:
-        """角色卡所在文件缺失 = 部署损坏：Planner 的 prompt 装配必须失败
-        （llm_planner 兜底降级 idle），绝不静默渲染无人格腔——那是最难被
+        """角色卡所在文件（= Planner 根页）缺失 = 部署损坏：prompt 装配必须
+        失败（llm_planner 兜底降级 idle），绝不静默渲染无人格腔——那是最难被
         发现的坏法。"""
         from qqbot.services.agent_loop.prompts import catalog
 
-        original = catalog._FILES["persona"]
-        catalog._FILES["persona"] = "__no_such_persona_card__.md"
+        original = catalog.CONSUMERS["planner"]
+        catalog.CONSUMERS["planner"] = "__no_such_planner_page__.md"
         try:
             with self.assertRaises(Exception):
                 catalog.render_system_prompt("planner", scope="group")
         finally:
-            catalog._FILES["persona"] = original
+            catalog.CONSUMERS["planner"] = original
 
 
 if __name__ == "__main__":
