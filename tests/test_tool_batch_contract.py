@@ -25,11 +25,11 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 from qqbot.core.time import china_now
-from qqbot.services.agent_loop import FakeIdlePlanner
 from qqbot.services.agent_loop.decision import (
     CallToolAction,
     DecisionContext,
     DecisionOutput,
+    IdleAction,
 )
 from qqbot.services.agent_loop.loop import AgentLoop
 from qqbot.services.agent_loop.supervisor import LoopSupervisor
@@ -39,6 +39,18 @@ from qqbot.services.agent_loop.tools.task import TaskTool
 
 
 # ─── 共用 fakes ───
+
+
+class _FakeIdlePlanner:
+    """always-idle 空 planner：本文件只关心 batch 事件，不需要真决策。
+
+    原为生产包里的 qqbot/services/agent_loop/planner.py::FakeIdlePlanner，
+    2026-07-31 迁入测试（生产侧从无消费者）。
+    """
+
+    async def decide(self, context: DecisionContext) -> DecisionOutput:
+        _ = context
+        return DecisionOutput(actions=[IdleAction(reason="bootstrap_skeleton")])
 
 
 class _EmptyResult:
@@ -114,7 +126,7 @@ class SupervisorBatchWakeTests(unittest.IsolatedAsyncioTestCase):
         self, scope_key: str
     ) -> tuple[LoopSupervisor, _RecordingLoop]:
         sup = LoopSupervisor(
-            planner=FakeIdlePlanner(),
+            planner=_FakeIdlePlanner(),
             session_factory=_factory_for([]),
         )
         fake = _RecordingLoop()
@@ -176,7 +188,7 @@ class AgentLoopNoBatchGateTests(unittest.IsolatedAsyncioTestCase):
         sup = _LegacyLatchSupervisor()
         loop = AgentLoop(
             scope_key="group:1",
-            planner=FakeIdlePlanner(),
+            planner=_FakeIdlePlanner(),
             session_factory=_factory_for(captured),
             supervisor=sup,
         )
@@ -522,7 +534,7 @@ class InlineToolBatchCloseTests(unittest.TestCase):
 
         loop = AgentLoop(
             scope_key="group:100",
-            planner=FakeIdlePlanner(),
+            planner=_FakeIdlePlanner(),
             session_factory=factory,
             supervisor=supervisor,
             tool_registry=registry,

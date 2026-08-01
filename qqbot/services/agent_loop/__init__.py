@@ -41,7 +41,6 @@ _LAZY: dict[str, str] = {
     "LLMPlanner": "llm_planner",
     "build_default_prompt_library": "llm_planner",
     "AgentLoop": "loop",
-    "FakeIdlePlanner": "planner",
     "Projector": "projection",
     "PromptLibrary": "prompts.catalog",
     "LoopSupervisor": "supervisor",
@@ -71,7 +70,6 @@ if TYPE_CHECKING:  # 静态分析仍看得到惰性符号
         build_default_prompt_library,
     )
     from qqbot.services.agent_loop.loop import AgentLoop
-    from qqbot.services.agent_loop.planner import FakeIdlePlanner
     from qqbot.services.agent_loop.projection import Projector
     from qqbot.services.agent_loop.prompts.catalog import PromptLibrary
     from qqbot.services.agent_loop.supervisor import LoopSupervisor
@@ -84,7 +82,6 @@ __all__ = [
     "CallToolAction",
     "DecisionContext",
     "DecisionOutput",
-    "FakeIdlePlanner",
     "IdleAction",
     "ImageRef",
     "LLMPlanner",

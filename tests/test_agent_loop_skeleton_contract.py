@@ -29,7 +29,8 @@ from unittest.mock import patch
 
 from qqbot.services.agent_loop import (
     AgentLoop,
-    FakeIdlePlanner,
+    DecisionOutput,
+    IdleAction,
     LoopSupervisor,
 )
 from qqbot.services.agent_loop.event_writer import parse_scope_key
@@ -39,6 +40,22 @@ from qqbot.services.event_ingest.ingest import _scope_key_for_wake
 from qqbot.services.event_ingest.system_event import SystemEvent
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
+
+class _FakeIdlePlanner:
+    """always-idle 空 planner：只验证循环接线（events → tick → events），不碰 LLM。
+
+    原为生产包里的 qqbot/services/agent_loop/planner.py::FakeIdlePlanner，
+    2026-07-31 迁入测试——它从来没有生产消费者，LoopSupervisor 装的是
+    LLMPlanner。按本目录惯例内联在用到它的测试文件里，不建共享 fixture 模块。
+    """
+
+    async def decide(self, context: Any) -> DecisionOutput:
+        _ = context
+        return DecisionOutput(
+            actions=[IdleAction(reason="bootstrap_skeleton")],
+            reasoning="v2 loop skeleton: no LLM planner in this test",
+        )
 
 
 class _EmptyResult:
@@ -206,7 +223,7 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
         captured: list[Any] = []
         loop = AgentLoop(
             scope_key="group:12345",
-            planner=FakeIdlePlanner(),
+            planner=_FakeIdlePlanner(),
             session_factory=_factory_for(captured),
         )
         loop.start()
@@ -347,7 +364,7 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
         captured: list[Any] = []
         loop = AgentLoop(
             scope_key="group:1",
-            planner=FakeIdlePlanner(),
+            planner=_FakeIdlePlanner(),
             session_factory=_factory_for(captured),
         )
         loop.start()
@@ -367,7 +384,7 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
 
         loop = AgentLoop(
             scope_key="group:12345",
-            planner=FakeIdlePlanner(),
+            planner=_FakeIdlePlanner(),
             session_factory=_factory_for(captured),
             bot_user_id_resolver=_resolver,
         )
@@ -391,7 +408,7 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
 
         loop = AgentLoop(
             scope_key="group:12345",
-            planner=FakeIdlePlanner(),
+            planner=_FakeIdlePlanner(),
             session_factory=_factory_for(captured),
             bot_user_id_resolver=_broken_resolver,
         )
@@ -437,7 +454,7 @@ class WakeDebounceTests(unittest.IsolatedAsyncioTestCase):
         captured: list[Any] = []
         loop = AgentLoop(
             scope_key="group:12345",
-            planner=FakeIdlePlanner(),
+            planner=_FakeIdlePlanner(),
             session_factory=_factory_for(captured),
         )
         with patch(
@@ -458,7 +475,7 @@ class WakeDebounceTests(unittest.IsolatedAsyncioTestCase):
         captured: list[Any] = []
         loop = AgentLoop(
             scope_key="group:12345",
-            planner=FakeIdlePlanner(),
+            planner=_FakeIdlePlanner(),
             session_factory=_factory_for(captured),
         )
         with patch(
@@ -478,7 +495,7 @@ class WakeDebounceTests(unittest.IsolatedAsyncioTestCase):
         captured: list[Any] = []
         loop = AgentLoop(
             scope_key="group:12345",
-            planner=FakeIdlePlanner(),
+            planner=_FakeIdlePlanner(),
             session_factory=_factory_for(captured),
         )
         with patch(
@@ -495,7 +512,7 @@ class WakeDebounceTests(unittest.IsolatedAsyncioTestCase):
         captured: list[Any] = []
         loop = AgentLoop(
             scope_key="group:12345",
-            planner=FakeIdlePlanner(),
+            planner=_FakeIdlePlanner(),
             session_factory=_factory_for(captured),
         )
         with (
@@ -520,7 +537,7 @@ class LoopSupervisorContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_start_spawns_system_loop(self) -> None:
         captured: list[Any] = []
         sup = LoopSupervisor(
-            planner=FakeIdlePlanner(),
+            planner=_FakeIdlePlanner(),
             session_factory=_factory_for(captured),
         )
         await sup.start()
@@ -531,7 +548,7 @@ class LoopSupervisorContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_wake_lazy_creates_group_loop(self) -> None:
         captured: list[Any] = []
         sup = LoopSupervisor(
-            planner=FakeIdlePlanner(),
+            planner=_FakeIdlePlanner(),
             session_factory=_factory_for(captured),
         )
         await sup.start()
@@ -553,7 +570,7 @@ class LoopSupervisorContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_private_wake_is_silently_dropped(self) -> None:
         captured: list[Any] = []
         sup = LoopSupervisor(
-            planner=FakeIdlePlanner(),
+            planner=_FakeIdlePlanner(),
             session_factory=_factory_for(captured),
         )
         await sup.start()
@@ -571,7 +588,7 @@ class LoopSupervisorContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_wake_after_stop_is_noop(self) -> None:
         captured: list[Any] = []
         sup = LoopSupervisor(
-            planner=FakeIdlePlanner(),
+            planner=_FakeIdlePlanner(),
             session_factory=_factory_for(captured),
         )
         await sup.start()
@@ -602,7 +619,7 @@ class MemoryCompactorWiringTests(unittest.IsolatedAsyncioTestCase):
         try:
             captured: list[Any] = []
             sup = LoopSupervisor(
-                planner=FakeIdlePlanner(),
+                planner=_FakeIdlePlanner(),
                 session_factory=_factory_for(captured),
             )
             await sup.start()
@@ -626,7 +643,7 @@ class MemoryCompactorWiringTests(unittest.IsolatedAsyncioTestCase):
             captured: list[Any] = []
             projector = Projector(_factory_for(captured))
             sup = LoopSupervisor(
-                planner=FakeIdlePlanner(),
+                planner=_FakeIdlePlanner(),
                 session_factory=_factory_for(captured),
                 projector=projector,
             )
@@ -640,23 +657,6 @@ class MemoryCompactorWiringTests(unittest.IsolatedAsyncioTestCase):
                 os.environ.pop("MEMORY_COMPACTION_ENABLED", None)
             else:
                 os.environ["MEMORY_COMPACTION_ENABLED"] = old
-
-
-class FakeIdlePlannerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_always_idle(self) -> None:
-        from qqbot.services.agent_loop.decision import DecisionContext, IdleAction
-
-        planner = FakeIdlePlanner()
-        ctx = DecisionContext(
-            scope_key="group:1",
-            correlation_id="c",
-            tick_seq=1,
-            now=datetime.now(ZoneInfo("Asia/Shanghai")),
-        )
-        decision = await planner.decide(ctx)
-        self.assertEqual(len(decision.actions), 1)
-        self.assertIsInstance(decision.actions[0], IdleAction)
-        self.assertEqual(decision.actions[0].reason, "bootstrap_skeleton")
 
 
 class IngestSupervisorIntegrationTests(unittest.IsolatedAsyncioTestCase):
