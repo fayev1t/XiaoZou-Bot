@@ -354,11 +354,11 @@ class PlannerSnapshotIntegrationTests(_SnapshotEnvTestCase):
         self.assertEqual(data["correlation_id"], "CID-9")
         self.assertEqual(data["model"], "stub-model")
         self.assertEqual(data["outcome"], "parsed")
-        # system prompt 分段统计（默认装配的 .md 段，group scope 至少含
-        # planner / envelope / group_chat_rules）
+        # system prompt 分段统计（根页正文挂消费者名，槽挂槽名；2026-07-31
+        # 并页后 group scope 只剩 planner / envelope 两种段名）
         section_names = [s["name"] for s in data["sections"]]
         self.assertIn("planner", section_names)
-        self.assertIn("group_chat_rules", section_names)
+        self.assertIn("envelope", section_names)
         for sec in data["sections"]:
             self.assertGreater(sec["chars"], 0)
             self.assertEqual(len(sec["sha256"]), 64)

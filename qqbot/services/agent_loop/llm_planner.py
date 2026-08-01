@@ -4,13 +4,13 @@
 不含 v1 业务）。Prompt 与解析逻辑均按 v2 任务与决策契约从零写。
 
 System prompt 不再硬编码 —— 完全交给 prompts/catalog.py 装配。默认库
-（build_default_prompt_library）取根页 `planner.md`，它在正文里用 `{{persona}}` /
-`{{system}}` / `{{envelope}}` / `{{group_chat_rules}}` / `{{tools_usage}}` 把共享
-资产拼在自己选定的位置（2026-07-30 起只有槽这一种装配机制，`ASSEMBLY` 与段间
-分隔符都已删除——分隔线现在是页正文里的字符）。2026-07-31 删除 Replyer 后
-Planner 是唯一的对话消费者：角色卡放在页首（那就是她自己），分析与最终措辞
-同归一层。需要迭代职责、参与规则或工具说明时直接改对应 .md 即可，不需要碰
-planner。
+（build_default_prompt_library）取根页 `planner.md`：2026-07-31 删除 Replyer 后
+Planner 是唯一的对话消费者，原先切成 `persona` / `system` / `group_chat_rules`
+三个文件槽的共享资产已并回该页，页里只剩 `{{envelope}}`（信封语法，纯格式规范，
+与投影层成对维护故仍是独立文件）与动态的 `{{tools_usage}}`（内容来自
+ToolRegistry，按 scope 过滤）。角色卡在页首（那就是她自己），分析与最终措辞同归
+一层。需要迭代人格、职责或参与规则时直接改 `planner.md`，改信封语法改
+`envelope.md`，改工具说明改 `tools/<name>.md`，都不需要碰 planner。
 
 错误兜底：LLM 不可用 / 接口报错 / JSON 不可解析 / schema 不符
 一律 fallback 为单一 IdleAction，并把错误细节塞进 reasoning。
@@ -57,10 +57,10 @@ from qqbot.services.agent_loop.tool_registry import ToolRegistry
 logger = get_logger(__name__)
 
 
-# Planner 的段清单与顺序全部写在根页 planner.md 的 {{槽}} 里 —— 逻辑递进：
-# 你是谁（persona）→ 怎么运行与输出什么 → 机器事实（system）→ 输入长什么样
-# （envelope）→ 什么时候需要发言（group_chat_rules）→ 你能调什么工具。
-# 分工理由写在 catalog 的 docstring。
+# Planner 的正文与顺序全部写在根页 planner.md 里 —— 逻辑递进：你是谁 →
+# 你所处的系统 → 输入信封（{{envelope}} 槽）→ 可调工具（{{tools_usage}} 槽）
+# → 你需要做什么 → 你的输出。协议参考先给定义，行为规范随后，输出契约收尾
+# （2026-08-01 维护者定稿）。分工理由写在 catalog 的 docstring。
 
 
 def build_default_prompt_library(
@@ -69,10 +69,11 @@ def build_default_prompt_library(
 ) -> PromptLibrary:
     """v2 默认 system prompt 装配 —— 委托 prompts/catalog.py。
 
-    要哪几段、什么顺序、怎么分隔，全写在根页 `planner.md` 的 `{{槽}}` 里；
-    这里只是 Planner 侧的入口。页与槽都在 render 时才读盘：改 .md 即生效、
-    新增/下架工具立即反映。根页或文件槽读出来为空、槽名未登记都直接 raise
-    （部署坏了不静默跑残缺 prompt）；tools_usage 未注入注册表时整槽跳过。
+    正文、顺序、分隔全写在根页 `planner.md` 里（两个槽 `{{envelope}}` /
+    `{{tools_usage}}` 位于系统段与行为规范之间）；这里只是 Planner 侧的入口。页与
+    槽都在 render 时才读盘：改 .md 即生效、新增/下架工具立即反映。根页或文件槽
+    读出来为空、槽名未登记都直接 raise（部署坏了不静默跑残缺 prompt）；
+    tools_usage 未注入注册表时整槽跳过。
     """
     from qqbot.services.agent_loop.prompts.catalog import build_library
 
@@ -93,8 +94,7 @@ class LLMPlanner:
         self._llm = llm_client
         self._tool_registry = tool_registry
         # prompt_library 优先：调用方明确传入就用它；否则按 tool_registry
-        # 装配默认库（planner 根页 + persona/system/envelope/
-        # group_chat_rules/tools_usage 槽）。
+        # 装配默认库（planner 根页 + envelope/tools_usage 两个槽）。
         if prompt_library is None:
             prompt_library = build_default_prompt_library(
                 tool_registry=tool_registry
@@ -235,8 +235,8 @@ def _build_messages(
     """构造 chat 输入 + 可选的 Prompt 快照（快照关闭 / scope 不在白名单时为
     None）。langchain_core.messages 在 langchain_openai 已是必依赖。
 
-    System prompt 完全由提示词库输出 —— 默认装配是 planner / envelope /
-    group_chat_rules / tools_usage 四段，每段在自己的 .md 文件里独立维护。
+    System prompt 完全由提示词库输出 —— 默认装配是根页 `planner.md` 的正文，
+    其后依次展开 `envelope.md` 与 tools_usage 段（逐工具 `tools/<name>.md`）。
 
     HumanMessage 的 text block 用 XML 信封而非 JSON 拼装：timeline 里每条
     item 的 render 字段本身就是 `<message ...>` / `<tool-call ...>` /
@@ -297,7 +297,8 @@ def _render_input_xml(
 ) -> str:
     """拼装喂给 LLM 的 XML 信封。
 
-    结构（顺序按**变化频率升序**排列——前缀缓存契约，2026-07-12）：
+    结构（顺序按**变化频率升序**排列——前缀缓存契约，2026-07-12；
+    saved-memes 为唯一显著性例外，见段末说明）：
 
       <agent-input scope="..." bot_qq="..." bot_role="...">
         <tool-catalog>
@@ -305,15 +306,15 @@ def _render_input_xml(
             <arguments-schema>{json schema 文本}</arguments-schema>
           </tool>
         </tool-catalog>
-        <saved-memes>
-          <meme hash="..." saved_at="...">描述</meme>
-        </saved-memes>                                  (有收藏才出)
         <timeline>
           <time when="...">
             {item.render ...}           (同秒的行共享一个时刻节点)
           </time>
           ...
         </timeline>
+        <saved-memes>
+          <meme hash="..." saved_at="...">描述</meme>
+        </saved-memes>                                  (有收藏才出)
         <active-tasks>
           <task task_id="..." state="..." description="...">
             <related-tools>tool1,tool2</related-tools>
@@ -336,15 +337,16 @@ def _render_input_xml(
     逐拍变（pending_tool_call_ids 随工具收口增删），排到 timeline 之后；
     每拍必变的 now 沉为尾部 <current/>；validation-error 只在同 tick
     校验重试出现（契约 §7.1），放最尾——同拍重试可复用直到 <current/> 的
-    前缀，且作为最后一行对模型最显著。timeline 仍然紧邻输出位置（其后只有
-    寥寥数行），recency bias 不受影响。
+    前缀，且作为最后一行对模型最显著。saved-memes 是唯一的显著性例外
+    （2026-08-01）：它少变、本可留在 timeline 之前吃前缀缓存，但选图发生在
+    读完局面之后，目录隔着整条 timeline 就几乎不被想起——移到 </timeline>
+    之后、active-tasks 之前，接受它随 timeline 追加逐拍重编码。
 
     工具结果只在 <timeline> 的 <tool-call status="complete"> 行呈现一次
     （2026-07-02 删除了 <pending-tool-results> 区——同一调用双重渲染、且无
-    消费切割地每拍重复出现，是模型复读的直接诱饵）。模型的跨拍自我记忆
-    2026-07-06 起也在 timeline 内——最近 K 条 decision_emitted 渲染为
-    <my-thought> 行（投影层负责，见 projection.build_timeline；独立的
-    <last-reasoning> 区块已删除）。
+    消费切割地每拍重复出现，是模型复读的直接诱饵）。2026-08-01 起
+    decision_emitted.reasoning 只保留在运行日志与快照，不再投影进 timeline；
+    跨拍事实与义务分别由客观事件行和 active-tasks 表达。
     """
     parts: list[str] = []
     # bot_qq 可选（值来自 context.bot_user_id）：未注入（启动初期 bot_registry
@@ -396,8 +398,17 @@ def _render_input_xml(
         )
     parts.append("</tool-catalog>")
 
+    parts.append("<timeline>")
+    # 时间流渲染：行按同秒分组嵌进 <time when="…"> 时刻节点，行内无时间
+    # 属性（render_timeline_stream，时间流契约 2026-07-26）。
+    parts.extend(render_timeline_stream(context.timeline))
+    parts.append("</timeline>")
+
     # ─── 表情包收藏夹（有才渲染）：meme 工具凭 hash 精确操作收藏的选图目录。
-    # 空收藏整段省略——不给模型一个空 <saved-memes> 去好奇。───
+    # 空收藏整段省略——不给模型一个空 <saved-memes> 去好奇。2026-08-01 从
+    # timeline 之前移到之后：选图发生在读完局面之后，目录隔着整条 timeline
+    # 时几乎不被想起；代价是本段进入 timeline 追加即失效的重编码区——显著性
+    # 换缓存，与下方 active-tasks 同型取舍（变化频率升序布局的唯一例外）。───
     saved_memes = getattr(context, "saved_memes", None) or []
     if saved_memes:
         parts.append("<saved-memes>")
@@ -411,12 +422,6 @@ def _render_input_xml(
                 f"{_esc_text(meme.description)}</meme>"
             )
         parts.append("</saved-memes>")
-
-    parts.append("<timeline>")
-    # 时间流渲染：行按同秒分组嵌进 <time when="…"> 时刻节点，行内无时间
-    # 属性（render_timeline_stream，时间流契约 2026-07-26）。
-    parts.extend(render_timeline_stream(context.timeline))
-    parts.append("</timeline>")
 
     # active-tasks 在 timeline 之后：任务活跃期它逐拍变（pending_tool_call_ids
     # 随工具收口增删），放前面会在多工具工作流里逐拍掐断 timeline 的缓存前缀；
@@ -437,8 +442,8 @@ def _render_input_xml(
     # 事件 payload / 日志配对 / 快照文件名都还靠它）。删的理由不是"省字节"：
     # 它与 now= 同处 <current/>，而 now 每拍必变且删不掉，所以 tick 从来没有
     # 额外掐断过任何一段可缓存前缀，缓存收益恒为零。真正的问题是它对模型
-    # **无锚点**：全信封只有这一处出现拍号，timeline 的 <my-thought> 只带
-    # time=，模型既减不出步数也定位不了任何行；而进程重启后 _tick_seq 归零、
+    # **无锚点**：全信封只有这一处出现拍号，timeline 的事件行都不带拍号，
+    # 模型既减不出步数也定位不了任何行；而进程重启后 _tick_seq 归零、
     # timeline 却从库里重新折叠出满窗历史，tick="1" 配一整段往事是**误导**而
     # 不只是噪音。（历史反证：Replyer 侧的 <current/> 从来不带 @tick 且从未
     # 缺过什么。）若将来要给模型"这是本轮连续推演第几步"的信号，应新增
@@ -522,7 +527,7 @@ def _log_request(context: DecisionContext, messages: list[Any]) -> None:
 
     布局优先可读：用换行 + 分隔条把 system / user / response 三段切开，
     避免一行 5KB+ 撑爆 terminal。system prompt 只打首尾几行 + 长度，
-    因为它基本静态（identity + protocol + group_chat_rules + tools usage）；
+    因为它基本静态（planner.md 正文 + envelope + tools usage）；
     user 段（XML 信封）是 tick 之间真正变化的东西，原样全打。
     """
     # messages = [SystemMessage, HumanMessage]

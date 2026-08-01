@@ -21,7 +21,7 @@
 
 与 meme_caption 的分工（两条 VLM 链并存，刻意不合并）：
   本模块 = 客观转录，给 Planner 判断"发生了什么"，不可变、按 hash 缓存；
-  meme_caption = 主观用途标注（"什么场合甩这张"），给 Replyer 选图，带
+  meme_caption = 主观用途标注（"什么场合甩这张"），给 Planner 选图，带
   context_note、可 recaption 重写。同一张图这两份描述内容/可变性/存储位置都不同，
   合并会两头不讨好。
 

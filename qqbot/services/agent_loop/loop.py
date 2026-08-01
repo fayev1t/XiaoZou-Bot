@@ -340,9 +340,9 @@ class AgentLoop:
         # 事件却写于 LLM 返回之后，而事件流按 occurred_at 排序（_fetch）。用
         # 写入时刻会把 LLM 往返期间到达的消息排到决策事件**之前**——那些消息
         # 根本没进本拍 context，却因此被读成"这拍已经看过"，人连发的第二句就
-        # 此被吞；<my-thought> 行同样会渲染到它们之后，位置信号跟着一起错。
-        # 决策"发生"于开始思考的时刻，回填后 timeline 的先后关系才与"这拍看到
-        # 了什么"一致。
+        # 此被吞。decision_emitted 自身虽不再投影，但仍是 unseen 折叠的决策
+        # 水位线；决策"发生"于开始思考的时刻，回填后水位线才与本拍真正看到的
+        # 内容一致。
         decision_id = await write_agent_event(
             self._session_factory,
             event_type="agent.decision_emitted",
@@ -709,7 +709,7 @@ def _validate_decision(decision: DecisionOutput) -> str | None:
 
     工具自己的 arguments / scope / permission 校验全部留在工具边界；这里仅
     校验跨 action 的组合约束。"一 tick 多回复"的旧硬约束已经移除，由
-    group_chat_rules.md 软规范引导。
+    planner.md §你需要做什么 的软规范引导。
     """
     actions = decision.actions
     if any(isinstance(a, IdleAction) for a in actions) and len(actions) > 1:

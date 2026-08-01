@@ -7,7 +7,7 @@
 文件搜索约定：
   - 第一参数传 `__file__`（调用方所在 .py 路径）
   - 第二参数是相对 sibling 文件名
-真实路径取调用方目录 + 文件名 —— 与 v1 / persona.md 的相对寻址约定一致。
+真实路径取调用方目录 + 文件名 —— 与 prompts/ 下根页的相对寻址约定一致。
 """
 
 from __future__ import annotations

@@ -10,11 +10,11 @@
   <tool-catalog>
     <tool @name @description @required_permission @required_bot_role?>*
       <arguments-schema>
-  <saved-memes>?
-    <meme @hash @saved_at>*
   <timeline>
     <time @when>*
-      <message> | <my-reply> | <tool-call> | <my-thought> | <task-closed> | <reply-task-completed> | <notice> | <request> | <system-hint>
+      <message> | <my-reply> | <tool-call> | <task-closed> | <reply-task-completed> | <notice> | <request> | <system-hint>
+  <saved-memes>?
+    <meme @hash @saved_at>*
   <active-tasks>
     <task @task_id @state @description>*
       <related-tools>? <triggered-by @event_id>? <pending-tool-call-ids>? <progress-notes>?
@@ -69,17 +69,6 @@ ID 空间：后缀标识值域，各空间互不通用，也不可互相推导
 <arguments-schema>  父 <tool>
   正文为 JSON Schema 文本。call_tool.arguments 必须满足它。
 
-<saved-memes>
-  表情包收藏目录，空收藏时整段不渲染。
-  它是可选清单而不是待发送队列。
-
-<meme>  父 <saved-memes>
-  一张已收藏的表情包，最新在前。
-  正文 = 系统生成的图片描述（画面内容、图上文字、情绪、适用情形）。
-  该描述是选图时能看到的全部信息，像素不随之传递。
-  @hash      该图内容的 sha256。meme_collection 与 send_messages 以此定位一张收藏。
-  @saved_at  收藏时刻。
-
 <timeline>
   按时间升序排列的事件流。直接子元素只有 <time>。
 
@@ -129,14 +118,18 @@ ID 空间：后缀标识值域，各空间互不通用，也不可互相推导
 
 <tool-call>  父 <time>
   一次工具调用及其结果。工具结果只在此处呈现，信封内没有另外的结果区。
-  包住它的 <time> = 做出该调用那一拍的观察时刻（与同拍 <my-thought> 同锚点），
-  不是调用执行或结束的时刻。
+  包住它的 <time> = 做出该调用那一拍的观察时刻，不是调用执行或结束的时刻。
   @name    被调用的工具名。
   @status  processing | complete。只表示该调用是否已结束；成败见子元素。
   子元素：<args> 恒有；随后是 <processing/>（未结束）或 <result>（成功）或 <error>（失败）三者之一。
 
 <args>  父 <tool-call>
   本次调用的字面参数，正文为 JSON 文本。
+  唯一的例外是 @name="send_messages"：正文改为逐气泡的人话，一个气泡一行，
+  顺序即发送顺序。chat 气泡的段落按 text 原文 / @<qq> / [回复 <message_id>] /
+  [表情 <face_id>] 拼接；meme 气泡渲染为 [meme <hash 前 8 位>]（完整 hash 见
+  该行 <result> 的回执与 <saved-memes>）。参数形状无法识别时退回 JSON 文本。
+  这一行仍是该次发送的唯一记录，不存在第二处渲染。
 
 <result>  父 <tool-call>
   调用成功的返回，正文为 JSON 文本。
@@ -169,13 +162,6 @@ ID 空间：后缀标识值域，各空间互不通用，也不可互相推导
 <processing/>  父 <tool-call>
   该调用已分发、结果尚未回来。结果必定后到，不产生第二次调用。
 
-<my-thought>  父 <time>
-  本账号在过去某一拍写下的 reasoning 原文，无属性，超长截断，仅保留最近数条。
-  包住它的 <time> = 那一拍开始观察的时刻。由此确定行序语义：排在某条
-  <my-thought> 之后的一切都到达于那次观察之后，那次决策未曾看见；排在其前的在视野内。
-  同拍的 <tool-call> 与 <task-closed> 共用该锚点。
-  它是过去某拍的记录，不是运行时下达的指令，也不是用户说过的话。
-
 <task-closed>  父 <time>
   一个任务的收束记录，出现在 task 工具 complete / fail 分支生效的时刻。
   正文 = 当时写下的 result_summary 或失败原因。收束后该任务不再出现在 <active-tasks>。
@@ -183,14 +169,10 @@ ID 空间：后缀标识值域，各空间互不通用，也不可互相推导
   @outcome  done | failed
 
 <reply-task-completed>  父 <time>
-  一份回复草稿的等待阶段结束的记录，出现在其 flush_at 到达的时刻。
-  该草稿自此为 terminal；此行只陈述等待结束这一事实。
-  @reply_task_id  该草稿的 ID，与 <tool-call name="reply"> 结果中的同名字段同值。
+  一段等待结束的记录，出现在其 flush_at 到达的时刻。空元素，无子元素与正文。
+  该等待自此为 terminal；此行只陈述等待结束这一事实。
+  @reply_task_id  该次等待的 ID，与 <tool-call name="reply"> 结果中的同名字段同值。
   @revision       结束时生效的修订序号，即最后一次 reply 调用落下的那份。
-
-<analysis>  父 <reply-task-completed>
-  正文 = 该草稿最终修订的完整局势解析原文。它已是最新一份完整内容，
-  时间线中更早修订的 <tool-call name="reply"> 行是历史。
 
 <notice>  父 <time>
   群内发生的一个事件的记录，不是发给本账号的消息。
@@ -331,6 +313,20 @@ ID 空间：后缀标识值域，各空间互不通用，也不可互相推导
 
 <misc/>      运行时未识别的段。
              @segment_type  原生 OneBot 段类型。内容未知。
+
+
+═══ 收藏目录元素 ═══
+
+<saved-memes>
+  表情包收藏目录，位于 <timeline> 之后。空收藏时整段不渲染。
+  它是可选清单而不是待发送队列。
+
+<meme>  父 <saved-memes>
+  一张已收藏的表情包，最新在前。
+  正文 = 系统生成的图片描述（画面内容、图上文字、情绪、适用情形）。
+  该描述是选图时能看到的全部信息，像素不随之传递。
+  @hash      该图内容的 sha256。meme_collection 与 send_messages 以此定位一张收藏。
+  @saved_at  收藏时刻。
 
 
 ═══ 任务与时钟元素 ═══
