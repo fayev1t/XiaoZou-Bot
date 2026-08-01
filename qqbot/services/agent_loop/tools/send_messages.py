@@ -1,10 +1,12 @@
 """SendMessagesTool —— Planner 亲自发言的唯一出口（2026-07-31 删除 Replyer）。
 
-链路（重构提案-删除Replyer.md §2/§4）：`reply` 保存分析并等待；到点后
+链路（重构提案-删除Replyer.md §2/§4）：`reply` 起一段等待；到点后
 ``runtime.reply_task_completed`` 唤醒 Planner；Planner 结合最新时间流决定
 idle / 查证 / 调本工具把话真正发出去。本工具**始终可调用**——运行时不检查
-是否存在完成事件，也不校验内容是否符合某份 analysis；"正常在完成事件之后
-发言"是提示词纪律，不是工具权限（§0.5，有意的软约束，不得补授权门闩）。
+是否存在完成事件，也不查 ReplyTask；"正常在完成事件之后发言"是提示词纪律，
+不是工具权限（§0.5，有意的软约束，不得补授权门闩）。**但这条实现事实只写在
+代码里**：2026-08-01 起 `send_messages.md` 不再向模型主动交底"没人拦你"——
+工具用法文档没有义务告诉模型某条纪律缺少强制力。
 
 它是一个**普通 ToolWorker 工具**（§4.3/§4.5）：走通用租约与 terminal 机制，
 不写任何领域/runtime 事件，不查询或修改 ReplyTask，也不为自己新增 fence 或
@@ -35,6 +37,7 @@ from typing import Any
 
 from qqbot.core.logging import get_logger
 from qqbot.services.agent_loop.outbound_messages import (
+    MAX_OUTBOUND_MESSAGES,
     delivery_status,
     first_error_reason,
     invalid_args,
@@ -51,6 +54,67 @@ logger = get_logger(__name__)
 
 _USAGE_PROMPT = load_sibling_md(__file__, "send_messages.md")
 
+# ── 气泡 schema（2026-08-01）：`items` 原本只是 {"type": "object"}，两种气泡
+# 唯一同框的地方是 messages.description 那段散文，chat 占前 2/3、meme 挂在分号
+# 后面——模型写 JSON 时最强的结构先验是 schema，而 schema 里表情包等于不存在。
+# 现按 task.py 的既有写法展开成 kind 判别的两分支，把"平级"在模型真正读的那份
+# 结构里说出来。schema 纯文档用途（tool_registry 模块头），真正的校验始终是
+# outbound_messages.validate_messages——两边形状逐字对齐，不得出现 schema 放行
+# 而校验拒绝的错位。
+#
+# 段级不写 additionalProperties：validate_content 只看 type/data，不拒绝多余
+# 键，schema 不能比校验更严。reply 段至多一个且必须在 content[0]，JSON Schema
+# 表达不了，留在 send_messages.md。
+_SEGMENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "type": {
+            "enum": ["text", "at", "reply", "face"],
+            "description": "段类型。",
+        },
+        "data": {
+            "type": "object",
+            "description": "该段类型的字段，全部位于 data 内。",
+        },
+    },
+    "required": ["type", "data"],
+}
+
+# 两分支各自的 required / additionalProperties 就是 validate_messages 里
+# extras = set(item) - {...} 那两处检查的形状。
+_CHAT_BUBBLE_SCHEMA = {
+    "properties": {
+        "kind": {
+            "const": "chat",
+            "description": "固定为 chat，表示一条聊天气泡。",
+        },
+        "content": {
+            "type": "array",
+            "minItems": 1,
+            "description": "OneBot V11 段数组。",
+            "items": _SEGMENT_SCHEMA,
+        },
+    },
+    "required": ["kind", "content"],
+    "additionalProperties": False,
+}
+
+_MEME_BUBBLE_SCHEMA = {
+    "properties": {
+        "kind": {
+            "const": "meme",
+            "description": "固定为 meme，表示一个表情包气泡。",
+        },
+        "image_hash": {
+            "type": "string",
+            "pattern": "^[0-9a-fA-F]{64}$",
+            "description": '<saved-memes> 中 <meme hash="..."> 的 sha256。',
+        },
+    },
+    "required": ["kind", "image_hash"],
+    "additionalProperties": False,
+}
+
 
 class SendMessagesTool(BaseTool):
     name = "send_messages"
@@ -58,16 +122,11 @@ class SendMessagesTool(BaseTool):
     # 目标——不照抄旧 send_message.py 的 ("group", "private")。
     allowed_scopes = ("group",)
     description = (
-        "Actually send your words into this group chat, as 1-4 ordered "
-        "bubbles (at most one of them a saved meme). This is the only way "
-        "anything you write becomes visible. The normal flow is: store your "
-        "analysis with `reply`, wait for <reply-task-completed>, re-read the "
-        "latest timeline, then either stay silent, investigate further, or "
-        "call this tool with the final wording you choose now. The result's "
-        "per-bubble receipts on this call's own row are the record of what "
-        "actually reached QQ. sent means said — never re-send it; uncertain "
-        "means the messages MAY already be out — never re-send the same "
-        "intent as a new call either."
+        "向当前群发送多条有序气泡。messages 中每项可为 OneBot V11 聊天气泡或"
+        "收藏表情包气泡。标准发言链路先由 reply 保存分析并等待，再在 "
+        "<reply-task-completed> 出现后调用本工具；运行时不强制该顺序。返回值中的"
+        "逐气泡回执是送达状态记录；status=uncertain 表示至少一条气泡可能已经"
+        "送达。"
     )
     usage_prompt = _USAGE_PROMPT
     arguments_schema = {
@@ -76,15 +135,14 @@ class SendMessagesTool(BaseTool):
             "messages": {
                 "type": "array",
                 "minItems": 1,
-                "maxItems": 4,
+                "maxItems": MAX_OUTBOUND_MESSAGES,
                 "description": (
-                    "Ordered bubbles. Each item is either "
-                    '{"kind":"chat","content":[<OneBot v11 segments>]} with '
-                    "text/at/reply/face segments (each field inside \"data\"), "
-                    'or {"kind":"meme","image_hash":"<sha256 copied from '
-                    "<saved-memes>>\"}."
+                    "按发送顺序排列的气泡数组。每项是一个 chat 气泡或一个 "
+                    "meme 气泡，两者平级、可任意穿插。"
                 ),
-                "items": {"type": "object"},
+                "items": {
+                    "oneOf": [_CHAT_BUBBLE_SCHEMA, _MEME_BUBBLE_SCHEMA]
+                },
             },
         },
         "required": ["messages"],
@@ -114,7 +172,7 @@ class SendMessagesTool(BaseTool):
                 f"send_messages received unknown argument(s): {', '.join(extras)}",
             )
 
-        # ── 静态校验：形状、段白名单、气泡与 meme 数量（无副作用）。
+        # ── 静态校验：形状、段白名单、气泡条数上限（无副作用；meme 不限量）。
         prepared, fail = validate_messages(arguments.get("messages"))
         if fail is not None:
             return fail

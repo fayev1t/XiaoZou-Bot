@@ -108,8 +108,9 @@ class MemeView:
 # PendingReplyView 已于 2026-07-24 删除（待办#19）：它是 <pending-reply> 段的
 # 载体，而 Planner 所需的每个字段都被 timeline 上的
 # <tool-call name="reply"> 行覆盖（调度字段在 <result>、内容在 <args>）。
-# 到点交接不复用这个有界投影视图：ReplyExecutor 从 reply_task 折叠态取最新
-# analysis 写进 runtime.reply_task_completed（2026-07-31 起）。
+# 到点交接不复用这个有界投影视图：ReplyExecutor 从 reply_task 折叠态复核后
+# 写 runtime.reply_task_completed（2026-07-31 起）。该完成事件 2026-08-01 起
+# 不带任何内容，只是一次到点叫醒。
 
 
 @dataclass(frozen=True)
@@ -125,8 +126,8 @@ class TimelineItem:
         "system_hint",
         "request",
         "task_closed",
-        "my_thought",
         "my_reply",
+        "reply_task_completed",
     ]
     render: str
     related_event_ids: list[str] = field(default_factory=list)
@@ -197,9 +198,10 @@ class DecisionContext:
 
     timeline: list[TimelineItem] = field(default_factory=list)
     active_tasks: list[TaskView] = field(default_factory=list)
-    # 2026-07-24 起 Planner context 没有 pending_reply 字段（待办#19）：待发稿
-    # 的调度状态与历史调用都在 timeline 的 <tool-call name="reply"> 行上；
-    # 到点后的完整 analysis 以 <reply-task-completed> 行回到 timeline。
+    # 2026-07-24 起 Planner context 没有 pending_reply 字段（待办#19）：等待的
+    # 调度状态与历史调用都在 timeline 的 <tool-call name="reply"> 行上；到点
+    # 只落一条空的 <reply-task-completed> 行（2026-08-01 删除 analysis 后它
+    # 不再携带内容）。
 
     # ─── 表情包收藏夹（meme_collection 管收藏；send_messages 发送）───
     # 全局共享的 agent_memes（2026-07-06 起全 bot 一份，created_at 倒序、
@@ -214,14 +216,11 @@ class DecisionContext:
     # 与 pending 区双重渲染，两处语义必然漂移。ToolResultView 仍保留——它是
     # timeline 渲染 tool-call 行时的折叠视图（fold_tool_results）。
 
-    # ─── 模型的跨拍自我记忆（2026-07-02 增 last_reasoning；2026-07-06 改为
-    # 思考轨迹内联，待办清单#4）───
-    # agent.decision_emitted 不再折叠成独立字段：build_timeline 直接把最近
-    # MAX_THOUGHT_ROWS 条（含 idle 拍、空白 reasoning 跳过）渲染为 timeline
-    # 的 <my-thought> 行，单条截 MAX_THOUGHT_CHARS 字、不挤占消息行预算。
-    # 旧的 last_reasoning / last_reasoning_at 字段与 <last-reasoning> 区块已
-    # 删除——只有 1 拍深的记忆使跨拍链条强度取决于最弱一拍，且与 <my-thought>
-    # 并存会双重渲染最新一条。
+    # ─── reasoning 不进入跨拍上下文（2026-08-01）───
+    # DecisionOutput.reasoning 仍随 agent.decision_emitted 落库，供日志、快照与
+    # 审计使用；Projector 对该事件强消隐，不再把自由工作笔记回显给下一拍。
+    # 跨拍的客观事实由 timeline 的消息 / 工具调用 / 结果表达，未完成义务由
+    # active_tasks 表达。旧的 last_reasoning 字段与 <my-thought> 行都不得复活。
 
     # ─── 同 tick 校验重试的反馈（任务与决策契约 §7.1）───
     # 上一次 decide() 输出未通过动作校验时，loop 带着错误描述重试；planner
@@ -248,8 +247,10 @@ class Planner(Protocol):
     """Stateless decision function.
 
     Implementations:
-    - FakeIdlePlanner — skeleton; always idle.
-    - (future) LLMPlanner — calls LLM① and parses DecisionOutput JSON.
+    - LLMPlanner — 现役唯一实现；调 LLM 并解析 DecisionOutput JSON。
+      解析失败一律降级为 IdleAction(llm_*_error)，不抛给循环。
+    测试里用的 always-idle 空实现内联在各测试文件中（`_FakeIdlePlanner`），
+    不再由生产包提供。
     """
 
     async def decide(self, context: DecisionContext) -> DecisionOutput: ...

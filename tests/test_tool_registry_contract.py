@@ -17,6 +17,7 @@ Covers (任务与决策契约 §5.1):
 
 from __future__ import annotations
 
+import re
 import unittest
 from typing import Any
 
@@ -302,6 +303,102 @@ class ToolScopeVisibilityTest(unittest.TestCase):
             allowed_scopes = "system"  # 字符串单值自动包成 tuple
 
         self.assertEqual(get_tool_allowed_scopes(_StrScope()), ("system",))
+
+
+class BuiltinToolDescriptionContractTest(unittest.TestCase):
+    """内置工具的 LLM 可见说明统一使用客观中文接口文档。"""
+
+    _HAN_RE = re.compile(r"[\u3400-\u9fff]")
+    _SECOND_PERSON_EN_RE = re.compile(r"\b(?:you|your|yours)\b", re.IGNORECASE)
+    _SUBJECTIVE_PHRASES = (
+        "何时使用",
+        "什么时候用",
+        "应该",
+        "应当",
+        "建议",
+        "更适合",
+        "优先选择",
+        "随意",
+    )
+
+    @staticmethod
+    def _tool_classes() -> list[type]:
+        from qqbot.services.agent_loop import tools
+
+        return [
+            getattr(tools, exported)
+            for exported in tools.__all__
+            if exported.endswith("Tool")
+        ]
+
+    def _assert_objective_chinese(self, text: str, label: str) -> None:
+        self.assertRegex(text, self._HAN_RE, label)
+        self.assertNotIn("你", text, label)
+        self.assertNotRegex(text, self._SECOND_PERSON_EN_RE, label)
+        for phrase in self._SUBJECTIVE_PHRASES:
+            self.assertNotIn(phrase, text, label)
+
+    def _check_schema(
+        self,
+        node: Any,
+        path: str,
+        field_docs: dict[str, bool],
+    ) -> None:
+        if isinstance(node, list):
+            for index, item in enumerate(node):
+                self._check_schema(item, f"{path}[{index}]", field_docs)
+            return
+        if not isinstance(node, dict):
+            return
+
+        annotation = node.get("description")
+        if isinstance(annotation, str):
+            self._assert_objective_chinese(annotation, f"{path}.description")
+
+        properties = node.get("properties")
+        if isinstance(properties, dict):
+            for field, field_schema in properties.items():
+                self.assertIsInstance(field_schema, dict, f"{path}.{field}")
+                field_docs[field] = field_docs.get(field, False) or isinstance(
+                    field_schema.get("description"), str
+                )
+
+        for key, value in node.items():
+            if key == "description" and isinstance(value, str):
+                continue
+            self._check_schema(value, f"{path}.{key}", field_docs)
+
+    def test_catalog_and_schema_descriptions_are_objective_chinese(self) -> None:
+        classes = self._tool_classes()
+        self.assertTrue(classes)
+        for tool_class in classes:
+            with self.subTest(tool=tool_class.name):
+                self._assert_objective_chinese(
+                    tool_class.description,
+                    f"{tool_class.name}.description",
+                )
+                field_docs: dict[str, bool] = {}
+                self._check_schema(
+                    tool_class.arguments_schema,
+                    f"{tool_class.name}.arguments_schema",
+                    field_docs,
+                )
+                for field, documented in field_docs.items():
+                    self.assertTrue(
+                        documented,
+                        f"{tool_class.name}.{field} 缺少中文字段说明",
+                    )
+
+    def test_usage_docs_are_objective_chinese_interface_docs(self) -> None:
+        for tool_class in self._tool_classes():
+            with self.subTest(tool=tool_class.name):
+                usage = tool_class.usage_prompt
+                self.assertTrue(
+                    usage.startswith(f"# 工具：`{tool_class.name}`"),
+                    tool_class.name,
+                )
+                self.assertIn("## 功能", usage, tool_class.name)
+                self._assert_objective_chinese(usage, tool_class.name)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,11 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 from qqbot.services.agent_loop import bot_registry
+from qqbot.services.agent_loop.outbound_messages import (
+    _ALLOWED_SEGMENT_TYPES,
+    MAX_OUTBOUND_MESSAGES,
+    validate_messages,
+)
 from qqbot.services.agent_loop.tools.send_messages import SendMessagesTool
 
 HASH_A = "ab" * 32
@@ -279,24 +284,105 @@ class SendMessagesMetadataTests(unittest.TestCase):
         # 只有 messages 一个业务参数：没有 target / token / 完成事件 ID。
         self.assertEqual(sorted(schema["properties"]), ["messages"])
 
-    def test_usage_doc_teaches_uncertain_and_partial_discipline(self) -> None:
-        """§5.3：uncertain = 可能已发出、禁止为同一意图再发；partial 只按
-        逐条 receipt 判断；调用行自己的回执就是发言记录（不派生
-        <my-reply>）。禁用授权/兑换/消费措辞——完成事件不得被读成 token。"""
+    def test_usage_doc_records_uncertain_and_partial_semantics(self) -> None:
+        """§5.3：uncertain 表示可能已送达，新调用可能造成重复；partial 按
+        逐条 receipt 表示既成发送事实；调用行自己的回执就是发言记录（不派生
+        <my-reply>）。完成事件不是发送参数，文档不使用 token 式措辞。"""
         doc = SendMessagesTool.usage_prompt
-        self.assertIn("may already be out", doc)
-        self.assertIn("re-send to be safe", doc)
-        self.assertIn("per-bubble receipts", doc)
-        self.assertIn("there is no separate row for it", doc)
-        self.assertIn("not a permission slip", doc)
+        self.assertIn("可能已经送达", doc)
+        self.assertIn("再次调用会产生新的独立发送命令", doc)
+        self.assertIn("逐气泡回执", doc)
+        self.assertIn("不会另外生成", doc)
         for forbidden in ("授权", "兑换", "消费", "领取"):
             self.assertNotIn(forbidden, doc)
+
+    def test_usage_doc_does_not_advertise_the_missing_gate(self) -> None:
+        """2026-08-01：运行时确实不检查完成事件（§0.5 有意的软约束，不得补
+        授权门闩），但**用法文档不再主动向模型交底这一点**。
+
+        "正常在完成事件之后发言"是提示词纪律；一份工具用法文档没有义务告诉
+        模型某条纪律缺少强制力——那句话唯一的作用就是邀请它绕过流程。实现
+        事实仍写在 send_messages.py 的 docstring 里，供维护者查阅。
+        """
+        doc = SendMessagesTool.usage_prompt
+        for leak in ("运行时允许独立调用", "不会检查", "不校验"):
+            self.assertNotIn(leak, doc)
 
     def test_description_names_the_two_step_flow(self) -> None:
         desc = SendMessagesTool.description
         self.assertIn("<reply-task-completed>", desc)
-        self.assertIn("per-bubble receipts", desc)
-        self.assertIn("never re-send", desc)
+        self.assertIn("逐气泡回执", desc)
+        self.assertIn("可能已经送达", desc)
+
+    def test_bubble_cap_lives_in_schema_and_usage_doc_only(self) -> None:
+        """条数上限只有一处真相（outbound_messages），schema 直接引用它；
+        具体数字只在工具介绍（usage doc）里写明，description 与其它提示词
+        层一律只说"多条"（2026-07-31 放宽到 10、meme 不再限量）。"""
+        schema = SendMessagesTool.arguments_schema
+        self.assertEqual(
+            schema["properties"]["messages"]["maxItems"], MAX_OUTBOUND_MESSAGES
+        )
+        self.assertIn(
+            f"1–{MAX_OUTBOUND_MESSAGES} 个有序气泡",
+            SendMessagesTool.usage_prompt,
+        )
+        self.assertNotIn("1-4", SendMessagesTool.description)
+        self.assertNotIn("at most one", SendMessagesTool.description)
+
+    def test_bubble_schema_presents_chat_and_meme_as_peer_branches(self) -> None:
+        """2026-08-01：`messages.items` 曾是 `{"type": "object"}`——两种气泡
+        唯一同框的地方是 description 那段散文，chat 占前 2/3、meme 挂在分号
+        后面当尾巴。模型逐 token 写 JSON 时最强的结构先验是 schema，那等于
+        表情包在结构上不存在，而提示词层（planner.md 的"优先让图说话"）却把
+        它当惯用表达。这里钉住两支平级：同一个 oneOf 下的兄弟、由 kind 判别、
+        各自带完整的 required 与 additionalProperties，没有主次没有嵌套。
+        """
+        items = SendMessagesTool.arguments_schema["properties"]["messages"][
+            "items"
+        ]
+        branches = items["oneOf"]
+        self.assertEqual(
+            [b["properties"]["kind"]["const"] for b in branches],
+            ["chat", "meme"],
+        )
+        for branch in branches:
+            with self.subTest(kind=branch["properties"]["kind"]["const"]):
+                self.assertEqual(branch["required"][0], "kind")
+                self.assertFalse(branch["additionalProperties"])
+        # 段类型白名单只有一处真相（outbound_messages），schema 不得自成一套。
+        segment_type = branches[0]["properties"]["content"]["items"][
+            "properties"
+        ]["type"]
+        self.assertEqual(set(segment_type["enum"]), set(_ALLOWED_SEGMENT_TYPES))
+
+    def test_bubble_schema_shape_matches_validate_messages(self) -> None:
+        """schema 是纯文档（tool_registry 模块头），真正的校验是
+        validate_messages——两边形状必须逐字对齐，否则模型照 schema 写出的
+        气泡会被校验拒绝，而它看不到 schema 之外的真相。
+
+        按每支的 required 造最小气泡送进真校验（必须通过），再多塞一个键
+        （必须被拒）——证明 additionalProperties:False 确有 extras 检查兜底，
+        不是一句装饰性的文档。
+        """
+        branches = SendMessagesTool.arguments_schema["properties"]["messages"][
+            "items"
+        ]["oneOf"]
+        minimal = {
+            "chat": {"kind": "chat", "content": [_TEXT]},
+            "meme": {"kind": "meme", "image_hash": HASH_A},
+        }
+        for branch in branches:
+            kind = branch["properties"]["kind"]["const"]
+            with self.subTest(kind=kind):
+                bubble = minimal[kind]
+                self.assertEqual(sorted(branch["required"]), sorted(bubble))
+                normalized, fail = validate_messages([bubble])
+                self.assertIsNone(fail)
+                self.assertEqual(normalized[0]["kind"], kind)
+                _, rejected = validate_messages([{**bubble, "extra": 1}])
+                self.assertEqual(
+                    getattr(rejected, "error_kind", None), "invalid_arguments"
+                )
 
 
 if __name__ == "__main__":

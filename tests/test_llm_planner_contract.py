@@ -84,8 +84,7 @@ class LLMPlannerContractTest(unittest.TestCase):
         body = (
             '{"reasoning":"hi","actions":[{"type":"call_tool",'
             '"tool_name":"reply",'
-            '"arguments":{"analysis":"他在 MSG_1 单独@我；问题尚未回答",'
-            '"hold_seconds":8}}]}'
+            '"arguments":{"hold_seconds":8}}]}'
         )
         llm = _StubLLM(response_content=body)
         planner = LLMPlanner(llm_client=llm)
@@ -216,107 +215,114 @@ class LLMPlannerContractTest(unittest.TestCase):
         self.assertEqual(out.reasoning, "oops")
 
     def test_planner_section_opens_system_prompt(self) -> None:
-        """planner.md 打头（页首即人格，随后是运行方式）：信封语法段
-        （envelope）在其后。"决策引擎"的机器视角开场随 2026-07-31 删除
-        Replyer 一并退役——Planner 就是她自己。"""
+        """planner.md 打头（页首即人格，随后是系统事实）：信封语法与工具用法
+        在系统段之后、行为规范（职责/输出）之前——先给定义再给纪律，输出契约
+        收尾（2026-08-01 维护者定稿）。
+        "决策引擎"的机器视角开场随 2026-07-31 删除 Replyer 一并退役——Planner
+        就是她自己。"""
         llm = _StubLLM(response_content='{"actions":[{"type":"idle","reason":"x"}]}')
         planner = LLMPlanner(llm_client=llm)
         asyncio.run(planner.decide(_ctx()))
         self.assertEqual(len(llm.invocations), 1)
         content = llm.invocations[0][0].content
         self.assertNotIn("决策引擎", content)
-        self.assertIn("# 你在怎样运行", content)
+        self.assertIn("# 你所处的系统", content)
+        self.assertIn("# 你需要做什么", content)
         self.assertIn("输入信封格式规范", content)
         self.assertLess(
-            content.index("# 你在怎样运行"),
             content.index("输入信封格式规范"),
+            content.index("# 你需要做什么"),
         )
 
     def test_planner_carries_the_rules_of_its_own_layer(self) -> None:
         """决策这一环独有的三条纪律只住在 planner.md，没有第三处，掉了就是真
-        没有了：念头≠动作、跨拍只能靠任务、一批工具不要重拨。"""
+        没有了：念头≠动作、跨拍只能靠任务、一批工具不要重拨。锚点句 2026-08-01
+        重钉到维护者的现行措辞（prompt 正文以维护者版本为真相源）。"""
         llm = _StubLLM(response_content='{"actions":[{"type":"idle","reason":"x"}]}')
         planner = LLMPlanner(llm_client=llm)
         rendered = planner._prompt_library.render(scope="group")
-        self.assertIn("那件事就没发生过", rendered)
-        self.assertIn("跨拍的事情只能靠任务活着", rendered)
-        self.assertIn("不要因为它还没回来就再发一次", rendered)
-        # system loop 同样要有（参与规则那段才是 scope 过滤的）
+        self.assertIn("没有落到时间线上的东西等于没有发生过", rendered)
+        self.assertIn("任务是这种断续存在里唯一的连续装置", rendered)
+        self.assertIn("想再发一次之前，先看", rendered)
+        # system loop 同样要有（页正文不分 scope）
         self.assertIn(
-            "跨拍的事情只能靠任务活着",
+            "任务是这种断续存在里唯一的连续装置",
             planner._prompt_library.render(scope="system"),
         )
 
     def test_system_mechanics_reach_the_planner(self) -> None:
-        """`system.md` 是"这台机器怎么转"的唯一出处，客观语域描述运行事实，
-        经 planner.md 的 {{system}} 槽进入 Planner prompt。"""
+        """"这个系统怎么转"的唯一出处是 planner.md §你所处的系统
+        （2026-07-31 由 system.md 并入）。锚点 2026-08-01 重钉到维护者的
+        现行措辞：时间线唯一且只增不改、按拍存在。"""
         from qqbot.services.agent_loop.prompts.catalog import build_library
 
         planner_text = build_library("planner").render(scope="group")
         for anchor in (
-            "时间线运行的系统",  # 时间线是唯一真相源
-            "运行以拍为单位",  # 按拍运行、留不下来的真留不下来
+            "这个世界对你而言只有一条时间线",
+            "你不是一直醒着的，你以拍为单位存在",
         ):
             with self.subTest(anchor=anchor):
                 self.assertIn(anchor, planner_text)
 
-    def test_persona_card_rides_the_planner_section(self) -> None:
-        """角色卡由 planner.md 的 `{{persona}}` 槽在 render 时填入，不是另起
-        一个消费者段——所以 `voice` / `disposition` 这些历史段名都不该存在。
+    def test_persona_card_opens_the_planner_page(self) -> None:
+        """角色卡就写在 planner.md 页首（2026-07-31 由 persona.md 并入，
+        persona / system / group_chat_rules 三个文件槽一并删除）——`persona` /
+        `voice` / `disposition` 这些历史段名都不该再作为槽存在，页里只剩
+        envelope（信封语法，仍是独立文件）与动态的 tools_usage。
 
         2026-07-31 删除 Replyer 后 Planner 是卡片唯一的消费者：卡片正文必须
-        在。锚点从卡片现取（写死原句的话，卡片一改断言就变成假通过），逐句对账
-        在 test_prompt_catalog_contract.LayerBoundaryTests。"""
+        在。锚点从页里现取（写死原句的话，卡片一改断言就变成假通过），逐句对账
+        与"没有第二份副本"在 test_prompt_catalog_contract.LayerBoundaryTests。"""
         llm = _StubLLM(response_content='{"actions":[{"type":"idle","reason":"x"}]}')
         planner = LLMPlanner(llm_client=llm)
-        slots = planner._prompt_library.slot_names()
-        self.assertIn("persona", slots)
-        self.assertIn("group_chat_rules", slots)
-        # 历史段名不得复活成槽
-        self.assertNotIn("disposition", slots)
-        self.assertNotIn("voice", slots)
+        self.assertEqual(
+            planner._prompt_library.slot_names(), ["envelope", "tools_usage"]
+        )
         from qqbot.services.agent_loop.prompts.catalog import (
             SLOT_PATTERN,
             _PROMPTS_DIR,
         )
 
         rendered = planner._prompt_library.render(scope="group")
-        card = (_PROMPTS_DIR / "persona.md").read_text(encoding="utf-8")
+        page = (_PROMPTS_DIR / "planner.md").read_text(encoding="utf-8")
+        lines = page.splitlines()
+        start = lines.index("# 你是谁") + 1
+        end = next(i for i in range(start, len(lines)) if lines[i].startswith("# "))
         anchors = [
             line.strip()
-            for line in card.splitlines()
+            for line in lines[start:end]
             if len(line.strip()) > 24 and line.strip().startswith("你")
         ]
-        self.assertTrue(anchors, "persona.md 没有第二人称锚点，断言会假通过")
+        self.assertTrue(anchors, "planner.md 人格段没有第二人称锚点，断言会假通过")
         for line in anchors:
             self.assertIn(line, rendered)
         self.assertIsNone(SLOT_PATTERN.search(rendered))
 
     def test_reply_usage_scoped_without_persona_card(self) -> None:
-        """**工具用法文档**里不得抄角色卡正文——卡片 2026-07-30 起确实进
-        Planner，但走的是 planner.md 的人格槽这一条路；`tools/*.md` 里再抄一份
-        就是第二个真相源，改一处忘另一处当场自相矛盾。"""
+        """**工具用法文档**里不得抄角色卡正文——卡片确实进 Planner，但走的是
+        planner.md 页首那一段这一条路；`tools/*.md` 里再抄一份就是第二个真相
+        源，改一处忘另一处当场自相矛盾。"""
         from qqbot.services.agent_loop.tools import build_default_registry
 
         reg = build_default_registry()
         group_docs = reg.usage_docs("group")
-        self.assertIn("## Tool: reply", group_docs)
-        self.assertIn("## Tool: send_messages", group_docs)
+        self.assertIn("## 工具：reply", group_docs)
+        self.assertIn("## 工具：send_messages", group_docs)
         # 退役的单数工具没有自己的分段（它是复数名的前缀，按标题行精确匹配）。
-        self.assertNotIn("## Tool: send_message\n", group_docs)
+        self.assertNotIn("## 工具：send_message\n", group_docs)
         self.assertNotIn("小奏", group_docs)
         system_docs = reg.usage_docs("system")
-        self.assertNotIn("## Tool: reply", system_docs)
-        self.assertNotIn("## Tool: send_messages", system_docs)
+        self.assertNotIn("## 工具：reply", system_docs)
+        self.assertNotIn("## 工具：send_messages", system_docs)
         self.assertNotIn("小奏", system_docs)
 
     def test_only_tools_usage_is_scope_filtered(self) -> None:
         """scope 这把尺子只作用在 `tools_usage` 上：工具按 allowed_scopes 过滤，
         群专用工具的用法不该泄漏进 system loop。
 
-        `group_chat_rules` **不**按 scope 过滤（任务与决策契约 §prompt 装配）：
-        定稿后它是两句 scope 无关的上位约束，system loop 读到也成立。此前这里
-        断言它在 system scope 被跳过，是早于该定稿的旧契约。"""
+        分段名单 2026-08-01 重锚：persona / system / group_chat_rules 三个旧
+        段名随 2026-07-31 并页进入 planner.md，分段现按「根页正文挂消费者名、
+        槽挂槽名」命名，两个 scope 下都只剩 planner 与 envelope。"""
         llm = _StubLLM(response_content='{"actions":[{"type":"idle","reason":"x"}]}')
         planner = LLMPlanner(llm_client=llm)
         group_names = [
@@ -327,11 +333,14 @@ class LLMPlannerContractTest(unittest.TestCase):
             sec.name
             for sec in planner._prompt_library.render_sections(scope="system")
         ]
-        for name in ("planner", "persona", "system", "envelope", "group_chat_rules"):
+        for name in ("planner", "envelope"):
             with self.subTest(name=name):
                 self.assertIn(name, group_names)
                 self.assertIn(name, system_names)
-        self.assertNotIn("disposition", group_names)
+        # 防回潮：并页前的旧段名不得以独立分段复活。
+        for retired in ("persona", "system", "group_chat_rules", "disposition"):
+            with self.subTest(retired=retired):
+                self.assertNotIn(retired, group_names)
 
     def test_task_note_branch_parsed_as_call_tool(self) -> None:
         body = (
@@ -365,8 +374,8 @@ class LLMPlannerContractTest(unittest.TestCase):
 
     def test_system_prompt_includes_envelope_syntax(self) -> None:
         """信封语法必须注入 system prompt —— LLM 据此读懂 <agent-input> 的标签
-        语义。信封语法的唯一出处是 envelope.md，本用例锚定
-        文档头和几个关键标签即可，避免绑死文案。"""
+        语义。信封语法的唯一出处是 envelope.md（2026-07-31 并页时它是唯一保留
+        下来的文件槽），本用例锚定文档头和几个关键标签即可，避免绑死文案。"""
         llm = _StubLLM(
             response_content='{"actions":[{"type":"idle","reason":"x"}]}'
         )
@@ -382,6 +391,7 @@ class LLMPlannerContractTest(unittest.TestCase):
         self.assertIn("<timeline>", content)
         self.assertIn("<time>", content)
         self.assertIn("<my-reply>", content)
+        self.assertNotIn("<my-thought", content)
         # 2026-07-02 起不再有 pending-tool-results 区（工具结果只在 timeline
         # 单点呈现，防双重渲染诱发复读）——文档不得再登记这个标签
         self.assertNotIn("<pending-tool-results>", content)
@@ -393,32 +403,13 @@ class LLMPlannerContractTest(unittest.TestCase):
         # 输出侧的动作形状在 planner.md（代码不下发 schema，删了就没有第二处）
         self.assertIn('"type":"call_tool"', content)
 
-    def test_system_prompt_includes_group_chat_rules_doc(self) -> None:
-        """group_chat_rules.md 必须注入 system prompt —— 规划层据此判断
-        "这一拍该不该动、动什么"。2026-07-30 定稿后它是两句上位约束（把
-        timeline 当整体语境读 + 自主判断是否行动），不再是情形清单，因此这里
-        只钉那两条不可失守的语义：整体语境而非逐标签响应、以及 idle 与行动
-        同为正常结果（这是唯一防"为产出而输出"的闸门）。"""
-        llm = _StubLLM(
-            response_content='{"actions":[{"type":"idle","reason":"x"}]}'
-        )
-        planner = LLMPlanner(llm_client=llm)
-        asyncio.run(planner.decide(_ctx()))
-        content = llm.invocations[0][0].content
-
-        # 整体语境，而不是逐个标签机械响应
-        self.assertIn("持续演变的整体语境", content)
-        self.assertIn("不要因单一信号机械响应", content)
-        # 不为产出而行动；idle 与行动同为正常结果
-        self.assertIn("不要为了产生输出而行动", content)
-        self.assertIn("采取行动与保持 idle 都是正常结果", content)
-
     def test_system_prompt_teaches_two_step_speaking(self) -> None:
         """发言两步的红线（2026-07-31 删除 Replyer）：reply 不承载最终字句、
-        只存解析并等待；措辞发生在 send_messages；只有 <my-reply> 是已发送
-        事实。三处正文各钉一句——planner.md 的运行段、tools/reply.md 与
-        tools/send_messages.md 的参数页（后两者随 tools_usage 段进
-        Planner prompt，所以本用例必须带工具注册表装配）。"""
+        只存解析并等待；措辞发生在 send_messages；该工具调用自身的逐气泡回执
+        是现行发送事实，<my-reply> 仅表示旧链路记录。三处正文各钉一句——
+        planner.md 的运行段、tools/reply.md 与 tools/send_messages.md 的接口页
+        （后两者随 tools_usage 段进 Planner prompt，所以本用例必须带工具注册表
+        装配）。"""
         from qqbot.services.agent_loop.tools import build_default_registry
 
         llm = _StubLLM(
@@ -430,23 +421,23 @@ class LLMPlannerContractTest(unittest.TestCase):
         asyncio.run(planner.decide(_ctx()))
         content = llm.invocations[0][0].content
 
-        # planner.md：开口分两步、完成事件不是命令也不是许可
-        self.assertIn("开口分两步", content)
-        self.assertIn("它不是必须说话的命令，也不是发言许可", content)
-        # tools/reply.md：reply 不承载消息正文，发言事实在 send_messages 的
-        # 逐条回执上（2026-07-31 实施后调整：不派生 <my-reply>）
-        self.assertIn("This call carries no message text", content)
-        self.assertIn("record words/images that really reached QQ.", content)
-        # tools/send_messages.md：uncertain 禁止"保险再发一遍"
-        self.assertIn("may already be out", content)
+        # planner.md：开口被拆成两步、完成唤醒既不是命令也不是许可
+        self.assertIn("开口被拆成两步", content)
+        self.assertIn("它既不是要你说话的命令", content)
+        # tools/reply.md：reply 不承载消息正文；tools/send_messages.md：调用行
+        # 自身的逐条回执是发言事实（不派生 <my-reply>）。
+        self.assertIn("该工具不发送消息", content)
+        self.assertIn("逐气泡回执构成发送记录", content)
+        # uncertain 客观标明对应气泡可能已送达。
+        self.assertIn("对应气泡可能已经送达", content)
         # 信封段这一侧只留客观定义（<my-reply> 现为仅旧记录的行）
         self.assertIn("其中成功的子元素即实际到达 QQ 的内容", content)
 
     def test_default_prompt_section_order(self) -> None:
-        """段序必须按根页写定的顺序拼接：
-        persona < planner 正文 < system < envelope < group_chat_rules <
-        tools_usage。LLM 按"你是谁→怎么运行→输入长什么样→什么时候需要发言
-        →工具"递进读。"""
+        """段序按根页写定的顺序：人格 < 系统 < 信封 < tools_usage
+        < 职责 < 输出。LLM 先读"你是谁→处在哪里→输入长什么样→手里有什么"，
+        再读"要做什么→怎么输出"——输出契约离真实输入最近
+        （2026-08-01 维护者定稿）。"""
         from qqbot.services.agent_loop.tool_registry import ToolRegistry
 
         class _StubTool:
@@ -471,18 +462,38 @@ class LLMPlannerContractTest(unittest.TestCase):
         asyncio.run(planner.decide(_ctx()))
         content = llm.invocations[0][0].content
 
-        # 段序用根页的槽序列直接对账：参与规则段的正文在迭代中，拿它的措辞当
-        # 锚点会让排序契约跟着文案一起红。
+        # 两个槽的先后：系统段之后依次是信封与工具用法，随后才是行为规范。
         self.assertEqual(
-            planner._prompt_library.slot_names(),
-            ["persona", "system", "envelope", "group_chat_rules", "tools_usage"],
+            planner._prompt_library.slot_names(), ["envelope", "tools_usage"]
         )
-        idx_identity = content.index("# 你在怎样运行")
+        # 段序用段标题对账，不拿会迭代的正文措辞当排序锚点。
+        idx_persona = content.index("# 你是谁")
+        idx_system = content.index("# 你所处的系统")
         idx_envelope = content.index("输入信封格式规范")
         idx_tools = content.index("STUB-TOOL-ORDER-MARKER")
+        idx_purpose = content.index("# 你需要做什么")
+        idx_output = content.index("# 你的输出")
 
-        self.assertLess(idx_identity, idx_envelope)
-        self.assertLess(idx_envelope, idx_tools)
+        self.assertEqual(
+            [
+                idx_persona,
+                idx_system,
+                idx_envelope,
+                idx_tools,
+                idx_purpose,
+                idx_output,
+            ],
+            sorted(
+                [
+                    idx_persona,
+                    idx_system,
+                    idx_envelope,
+                    idx_tools,
+                    idx_purpose,
+                    idx_output,
+                ]
+            ),
+        )
 
     def test_reply_tool_usage_doc_renders_via_tool_registry(self) -> None:
         """ReplyTool.usage_prompt 必须随 registry 进入 Planner prompt。"""
@@ -499,15 +510,14 @@ class LLMPlannerContractTest(unittest.TestCase):
         content = llm.invocations[0][0].content
 
         # 按工具名分段的标题：发言两步各一段
-        self.assertIn("## Tool: reply", content)
-        self.assertIn("## Tool: send_messages", content)
-        # 锚点随 reply.md 的现行措辞（2026-07-31 删除 Replyer 后 pending →
-        # waiting）：
-        self.assertIn("short-lived", content)
-        self.assertIn("means **waiting**, not sent", content)
+        self.assertIn("## 工具：reply", content)
+        self.assertIn("## 工具：send_messages", content)
+        # 锚点随 reply.md 的现行接口语义：保存分析并等待，不直接发送。
+        self.assertIn("保存当前 scope 的完整会话分析并启动短时等待", content)
+        self.assertIn("成功仅表示修订已保存并进入等待状态", content)
         # 退役的单数 send_message 不得再有自己的分段（注意它是复数名的前缀，
         # 用段标题加换行精确匹配）。
-        self.assertNotIn("## Tool: send_message\n", content)
+        self.assertNotIn("## 工具：send_message\n", content)
 
     def test_system_prompt_includes_tool_usage_docs(self) -> None:
         """Tool 的 sibling .md 必须按工具名分段注入 system prompt，
@@ -533,12 +543,12 @@ class LLMPlannerContractTest(unittest.TestCase):
         asyncio.run(planner.decide(_ctx()))
         content = llm.invocations[0][0].content
 
-        self.assertIn("## Tool: stub_tool", content)
+        self.assertIn("## 工具：stub_tool", content)
         self.assertIn("STUB-TOOL-USAGE-MARKER", content)
 
     def test_system_prompt_skips_tool_without_usage_prompt(self) -> None:
         """没写 sibling .md 的工具不应在 system prompt 里产生孤儿
-        `## Tool: foo` 空标题。"""
+        `## 工具：foo` 空标题。"""
         from qqbot.services.agent_loop.tool_registry import ToolRegistry
 
         class _NoUsageTool:
@@ -560,7 +570,7 @@ class LLMPlannerContractTest(unittest.TestCase):
         asyncio.run(planner.decide(_ctx()))
         content = llm.invocations[0][0].content
 
-        self.assertNotIn("## Tool: no_usage_tool", content)
+        self.assertNotIn("## 工具：no_usage_tool", content)
 
     def test_custom_prompt_library_overrides_default(self) -> None:
         """传入自定义提示词库时绕过默认装配 —— 调用方拥有最终拼接权。"""
@@ -596,13 +606,14 @@ class LLMPlannerContractTest(unittest.TestCase):
         content = llm.invocations[0][0].content
 
         self.assertIn("<active-tasks>", content)
-        self.assertIn("## Tool: task", content)
-        self.assertIn('action="complete"', content)
-        self.assertIn('action="fail"', content)
+        self.assertIn("## 工具：task", content)
+        # 收束记法锚点钉 tools/task.md 现行 JSON 写法（XML 属性记法已退役）。
+        self.assertIn('"action":"complete"', content)
+        self.assertIn('"action":"fail"', content)
         self.assertNotIn('"type":"complete_task"', content)
         self.assertNotIn('"type":"fail_task"', content)
-        # 必须明示"新消息不会自动取消 task"
-        self.assertIn("无关的新消息不会替你关掉它", content)
+        # 必须明示"新消息不会自动取消 task"（锚点为维护者现行措辞）
+        self.assertIn("别的事不会替你关掉它", content)
 
     def test_human_message_is_plain_text_never_multimodal(self) -> None:
         """2026-07-28：Planner 是纯文本模型。timeline 里带已落盘图片的消息
@@ -832,11 +843,8 @@ class LLMPlannerContractTest(unittest.TestCase):
 # timeline 渲染用例继续把守（fold 层 + <tool-call> 渲染层双覆盖）。
 
 
-class EnvelopeSelfMemoryTests(unittest.TestCase):
-    """<validation-error>（2026-07-02）与 <last-reasoning> 移除（2026-07-06
-    思考轨迹内联：自我记忆随投影层的 <my-thought> timeline 行进信封，
-    llm_planner 不再渲染独立区块——见 test_agent_loop_projection_contract
-    的 MyThoughtTests）。"""
+class EnvelopeReasoningIsolationTests(unittest.TestCase):
+    """<validation-error> 仍进重试输入；reasoning 不进入跨拍信封。"""
 
     def _render_with(self, **overrides: Any) -> str:
         from dataclasses import replace
@@ -851,7 +859,7 @@ class EnvelopeSelfMemoryTests(unittest.TestCase):
 
     def test_last_reasoning_block_removed(self) -> None:
         # DecisionContext 已无 last_reasoning 字段，信封任何情况下都不得再
-        # 出现 <last-reasoning> 区块（防复活：它会与 <my-thought> 双重渲染）。
+        # 出现 <last-reasoning> 区块。
         from qqbot.services.agent_loop.decision import DecisionContext
 
         xml = self._render_with()
@@ -860,25 +868,14 @@ class EnvelopeSelfMemoryTests(unittest.TestCase):
         self.assertFalse(hasattr(_ctx(), "last_reasoning"))
         self.assertFalse(hasattr(DecisionContext, "last_reasoning"))
 
-    def test_my_thought_timeline_rows_pass_through_envelope(self) -> None:
-        # 思考行是普通 TimelineItem：planner 按时间流包进 <time when="…">
-        # 节点后原样嵌入（render_timeline_stream，时间流契约 2026-07-26）
-        from dataclasses import replace
-
-        row = TimelineItem(
-            event_id="D1",
-            occurred_at=china_now(),
-            kind="my_thought",
-            render="<my-thought>先观望</my-thought>",
-        )
+    def test_prompt_does_not_register_a_reasoning_history_row(self) -> None:
         llm = _StubLLM(
             response_content='{"actions":[{"type":"idle","reason":"x"}]}'
         )
         planner = LLMPlanner(llm_client=llm)
-        asyncio.run(planner.decide(replace(_ctx(), timeline=[row])))
-        xml = llm.invocations[0][1].content
-        self.assertIn('<time when="', xml)
-        self.assertIn("<my-thought>先观望</my-thought>", xml)
+        rendered = planner._prompt_library.render(scope="group")
+        self.assertNotIn("<my-thought", rendered)
+        self.assertIn("不回显到后续输入", rendered)
 
     def test_validation_feedback_rendered_on_retry_context(self) -> None:
         xml = self._render_with(
@@ -936,8 +933,9 @@ class JsonParseRetryTests(unittest.TestCase):
 class SavedMemesEnvelopeTests(unittest.TestCase):
     """<saved-memes> 渲染契约（表情包工具黑盒设计 §prompt 注入）：
     有收藏才渲染整段；每条 <meme> 带 hash / saved_at 属性 + 描述正文
-    （XML 转义）；位置在 </tool-catalog> 之后、<timeline> 之前（2026-07-12
-    信封段序按变化频率升序，见 EnvelopeCacheLayoutTests）。"""
+    （XML 转义）；位置在 </timeline> 之后、<active-tasks> 之前（2026-08-01
+    显著性移位——选图发生在读完局面之后，目录须紧邻决策位置；缓存代价
+    见 EnvelopeCacheLayoutTests）。"""
 
     def _envelope_text(self, ctx: DecisionContext) -> str:
         llm = _StubLLM(
@@ -964,7 +962,7 @@ class SavedMemesEnvelopeTests(unittest.TestCase):
             ],
         )
 
-    def test_saved_memes_rendered_between_catalog_and_timeline(self) -> None:
+    def test_saved_memes_rendered_between_timeline_and_tasks(self) -> None:
         text = self._envelope_text(
             self._ctx_with_memes("黑猫瞪眼，配字就这，嘲讽用")
         )
@@ -972,12 +970,12 @@ class SavedMemesEnvelopeTests(unittest.TestCase):
         self.assertIn(f'<meme hash="{"ab" * 32}"', text)
         self.assertIn('saved_at="', text)
         self.assertIn("黑猫瞪眼，配字就这，嘲讽用", text)
-        # 布局按变化频率升序（前缀缓存契约）：catalog → memes → timeline
+        # 2026-08-01 显著性移位：timeline → memes → active-tasks
         self.assertLess(
-            text.index("</tool-catalog>"), text.index("<saved-memes>")
+            text.index("</timeline>"), text.index("<saved-memes>")
         )
         self.assertLess(
-            text.index("</saved-memes>"), text.index("<timeline>")
+            text.index("</saved-memes>"), text.index("<active-tasks>")
         )
 
     def test_no_saved_memes_omits_section(self) -> None:
@@ -996,10 +994,10 @@ class PendingReplySectionRemovedTests(unittest.TestCase):
 
     它的每个字段都被 timeline 上的 `<tool-call name="reply">` 行逐字段覆盖
     （reply_task_id / revision / flush_at / hard_deadline 在 `<result>` 里，
-    analysis / hold_seconds 在 `<args>` 里）。reply 成功行不再折叠之后，独立
-    状态区就是重复渲染，一并撤掉；顺带撤掉了信封里变化最频繁的那一段
-    （每次落稿都变、创建/flush 时整段出现消失），`</active-tasks>` 到
-    `<current/>` 之间不再有缓存抖动源。
+    hold_seconds 在 `<args>` 里）。reply 成功行不再折叠之后，独立状态区就是
+    重复渲染，一并撤掉；顺带撤掉了信封里变化最频繁的那一段（每次续期都变、
+    创建/到点时整段出现消失），`</active-tasks>` 到 `<current/>` 之间不再有
+    缓存抖动源。
     """
 
     def test_envelope_has_no_pending_reply_section(self) -> None:
@@ -1033,8 +1031,10 @@ class EnvelopeCacheLayoutTests(unittest.TestCase):
 
     OpenAI 系 API 的自动前缀缓存要求前缀**逐字节一致**：每拍必变的 now
     不得出现在信封头部（否则缓存前缀在 system prompt 末尾就断掉，timeline
-    每拍全价重计费），段序按变化频率升序：tool-catalog → saved-memes →
-    timeline → active-tasks → <current/> → validation-error。原
+    每拍全价重计费），段序按变化频率升序：tool-catalog → timeline →
+    saved-memes → active-tasks → <current/> → validation-error。saved-memes
+    少变、本应在 timeline 之前，2026-08-01 为选图显著性移到其后（唯一例外，
+    代价是随 timeline 追加逐拍重编码，见 SavedMemesEnvelopeTests）。原
     pending-reply 段已于 2026-07-24 删除，@tick 已于 2026-07-30 删除。改动
     信封布局前必须先想清对缓存前缀的影响——本类是回归防线。"""
 

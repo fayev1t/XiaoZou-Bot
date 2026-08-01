@@ -4,7 +4,7 @@
 - ``normalize_segment``：LLM 输出的已知漂移（段字段拍平、reply 的
   message_id 别名）无损归一，其余形态原样透传交严格校验 fail loudly；
 - ``validate_content``：OneBot 段白名单 + 结构 + 顺序 + 每段字段；
-- ``validate_messages``：1–4 气泡、至多一张 meme、chat/meme 形状。
+- ``validate_messages``：1–10 气泡、meme 不限量、chat/meme 形状。
 """
 
 from __future__ import annotations
@@ -143,6 +143,13 @@ class ValidateMessagesTests(unittest.TestCase):
                 self.assertEqual(fail.error_kind, "invalid_arguments")
 
     def test_bubble_count_is_capped(self) -> None:
+        """上限 10（2026-07-31 自 4 放宽），到顶通过、超一条即拒。"""
+        self.assertEqual(MAX_OUTBOUND_MESSAGES, 10)
+        normalized, fail = validate_messages(
+            [{"kind": "chat", "content": [_TEXT]}] * MAX_OUTBOUND_MESSAGES
+        )
+        self.assertIsNone(fail)
+        self.assertEqual(len(normalized), MAX_OUTBOUND_MESSAGES)
         _, fail = validate_messages(
             [{"kind": "chat", "content": [_TEXT]}]
             * (MAX_OUTBOUND_MESSAGES + 1)
@@ -150,15 +157,13 @@ class ValidateMessagesTests(unittest.TestCase):
         assert fail is not None
         self.assertEqual(fail.extra["reason_code"], "too_many_messages")
 
-    def test_second_meme_is_rejected(self) -> None:
-        _, fail = validate_messages(
-            [
-                {"kind": "meme", "image_hash": HASH_A},
-                {"kind": "meme", "image_hash": HASH_A},
-            ]
+    def test_multiple_memes_are_allowed(self) -> None:
+        """meme 单次限量已取消（2026-07-31）：只要不超总条数就放行。"""
+        normalized, fail = validate_messages(
+            [{"kind": "meme", "image_hash": HASH_A}] * 3
         )
-        assert fail is not None
-        self.assertEqual(fail.extra["reason_code"], "too_many_memes")
+        self.assertIsNone(fail)
+        self.assertEqual([item["kind"] for item in normalized], ["meme"] * 3)
 
     def test_bad_meme_hash_is_rejected(self) -> None:
         for image_hash in ("short", 123, None, "z" * 64):

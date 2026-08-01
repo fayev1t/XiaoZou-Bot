@@ -1,7 +1,15 @@
-# Tool: send_messages
+# 工具：`send_messages`
 
-`send_messages` is how your words actually reach the group. One call sends
-1–4 ordered bubbles; nothing else you write anywhere becomes visible chat.
+## 功能
+
+`send_messages` 向当前群发送 1–10 个有序气泡。`messages` 是唯一业务参数，
+目标群由当前 `scope_key` 注入，不存在 `target` 或 `group_id` 参数。
+
+标准发言链路由 `reply` 起一段等待、`<reply-task-completed>` 唤醒以及
+`send_messages` 发送组成。落笔依据是唤醒那一刻的时间线，不是决定开口时的
+判断。
+
+## 参数
 
 ```json
 {
@@ -12,73 +20,61 @@
         {"type": "text", "data": {"text": "周日会提前关门，最好五点前到"}}
       ]
     },
-    {"kind": "meme", "image_hash": "<64-char sha256 from <saved-memes>>"}
+    {"kind": "meme", "image_hash": "<saved-memes 中的 64 位 sha256>"}
   ]
 }
 ```
 
-`messages` is the only argument. The target is always the current group —
-there is no target field, and you cannot send into another scope.
+`messages` 为非空数组，最多 10 项，按数组顺序发送。每项支持以下一种结构。
 
-## Bubbles
+### chat 气泡
 
-- 1–4 bubbles per call, in order; at most **one** of them a meme.
-- A complete utterance belongs in **one** call's bubbles. Do not split one
-  intent across several `send_messages` calls — every call is a separate send
-  command and the runtime never merges or deduplicates two commands.
-- `kind:"chat"` content allows OneBot v11 `text` / `at` / `reply` / `face`
-  segments only, every field inside `"data"`:
-  `{"type":"text","data":{"text":"..."}}` /
-  `{"type":"at","data":{"qq":"10001"}}` /
-  `{"type":"reply","data":{"id":"<message_id>"}}` /
-  `{"type":"face","data":{"id":"178"}}`. Never flatten fields to the segment
-  top level.
-- This list is the set of legal structures, not slots to fill. A `reply`
-  segment is optional, at most one, and must be `content[0]`; use it only when
-  the quote is genuinely needed to make clear what you are answering.
-- `kind:"meme"` is its own single bubble; copy the hash from `<saved-memes>`
-  exactly. A meme that has since been removed from the collection fails the
-  call before anything is sent.
-- Empty `messages` is invalid — when there is nothing to say, do not call
-  this tool at all.
+```json
+{"kind": "chat", "content": [{"type": "text", "data": {"text": "..."}}]}
+```
 
-## When to call
+`content` 为 OneBot V11 段数组，仅支持：
 
-The normal speaking flow is: store your analysis with `reply` and wait; when
-`<reply-task-completed>` appears you are woken with the latest timeline;
-re-read it, then decide — stay silent, investigate with other tools first, or
-call `send_messages` with the wording you choose **now**, informed by
-everything that arrived while you waited.
+- `text`：`{"type":"text","data":{"text":"..."}}`
+- `at`：`{"type":"at","data":{"qq":"10001"}}`
+- `reply`：`{"type":"reply","data":{"id":"<message_id>"}}`
+- `face`：`{"type":"face","data":{"id":"178"}}`
 
-The completed row is a fact about the wait being over. It is not an order to
-speak and not a permission slip: the tool executes whenever called, with or
-without it. Outside recovery of your own interrupted flow, do not call
-`send_messages` without having gone through `reply` first — that discipline
-is yours to keep, nothing will enforce it for you.
+所有段字段均位于 `data` 内。`reply` 段最多一个；存在时必须是
+`content[0]`。空 `content`、空文本和未登记段类型会导致整次调用在发送前失败。
 
-## Reading the result
+### meme 气泡
 
-The result carries a `status` plus per-bubble receipts. That receipt list,
-on your own `<tool-call name="send_messages">` row, is the record of what
-actually reached QQ — there is no separate row for it.
+```json
+{"kind": "meme", "image_hash": "<saved-memes 中的 64 位 sha256>"}
+```
 
-- `status:"sent"` (success) — every bubble confirmed out. The thing is said;
-  never send the same content again.
-- `status:"partial"` (error) — judge strictly by the per-bubble receipts:
-  bubbles marked `sent` are out, the rest are not. Never resend a bubble that
-  is already out. If completing the thought is still worth it, compose a
-  **new** call covering only what never made it — and first ask yourself
-  whether it still reads naturally in the chat.
-- `status:"failed"` (error) — nothing was delivered; the `<tool-call>` error
-  is the whole story. You may reorganize and send a new call if speaking is
-  still right.
-- `status:"uncertain"` (error) — at least one bubble **may already be out**
-  (the connection broke mid-send, or the platform answered without a message
-  id). Do not "re-send to be safe": a new call is a new command that really
-  sends again, so if the words did land the group sees them twice. Wait —
-  your call's receipts and how people react tell you what happened; only
-  speak again when the timeline shows the words never arrived.
+`image_hash` 必须存在于当前 `<saved-memes>` 收藏中。每个 meme 气泡
+独占一个气泡位置；meme 数量不单独设限，只受 `messages` 总数上限约束。
+发送前会统一检查收藏记录与媒体文件；任一项无效时不会发送任何气泡。
 
-Failures like `invalid_arguments` carry a `reason_code` naming the exact
-problem (bad segment shape, too many bubbles, unknown meme hash…); fix the
-payload instead of retrying it unchanged.
+组稿时先扫一遍 `<saved-memes>`：描述与当下场面对得上的图，独立成一个
+meme 气泡发出，可以代替一句话甚至一整段文字——贴切的图往往比解释更有
+表达力。meme 气泡与 chat 气泡按数组顺序自由穿插。`image_hash` 从
+`<meme hash="...">` 整段复制即可；复制无误的 hash 不会在发送前校验上
+失败。
+
+## 执行与记录
+
+同一次调用中的气泡按顺序逐项发送。每次 `send_messages` 调用都是独立发送
+命令；运行时不会合并或去重两次调用。该调用自身
+`<tool-call name="send_messages">` 行中的参数与逐气泡回执构成发送记录，不会
+另外生成当前链路的 `<my-reply>` 行。
+
+## 返回状态
+
+返回值包含 `status` 和逐气泡 `receipts`：
+
+- `sent`：全部气泡确认送达，工具终态为成功。
+- `partial`：部分气泡确认送达、其余明确失败，工具终态为失败。回执中
+  `status="sent"` 的气泡已经送达。
+- `failed`：全部气泡明确未送达，工具终态为失败。
+- `uncertain`：至少一个气泡的送达状态无法确认，工具终态为失败。该状态表示
+  对应气泡可能已经送达；再次调用会产生新的独立发送命令，可能形成重复消息。
+
+`invalid_arguments` 会通过 `reason_code` 标识具体参数问题。

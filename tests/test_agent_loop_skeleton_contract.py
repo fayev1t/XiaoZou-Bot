@@ -246,6 +246,12 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
                 "runtime.tick_ended",
             ],
         )
+        # reasoning 只退出 Planner 的后续输入，不退出事件审计链。
+        decision_payload = _values_of(captured[1]).get("payload")
+        self.assertEqual(
+            decision_payload["reasoning"],
+            "v2 loop skeleton: no LLM planner in this test",
+        )
 
         # 同一 tick 内 correlation_id 一致
         corrs = {_values_of(stmt).get("correlation_id") for stmt in captured}
@@ -268,10 +274,9 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
         投影读于 planner.decide() 之前、事件却写于 LLM 返回之后，而事件流按
         occurred_at 排序（Projector._fetch）。若取写入时刻，LLM 往返期间到达
         的消息会排到决策事件**之前**——那些消息根本没进本拍 context，却被读
-        成"这拍已经看过"（人连发的第二句因此被吞），`<my-thought>` 行也会渲染
-        到它们之后，水位线取自这个时间戳的 `<message unseen="true">`（2026-
-        07-28 复活）同样会误标。行位置判据是这条语义的地基，本条时间戳护栏
-        即其基础。
+        成"这拍已经看过"（人连发的第二句因此被吞）。decision_emitted 虽不再
+        投影，其时间戳仍是 `<message unseen="true">` 的水位线；取错时刻会
+        直接误标，因此本条护栏仍是第一拍判定的地基。
         """
         captured: list[Any] = []
         loop = AgentLoop(
@@ -312,13 +317,12 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
         推进的 task_state_changed）occurred_at = 本拍投影时刻（2026-07-27，
         补齐待办清单#18 的另一半）。
 
-        #18 只回填了 decision_emitted：<my-thought> 行归位了，但真正携带授权
-        内容的 <tool-call> 行仍取写入时刻，LLM 往返期间到达的消息排在它之前
+        #18 最初只回填 decision_emitted，但真正携带动作内容的 <tool-call> 行
+        仍取写入时刻，LLM 往返期间到达的消息排在它之前
         ——下一拍 Planner 与 Replyer（折入条款以授权行位置为参照）都把没进
         本拍 context 的消息读成"落稿前已看过、有意不接"，连发的后续消息就此
-        既不被补授权也不被折入。行位置是"处理过没有"的判据，因此动作事件
-        必须与 decision 同锚——`<message unseen="true">`（2026-07-28 复活）
-        的水位线同样依赖这批事件的时间戳，锚点错了它也会跟着误标。
+        既不被补授权也不被折入。可见动作行必须与 decision 同锚，才能正确表达
+        "动作拍板时看到了哪些消息"。
         """
         captured: list[Any] = []
         registry = ToolRegistry()

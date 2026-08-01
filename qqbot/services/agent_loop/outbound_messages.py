@@ -25,9 +25,9 @@ from typing import Any
 
 from qqbot.services.agent_loop.tool_registry import ToolOutcome
 
-# 一次发送最多 4 个气泡、其中至多 1 张收藏表情包。
-MAX_OUTBOUND_MESSAGES = 4
-MAX_MEMES_PER_SEND = 1
+# 一次发送最多 10 个气泡；meme 气泡不再单独限量（2026-07-31 放开，多少条、
+# 几张图由提示词层的分寸把关，代码只兜住总条数这个硬上限）。
+MAX_OUTBOUND_MESSAGES = 10
 
 # 当前允许的出站段类型（白名单）。其它一律 unsupported_segment_type——不放行
 # 给上游碰运气，给 LLM 精确的 segment_index/segment_type 而非一段 napcat
@@ -226,9 +226,8 @@ def validate_messages(
     返回 ``(归一后的 messages, None)`` 或 ``([], 失败 outcome)``。结构规则：
     1–``MAX_OUTBOUND_MESSAGES`` 个气泡；每个是 ``{"kind":"chat","content":[…]}``
     或 ``{"kind":"meme","image_hash":"<sha256>"}``；chat 段先经
-    ``normalize_segment`` 归一再走严格校验；meme 至多
-    ``MAX_MEMES_PER_SEND`` 张（hash 是否仍在收藏、媒体是否可读属于投递前的
-    动态 preflight，不在这里查库）。
+    ``normalize_segment`` 归一再走严格校验；meme 气泡数量不限（hash 是否仍在
+    收藏、媒体是否可读属于投递前的动态 preflight，不在这里查库）。
     """
     if not isinstance(messages, list) or not messages:
         return [], invalid_args(
@@ -242,7 +241,6 @@ def validate_messages(
             f"at most {MAX_OUTBOUND_MESSAGES} bubbles per send",
         )
     normalized: list[dict] = []
-    meme_count = 0
     for index, item in enumerate(messages):
         if not isinstance(item, dict):
             return [], invalid_args(
@@ -272,12 +270,6 @@ def validate_messages(
                 return [], invalid_args(
                     "unexpected_argument",
                     f"messages[{index}] has unknown key(s): {', '.join(extras)}",
-                )
-            meme_count += 1
-            if meme_count > MAX_MEMES_PER_SEND:
-                return [], invalid_args(
-                    "too_many_memes",
-                    f"at most {MAX_MEMES_PER_SEND} meme per send",
                 )
             image_hash = item.get("image_hash")
             if not _is_sha256_hex(image_hash):

@@ -13,6 +13,9 @@ Strategy:
 - Build the timeline from messages / notices / tool-call pairs / replies /
   agent-visible runtime hints. Task and tool-result events are folded
   upstream and do NOT produce timeline rows of their own.
+- Keep `agent.decision_emitted` out of the timeline. Its reasoning remains
+  persisted for audit and its timestamp remains the unseen-message watermark,
+  but the free-form note is never fed into a later Planner tick.
 
 Folding and rendering are split into pure staticmethods so unit tests
 can drive them without a DB.
@@ -130,24 +133,14 @@ class Projector:
     # 老笔记换 token 不划算。
     MAX_PROGRESS_NOTES_PER_TASK = 5
 
-    # ─── 思考轨迹内联（2026-07-06，待办清单#4）───
-    # timeline 渲染的 <my-thought> 行数上限与单条截断长度。每拍（含 idle）
-    # 都写 agent.decision_emitted，全量渲染会淹掉真实对话；只保留最近 K 条、
-    # 单条截断，且不挤占消息行预算（见 project() 的裁剪逻辑）。
-    MAX_THOUGHT_ROWS = 10
-    MAX_THOUGHT_CHARS = 300
-
     # ─── 窗口锚定滞回（2026-07-12，前缀缓存契约）───
     # OpenAI 系 API 的自动前缀缓存要求前缀**逐字节一致**。若裁剪恒取"尾部
     # 正好 max 条"，活跃群每来一条消息窗口起点就前移一行，timeline 的缓存
     # 前缀每拍从起点断掉。改为锚定+滞回：起点钉在上一拍的首行（anchor），
     # 窗口放任增长到 max + SLACK 条才一次性前移回 max 条——起点每 SLACK 条
-    # 新行才跳一次，其间各拍共享整段 timeline 前缀。<my-thought> 的"最近
-    # K 条"选择边界同理滞回（否则每拍新增一条决策，第 K 旧的思考行就从
-    # timeline 中段被抹掉，前缀照断）。锚失效（掉出取数窗 / 重启丢内存态）
-    # 时退回朴素裁剪并重新锚定，只多一次缓存 miss。
+    # 新行才跳一次，其间各拍共享整段 timeline 前缀。锚失效（掉出取数窗 /
+    # 重启丢内存态）时退回朴素裁剪并重新锚定，只多一次缓存 miss。
     TIMELINE_TRIM_SLACK = 30
-    THOUGHT_ROWS_SLACK = 5
 
     def __init__(
         self,
@@ -163,11 +156,10 @@ class Projector:
         # tick 侧未覆盖计数在阈值处不被截断、recap 正常时都在取数窗内。
         self._max_items = max_items
         self._max_timeline_items = max_timeline_items
-        # scope_key → 上一拍渲染的 timeline 首行 / 首条 <my-thought> 行的
-        # event_id（窗口锚定滞回，见类常量注释）。纯内存态：重启即空，首拍
-        # 走朴素裁剪重新锚定，代价只是一次缓存 miss，不落库。
+        # scope_key → 上一拍渲染的 timeline 首行 event_id（窗口锚定滞回，
+        # 见类常量注释）。纯内存态：重启即空，首拍走朴素裁剪重新锚定，
+        # 代价只是一次缓存 miss，不落库。
         self._timeline_anchors: dict[str, str] = {}
-        self._thought_anchors: dict[str, str] = {}
         # 记忆压缩触顶探针（记忆系统契约 §4.2）：build_context 每拍投影后
         # 回调 (scope_key, 最新 recap 之后的事件数)。压缩器在通知入口校验
         # 阈值；启动/空闲期没有另一路扫描触发。未装配时零开销。
@@ -243,23 +235,17 @@ class Projector:
             bot_user_id=bot_user_id,
             bot_role=bot_role,
             timeline_anchor=self._timeline_anchors.get(scope_key),
-            thought_anchor=self._thought_anchors.get(scope_key),
             pinned_event_id=recap.event_id if recap is not None else None,
         )
-        # 记录本拍窗口锚：timeline 首行 = 下一拍的裁剪起点候选；首条
-        # <my-thought> 行 = 下一拍思考选择的起点候选。无思考行时保留旧锚
-        # （下一拍找不到会自动退朴素选择，无需清理）。钉住的 recap 行不做
-        # 锚——它不参与裁剪计数，锚在它身上会让滞回每拍退回朴素裁剪。
+        # 记录本拍窗口锚：timeline 首行 = 下一拍的裁剪起点候选。钉住的
+        # recap 行不做锚——它不参与裁剪计数，锚在它身上会让滞回每拍退回
+        # 朴素裁剪。
         if ctx.timeline:
             for item in ctx.timeline:
                 if recap is not None and item.event_id == recap.event_id:
                     continue
                 self._timeline_anchors[scope_key] = item.event_id
                 break
-            for item in ctx.timeline:
-                if item.kind == "my_thought":
-                    self._thought_anchors[scope_key] = item.event_id
-                    break
         # 任务持久化补全：fold_tasks 只看最近 300 条取数窗，未完成任务的
         # task_created 被水群挤出窗口后会从 active_tasks 消失（与"任务跨 tick
         # 持久"契约冲突，是 bug）。这里查 agent_tasks 读模型，把"仍 pending/
@@ -275,10 +261,9 @@ class Projector:
         # 多查一次 reply_task 事件、只为渲染 <pending-reply>，而那一段的每个
         # Planner 所需字段都被 timeline 上的 <tool-call name="reply"> 行覆盖
         # （reply_task_id / revision / flush_at / hard_deadline 在 <result> 里，
-        # analysis / hold_seconds 在 <args> 里）。reply 成功行不再折叠之后主从
-        # 关系反转，Planner 信封没有独立状态区。ReplyExecutor 不走这条投影来取
-        # 当前授权：它从 reply_task 领域事件折叠最新 analysis，避免 terminal 竞态与
-        # timeline 裁剪。
+        # hold_seconds 在 <args> 里）。reply 成功行不再折叠之后主从关系反转，
+        # Planner 信封没有独立状态区。ReplyExecutor 也不走这条投影：它从
+        # reply_task 领域事件折叠调度事实，避免 terminal 竞态与 timeline 裁剪。
         return ctx
 
     async def _augment_with_persisted_tasks(
@@ -476,7 +461,6 @@ class Projector:
         bot_user_id: str | None = None,
         bot_role: str | None = None,
         timeline_anchor: str | None = None,
-        thought_anchor: str | None = None,
         pinned_event_id: str | None = None,
     ) -> DecisionContext:
         active_tasks = Projector.fold_tasks(events, scope_key=scope_key)
@@ -487,14 +471,11 @@ class Projector:
             events,
             tool_views=tool_views,
             unseen_message_ids=Projector.fold_unseen_message_ids(events),
-            thought_anchor=thought_anchor,
         )
         # 裁到尾部 max_timeline_items 条 —— fetch 上限给得宽是为了 fold 任务/
         # 工具结果时能看到足够长的事件链，但塞给 LLM 的不必那么多。
-        # <my-thought> 行不占消息行预算（待办清单#4"不挤占"约定）：从尾部
-        # 数满 max 条**非思考行**为止，区间内的思考行顺带保留——它们本身已被
-        # MAX_THOUGHT_ROWS 封顶，不会失控。timeline_anchor（上一拍窗口首行）
-        # 有效时起点滞回钉住，见 _trim_timeline。
+        # timeline_anchor（上一拍窗口首行）有效时起点滞回钉住，见
+        # _trim_timeline。
         if max_timeline_items is not None:
             # recap 行钉住（记忆系统契约 §3.2）：摘出裁剪再前插——既不占
             # max_timeline_items 行预算，也永不被裁掉（借 MaiBot 的
@@ -551,21 +532,16 @@ class Projector:
     ) -> list[TimelineItem]:
         """尾部裁剪 + 窗口锚定滞回（前缀缓存契约，见类常量注释）。
 
-        朴素裁剪 = 从尾部数满 ``max_items`` 条非思考行。给了 ``anchor``
-        （上一拍窗口首行的 event_id）且它仍在窗内、锚起的非思考行数未超
+        朴素裁剪 = 保留尾部 ``max_items`` 行。给了 ``anchor``（上一拍窗口
+        首行的 event_id）且它仍在窗内、锚起的行数未超
         ``max_items + TIMELINE_TRIM_SLACK`` 时，起点钉在锚上不动——各拍共享
         同一窗口起点，timeline 前缀逐字节稳定；超出滞回带或锚已失效（掉出
         取数窗 / 重启）则退回朴素裁剪，由 caller 重新锚定。
         """
-        naive = -1
-        non_thought = 0
-        for i in range(len(timeline) - 1, -1, -1):
-            if timeline[i].kind != "my_thought":
-                non_thought += 1
-                if non_thought >= max_items:
-                    naive = i
-                    break
-        if naive <= 0:
+        if max_items <= 0:
+            return []
+        naive = max(0, len(timeline) - max_items)
+        if naive == 0:
             return timeline  # 不足预算（或起点已是首行），整段保留
         if anchor:
             # 锚只可能在朴素起点或更早（窗口只会向前追加）；更新的"锚"说明
@@ -573,13 +549,8 @@ class Projector:
             for idx in range(naive + 1):
                 if timeline[idx].event_id != anchor:
                     continue
-                kept_non_thought = sum(
-                    1 for it in timeline[idx:] if it.kind != "my_thought"
-                )
-                if (
-                    kept_non_thought
-                    <= max_items + Projector.TIMELINE_TRIM_SLACK
-                ):
+                kept_rows = len(timeline) - idx
+                if kept_rows <= max_items + Projector.TIMELINE_TRIM_SLACK:
                     return timeline[idx:]
                 break  # 超出滞回带：一次性前移回朴素起点
         return timeline[naive:]
@@ -596,8 +567,8 @@ class Projector:
         窗口内**最后一条** agent.decision_emitted 为水位线：其后到达的
         external.message.* 即"未见过"，渲染时标 `unseen="true"`（见
         _render_message），把"这拍是这些消息的第一拍"变成结构性事实——
-        不靠模型比对 <my-thought time=> 自行推断。窗口内从没有过决策时
-        全部消息算未见过（该 scope 真正意义上的第一拍）。
+        不靠模型从自由工作笔记推断。窗口内从没有过决策时全部消息算未见过
+        （该 scope 真正意义上的第一拍）。
 
         planner 抛异常的残拍不写 decision_emitted（loop._tick 直接收尾），
         不推进水位线——那一拍确实没"看到"消息，语义自洽。bot 自己的发言
@@ -767,7 +738,6 @@ class Projector:
         *,
         tool_views: Sequence[ToolResultView],
         unseen_message_ids: frozenset[str] | set[str] = frozenset(),
-        thought_anchor: str | None = None,
     ) -> list[TimelineItem]:
         tool_view_by_id = {tv.tool_call_id: tv for tv in tool_views}
         # 预扫一遍构建 reply 段引用所需的索引（被回复消息摘要 + 用户名映射），
@@ -784,41 +754,6 @@ class Projector:
         # scope 锁内复核，这里是投影侧的第二道防线——更低 revision 的
         # completed、以及 cancelled 任务上迟到的 completed 不渲染。
         reply_task_guard = _build_reply_task_guard(events)
-
-        # ─── 思考轨迹内联（2026-07-06，待办清单#4）───
-        # 预扫出要渲染成 <my-thought> 行的决策事件：只保留最近
-        # MAX_THOUGHT_ROWS 条、reasoning 非空白的（空白 reasoning 没有内容
-        # 可看，跳过）。更早的决策不渲染：思考是辅助记忆，K 之外的旧念头换
-        # token 不划算。这些行同时也是"我处理到哪儿"的信号——decision_emitted
-        # 的 occurred_at 回填为本拍投影时刻后，行在消息之前=那拍没看到它，
-        # 之后=看过了；2026-07-28 起 <message> 自己的 unseen="true"（见
-        # fold_unseen_message_ids）是同一件事更直接的信号，行位置规则仍然
-        # 成立，当兜底。
-        # thought_anchor（上一拍首条思考行）有效时选择起点滞回钉住——否则
-        # 每拍新增一条决策就把第 K 旧的思考行从 timeline 中段抹掉，掐断
-        # 前缀缓存（见类常量注释）；攒满 K + THOUGHT_ROWS_SLACK 条才一次性
-        # 收回最近 K 条。
-        thoughts = [
-            ev
-            for ev in events
-            if ev.type == "agent.decision_emitted"
-            and isinstance((ev.payload or {}).get("reasoning"), str)
-            and str((ev.payload or {}).get("reasoning")).strip()
-        ]
-        selected = thoughts[-Projector.MAX_THOUGHT_ROWS :]
-        if thought_anchor:
-            for j, ev in enumerate(thoughts):
-                if ev.event_id != thought_anchor:
-                    continue
-                anchored = thoughts[j:]
-                if (
-                    len(thoughts) - j
-                    <= Projector.MAX_THOUGHT_ROWS
-                    + Projector.THOUGHT_ROWS_SLACK
-                ):
-                    selected = anchored
-                break  # 超出滞回带：一次性收回最近 K 条
-        thought_ids = {ev.event_id for ev in selected}
 
         items: list[TimelineItem] = []
         for ev in events:
@@ -859,19 +794,9 @@ class Projector:
                 # timeline。
                 continue
             if ev.type == "agent.decision_emitted":
-                # 思考轨迹内联（待办清单#4）：最近 K 条渲染 <my-thought> 行
-                # ——模型跨拍看得到自己一路在想什么，链条强度不再取决于
-                # 单拍深的 <last-reasoning>（该独立区块已随本行删除，防最新
-                # 一条双重渲染）。K 之外 / 空白 reasoning 的决策仍消隐。
-                if ev.event_id in thought_ids:
-                    items.append(
-                        TimelineItem(
-                            event_id=ev.event_id,
-                            occurred_at=ev.occurred_at,
-                            kind="my_thought",
-                            render=Projector._render_my_thought(ev),
-                        )
-                    )
+                # reasoning 是运行日志与审计信息，不是下一拍的输入。自由笔记
+                # 一旦逐字回显，就会把旧的回复意图、口吻乃至草稿变成高显著度
+                # 自我提示；跨拍事实与义务分别由 timeline / active_tasks 承载。
                 continue
             if ev.type in (
                 "agent.reply_emitted",
@@ -881,21 +806,19 @@ class Projector:
             ):
                 # reply_emitted/delivered/failed 是历史链路；现役发送事实为
                 # runtime.reply_flushed。这里继续跳过旧库遗留事件。idle_decision
-                # 是纯运营事件（当拍
-                # 的 reasoning 已在 decision_emitted 上渲染 <my-thought>），仍消隐。
+                # 是纯运营事件，仍消隐。
                 continue
 
             if ev.type == "agent.tool_called":
                 tc_id = ev.payload.get("tool_call_id")
                 tv = tool_view_by_id.get(tc_id)
                 # 2026-07-24（待办#19）起 reply 的成功行**不再折叠**：它是
-                # Planner 回看每次解析的时间线记录——<args> 是该次原文
-                # （analysis/hold_seconds），<result> 是它落成的调度事实
-                # （reply_task_id/revision/flush_at/hard_deadline）。折叠是为
-                # 了避免与 <pending-reply> 双重渲染，而那一段已随本次改动删除，
-                # Planner 内容留在 timeline，不另立状态区。到点后的当前
-                # analysis 由 <reply-task-completed> 行自包含送达，不依赖这行
-                # 是否 terminal/仍在窗口。
+                # Planner 回看自己每次等了多久的时间线记录——<args> 是该次
+                # hold_seconds，<result> 是它落成的调度事实（reply_task_id/
+                # revision/flush_at/hard_deadline）。折叠是为了避免与
+                # <pending-reply> 双重渲染，而那一段已随当时的改动删除。
+                # 2026-08-01 删掉 analysis 之后这些行更是短到不值得折叠，而且
+                # 连成一串正好让模型看见自己续了几次等待。
                 items.append(
                     TimelineItem(
                         event_id=ev.event_id,
@@ -1035,7 +958,8 @@ class Projector:
             attrs.append(f'sender_qq="{_esc_attr(str(qq))}"')
         # sender_role：发送者在本群的角色。只在 owner/admin 时渲染——napcat 的
         # sender.role 三值 owner/admin/member，member 是绝大多数，逐条渲染纯耗
-        # token；缺省语义（普通成员或未知）在 envelope.md 里写死，无歧义。
+        # token；缺省语义（普通成员或未知）在 planner.md §输入信封格式规范
+        # 里写死，无歧义。
         role = str(sender.get("role") or "").strip().lower()
         if role in ("owner", "admin"):
             attrs.append(f'sender_role="{role}"')
@@ -1138,6 +1062,10 @@ class Projector:
         name = str(ev.payload.get("tool_name", "?"))
         args = ev.payload.get("arguments", {})
         args_json = _safe_json(args)
+        if name == "send_messages":
+            spoken = _render_spoken_args(args)
+            if spoken is not None:
+                args_json = spoken
         if tv is None or tv.status == "processing":
             inner = "<processing/>"
             status = "processing"
@@ -1179,20 +1107,6 @@ class Projector:
             f'outcome="{_esc_attr(outcome)}">'
             f"{body}</task-closed>"
         )
-
-    @staticmethod
-    def _render_my_thought(ev: _EventSnapshot) -> str:
-        """agent.decision_emitted → <my-thought> 行（思考轨迹内联，待办清单#4）。
-
-        正文是模型当拍的 reasoning 原文，截 MAX_THOUGHT_CHARS 字防长独白
-        挤占窗口。它是记忆不是指令——配套硬规则（念头≠动作：念头后没有对应
-        tool-call 即那件事没发生；旧思考里的草稿措辞不得直接当消息发出）在
-        planner.md §这个系统是这样运行的 与 envelope.md §<my-thought>。
-        """
-        reasoning = str((ev.payload or {}).get("reasoning") or "").strip()
-        if len(reasoning) > Projector.MAX_THOUGHT_CHARS:
-            reasoning = reasoning[: Projector.MAX_THOUGHT_CHARS] + "…"
-        return f"<my-thought>{_esc_text(reasoning)}</my-thought>"
 
     @staticmethod
     def _render_context_recap(ev: _EventSnapshot) -> str:
@@ -1240,23 +1154,19 @@ class Projector:
 
     @staticmethod
     def _render_reply_task_completed(ev: _EventSnapshot) -> str:
-        """runtime.reply_task_completed → <reply-task-completed> 行。
+        """runtime.reply_task_completed → <reply-task-completed> 空元素行。
 
-        只陈述"这份稿的等待阶段结束了"与最终 analysis 原文；没有授权 ID、
-        unseen、consumed 或 expires_at——元素命名刻意不表达任何发言权限
-        （重构提案-删除Replyer.md §5.4）。
+        只陈述"这段等待结束了"这一件事；没有授权 ID、unseen、consumed 或
+        expires_at——元素命名刻意不表达任何发言权限（重构提案-删除Replyer.md
+        §5.4）。2026-08-01 起连 <analysis> 子元素也没有了：这一行的信息量
+        本来就该低到只是一次叫醒，该说什么去读它上面的时间线。
         """
         payload = ev.payload or {}
         attrs = [
             f'reply_task_id="{_esc_attr(str(payload.get("reply_task_id") or ""))}"',
             f'revision="{_esc_attr(str(payload.get("revision") or ""))}"',
         ]
-        analysis = str(payload.get("analysis") or "").strip()
-        return (
-            f"<reply-task-completed {' '.join(attrs)}>"
-            f"<analysis>{_esc_text(analysis)}</analysis>"
-            "</reply-task-completed>"
-        )
+        return f"<reply-task-completed {' '.join(attrs)}/>"
 
     @staticmethod
     def _render_reply_flushed(ev: _EventSnapshot) -> str:
@@ -1360,6 +1270,61 @@ def _safe_json(value) -> str:
         return str(value)
 
 
+def _render_spoken_args(args: object) -> str | None:
+    """把 `send_messages` 的参数渲染成人话——一个气泡一行。
+
+    动机（2026-08-01）：2026-07-31 裁定「一次发送只渲染一行」之后，自己说过
+    的话在 timeline 上的唯一形态就是这一行的 <args>，而它是 JSON 参数文本；
+    别人的话则是自然的 <message> 行。同一份 prompt 里「我」的语言是转义后的
+    结构体、「他人」的语言是话，模型对"我刚才是什么语气"几乎无感——线上实测
+    表现为跨拍复用同一句式（连续三条都是「我看你脑子是…」）。这里只改形态，
+    记录仍是同一份、仍只有这一行，不派生第二行（不与那条裁定冲突）。
+
+    渲染层不做参数校验：形状一旦不认识就返回 None，由调用方退回 JSON 原文。
+    空 `messages`（历史事件里有）同样退回 JSON，避免渲染出一个空 <args>。
+    """
+    if not isinstance(args, dict):
+        return None
+    messages = args.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return None
+    lines: list[str] = []
+    for bubble in messages:
+        if not isinstance(bubble, dict):
+            return None
+        kind = bubble.get("kind")
+        if kind == "meme":
+            image_hash = _nonempty_str(bubble.get("image_hash"))
+            # 短前缀足够让她认出"这张我刚发过"；完整 hash 在 <result> 回执和
+            # <saved-memes> 里，不必在这条人话行上铺 64 个十六进制字符。
+            lines.append(f"[meme {image_hash[:8]}]" if image_hash else "[meme]")
+            continue
+        if kind != "chat":
+            return None
+        content = bubble.get("content")
+        if not isinstance(content, list) or not content:
+            return None
+        parts: list[str] = []
+        for seg in content:
+            if not isinstance(seg, dict):
+                return None
+            data = seg.get("data")
+            data = data if isinstance(data, dict) else {}
+            seg_type = seg.get("type")
+            if seg_type == "text":
+                parts.append(str(data.get("text", "")))
+            elif seg_type == "at":
+                parts.append(f"@{data.get('qq', '')}")
+            elif seg_type == "reply":
+                parts.append(f"[回复 {data.get('id', '')}]")
+            elif seg_type == "face":
+                parts.append(f"[表情 {data.get('id', '')}]")
+            else:
+                return None
+        lines.append("".join(parts))
+    return "\n".join(lines)
+
+
 # agent.tool_failed.payload 顶层的"信封字段"——不属于结构化失败附加信息（extra）。
 # 工具执行层把 payload 拼成 {tool_call_id, tool_name, task_id, error_kind,
 # error_message, **outcome.extra}，fold_tool_results 据此把其余键收进
@@ -1405,7 +1370,7 @@ def _render_error_element(
     ``error_extra``（required_tier / actual_tier / required_bot_role /
     actual_bot_role / retcode / action / allowed_scopes ...）是工具失败时
     ``ToolOutcome.extra`` 平铺进 ``tool_failed.payload`` 的结构化字段。历史上这里
-    只渲染 kind+message，把它们丢了——envelope.md 承诺 payload 带
+    只渲染 kind+message，把它们丢了——planner.md §输入信封格式规范 承诺 payload 带
     required_tier/actual_tier，却从没真到模型。现在逐个作属性透出：标量原样、
     列表/字典 JSON 编码，让 LLM 精确解释"差在哪一级权限 / napcat 具体报了什么"。
 
@@ -1441,8 +1406,8 @@ def _render_segments(
 ) -> tuple[str, list[ImageRef]]:
     """把 OneBot V11 段数组翻译成内联 XML 标签 + 收集已落盘的 ImageRef。
 
-    支持的段类型 → 标签（属性一律"缺失=未知/不适用"，语义与 envelope.md
-    §内联段 一一对应，两处必须同步改）：
+    支持的段类型 → 标签（属性一律"缺失=未知/不适用"，语义与 planner.md
+    §输入信封格式规范 的"内联段"一一对应，两处必须同步改）：
       text     → 原文（XML escape）
       at       → <at qq="..." name="..."/> 或 <at-all/>（qq= 与出站段
                  data.qq 同名同值，模型可直抄）

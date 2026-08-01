@@ -21,6 +21,8 @@ from qqbot.services.agent_loop.decision import TimelineItem
 from qqbot.services.agent_loop.projection import (
     Projector,
     _EventSnapshot,
+    _esc_text,
+    _safe_json,
     render_timeline_stream,
 )
 
@@ -1941,8 +1943,8 @@ class BuildTimelineTests(unittest.TestCase):
     def test_reply_lifecycle_events_are_filtered_out(self) -> None:
         # 发言已同步：reply_emitted/delivered/failed 不再产生（历史遗留事件也
         # 只 skip）；idle_decision 是纯运营事件不进 timeline。decision_emitted
-        # 2026-07-06 起渲染 <my-thought> 行，但空白/缺失 reasoning 的仍消隐
-        # ——本例 payload={} 无 reasoning，照旧不出行。发送结果由
+        # 的 reasoning 只留在运行日志与审计中，不论正文是否为空都不进投影。
+        # 发送结果由
         # send_message 工具的 <tool-call>（succeeded/failed）表达，没有独立行。
         evs = [
             _snap(type="agent.decision_emitted", payload={}),
@@ -2052,15 +2054,12 @@ class ProjectIntegrationTests(unittest.TestCase):
         self.assertEqual(context.active_tasks, [])
         # bot_user_id 默认 None；未注入时不破坏旧用例
         self.assertIsNone(context.bot_user_id)
-        # 2026-07-06：跨拍自我记忆改为 timeline 的 <my-thought> 行，
-        # last_reasoning / last_reasoning_at 字段已随 <last-reasoning> 删除
+        # reasoning 不进入 DecisionContext；旧的单条折叠字段也不得复活。
         self.assertFalse(hasattr(context, "last_reasoning"))
         self.assertFalse(hasattr(context, "last_reasoning_at"))
 
-    def test_decisions_render_as_my_thought_rows(self) -> None:
-        """思考轨迹内联（2026-07-06，待办清单#4）：decision_emitted 渲染
-        <my-thought> 行（含 idle 拍）；空白 reasoning 的决策消隐；旧的
-        fold_last_reasoning / <last-reasoning> 单条折叠已删除。"""
+    def test_decision_reasoning_is_not_projected(self) -> None:
+        """reasoning 仍可随 decision_emitted 落库，但不成为下一拍输入。"""
         evs = [
             _snap(
                 type="agent.decision_emitted",
@@ -2085,13 +2084,7 @@ class ProjectIntegrationTests(unittest.TestCase):
             tick_seq=2,
             now=BASE_TIME + timedelta(seconds=10),
         )
-        kinds = [it.kind for it in context.timeline]
-        self.assertEqual(kinds, ["my_thought", "my_thought"])
-        self.assertIn("先观望", context.timeline[0].render)
-        self.assertIn("等他贴完", context.timeline[1].render)
-        # 时间流契约：思考行内也不带 time=，时刻在 <time> 节点上
-        self.assertNotIn('time="', context.timeline[1].render)
-        # 单条折叠接口随 <last-reasoning> 一并删除，防复活
+        self.assertEqual(context.timeline, [])
         self.assertFalse(hasattr(Projector, "fold_last_reasoning"))
 
     def test_task_closed_renders_timeline_row(self) -> None:
@@ -2391,21 +2384,18 @@ class RecallRenderingNoteTests(unittest.TestCase):
 
 
 class ReplyFlushedProjectionTests(unittest.TestCase):
-    def test_successful_reply_tool_row_is_rendered_as_authorization(self) -> None:
+    def test_successful_reply_tool_row_is_rendered_in_full(self) -> None:
         """2026-07-24（待办#19）起 reply 成功行**不再折叠**：它是 append-only
-        规划历史的一部分——<args> 是这次解析原文（含 hold_seconds），<result>
-        是它落成的调度事实。到点后的当前完整 analysis 另由
-        <reply-task-completed> 行自包含地送达；这里不做历史合并。"""
+        规划历史的一部分——<args> 是这次的 hold_seconds，<result> 是它落成的
+        调度事实。2026-08-01 删掉内容通道后这行更短，连成一串正好让 Planner
+        看见自己续了几次等待。"""
         called = _snap(
             type="agent.tool_called",
             event_id="TC_EVENT",
             payload={
                 "tool_call_id": "TC_REPLY",
                 "tool_name": "reply",
-                "arguments": {
-                    "analysis": "他在 MSG_1 单独问天气；问题尚未回答",
-                    "hold_seconds": 8,
-                },
+                "arguments": {"hold_seconds": 8},
             },
         )
         result = _snap(
@@ -2426,10 +2416,9 @@ class ReplyFlushedProjectionTests(unittest.TestCase):
         self.assertEqual([it.kind for it in items], ["tool_call"])
         render = items[0].render
         self.assertIn('<tool-call name="reply" status="complete"', render)
-        # 解析原文（<args>）与调度事实（<result>）都在同一行上，Planner 据此
-        # 回看"我当时写了什么、什么时候到点"；当前 analysis 不依赖这行送达。
+        # 等待时长（<args>）与调度事实（<result>）都在同一行上，Planner 据此
+        # 回看"我当时打算等多久、什么时候到点"。
         self.assertIn("hold_seconds", render)
-        self.assertIn("回答", render)
         self.assertIn("R1", render)
         self.assertIn("flush_at", render)
 
@@ -2623,16 +2612,107 @@ class ReplyFlushedProjectionTests(unittest.TestCase):
         self.assertIn('from_self="true"', message_rows[0].render)
         self.assertIn('from_qq="10001"', message_rows[0].render)
 
-    def test_reply_task_completed_renders_analysis_row(self) -> None:
-        """runtime.reply_task_completed → <reply-task-completed> 行：只陈述
-        等待结束与最终 analysis，没有授权/unseen/consumed/expires 语义。"""
+    def test_send_messages_args_render_as_speech_not_json(self) -> None:
+        """2026-08-01：`send_messages` 的 <args> 渲染成人话，一个气泡一行。
+
+        2026-07-31 裁定「一次发送只渲染一行」之后，自己说过的话在 timeline 上
+        的唯一形态就是这一行的 <args>。它过去是 JSON 参数文本，而别人的话是
+        自然的 <message> 行——同一份 prompt 里「我」的语言是结构体、「他人」的
+        语言是话，模型读不出自己刚才什么语气，线上表现为跨拍复用同一句式。
+        这里钉的是：话本身以人话出现、且没有 JSON 骨架残留。"""
+        called = _snap(
+            type="agent.tool_called",
+            event_id="TC_SPEAK_EVENT",
+            payload={
+                "tool_call_id": "TC_SPEAK",
+                "tool_name": "send_messages",
+                "arguments": {
+                    "messages": [
+                        {
+                            "kind": "chat",
+                            "content": [
+                                {"type": "reply", "data": {"id": "77"}},
+                                {"type": "at", "data": {"qq": "222"}},
+                                {"type": "text", "data": {"text": "你认真的?"}},
+                            ],
+                        },
+                        {"kind": "chat", "content": [
+                            {"type": "text", "data": {"text": "算了"}}
+                        ]},
+                        {"kind": "meme", "image_hash": "ab12cd34" + "f" * 56},
+                    ]
+                },
+            },
+        )
+        items = Projector.build_timeline([called], tool_views=[])
+        rendered = items[0].render
+        self.assertIn(
+            "<args>[回复 77]@222你认真的?\n算了\n[meme ab12cd34]</args>", rendered
+        )
+        # JSON 骨架不得残留——留着就等于话仍以结构体形态出现。转义后的引号
+        # （&quot;）不能拿来当锚点，否则断言永远成立，故只查裸键名。
+        for skeleton in ("kind", "content", "data", "image_hash"):
+            with self.subTest(skeleton=skeleton):
+                self.assertNotIn(skeleton, rendered)
+
+    def test_unrecognised_send_messages_args_fall_back_to_json(self) -> None:
+        """渲染层不做参数校验：形状不认识就退回 JSON 原文，绝不吞掉内容。
+        空 `messages`（历史事件里真实存在）同样退回，避免渲染出空 <args>。"""
+        for arguments in (
+            {"messages": []},
+            {"messages": [{"kind": "chat", "content": [
+                {"type": "video", "data": {"file": "x.mp4"}}
+            ]}]},
+            {"messages": "不是数组"},
+            {},
+        ):
+            with self.subTest(arguments=arguments):
+                called = _snap(
+                    type="agent.tool_called",
+                    event_id="TC_ODD",
+                    payload={
+                        "tool_call_id": "TC_ODD",
+                        "tool_name": "send_messages",
+                        "arguments": arguments,
+                    },
+                )
+                rendered = Projector.build_timeline(
+                    [called], tool_views=[]
+                )[0].render
+                self.assertIn(
+                    f"<args>{_esc_text(_safe_json(arguments))}</args>", rendered
+                )
+
+    def test_other_tools_keep_json_args(self) -> None:
+        """人话渲染只对 `send_messages` 开口——别的工具参数是协议数据，
+        照 JSON 渲染（envelope.md 的 <args> 通则）。"""
+        called = _snap(
+            type="agent.tool_called",
+            event_id="TC_REPLY",
+            payload={
+                "tool_call_id": "TC_REPLY",
+                "tool_name": "reply",
+                "arguments": {"hold_seconds": 8},
+            },
+        )
+        rendered = Projector.build_timeline([called], tool_views=[])[0].render
+        self.assertIn("&quot;hold_seconds&quot;", rendered)
+
+    def test_reply_task_completed_renders_an_empty_row(self) -> None:
+        """runtime.reply_task_completed → <reply-task-completed> 空元素行。
+
+        2026-08-01 删除 analysis 后它只陈述"这段等待结束了"这一件事：没有
+        内容，也没有授权/unseen/consumed/expires 语义。这一行的信息量本来就
+        该低到只是一次叫醒——该说什么去读它上面的时间线。升级前事件里残留的
+        analysis 键不得再被渲染出来。
+        """
         completed = _snap(
             type="runtime.reply_task_completed",
             event_id="DONE",
             payload={
                 "reply_task_id": "R1",
                 "revision": 3,
-                "analysis": "李四在问营业时间；需要说明周日提前关门 & 别接价格线",
+                "analysis": "升级前残留的判读，不得渲染",
                 "completed_at": "2026-07-31T20:30:08+08:00",
             },
         )
@@ -2641,14 +2721,11 @@ class ReplyFlushedProjectionTests(unittest.TestCase):
             [item.kind for item in items], ["reply_task_completed"]
         )
         rendered = items[0].render
-        self.assertIn(
-            '<reply-task-completed reply_task_id="R1" revision="3">', rendered
+        self.assertEqual(
+            rendered, '<reply-task-completed reply_task_id="R1" revision="3"/>'
         )
-        self.assertIn(
-            "<analysis>李四在问营业时间；需要说明周日提前关门 &amp; "
-            "别接价格线</analysis>",
-            rendered,
-        )
+        self.assertNotIn("<analysis>", rendered)
+        self.assertNotIn("不得渲染", rendered)
         for forbidden in ("authorization", "unseen", "consumed", "expires"):
             self.assertNotIn(forbidden, rendered)
 
@@ -2663,7 +2740,7 @@ class ReplyFlushedProjectionTests(unittest.TestCase):
         stale = _snap(
             type="runtime.reply_task_completed",
             event_id="DONE_V1",
-            payload={"reply_task_id": "R1", "revision": 1, "analysis": "旧"},
+            payload={"reply_task_id": "R1", "revision": 1},
             seconds_offset=1,
         )
         self.assertEqual(
@@ -2677,7 +2754,7 @@ class ReplyFlushedProjectionTests(unittest.TestCase):
         late = _snap(
             type="runtime.reply_task_completed",
             event_id="DONE_R2",
-            payload={"reply_task_id": "R2", "revision": 1, "analysis": "迟"},
+            payload={"reply_task_id": "R2", "revision": 1},
             seconds_offset=1,
         )
         self.assertEqual(
@@ -2692,7 +2769,7 @@ class ReplyFlushedProjectionTests(unittest.TestCase):
         done = _snap(
             type="runtime.reply_task_completed",
             event_id="DONE_OK",
-            payload={"reply_task_id": "R3", "revision": 1, "analysis": "现行"},
+            payload={"reply_task_id": "R3", "revision": 1},
             seconds_offset=1,
         )
         items = Projector.build_timeline([upsert, done], tool_views=[])
@@ -2903,15 +2980,12 @@ class SavedMemesAugmentTests(unittest.IsolatedAsyncioTestCase):
 
 
 class HandledBoundaryByRowOrderTests(unittest.TestCase):
-    """"我处理到哪儿了"由 `<message unseen="true">` 与 timeline 的行位置
-    共同表达（2026-07-24 待办清单#18 删除 unseen、改用纯行位置；2026-07-28
-    复活 unseen，见 projection.py::fold_unseen_message_ids 的复活说明）。
+    """"我处理到哪儿了"由 `<message unseen="true">` 直接表达。
 
-    行位置规则本身没变过，继续成立：`<my-thought>` / `<my-reply>` 行
-    **之后**的消息 = 那拍没看到它，前提是 decision_emitted 的 occurred_at
-    回填为本拍投影时刻，护栏在 test_agent_loop_skeleton_contract.py::
-    test_decision_timestamp_is_tick_start_not_write_time。unseen="true"
-    是同一件事更直接的信号，水位线取窗口内最后一条 agent.decision_emitted。
+    水位线取窗口内最后一条 agent.decision_emitted；该事件本身不投影，但其
+    occurred_at 仍须回填为本拍投影时刻。时间戳护栏在
+    test_agent_loop_skeleton_contract.py::
+    test_decision_timestamp_is_tick_start_not_write_time。
     """
 
     def test_message_after_last_decision_carries_unseen_attribute(self) -> None:
@@ -2994,9 +3068,8 @@ class HandledBoundaryByRowOrderTests(unittest.TestCase):
             Projector.fold_unseen_message_ids(evs), frozenset({"M1", "M2"})
         )
 
-    def test_row_order_places_thought_between_the_two_messages(self) -> None:
-        """行位置就是判据：决策事件夹在两条消息之间时，<my-thought> 行必须
-        落在它们中间——上面的是那拍看过的，下面的是那拍之后才来的。"""
+    def test_hidden_decision_does_not_create_a_timeline_row(self) -> None:
+        """决策事件夹在消息之间时只推进 unseen 水位线，不泄漏 reasoning。"""
         evs = [
             _snap(
                 type="external.message.group",
@@ -3031,95 +3104,49 @@ class HandledBoundaryByRowOrderTests(unittest.TestCase):
         )
         self.assertEqual(
             [it.kind for it in context.timeline],
-            ["message", "my_thought", "message"],
+            ["message", "message"],
         )
         self.assertEqual(
-            [it.event_id for it in context.timeline][::2], ["M1", "M2"]
+            [it.event_id for it in context.timeline], ["M1", "M2"]
         )
+        self.assertNotIn("先等", "".join(it.render for it in context.timeline))
+        self.assertIn('unseen="true"', context.timeline[1].render)
 
 
-class MyThoughtTests(unittest.TestCase):
-    """<my-thought> 行契约（2026-07-06，待办清单#4 思考轨迹内联）。
+class DecisionReasoningIsolationTests(unittest.TestCase):
+    """自由 reasoning 只用于日志与审计，不得成为跨拍自我提示。"""
 
-    decision_emitted（含 idle 拍）渲染为 timeline 的 <my-thought> 行：只保留
-    最近 MAX_THOUGHT_ROWS 条、单条截 MAX_THOUGHT_CHARS 字、正文 XML 转义；
-    project() 裁剪只数非思考行——思考行不挤占消息行预算。
-    """
-
-    @staticmethod
-    def _decision(reasoning: str, offset: float) -> "_EventSnapshot":
-        return _snap(
-            type="agent.decision_emitted",
-            payload={"reasoning": reasoning},
-            event_id=f"D{int(offset * 1000)}",
-            seconds_offset=offset,
-        )
-
-    def test_capped_at_max_thought_rows(self) -> None:
-        evs = [self._decision(f"想法{i}", i) for i in range(1, 14)]  # 13 条
-        items = Projector.build_timeline(evs, tool_views=[])
-        self.assertEqual(len(items), Projector.MAX_THOUGHT_ROWS)
-        # 保留的是最近 K 条（想法4..想法13），时间序不变
-        self.assertIn("想法4", items[0].render)
-        self.assertIn("想法13", items[-1].render)
-
-    def test_truncated_at_max_chars(self) -> None:
-        long_text = "长" * (Projector.MAX_THOUGHT_CHARS + 50)
+    def test_reasoning_never_appears_in_timeline(self) -> None:
+        secret = "下一拍用傲娇口吻照这份草稿回复"
         items = Projector.build_timeline(
-            [self._decision(long_text, 1)], tool_views=[]
+            [
+                _snap(
+                    type="agent.decision_emitted",
+                    payload={"reasoning": secret},
+                )
+            ],
+            tool_views=[],
         )
-        self.assertIn("…", items[0].render)
-        self.assertNotIn(
-            "长" * (Projector.MAX_THOUGHT_CHARS + 1), items[0].render
-        )
+        self.assertEqual(items, [])
 
-    def test_reasoning_xml_escaped(self) -> None:
-        items = Projector.build_timeline(
-            [self._decision("对比 <b> & 引用", 1)], tool_views=[]
-        )
-        self.assertIn("&lt;b&gt;", items[0].render)
-        self.assertNotIn("<b>", items[0].render)
-
-    def test_thoughts_do_not_consume_message_budget(self) -> None:
-        """project(max_timeline_items=3)：3 条消息预算照满，穿插的思考行
-        顺带保留（4 行总量），而不是把最老一条消息挤出去。"""
-        evs = [
-            _snap(
-                type="external.message.group",
-                event_id=f"M{i}",
-                payload={
-                    "segments": [
-                        {"type": "text", "data": {"text": f"m{i}"}}
-                    ]
-                },
-                seconds_offset=i,
-            )
-            for i in range(1, 6)  # M1..M5
-        ]
-        evs.insert(4, self._decision("穿插的想法", 4.5))  # M4 与 M5 之间
-        context = Projector.project(
-            evs,
-            scope_key="group:999",
-            correlation_id="c",
-            tick_seq=1,
-            now=BASE_TIME + timedelta(seconds=10),
-            max_timeline_items=3,
-        )
-        kinds = [it.kind for it in context.timeline]
-        self.assertEqual(
-            kinds, ["message", "message", "my_thought", "message"]
-        )
-        self.assertIn("m3", context.timeline[0].render)
-        self.assertIn("m5", context.timeline[-1].render)
+    def test_thought_projection_helpers_are_absent(self) -> None:
+        for name in (
+            "MAX_THOUGHT_ROWS",
+            "MAX_THOUGHT_CHARS",
+            "THOUGHT_ROWS_SLACK",
+            "_render_my_thought",
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(Projector, name))
 
 
 class WindowAnchorHysteresisTests(unittest.TestCase):
     """窗口锚定滞回契约（2026-07-12，前缀缓存）。
 
-    timeline 裁剪起点与 <my-thought> 选择边界都钉在上一拍的锚（event_id）上，
-    直到超出滞回带（TIMELINE_TRIM_SLACK / THOUGHT_ROWS_SLACK）才一次性前移
-    ——保证连续各拍的 timeline 前缀逐字节稳定。锚由 build_context 从上一拍
-    结果的首行取出、下一拍以入参喂回（project 仍是纯函数）。
+    timeline 裁剪起点钉在上一拍的锚（event_id）上，直到超出
+    TIMELINE_TRIM_SLACK 才一次性前移——保证连续各拍的 timeline 前缀逐字节
+    稳定。锚由 build_context 从上一拍结果的首行取出、下一拍以入参喂回
+    （project 仍是纯函数）。
     """
 
     @staticmethod
@@ -3131,15 +3158,6 @@ class WindowAnchorHysteresisTests(unittest.TestCase):
                 "segments": [{"type": "text", "data": {"text": f"m{i}"}}],
                 "sender": {"nickname": "u", "user_id": 1},
             },
-            seconds_offset=i,
-        )
-
-    @staticmethod
-    def _decision(i: int) -> "_EventSnapshot":
-        return _snap(
-            type="agent.decision_emitted",
-            event_id=f"D{i:03d}",
-            payload={"reasoning": f"想法{i}"},
             seconds_offset=i,
         )
 
@@ -3172,7 +3190,7 @@ class WindowAnchorHysteresisTests(unittest.TestCase):
         )
 
     def test_anchor_exceeding_slack_recuts_to_max(self) -> None:
-        """锚起的非思考行数超过 max + TIMELINE_TRIM_SLACK → 一次性收回尾部
+        """锚起的行数超过 max + TIMELINE_TRIM_SLACK → 一次性收回尾部
         max 条并重新锚定。"""
         evs = [self._msg(i) for i in range(20)]
         anchor = self._project(evs).timeline[0].event_id  # M015
@@ -3190,28 +3208,6 @@ class WindowAnchorHysteresisTests(unittest.TestCase):
         ctx = self._project(evs, anchor="M_GONE")
         self.assertEqual(len(ctx.timeline), 5)
         self.assertEqual(ctx.timeline[0].event_id, "M015")
-
-    def test_thought_anchor_pins_selection_within_slack(self) -> None:
-        """思考选择边界钉在锚上：新增决策不再把第 K 旧的思考行挤出窗口。"""
-        evs = [self._decision(i) for i in range(1, 14)]  # 13 条，朴素取 D004 起
-        items = Projector.build_timeline(evs, tool_views=[])
-        self.assertEqual(items[0].event_id, "D004")
-        # 下一拍：新增 2 条决策，带锚选择 → D004 仍在，行数 12
-        evs2 = evs + [self._decision(i) for i in range(14, 16)]
-        items2 = Projector.build_timeline(
-            evs2, tool_views=[], thought_anchor="D004"
-        )
-        self.assertEqual(items2[0].event_id, "D004")
-        self.assertEqual(len(items2), 12)
-
-    def test_thought_anchor_exceeding_slack_recuts_to_last_k(self) -> None:
-        evs = [self._decision(i) for i in range(1, 21)]  # 20 条
-        # 从 D001 起 20 条 > MAX_THOUGHT_ROWS + THOUGHT_ROWS_SLACK (15)
-        items = Projector.build_timeline(
-            evs, tool_views=[], thought_anchor="D001"
-        )
-        self.assertEqual(len(items), Projector.MAX_THOUGHT_ROWS)
-        self.assertEqual(items[0].event_id, "D011")
 
 
 class RenderTimelineStreamContractTests(unittest.TestCase):
