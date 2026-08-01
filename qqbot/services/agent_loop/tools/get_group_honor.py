@@ -53,14 +53,10 @@ class GetGroupHonorTool(BaseTool):
     # required_permission 用 BaseTool 默认 GUEST（查询无副作用）
     usage_prompt = _USAGE_PROMPT
     description = (
-        "Get honor / leaderboard info for the CURRENT group (talkative streak "
-        "龙王, performers, legends, etc.). Operates on the current group only "
-        "— group_id comes from your scope, you cannot query another group. "
-        "Optionally pass type: one of talkative, performer, legend, "
-        "strong_newbie, emotion, or all (default all). Returns "
-        "current_talkative (if any) plus each leaderboard list trimmed to its "
-        "top 5 entries (user_id, nickname, description). Read-only, no side "
-        "effects."
+        "查询当前群的荣誉与榜单信息。group_id 从当前 scope 注入；type 可指定 "
+        "talkative、performer、legend、strong_newbie、emotion 或 all。结果包含"
+        "平台提供的 current_talkative，并将各榜单截断为前 5 条。该调用为只读"
+        "操作。"
     )
     arguments_schema = {
         "type": "object",
@@ -68,8 +64,8 @@ class GetGroupHonorTool(BaseTool):
             "type": {
                 "type": "string",
                 "description": (
-                    "Which honor leaderboard to fetch: talkative, performer, "
-                    "legend, strong_newbie, emotion, or all (default all)."
+                    "待查询的榜单类型：talkative、performer、legend、"
+                    "strong_newbie、emotion 或 all；默认 all。"
                 ),
                 "enum": [
                     "talkative",

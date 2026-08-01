@@ -84,16 +84,10 @@ class GetMemberListTool(BaseTool):
     # required_permission 用 BaseTool 默认 GUEST（查询无副作用）
     usage_prompt = _USAGE_PROMPT
     description = (
-        "List members of the CURRENT group. Operates on the current group "
-        "only — group_id comes from your scope, you cannot list another group. "
-        "Optional arguments: limit (default 200, capped at 500); role "
-        "('owner'/'admin'/'member') to filter by group role, e.g. to list all "
-        "admins; include_activity=true to add join_time / last_sent_time per "
-        "member. Returns count (total member count), matched (members "
-        "matching the role filter) and members (a list TRUNCATED to limit, "
-        "each with user_id, nickname, card, role, plus banned_until when the "
-        "member is currently muted). Read-only; the list is capped to avoid "
-        "flooding your context."
+        "查询当前群的成员列表。group_id 从当前 scope 注入。可通过 role 过滤群"
+        "角色，通过 limit 控制返回条数，通过 include_activity 控制是否返回入群与"
+        "最后发言时间。结果包含总人数 count、匹配人数 matched 和截断后的 members。"
+        "该调用为只读操作。"
     )
     arguments_schema = {
         "type": "object",
@@ -101,8 +95,8 @@ class GetMemberListTool(BaseTool):
             "limit": {
                 "type": "integer",
                 "description": (
-                    "Max members to return (default 200, capped at 500). The "
-                    "full total is still reported as count."
+                    "members 的最大返回条数，默认 200，最大 500；count 仍返回完整"
+                    "成员总数。"
                 ),
                 "default": _DEFAULT_LIMIT,
             },
@@ -110,18 +104,16 @@ class GetMemberListTool(BaseTool):
                 "type": "string",
                 "enum": ["owner", "admin", "member"],
                 "description": (
-                    "Optional. Only return members with this group role "
-                    "(filter applies BEFORE truncation, so e.g. "
-                    "role='admin' reliably lists every admin)."
+                    "可选的群角色过滤条件；支持 owner、admin、member，过滤先于"
+                    "limit 截断执行。"
                 ),
             },
             "include_activity": {
                 "type": "boolean",
                 "default": False,
                 "description": (
-                    "Optional. When true each entry also carries join_time "
-                    "and last_sent_time (Asia/Shanghai ISO). Costs tokens — "
-                    "only enable when activity actually matters."
+                    "为 true 时，每个成员条目附带 Asia/Shanghai 时区的 join_time "
+                    "和 last_sent_time。"
                 ),
             },
         },

@@ -39,27 +39,20 @@ class SetTitleTool(BaseTool):
     required_bot_role = "owner"  # set_group_special_title 是群主专属能力，bot 须是群主
     usage_prompt = _USAGE_PROMPT
     description = (
-        "Set or clear the special title (专属头衔) of a member in the CURRENT "
-        "group. Operates on the current group only — group_id comes from your "
-        "scope, you cannot edit titles in another group. Pass user_id (the QQ "
-        "number — read it from a <message sender_id=\"USER_ID\"> in the "
-        "timeline) and title (the new special title); pass title=\"\" (empty) "
-        "to CLEAR it. This is a sensitive privileged action; requires the bot "
-        "ITSELF to be the group OWNER (群主) — if it isn't, the call fails and "
-        "you'll see the reason next tick."
+        "设置或清空当前群中指定成员的专属头衔。group_id 从当前 scope 注入，"
+        "user_id 指定成员，title 指定新头衔；空字符串表示清空。调用要求发起用户"
+        "权限不低于 OWNER，且机器人群角色为 owner。"
     )
     arguments_schema = {
         "type": "object",
         "properties": {
             "user_id": {
                 "type": "integer",
-                "description": "QQ number of the member whose title to set.",
+                "description": "目标成员的 QQ 号。",
             },
             "title": {
                 "type": "string",
-                "description": (
-                    "New special title. Empty string clears the title."
-                ),
+                "description": "新的专属头衔；空字符串表示清空头衔。",
                 "default": "",
             },
         },

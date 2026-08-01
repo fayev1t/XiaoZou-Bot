@@ -7,7 +7,8 @@ run() 无论成功失败都返回一个 ToolOutcome。
 
 本元测试是**防漏判的安全网**：遍历**所有内置工具**（tools.__all__ 里的全部
 BaseTool 子类，见 _registry_of_all_builtin_tools）——刻意**不用**
-build_default_registry()：它 2026-07-01 起默认只注册 send_message、其余工具整体下架，
+build_default_registry()：30 个内置工具里它当前只注册 15 个，另 15 个（ban / poke /
+recall / set_card / set_essence …）的 registry.register 行被整体注释掉待逐个恢复，
 但「下架」不等于允许它们的权限闸门退化——重做恢复时若漏了 enforce_access，本网
 仍须变红。遍历项：
 - required_permission > GUEST 的工具：发起人 GUEST 触发 → outcome.error_kind ==
@@ -45,8 +46,8 @@ def _registry_of_all_builtin_tools() -> ToolRegistry:
     """含**所有内置工具**的 registry —— 本安全网的遍历源。
 
     校验的是「每个工具都在 execute() 首行 enforce_access 并 return 失败」，与
-    build_default_registry() 当前实际注册了哪些工具**无关**：默认注册表 2026-07-01
-    起只留 send_message，但下架工具的权限闸门仍须正确。故遍历 tools.__all__ 里的全部
+    build_default_registry() 当前实际注册了哪些工具**无关**：默认注册表只留 15 个，
+    但另外 15 个下架工具的权限闸门仍须正确。故遍历 tools.__all__ 里的全部
     BaseTool 子类自建 registry，而非用会被裁剪的 build_default_registry()。
     工具无构造依赖，直接实例化即可。"""
     reg = ToolRegistry()

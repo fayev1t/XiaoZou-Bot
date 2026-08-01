@@ -48,9 +48,8 @@ _USAGE_PROMPT = load_sibling_md(__file__, "webfetch.md")
 class WebfetchTool(BaseTool):
     name = "webfetch"
     description = (
-        "Fetch a single web page by URL and return its readable body text. "
-        "Use it to read a link mentioned in chat, or to expand one websearch "
-        "hit whose snippet is insufficient."
+        "读取一个公开 HTTP(S) URL，提取网页标题与可读正文，并返回重定向后的"
+        "最终 URL、状态码、内容类型及截断状态。"
     )
     usage_prompt = _USAGE_PROMPT
     # GUEST / 不限 scope：任何人都能让小奏读个链接。
@@ -59,7 +58,7 @@ class WebfetchTool(BaseTool):
         "properties": {
             "url": {
                 "type": "string",
-                "description": "Absolute http/https URL to fetch.",
+                "description": "待读取的绝对 HTTP(S) URL；不接受内网或环回地址。",
             },
             "max_chars": {
                 "type": "integer",
@@ -67,8 +66,7 @@ class WebfetchTool(BaseTool):
                 "maximum": _MAX_MAX_CHARS,
                 "default": _DEFAULT_MAX_CHARS,
                 "description": (
-                    "Body text truncation length. Raise only when you truly "
-                    "need more of the page."
+                    "正文截断长度，默认 8000，取值范围为 500–20000。"
                 ),
             },
         },

@@ -58,15 +58,9 @@ class SearchHistoryTool(BaseTool):
 
     name = "search_history"
     description = (
-        "Retrieve older events from this scope's history beyond the current "
-        "timeline window (which is capped at 100 most-recent items). Use this "
-        "when answering a question requires context older than what you can "
-        "see directly. Filters can combine: anchor (anchor_event_id or task_id "
-        "to use that task's trigger event as anchor), a time window "
-        "(start_time/end_time ISO8601), and/or a keyword (query — fuzzy "
-        "similarity match against message text, not exact substring; a "
-        "close paraphrase can still hit). Results are returned in the same "
-        "XML format as the normal timeline."
+        "检索当前 scope 中未包含在近期时间线窗口内的历史事件。过滤条件可组合："
+        "anchor_event_id 或 task_id 提供锚点，start_time/end_time 提供时间范围，"
+        "query 对消息文本执行模糊相似度匹配。结果使用与时间线相同的 XML 格式。"
     )
     usage_prompt = _USAGE_PROMPT
     # required_permission / required_bot_role 用 BaseTool 默认值（GUEST /
@@ -77,36 +71,35 @@ class SearchHistoryTool(BaseTool):
             "anchor_event_id": {
                 "type": "string",
                 "description": (
-                    "If set, only events strictly older than this event_id "
-                    "are returned (event_id is ULID = chronologically sortable)."
+                    "仅返回严格早于该 event_id 的事件；event_id 为按时间可排序的 "
+                    "ULID。"
                 ),
             },
             "task_id": {
                 "type": "string",
                 "description": (
-                    "If set and anchor_event_id is not, resolve the anchor "
-                    "to this task's triggered_by_event_id."
+                    "未提供 anchor_event_id 时，以该任务的 triggered_by_event_id "
+                    "作为锚点。"
                 ),
             },
             "start_time": {
                 "type": "string",
-                "description": "ISO8601 lower bound (inclusive).",
+                "description": "ISO8601 格式的起始时间，包含边界。",
             },
             "end_time": {
                 "type": "string",
-                "description": "ISO8601 upper bound (inclusive).",
+                "description": "ISO8601 格式的结束时间，包含边界。",
             },
             "query": {
                 "type": "string",
                 "description": (
-                    "Fuzzy keyword to match against message text (trigram "
-                    "similarity, not exact substring — close paraphrases "
-                    "can still match). Short, distinctive phrases work best."
+                    "用于匹配消息文本的模糊关键词；采用 trigram 相似度，不要求"
+                    "精确子串匹配。"
                 ),
             },
             "limit": {
                 "type": "integer",
-                "description": f"Max items to return; capped at {_MAX_LIMIT}.",
+                "description": f"最大返回条数，上限为 {_MAX_LIMIT}。",
                 "default": _DEFAULT_LIMIT,
             },
         },

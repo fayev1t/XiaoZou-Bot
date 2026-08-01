@@ -37,18 +37,15 @@ class GetStrangerInfoTool(BaseTool):
     # required_permission 用 BaseTool 默认 GUEST（查询无副作用）
     usage_prompt = _USAGE_PROMPT
     description = (
-        "Look up the basic public profile of ANY QQ user by user_id, even "
-        "someone who is not in this group (uses QQ's public stranger info). "
-        "Works in any scope; it does NOT depend on a group. Pass user_id (the "
-        "QQ number to look up). Returns user_id, nickname, sex and age. "
-        "Read-only, no side effects."
+        "按 user_id 查询 QQ 用户的公开基础资料，不依赖群成员关系且 scope 不限。"
+        "返回 user_id、nickname、sex 和 age。该调用为只读操作。"
     )
     arguments_schema = {
         "type": "object",
         "properties": {
             "user_id": {
                 "type": "integer",
-                "description": "QQ number of the user to look up.",
+                "description": "待查询用户的 QQ 号。",
             },
         },
         "required": ["user_id"],

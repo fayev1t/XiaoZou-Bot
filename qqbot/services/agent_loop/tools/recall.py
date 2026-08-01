@@ -48,13 +48,9 @@ class RecallTool(BaseTool):
     # required_bot_role 不设：撤自己的消息无需 admin，撤别人的由 napcat 把关。
     usage_prompt = _USAGE_PROMPT
     description = (
-        "Recall (delete) a single message in the CURRENT group. Pass "
-        "message_id — the onebot_message_id of the message to recall — which "
-        "you read from a <message ... id=\"MESSAGE_ID\"> row in the timeline "
-        "(the id attribute IS the onebot_message_id). Recalling your OWN "
-        "message always works; recalling SOMEONE ELSE's message requires the "
-        "bot itself to be a group admin — if it isn't, the call fails and "
-        "you'll see the reason next tick."
+        "撤回当前群中的一条消息。message_id 指定 onebot_message_id。撤回机器人"
+        "自身消息不要求群管理角色；撤回其他成员消息时，机器人须为 admin 或 "
+        "owner，且角色严格高于消息作者。"
     )
     arguments_schema = {
         "type": "object",
@@ -62,8 +58,7 @@ class RecallTool(BaseTool):
             "message_id": {
                 "type": "integer",
                 "description": (
-                    "onebot_message_id of the message to recall, taken from a "
-                    "<message ... id=\"MESSAGE_ID\"> row in the timeline."
+                    "目标消息的 onebot_message_id，对应时间线消息的 id 属性。"
                 ),
             },
         },

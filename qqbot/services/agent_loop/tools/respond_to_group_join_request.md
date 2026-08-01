@@ -1,37 +1,54 @@
-# Tool: respond_to_group_join_request
+# 工具：`respond_to_group_join_request`
 
-`respond_to_group_join_request` approves or rejects a pending **join request to the current group** — a `<request kind="group.add" event_id="..." user_qq="..." comment="..."/>` row in the timeline. Maps to the OneBot V11 action `set_group_add_request`.
+## 功能
 
-## When to use
+`respond_to_group_join_request` 审批当前群的一条入群申请，对应 OneBot V11
+`set_group_add_request`。目标申请必须已作为
+`<request kind="group.add" event_id="..."/>` 出现在当前群时间线中。
 
-Only when a group **admin or owner** has given an explicit, unambiguous instruction to admit or reject a specific applicant. "同意 123456 进群" / "把刚申请的那个拒了" (with exactly one pending request) are actionable; silence, a joke, or a member (non-admin) saying "让他进吧" are not. When a request appears you may post one short line telling admins it exists — the tool call itself waits for their word.
+该工具不处理好友申请或机器人入群邀请。
 
-Ambiguity blocks the call: if "同意他" could match more than one pending `<request>` row, or you cannot tell which applicant is meant, ask for clarification instead of guessing. Never approve or reject on your own judgment, and never respond to the same request twice — after a successful call for an event_id, that request is settled.
-
-This tool cannot process friend requests or group invitations; those never appear in the group timeline.
-
-## Arguments
+## 参数
 
 ```json
 {
-  "tool_name": "respond_to_group_join_request",
-  "arguments": {
-    "request_event_id": "EV_123",
-    "approve": true,
-    "reason": ""
-  }
+  "request_event_id": "EV_123",
+  "approve": true,
+  "reason": ""
 }
 ```
 
-- `request_event_id` (required, string) — the `event_id` attribute of the `<request kind="group.add">` row, copied verbatim. The napcat credential (`flag`) is looked up from that event server-side; you never see or pass it. An event_id that is not a group.add request, or belongs to another group, is refused.
-- `approve` (required, boolean) — `true` admits the applicant, `false` turns them away.
-- `reason` (optional, string) — shown to the applicant when rejecting; ignored when approving.
+- `request_event_id`：必填字符串，取目标 `group.add` 请求事件的 `event_id`。
+  工具会根据该事件读取 napcat `flag`；调用参数不包含 `flag`。
+- `approve`：必填布尔值。`true` 表示同意，`false` 表示拒绝。
+- `reason`：可选字符串。`approve=false` 时作为拒绝原因传给平台；
+  `approve=true` 时忽略。
 
-## Permissions
+事件类型必须为 `external.request.group.add`，且事件所属群必须等于当前
+`scope_key` 中的群。
 
-- **Triggering user**: ADMIN-level — a group admin or owner must have asked for it. Set `triggered_by_event_id` on the call to that person's `<message>`; their live group role is verified at call time. Omitting it, or pointing at a non-admin's message, yields `permission_denied_user_tier`.
-- **The bot itself** must be a group **admin** (or owner) for napcat to accept the response. If it isn't, the call fails with the reason next tick — relay it, don't retry.
+## 权限与作用域
 
-## Result
+- `allowed_scopes=("group",)`。
+- `required_permission=ADMIN`。`triggered_by_event_id` 所指消息的发送者会在
+  调用时按实时群角色校验。
+- `required_bot_role="admin"`，群主同时满足该条件。
 
-On success: `{"request_event_id": "...", "group_id": <int>, "user_id": <int>, "approve": <bool>, "applied": true}`. The applicant joining also produces a `<notice kind="group_increase">` shortly after an approval. On failure you get a `tool_failed` with a structured reason (bad event_id, wrong group, permission, or a napcat error such as an already-expired request) — read it and explain or move on; don't blindly redial.
+## 返回
+
+成功返回：
+
+```json
+{
+  "request_event_id": "EV_123",
+  "group_id": 100,
+  "user_id": 456,
+  "approve": true,
+  "applied": true
+}
+```
+
+事件不存在、类型不匹配、事件不属于当前群或缺少 `flag` 时返回
+`invalid_arguments`。权限不满足时返回 `permission_denied_user_tier` 或
+`permission_denied_bot_role`；OneBot 调用失败时返回
+`upstream_action_failed`。

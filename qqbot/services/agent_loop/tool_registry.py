@@ -2,8 +2,8 @@
 
 一个 Tool 描述了 agent 可调用的一项能力：
   - name                 工具名（agent.tool_called.payload.tool_name 匹配它）
-  - description          提示给 LLM 的简短说明（写入 prompt 的 tool_catalog）
-  - arguments_schema     JSON Schema (dict)，描述 arguments 字段，纯文档用途
+  - description          面向 LLM 的客观中文能力简介（写入 tool_catalog）
+  - arguments_schema     JSON Schema (dict)，字段说明使用客观中文，纯文档用途
   - required_permission  (可选) 触发用户最低 tier；默认 GUEST
   - required_bot_role    (可选) 要求 bot 自己在群里的最低角色 "admin"/"owner"；默认
                          None（不限）。旧 require_bot_admin=True 等价 "admin"
@@ -14,8 +14,8 @@
 权限/判定语义（**全部在工具内**，详见 BaseTool 与 core/permissions.py）：
 
 - required_permission / required_bot_role / allowed_scopes 是**纯元数据**，不影响
-  catalog 可见性（scope 隔离除外）—— LLM 总能看见自己 scope 内的全部工具，靠
-  description 自判是否可调。
+  catalog 可见性（scope 隔离除外）—— LLM 总能看见自己 scope 内的全部工具，
+  根据接口说明与权限元数据生成调用。
 - execute() 第一行 ``if fail := await self.enforce_access(context): return fail``——
   enforce_access = enforce_scope（越 scope → tool_unavailable_in_scope）+
   enforce_permission（发起人 tier，**实时**查其当前群角色）+ enforce_bot_admin（bot
@@ -87,7 +87,8 @@ class ToolOutcome:
     error_kind**（契约 §6/§7.2）；Projection 据这两类事件渲染 ``<tool-call>``
     （两态：complete + ``<result>`` / ``<error>``）。
 
-    ``error_kind`` 收敛成固定语义集（见 envelope.md §<error>、契约 §7.2）：
+    ``error_kind`` 收敛成固定语义集（见 planner.md §输入信封格式规范 的 <error>、
+    契约 §7.2）：
       ``tool_unavailable_in_scope`` / ``invalid_arguments`` /
       ``permission_denied_user_tier`` / ``permission_denied_bot_role`` /
       ``no_bot_available`` / ``upstream_action_failed`` / ``internal_tool_error``。
@@ -169,8 +170,9 @@ class Tool(Protocol):
 
     # `usage_prompt` 不是必填——老工具或单测里的 stub 可以省略。
     # ToolRegistry.usage_docs() 用 getattr 兜底，缺失等同于空串。
-    # 命名约定：把详细用法（何时该调、参数搭配、结果解读、踩坑）放在
-    # sibling .md，由 prompts.load_sibling_md(__file__, "...") 加载注入。
+    # 命名约定：把客观中文接口文档（能力、参数、权限与作用域、返回和失败）放在
+    # sibling .md，由 prompts.load_sibling_md(__file__, "...") 加载注入；不在
+    # 工具文档中加入人格、情境偏好或调用倾向。
 
     # `required_permission` / `required_bot_role` 都不是必填——老工具或单测
     # stub 可以省略。catalog() 与工具内 enforce_* 用 getattr 兜底，缺失等同于
@@ -603,9 +605,9 @@ class ToolRegistry:
         ]
 
     def usage_docs(self, scope: str | None = None) -> str:
-        """汇总已注册工具的 usage_prompt，提示词库在 system prompt 里
+        """汇总已注册工具的中文接口文档，提示词库在 system prompt 里
         作为一段注入。空 usage_prompt 的工具静默跳过 —— 不会出现孤儿
-        `## Tool: foo` 标题。
+        `## 工具：foo` 标题。
 
         与 catalog() 对称地支持 per-scope 过滤：scope 给定时，allowed_scopes
         限定的工具的用法文档不进别的 scope 的 prompt（群专用工具的用法不泄漏进
@@ -624,7 +626,7 @@ class ToolRegistry:
             usage = str(usage).strip()
             if not usage:
                 continue
-            sections.append(f"## Tool: {name}\n\n{usage}")
+            sections.append(f"## 工具：{name}\n\n{usage}")
         return "\n\n".join(sections)
 
     def __len__(self) -> int:

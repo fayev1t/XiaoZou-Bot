@@ -44,12 +44,9 @@ class GetGroupInfoTool(BaseTool):
     # required_permission 用 BaseTool 默认 GUEST（查询无副作用）
     usage_prompt = _USAGE_PROMPT
     description = (
-        "Get basic info about the CURRENT group. Operates on the current "
-        "group only — group_id comes from your scope, you cannot query "
-        "another group. Takes no arguments. Returns group_id, group_name, "
-        "member_count and max_member_count, plus group_remark and "
-        "group_create_time when the platform provides them. Read-only, no "
-        "side effects."
+        "查询当前群的基础资料。无需参数，group_id 从当前 scope 注入。返回 "
+        "group_id、group_name、member_count、max_member_count，以及平台提供时的 "
+        "group_remark 和 group_create_time。该调用为只读操作。"
     )
     arguments_schema = {
         "type": "object",

@@ -44,14 +44,9 @@ class SetEssenceTool(BaseTool):
     required_bot_role = "admin"  # set_essence_msg 需要 bot 自己是群管理员
     usage_prompt = _USAGE_PROMPT
     description = (
-        "Set or unset a single message as a group ESSENCE message (群精华). "
-        "Pass message_id — the onebot_message_id of the target message — which "
-        "you read from a <message ... id=\"MESSAGE_ID\"> row in the timeline "
-        "(the id attribute IS the onebot_message_id) — and action: \"set\" "
-        "(default) to add it to the group essence list, or \"delete\" to "
-        "remove it. This is a high-visibility group-wide action; requires the "
-        "bot itself to be a group admin/owner — if it isn't, the call fails "
-        "and you'll see the reason next tick."
+        "将指定消息加入群精华列表或从列表移除。message_id 指定 "
+        "onebot_message_id；action=set 表示加入，action=delete 表示移除。调用"
+        "要求发起用户权限不低于 OWNER，机器人群角色不低于 admin。"
     )
     arguments_schema = {
         "type": "object",
@@ -59,16 +54,14 @@ class SetEssenceTool(BaseTool):
             "message_id": {
                 "type": "integer",
                 "description": (
-                    "onebot_message_id of the target message, taken from a "
-                    "<message ... id=\"MESSAGE_ID\"> row in the timeline."
+                    "目标消息的 onebot_message_id，对应时间线消息的 id 属性。"
                 ),
             },
             "action": {
                 "type": "string",
                 "enum": ["set", "delete"],
                 "description": (
-                    "\"set\" to mark the message as essence (default); "
-                    "\"delete\" to remove it from the essence list."
+                    "set 表示加入群精华列表；delete 表示从群精华列表移除。"
                 ),
                 "default": "set",
             },

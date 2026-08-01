@@ -1,31 +1,31 @@
-# Tool: whole_ban
+# 工具：`whole_ban`
 
-`whole_ban` turns the **current group's** whole-group mute (全员禁言) on or off. Maps to the OneBot V11 action `set_group_whole_ban`.
+## 功能
 
-## When to use
+`whole_ban` 开启或关闭当前群的全员禁言，对应 OneBot V11
+`set_group_whole_ban`。开启后，普通成员不能发言，群管理员和群主仍可发言。
 
-This is a **high-impact** switch: when it is on, *every* ordinary member is silenced and only admins/owner can speak. Reach for it only in genuine group-wide situations a group owner asked you to handle — e.g. shutting down a spam flood or ad raid, or quieting the group during an announcement — and lift it again as soon as the situation is over. Turning it on affects everyone at once and is highly visible, so never do it on a whim or to win an argument; for one disruptive person prefer `ban` (mute that member) or `kick` instead.
-
-## Arguments
+## 参数
 
 ```json
 {
-  "tool_name": "whole_ban",
-  "arguments": {
-    "enable": true
-  }
+  "enable": true
 }
 ```
 
-- `enable` (optional, bool, default `true`) — `true` turns whole-group mute **on** (nobody but admins can speak); `false` **lifts** it. Be explicit: pass `false` when someone asks you to "unmute the group" / "解除全员禁言".
+- `enable`：可选布尔值，默认 `true`；`true` 表示开启全员禁言，
+  `false` 表示关闭。
+- `group_id` 从当前 `scope_key` 注入，参数中不存在 `group_id`。
 
-The target group is **always the current one** — `group_id` is taken from your scope automatically; you cannot mute another group and there is no `group_id` argument.
+## 权限与作用域
 
-## Permissions
+- `allowed_scopes=("group",)`。
+- `required_permission=OWNER`。`triggered_by_event_id` 所指消息的发送者会在
+  调用时按实时群角色校验。
+- `required_bot_role="admin"`，群主同时满足该条件。
 
-- **Triggering user**: this is an OWNER-level action — the group owner (or a system admin) must have asked for it. Set `triggered_by_event_id` on the call to that person's message; if you omit it the caller is treated as GUEST and the action is refused.
-- **The bot itself** must be a group **admin** (or owner). If it isn't, the call fails and you'll see the reason next tick — relay it, don't keep retrying.
+## 返回
 
-## Result
-
-On success: `{"ok": true, "group_id": <int>, "enable": <bool>}`. On a permission failure (caller not allowed, or the bot isn't admin) or a napcat error you get a `tool_failed` with a human-readable reason — read it, explain or abort, do **not** blindly retry the same call.
+成功返回 `ok`、`group_id` 和 `enable`。权限条件不满足时返回
+`permission_denied_user_tier` 或 `permission_denied_bot_role`；OneBot
+调用失败时返回 `upstream_action_failed`。

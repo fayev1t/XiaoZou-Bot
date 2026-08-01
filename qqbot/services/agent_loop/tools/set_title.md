@@ -1,35 +1,33 @@
-# Tool: set_title
+# 工具：`set_title`
 
-`set_title` sets — or clears — the special title (专属头衔) of a member in the **current group**. Maps to the OneBot V11 action `set_group_special_title` (note: napcat's parameter is named `special_title`).
+## 功能
 
-## When to use
+`set_title` 设置或清空当前群中指定成员的专属头衔，对应 OneBot V11
+`set_group_special_title`。
 
-Use it only when the group **owner** asks you to award a special title — a small honorific badge shown next to a member's name — or to remove one. Titles are cosmetic but owner-gated by QQ, so treat them as a privileged, owner-only favour. To remove a title, pass an empty string.
-
-Don't hand out titles on your own initiative, to tease someone, or on a non-owner's say-so. Keep the text short and inoffensive; QQ caps the length (commonly ~6 Chinese chars) and may silently truncate or reject an over-long title.
-
-## Arguments
+## 参数
 
 ```json
 {
-  "tool_name": "set_title",
-  "arguments": {
-    "user_id": 12345,
-    "title": "传奇人物"
-  }
+  "user_id": 12345,
+  "title": "专属头衔"
 }
 ```
 
-- `user_id` (required, int) — the QQ number of the member whose title to set. Read it from a `<message sender_qq="USER_QQ">` row in the timeline, or from an inline `<at qq="USER_QQ"/>` segment. Don't invent ids.
-- `title` (optional, string, default `""`) — the new special title. An **empty string clears** it. The tool maps this onto napcat's `special_title` field for you; you always pass `title`.
+- `user_id`：必填整数，表示目标成员的 QQ 号。
+- `title`：可选字符串，默认空字符串；空字符串表示清空专属头衔。
+- `group_id` 从当前 `scope_key` 注入，参数中不存在 `group_id`。
+- 工具会将 `title` 映射为 OneBot 的 `special_title` 参数。
 
-The target group is **always the current one** — `group_id` is taken from your scope automatically; you cannot edit titles in another group and there is no `group_id` argument.
+## 权限与作用域
 
-## Permissions
+- `allowed_scopes=("group",)`。
+- `required_permission=OWNER`。`triggered_by_event_id` 所指消息的发送者会在
+  调用时按实时群角色校验。
+- `required_bot_role="owner"`；机器人为普通管理员时不满足条件。
 
-- **Triggering user**: this is an OWNER-level action — only the group owner can authorize it. Set `triggered_by_event_id` on the call to the owner's message; if you omit it the caller is treated as GUEST and the change is refused.
-- **The bot itself** must be the group **owner** (群主). Admin is not enough — special titles are an owner-only power. If the bot isn't the owner, the call fails and you'll see the reason next tick — relay it, don't keep retrying.
+## 返回
 
-## Result
-
-On success: `{"ok": true, "group_id": <int>, "user_id": <int>, "title": <str>}`. On a permission failure (caller not the owner, or the bot isn't the owner) or a napcat error you get a `tool_failed` with a human-readable reason — read it, explain or abort, do **not** blindly retry the same call.
+成功返回 `ok`、`group_id`、`user_id` 和 `title`。权限条件不满足时返回
+`permission_denied_user_tier` 或 `permission_denied_bot_role`；OneBot
+调用失败时返回 `upstream_action_failed`。

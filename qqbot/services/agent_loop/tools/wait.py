@@ -5,9 +5,9 @@
 说完再回"。本工具把"何时思考"的部分决定权交还模型。
 
 职责收窄（2026-07-19，ReplyTask 换轨）："等他把话说完再回"的回复防抖已整体
-移交 reply 工具的维持窗口（局势变化时追加一份完整授权，最新 hold_seconds
-直接替换旧时机；见 group_chat_rules §时机）；wait 只保留自我提醒
-/ 延迟执行其它动作的用途，description 与 wait.md 不得再引导用它等分条消息。
+移交 reply 工具的等待窗口（局势变化时再调一次，最新 hold_seconds 直接替换
+旧时机；2026-08-01 起 reply 只剩这一个参数）；wait 只保留自我提醒 / 延迟
+执行其它动作的用途，description 与 wait.md 不得再引导用它等分条消息。
 
 执行语义（**绝不在工具内 sleep**——ToolWorker 串行跑工具，长眠会卡死整个
 派发通道）：execute() 只登记一个 asyncio 定时器就立刻返回成功（带 wake_at）。
@@ -51,17 +51,10 @@ class WaitTool(BaseTool):
 
     name = "wait"
     description = (
-        "Schedule a wake-up for yourself after N seconds. Use this when the "
-        "right move is to check back later instead of acting now — e.g. you "
-        "promised to follow up in a few minutes, or a running task deserves "
-        "a later look. NOT for holding a reply while someone finishes a "
-        "multi-part message — that is the reply tool's hold window (call "
-        "reply again with a fresh complete authorization when the picture "
-        "changes; the newest hold_seconds replaces the old wait). When the "
-        "timer fires you get a new tick whose timeline carries "
-        '<system-hint kind="wait_elapsed"> echoing your note. The timer is '
-        "in-memory: a process restart drops it (your wait tool-call stays "
-        "visible in the timeline, so you can tell and re-schedule)."
+        "在指定秒数后为当前 scope 安排一次唤醒。计时器触发时写入包含 note 的 "
+        '<system-hint kind="wait_elapsed"> 并启动新 tick。计时器仅保存在进程'
+        "内存中，进程重启后不会恢复；工具调用记录仍保留在时间线中。本工具不"
+        "修改 reply 草稿或其 hold_seconds。"
     )
     usage_prompt = _USAGE_PROMPT
     arguments_schema = {
@@ -72,16 +65,14 @@ class WaitTool(BaseTool):
                 "minimum": MIN_WAIT_SECONDS,
                 "maximum": MAX_WAIT_SECONDS,
                 "description": (
-                    "Delay before the wake-up, in seconds "
-                    f"({MIN_WAIT_SECONDS}-{MAX_WAIT_SECONDS})."
+                    "唤醒前的等待秒数，取值范围为 "
+                    f"{MIN_WAIT_SECONDS}–{MAX_WAIT_SECONDS}。"
                 ),
             },
             "note": {
                 "type": "string",
                 "description": (
-                    "Why you are waiting / what to do on wake-up. Echoed "
-                    "back verbatim inside the wait_elapsed hint — this is "
-                    "your memo to your future self."
+                    "可选备忘文本；计时器触发后会原样写入 wait_elapsed 提示。"
                 ),
             },
         },

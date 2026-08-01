@@ -1,26 +1,47 @@
-# websearch — when and how to use
+# 工具：`websearch`
 
-## When to call
+## 功能
 
-- The user asks about something time-sensitive (今天的新闻 / 最新版本 / 比赛比分 / 价格行情) that your training cutoff cannot cover.
-- A factual claim is being argued in the group and you need an external citation.
-- A name, paper, repo, or product reference is mentioned that you don't recognize — search before guessing.
+`websearch` 按关键词检索公开网页，返回结构化搜索结果，并可为前若干条结果
+附加正文。后端由 `WEBSEARCH_PROVIDER` 选择：默认 `exa`，可选
+`tavily`。
 
-Do **NOT** call websearch for:
-- Pure opinion / chat / casual jokes — just reply.
-- Information already present in the timeline (including a completed `<tool-call name="websearch">` row from an earlier tick).
-- Looking up an internal QQ user (use `search_history` instead).
+## 参数
 
-## Arguments
+- `query`：必填非空字符串，自然语言搜索关键词。
+- `fetch_top_n`：可选整数，默认 0，范围 0–5。大于 0 时，为前 N 条结果附加
+  `fetched_text`；正文抓取失败时对应结果包含 `fetch_error`。
+- `max_results`：可选整数，默认 10，范围 1–20，表示返回结果数量上限。
 
-- `query` (required): plain natural-language keywords. Be specific; cut filler words. Use the language the source material is written in (e.g., Chinese keywords for Chinese sites).
-- `fetch_top_n` (optional, default 0, max 5): also return full body text for the top N hits. Costly — only set this when snippets are clearly insufficient (e.g. you need a quote, a number from inside an article). Leave at 0 for "I just need URLs and one-liner summaries".
-- `max_results` (optional, default 10, max 20): upper bound on hits returned.
+## 权限与作用域
 
-## Result interpretation
+`required_permission=GUEST`，`allowed_scopes` 不限，不要求机器人群角色。
 
-Each item has `title`, `url`, `snippet`, optionally `fetched_text` (if `fetch_top_n` covered it) and `fetch_error` (body unavailable for that hit — don't retry it, work with the snippet). To read ONE specific URL you already have (from chat or from an earlier search), use the `webfetch` tool instead of searching again.
+## 返回
 
-## After the call
+成功返回：
 
-The result appears on your `<tool-call name="websearch">` timeline row (status="complete") on the next tick. Read it BEFORE issuing another search — don't search the same thing twice. When replying, cite the source URL inline so users can verify.
+```json
+{
+  "query": "搜索词",
+  "engine": "exa",
+  "results": [
+    {
+      "title": "标题",
+      "url": "https://example.com/",
+      "snippet": "摘要",
+      "fetched_text": null,
+      "fetch_error": null
+    }
+  ],
+  "warnings": []
+}
+```
+
+`fetched_text` 仅在 `fetch_top_n` 覆盖该结果且正文读取成功时填充，单条最长
+8000 个字符。单条正文读取失败不会使整次搜索失败，而是写入该条
+`fetch_error`。
+
+`query` 为空时返回 `invalid_arguments`。后端配置无效时返回
+`internal_tool_error`；搜索服务或网络异常由工具基类归一为
+`internal_tool_error`。

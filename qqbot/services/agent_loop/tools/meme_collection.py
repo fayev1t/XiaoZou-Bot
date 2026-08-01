@@ -53,8 +53,8 @@ delete_meme / recaption_meme 合并而来（应用户拍板"能力全集合在�
   internal_tool_error  session_factory / caption_image 未接线。
   另沿用 tool_unavailable_in_scope。
 
-发送不属于本工具：Planner 在 send_messages 的 messages 里放一个
-`{"kind":"meme","image_hash":…}` 气泡（每次至多一张），与文本一起按序发送。
+发送不属于本工具：Planner 在 send_messages 的 messages 里放
+`{"kind":"meme","image_hash":…}` 气泡（数量不限），与文本一起按序发送。
 
 依赖注入：session_factory / caption_image / tool_call_event_id 全部来自
 ToolWorker 统一注入的 run() context，无构造依赖。
@@ -103,21 +103,11 @@ class MemeCollectionTool(BaseTool):
 
     name = "meme_collection"
     description = (
-        "Your saved-meme (表情包) collection. This tool ONLY curates the "
-        "collection — it never sends anything and there is no send action; "
-        "the reply composer picks at most one meme out of <saved-memes> on "
-        "its own when a reply_task flushes. What you do here decides what it "
-        "will have to choose from. `action` selects the operation. 'save' "
-        "collects an image from this chat into the collection (the system "
-        "looks at the image and writes the searchable description — you do "
-        "not write it; optional context_note adds chat context the pixels "
-        "cannot show; pass an ARRAY of up to 10 hashes to save several "
-        "images at once). 'delete' removes a saved meme from the "
-        "collection. 'recaption' regenerates a saved meme's description "
-        "(optional context_note steers it). Every action takes image_hash, "
-        'copied VERBATIM: for save from an <image hash="..."/> tag in the '
-        'timeline; for delete/recaption from a <meme hash="..."> entry in '
-        "<saved-memes>."
+        "管理全局共享的表情包收藏夹，不执行发送。action=save 按 image_hash "
+        "收录图片并生成检索描述，支持最多 10 个 hash 的数组；action=delete 删除"
+        "收藏记录；action=recaption 重新生成收藏描述。save 和 recaption 可通过 "
+        "context_note 提供图片本身不包含的上下文。表情包发送由 send_messages 的 "
+        "meme 气泡完成。"
     )
     usage_prompt = _USAGE_PROMPT
     # 收藏管理挂在聊天 scope 上；system scope 不暴露。
@@ -128,31 +118,21 @@ class MemeCollectionTool(BaseTool):
             "action": {
                 "type": "string",
                 "enum": ["save", "delete", "recaption"],
-                "description": (
-                    "Which operation to perform on the meme collection."
-                ),
+                "description": "收藏操作：save、delete 或 recaption。",
             },
             "image_hash": {
                 "type": ["string", "array"],
                 "items": {"type": "string"},
                 "description": (
-                    "64-char sha256 hex of the image. For action=save copy "
-                    'it verbatim from an <image hash="..."/> tag in the '
-                    "timeline; for delete/recaption from a "
-                    '<meme hash="..."> entry in <saved-memes> (or from an '
-                    "earlier save result). action=save also accepts an "
-                    "array of up to 10 hashes (batch save); the other "
-                    "actions take a single string only."
+                    "图片的 64 位 sha256 十六进制值。save 可接收单个字符串或最多 "
+                    "10 个字符串的数组；delete 和 recaption 仅接收单个字符串。"
                 ),
             },
             "context_note": {
                 "type": "string",
                 "description": (
-                    "Only for action=save/recaption: optional chat context "
-                    "the image itself cannot show (e.g. 这是谁的名场面 / "
-                    "本群拿它玩什么梗). Folded into the generated "
-                    "description; not shown to users. For recaption, omit "
-                    "to reuse the note recorded at save time."
+                    "仅用于 save 和 recaption 的可选上下文，内容会参与描述生成但"
+                    "不会直接展示给用户。recaption 省略该字段时复用收录时保存的值。"
                 ),
             },
         },

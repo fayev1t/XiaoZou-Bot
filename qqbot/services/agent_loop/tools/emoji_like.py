@@ -47,13 +47,8 @@ class EmojiLikeTool(BaseTool):
     # required_bot_role 不设：贴表情回应是轻量互动，bot 无需群管理员。
     usage_prompt = _USAGE_PROMPT
     description = (
-        "React to a single message with a QQ emoji (表情回应) in the CURRENT "
-        "group. Pass message_id — the onebot_message_id of the target "
-        "message — which you read from a <message ... id=\"MESSAGE_ID\"> row "
-        "in the timeline (the id attribute IS the onebot_message_id) — "
-        "emoji_id (the QQ emoji/face id to react with; number or string), and "
-        "set (true = add the reaction, the default; false = remove a reaction "
-        "you previously added)."
+        "为当前群中的指定消息添加或移除 QQ 表情回应。message_id 指定 OneBot "
+        "消息，emoji_id 指定 QQ 表情 ID，set=true 表示添加，set=false 表示移除。"
     )
     arguments_schema = {
         "type": "object",
@@ -61,22 +56,16 @@ class EmojiLikeTool(BaseTool):
             "message_id": {
                 "type": "integer",
                 "description": (
-                    "onebot_message_id of the target message, taken from a "
-                    "<message ... id=\"MESSAGE_ID\"> row in the timeline."
+                    "目标消息的 onebot_message_id，对应时间线消息的 id 属性。"
                 ),
             },
             "emoji_id": {
                 "type": "string",
-                "description": (
-                    "QQ emoji/face id to react with (number or string)."
-                ),
+                "description": "QQ 表情或 face 的 ID，可使用数字字符串。",
             },
             "set": {
                 "type": "boolean",
-                "description": (
-                    "true = add the emoji reaction (default); false = remove "
-                    "it."
-                ),
+                "description": "true 表示添加回应；false 表示移除回应。",
                 "default": True,
             },
         },

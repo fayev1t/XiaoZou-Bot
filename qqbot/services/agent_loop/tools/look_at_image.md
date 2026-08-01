@@ -1,34 +1,40 @@
-# look_at_image — when and how to use
+# 工具：`look_at_image`
 
-## What you already have
+## 功能
 
-Every downloaded image in the timeline arrives with `desc="..."` — an objective transcription written by a vision model the moment the image was received: what is in the frame, and every piece of text in it, copied out verbatim. **That description is written with no knowledge of the conversation**, because at the time the image arrived the surrounding messages often did not exist yet. It describes; it does not interpret.
+`look_at_image` 针对一张已下载图片执行一次视觉问答。时间线中已有的
+`desc="..."` 是图片接收时生成的通用转录；本工具会新建一次视觉模型调用，并
+针对 `question` 返回答案，不修改原有 `desc`。
 
-So the split is: what the image *contains* is already in your hands. What it *means here, now, in this conversation* is your job — you have the timeline, the description writer did not.
+## 参数
 
-## When to call
+```json
+{
+  "image_hash": "<64 位 sha256>",
+  "question": "需要从图片中识别的具体信息"
+}
+```
 
-Only when the answer you need is something the description could not have anticipated, and the pixels would settle it. That means the information is genuinely in the image but too fine-grained, too peripheral, or too dependent on the current question for a general transcription to have captured it.
+- `image_hash`：必填，时间线 `<image hash="..."/>` 中的 64 位 sha256。
+  没有 hash 的图片未落盘，不能调用本工具查询。
+- `question`：必填非空字符串，最长 500 个字符。视觉模型仅接收图片和该问题，
+  不接收群聊时间线；问题中需要包含回答所需的上下文。
 
-Do **NOT** call it:
+## 权限与作用域
 
-- To get a description. You have one. Asking again spends a vision call to receive worse information than the `desc=` already in front of you.
-- To re-read text that the `desc=` already transcribed.
-- On an `<image/>` with no `hash=` — that image was never downloaded and there is nothing to look at.
-- To ask the same question about the same image twice. Your earlier answer is still on its `<tool-call>` row in the timeline; read it there.
-- When your real uncertainty is about intent rather than content — why someone sent an image is read from the conversation, not from the picture.
+`required_permission=GUEST`，`allowed_scopes` 不限，不要求机器人群角色。
 
-## Arguments
+## 返回
 
-- `image_hash` (required): the 64-char sha256, copied verbatim from `<image hash="..."/>`.
-- `question` (required): the one specific thing you need to know. The model on the other end sees the image and your question — nothing else. If understanding the question requires context, put that context into the question yourself, in your own words. A vague or general question wastes the call.
+成功返回：
 
-## Result interpretation
+```json
+{
+  "image_hash": "<sha256>",
+  "question": "...",
+  "answer": "视觉模型回答"
+}
+```
 
-You get back an answer to exactly what you asked, and nothing else — no summary of the image, no advice. If the answer says the image does not show it, believe it and do not ask a rephrased version of the same question; that is the model telling you the pixels have no more to give.
-
-A failure means the image is unreachable (wrong hash, never downloaded, file cleaned up) or the vision backend is temporarily unavailable. Neither is fixed by retrying immediately.
-
-## After the call
-
-The answer appears on your `<tool-call name="look_at_image">` timeline row on the next tick, and stays there for the rest of the window — it is now part of what you know about that image, alongside its `desc=`.
+hash 格式错误或问题为空时返回 `invalid_arguments`；图片文件不存在时返回
+`image_not_found`；视觉模型调用失败时返回 `upstream_action_failed`。

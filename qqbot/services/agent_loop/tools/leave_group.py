@@ -39,14 +39,10 @@ class LeaveGroupTool(BaseTool):
     # 自己退群不需要 bot 是管理员 → 不设 required_bot_role（保持 BaseTool 默认 None）。
     usage_prompt = _USAGE_PROMPT
     description = (
-        "⚠️ HIGH-RISK, IRREVERSIBLE. Make the bot LEAVE the CURRENT group "
-        "(or DISMISS the whole group if the bot is its owner and "
-        "is_dismiss=true). Operates on the current group only — group_id comes "
-        "from your scope, you cannot affect another group. Pass is_dismiss "
-        "(optional, default false): when true and the bot is the group owner, "
-        "the entire group is disbanded. After this runs the bot is gone from "
-        "the group and can no longer receive or send anything there; this "
-        "cannot be undone — only do it on an explicit owner request."
+        "使机器人退出当前群。group_id 从当前 scope 注入；is_dismiss=false 时仅"
+        "退出，is_dismiss=true 时解散整个群。调用要求发起用户权限不低于 OWNER；"
+        "解散群还要求机器人群角色为 owner。成功退出后机器人无法继续收发该群"
+        "消息，本工具不提供撤销操作。"
     )
     arguments_schema = {
         "type": "object",
@@ -54,8 +50,8 @@ class LeaveGroupTool(BaseTool):
             "is_dismiss": {
                 "type": "boolean",
                 "description": (
-                    "If true and the bot is the group owner, dismiss "
-                    "(disband) the whole group instead of just leaving."
+                    "false 表示机器人退出当前群；true 表示解散整个群，并要求"
+                    "机器人为群主。"
                 ),
                 "default": False,
             },

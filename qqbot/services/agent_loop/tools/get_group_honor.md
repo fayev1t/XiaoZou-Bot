@@ -1,31 +1,32 @@
-# Tool: get_group_honor
+# 工具：`get_group_honor`
 
-`get_group_honor` gets the honor / leaderboard info for the **current group** (talkative streak 龙王, performers 群聊之火, legends 群聊炽焰, etc.). Maps to the OneBot V11 action `get_group_honor_info`.
+## 功能
 
-## When to use
+`get_group_honor` 查询当前群的荣誉与榜单信息，对应 OneBot V11
+`get_group_honor_info`。该调用为只读操作。
 
-This is a **read-only** lookup. Use it when the conversation is about group rankings or honors: who the current 龙王 (talkative streak holder) is, who the top talkers / performers are, or for a bit of fun when someone asks "谁是龙王". Each leaderboard can be long, so the result keeps only the **top few** of each list — it's for naming the leaders, not for reproducing the full board.
-
-## Arguments
+## 参数
 
 ```json
 {
-  "tool_name": "get_group_honor",
-  "arguments": {
-    "type": "all"
-  }
+  "type": "all"
 }
 ```
 
-- `type` (optional, string, default `"all"`) — which leaderboard to fetch. One of: `talkative`, `performer`, `legend`, `strong_newbie`, `emotion`, or `all`. Use `all` (the default) to get every board at once; pick a specific one only when you just need that single ranking.
+`type` 为可选字符串，默认 `all`，支持 `talkative`、`performer`、
+`legend`、`strong_newbie`、`emotion` 和 `all`。`group_id` 从当前
+`scope_key` 注入，参数中不存在 `group_id`。
 
-The target group is **always the current one** — `group_id` is taken from your scope automatically; you cannot query another group and there is no `group_id` argument.
+## 权限与作用域
 
-## Permissions
+`allowed_scopes=("group",)`，`required_permission=GUEST`，不要求机器人
+群角色。
 
-- **Triggering user**: none required. This is a GUEST-level read with no side effects, so any caller can prompt it and you do **not** need to set `triggered_by_event_id`.
-- **The bot itself**: no special role needed — the bot does **not** have to be a group admin to read honor info.
+## 返回
 
-## Result
+成功结果包含 `group_id`、`type`，以及平台提供时的
+`current_talkative` 和一个或多个 `*_list`。每个榜单最多返回前 5 条，每条
+仅保留 `user_id`、`nickname`、`description`。没有数据的榜单不会出现在
+结果中。
 
-On success: `{"group_id", "type", ...}` plus, when present, `current_talkative` (the active 龙王) and one or more `*_list` entries (`talkative_list`, `performer_list`, `legend_list`, …). Each leaderboard list is **trimmed to its top 5** entries, and every entry is slimmed to `{"user_id", "nickname", "description"}` (avatars and counts are dropped). A board with no data simply won't appear in the result. On a napcat error you get a `tool_failed` with a human-readable reason — read it and explain or move on, do **not** blindly retry the same call.
+OneBot 调用失败时返回 `upstream_action_failed`。

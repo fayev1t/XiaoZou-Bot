@@ -1,47 +1,53 @@
-# Tool: get_pending_join_requests
+# 工具：`get_pending_join_requests`
 
-`get_pending_join_requests` counts and lists the join requests currently **pending** for the **current group**. Maps to the napcat extended action `get_group_system_msg` (go-cqhttp compatible).
+## 功能
 
-## When to use
+`get_pending_join_requests` 查询当前群在 napcat 系统消息中的入群申请，对应
+`get_group_system_msg`。该调用为只读操作，只返回当前群的待处理申请和近期已
+处理数量；其他群的申请及机器人入群邀请会被过滤。
 
-This is a **read-only** lookup. Use it when an admin asks things like "现在有几个入群申请？" / "谁在申请进群？", or when you want to double-check the live backlog before or after handling a `<request kind="group.add"/>` row. It reflects napcat's **current** view of the account's system messages, filtered down to this group — requests belonging to other groups and invitations for the bot itself are dropped before you see anything.
-
-## Arguments
+## 参数
 
 ```json
-{
-  "tool_name": "get_pending_join_requests",
-  "arguments": {}
-}
+{}
 ```
 
-This tool **takes no arguments**. The target group is **always the current one** — `group_id` is taken from your scope automatically; you cannot query another group's requests.
+本工具不接收业务参数。`group_id` 从当前 `scope_key` 注入，参数中不存在
+`group_id`。
 
-## Permissions
+## 权限与作用域
 
-- **Triggering user**: none required. This is a GUEST-level read with no side effects, so any caller can prompt it and you do **not** need to set `triggered_by_event_id`. (Actually approving/rejecting via `respond_to_group_join_request` is a separate, ADMIN-gated step.)
-- **The bot itself**: must be a **group admin or owner** — QQ only delivers join requests to admins, so a non-admin bot has nothing to query. If the bot isn't admin the call fails upfront with `permission_denied_bot_role` instead of returning a misleading empty list.
+- `allowed_scopes=("group",)`。
+- `required_permission=GUEST`。
+- `required_bot_role="admin"`，群主同时满足该条件。
 
-## Result
+## 返回
 
-On success:
+成功返回：
 
 ```json
 {
   "group_id": 100,
   "pending_count": 2,
   "requests": [
-    {"user_id": 456, "nickname": "小明", "comment": "同学推荐来的"}
+    {"user_id": 456, "nickname": "小明", "comment": "申请说明"}
   ],
   "handled_recent_count": 1,
   "may_be_incomplete": true
 }
 ```
 
-- `requests` — **pending** requests only, capped at 50 entries (`pending_count` is the full filtered count). `nickname` / `comment` may be null. The napcat `flag` credential is **never** included — approving never requires it from you.
-- `handled_recent_count` — recently handled (already accepted/rejected) requests of this group still visible in the system-message window. Informational only; do not act on them again.
-- `may_be_incomplete` — always true: the platform only returns the most recent system messages, so under a large backlog the true count may be higher. When precision matters, say "至少 N 个" instead of claiming an exact total.
+- `pending_count` 是当前响应中属于本群的待处理申请数。
+- `requests` 最多返回 50 条；`nickname` 和 `comment` 可以为 `null`。
+- 返回结果不包含 napcat `flag`。
+- `handled_recent_count` 是响应窗口中属于本群且已处理的申请数。
+- `may_be_incomplete` 固定为 `true`，表示平台只返回近期系统消息，结果不保证
+  覆盖全部历史积压。
 
-## Acting on a request
+本工具的结果不包含 `request_event_id`。审批操作
+`respond_to_group_join_request` 使用时间线
+`<request kind="group.add">` 事件的 `event_id`。没有对应时间线事件的申请
+不能通过该审批工具处理。
 
-This tool does **not** return a `request_event_id`. To approve or reject, find the matching `<request kind="group.add" user_qq="..."/>` row in your timeline (match by `user_id`) and call `respond_to_group_join_request` with that row's `event_id` — and only on an explicit admin/owner instruction. If a pending request has **no** timeline row (it arrived while the bot was offline and napcat does not re-push request events), you cannot respond to it via tools: tell the admin to handle that one in the QQ client. On a napcat error you get a `tool_failed` with a human-readable reason — read it and explain or move on, do **not** blindly retry the same call.
+上游响应结构无法识别时返回 `upstream_payload_invalid`；OneBot 调用失败时
+返回 `upstream_action_failed`。

@@ -35,10 +35,9 @@ class TaskTool(BaseTool):
     name = "task"
     execution_mode = "inline"
     description = (
-        "Create and maintain durable tasks that must survive across ticks. "
-        "Use action=create/note/complete/fail. This tool completes inline in "
-        "the current tick, so a create result can define a task_ref for later "
-        "call_tool actions in the same actions list."
+        "创建并维护可跨 tick 持续存在的任务。action 支持 create、note、"
+        "complete 和 fail。工具在当前 tick 内联执行；create 返回的 task_ref "
+        "可供同一 actions 列表中的后续 call_tool 动作引用。"
     )
     usage_prompt = _USAGE_PROMPT
     arguments_schema = {
@@ -46,23 +45,32 @@ class TaskTool(BaseTool):
         "oneOf": [
             {
                 "properties": {
-                    "action": {"const": "create"},
+                    "action": {
+                        "const": "create",
+                        "description": "固定为 create，表示创建任务。",
+                    },
                     "description": {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": _SHORT_TEXT_MAX_LENGTH,
+                        "description": "任务目标描述。",
                     },
                     "related_tools": {
                         "type": "array",
                         "items": {"type": "string", "minLength": 1},
+                        "description": "与任务相关的工具名列表。",
                     },
                     "parent_task_id": {
                         "type": ["string", "null"],
                         "minLength": 1,
+                        "description": "父任务 ID；无父任务时可省略或传 null。",
                     },
                     "task_ref": {
                         "type": ["string", "null"],
                         "minLength": 1,
+                        "description": (
+                            "本次 actions 列表内使用的任务别名；create 结果会原样返回。"
+                        ),
                     },
                 },
                 "required": ["action", "description"],
@@ -70,12 +78,20 @@ class TaskTool(BaseTool):
             },
             {
                 "properties": {
-                    "action": {"const": "note"},
-                    "task_id": {"type": "string", "minLength": 1},
+                    "action": {
+                        "const": "note",
+                        "description": "固定为 note，表示追加进度记录。",
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "目标任务 ID。",
+                    },
                     "note": {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": _SHORT_TEXT_MAX_LENGTH,
+                        "description": "写入任务的进度记录。",
                     },
                 },
                 "required": ["action", "task_id", "note"],
@@ -83,12 +99,20 @@ class TaskTool(BaseTool):
             },
             {
                 "properties": {
-                    "action": {"const": "complete"},
-                    "task_id": {"type": "string", "minLength": 1},
+                    "action": {
+                        "const": "complete",
+                        "description": "固定为 complete，表示完成任务。",
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "目标任务 ID。",
+                    },
                     "result_summary": {
                         "type": ["string", "null"],
                         "minLength": 1,
                         "maxLength": _DETAIL_TEXT_MAX_LENGTH,
+                        "description": "可选的任务结果摘要。",
                     },
                 },
                 "required": ["action", "task_id"],
@@ -96,12 +120,20 @@ class TaskTool(BaseTool):
             },
             {
                 "properties": {
-                    "action": {"const": "fail"},
-                    "task_id": {"type": "string", "minLength": 1},
+                    "action": {
+                        "const": "fail",
+                        "description": "固定为 fail，表示任务失败。",
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "目标任务 ID。",
+                    },
                     "reason": {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": _DETAIL_TEXT_MAX_LENGTH,
+                        "description": "任务失败原因。",
                     },
                 },
                 "required": ["action", "task_id", "reason"],

@@ -1,35 +1,33 @@
-# Tool: set_admin
+# 工具：`set_admin`
 
-`set_admin` grants or revokes group-admin (管理员) status for a member of the **current group**. Maps to the OneBot V11 action `set_group_admin`.
+## 功能
 
-## When to use
+`set_admin` 授予或撤销当前群中指定成员的管理员身份，对应 OneBot V11
+`set_group_admin`。
 
-Use it **only** on the explicit instruction of the group **owner** to promote a trusted member to admin, or to demote one. This hands over (or takes back) real moderation power — the ability to mute, kick, and manage others — so it is one of the most consequential actions available. There is no partial step: the person either becomes an admin or loses it.
-
-Never promote/demote on your own judgement, to reward banter, or based on a non-owner's request. When in doubt, decline and ask the owner to confirm.
-
-## Arguments
+## 参数
 
 ```json
 {
-  "tool_name": "set_admin",
-  "arguments": {
-    "user_id": 12345,
-    "enable": true
-  }
+  "user_id": 12345,
+  "enable": true
 }
 ```
 
-- `user_id` (required, int) — the QQ number of the member to promote or demote. Read it from a `<message sender_qq="USER_QQ">` row in the timeline, or from an inline `<at qq="USER_QQ"/>` segment. Don't invent ids.
-- `enable` (optional, bool, default `true`) — `true` makes them a group admin; `false` revokes their admin. Be explicit; don't rely on the default when demoting.
+- `user_id`：必填整数，表示目标成员的 QQ 号。
+- `enable`：可选布尔值，默认 `true`；`true` 表示授予管理员，
+  `false` 表示撤销管理员。
+- `group_id` 从当前 `scope_key` 注入，参数中不存在 `group_id`。
 
-The target group is **always the current one** — `group_id` is taken from your scope automatically; you cannot change roles in another group and there is no `group_id` argument.
+## 权限与作用域
 
-## Permissions
+- `allowed_scopes=("group",)`。
+- `required_permission=OWNER`。`triggered_by_event_id` 所指消息的发送者会在
+  调用时按实时群角色校验。
+- `required_bot_role="owner"`；机器人为普通管理员时不满足条件。
 
-- **Triggering user**: this is an OWNER-level action — only the group owner can authorize it. Set `triggered_by_event_id` on the call to the owner's message; if you omit it the caller is treated as GUEST and the change is refused.
-- **The bot itself** must be the group **owner** (群主). Admin is not enough — appointing admins is an owner-only power. If the bot isn't the owner, the call fails and you'll see the reason next tick — relay it, don't keep retrying.
+## 返回
 
-## Result
-
-On success: `{"ok": true, "group_id": <int>, "user_id": <int>, "enable": <bool>}`. On a permission failure (caller not the owner, or the bot isn't the owner) or a napcat error you get a `tool_failed` with a human-readable reason — read it, explain or abort, do **not** blindly retry the same call.
+成功返回 `ok`、`group_id`、`user_id` 和 `enable`。权限条件不满足时返回
+`permission_denied_user_tier` 或 `permission_denied_bot_role`；OneBot
+调用失败时返回 `upstream_action_failed`。

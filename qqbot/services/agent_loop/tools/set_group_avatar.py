@@ -40,15 +40,9 @@ class SetGroupAvatarTool(BaseTool):
     required_bot_role = "admin"  # set_group_portrait 需要 bot 自己是群管理员
     usage_prompt = _USAGE_PROMPT
     description = (
-        "Set the avatar (portrait) of the CURRENT group. Operates on the "
-        "current group only — group_id comes from your scope, you cannot "
-        "affect another group. Pass file (required): an image source — a URL, "
-        "a local file path, or a base64 string. NOTE: the bot usually has no "
-        "ready image source of its own, so this tool is of limited usefulness "
-        "in practice but is kept for cases where an image source is available. "
-        "This is a high-visibility change everyone in the group sees; requires "
-        "the bot itself to be a group admin/owner — if it isn't, the call "
-        "fails and you'll see the reason next tick."
+        "设置当前群的群头像。group_id 从当前 scope 注入，file 接收图片 URL、"
+        "本地文件路径或 base64 字符串。调用要求发起用户权限不低于 OWNER，"
+        "机器人群角色不低于 admin。"
     )
     arguments_schema = {
         "type": "object",
@@ -56,8 +50,7 @@ class SetGroupAvatarTool(BaseTool):
             "file": {
                 "type": "string",
                 "description": (
-                    "Image source: URL, local file path, or base64 string "
-                    "(required)."
+                    "图片来源，支持 URL、本地文件路径或 base64 字符串；必填。"
                 ),
             },
         },

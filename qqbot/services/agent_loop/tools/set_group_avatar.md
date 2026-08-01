@@ -1,31 +1,32 @@
-# Tool: set_group_avatar
+# 工具：`set_group_avatar`
 
-`set_group_avatar` sets the avatar (portrait) of the **current group**. Maps to the OneBot V11 action `set_group_portrait`.
+## 功能
 
-## When to use
+`set_group_avatar` 设置当前群的群头像，对应 OneBot V11
+`set_group_portrait`。调用成功后，新头像对当前群成员可见。
 
-The group avatar is shown to **everyone** in the group and in their group list, so changing it is a high-visibility change. Only do it when the group owner (or a system admin) explicitly asks, **and** you actually have a concrete image source to use. NOTE: the bot usually has no ready image of its own (it can't generate a URL or base64 out of thin air), so in practice this tool is rarely usable — if you have no real `file` source, don't call it; say you need an image instead.
-
-## Arguments
+## 参数
 
 ```json
 {
-  "tool_name": "set_group_avatar",
-  "arguments": {
-    "file": "https://example.com/avatar.png"
-  }
+  "file": "https://example.com/avatar.png"
 }
 ```
 
-- `file` (required, string, non-empty) — the image source: an HTTP(S) URL, a local file path, or a base64 string. Must point at a real image; an empty or whitespace-only value is rejected. Don't fabricate a URL.
+- `file`：必填非空字符串，支持 HTTP(S) URL、本地文件路径或 base64 字符串。
+- `group_id` 从当前 `scope_key` 注入，参数中不存在 `group_id`。
+- 工具不生成图片来源；`file` 的解析与下载由 napcat 处理。
 
-The target group is **always the current one** — `group_id` is taken from your scope automatically; you cannot change another group's avatar and there is no `group_id` argument.
+## 权限与作用域
 
-## Permissions
+- `allowed_scopes=("group",)`。
+- `required_permission=OWNER`。`triggered_by_event_id` 所指消息的发送者会在
+  调用时按实时群角色校验。
+- `required_bot_role="admin"`，群主同时满足该条件。
 
-- **Triggering user**: this is an OWNER-level action — the group owner (or a system admin) must have asked for it. Set `triggered_by_event_id` on the call to that person's message; if you omit it the caller is treated as GUEST and the action is refused.
-- **The bot itself** must be a group **admin** (or owner). If it isn't, the call fails and you'll see the reason next tick — relay it, don't keep retrying.
+## 返回
 
-## Result
-
-On success: `{"ok": true, "group_id": <int>}`. On a permission failure (caller not allowed, or the bot isn't admin) or a napcat error (e.g. the image source couldn't be fetched) you get a `tool_failed` with a human-readable reason — read it, explain or abort, do **not** blindly retry the same call.
+成功返回 `{"ok":true,"group_id":<int>}`。参数无效时返回
+`invalid_arguments`；权限条件不满足时返回 `permission_denied_user_tier`
+或 `permission_denied_bot_role`；图片来源或 OneBot 调用失败时返回
+`upstream_action_failed`。

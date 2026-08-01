@@ -231,21 +231,18 @@ class ToolIdentityTests(unittest.TestCase):
             schema["properties"]["action"]["enum"],
             ["save", "delete", "recaption"],
         )
-        # description 是 catalog 里模型唯一看得到的能力说明：既不能提供发送，
-        # 也要明说自己不发送，否则改名的意义（消除"发图入口"误读）就没了。
+        # description 是 catalog 中的概要接口说明：必须客观写清收藏与发送边界。
         description = MemeCollectionTool.description
-        self.assertIn("never sends", description)
+        self.assertIn("不执行发送", description)
+        self.assertIn("send_messages", description)
         self.assertNotIn("action=send", description)
 
     def test_usage_prompt_keeps_the_speaking_boundary(self) -> None:
         usage = MemeCollectionTool.usage_prompt or ""
         self.assertIn("meme_collection", usage)
-        self.assertIn("never sends", usage)
-        # 发不发图在 send_messages 那一步现场决定（2026-07-31 删除 Replyer）；
-        # analysis 只交接人物/话题/时间/内容，不预先绑定表达形态。
-        self.assertIn("Do not steer", usage)
-        self.assertIn("`reply.analysis`", usage)
+        self.assertIn("该工具不发送消息", usage)
         self.assertIn("send_messages", usage)
+        self.assertNotIn("action=send", usage)
         self.assertNotIn("gist", usage)
 
 

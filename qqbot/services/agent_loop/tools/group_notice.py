@@ -38,24 +38,20 @@ class GroupNoticeTool(BaseTool):
     required_bot_role = "admin"  # _send_group_notice 需要 bot 自己是群管理员
     usage_prompt = _USAGE_PROMPT
     description = (
-        "Publish a group notice (群公告) in the CURRENT group. Operates on the "
-        "current group only — group_id comes from your scope, you cannot post "
-        "to another group. Pass content (the notice body text, required, "
-        "non-empty) and optionally image (a URL or file path to attach). This "
-        "is a high-visibility broadcast everyone in the group sees; requires "
-        "the bot itself to be a group admin/owner — if it isn't, the call "
-        "fails and you'll see the reason next tick."
+        "在当前群发布群公告。group_id 从当前 scope 注入，content 指定公告正文，"
+        "image 可指定附图 URL 或文件路径。调用要求发起用户权限不低于 OWNER，"
+        "机器人群角色不低于 admin。"
     )
     arguments_schema = {
         "type": "object",
         "properties": {
             "content": {
                 "type": "string",
-                "description": "Notice body text (required, non-empty).",
+                "description": "公告正文，必填且不能为空。",
             },
             "image": {
                 "type": "string",
-                "description": "Optional image URL or file path to attach.",
+                "description": "可选的附图 URL 或文件路径。",
             },
         },
         "required": ["content"],

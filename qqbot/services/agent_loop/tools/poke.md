@@ -1,31 +1,27 @@
-# Tool: poke
+# 工具：`poke`
 
-`poke` sends a poke (戳一戳) to a member in the **current group**. Maps to the OneBot V11 action `group_poke`.
+## 功能
 
-## When to use
+`poke` 向当前群中的指定成员发送一次戳一戳，对应 OneBot V11
+`group_poke`。调用成功后，平台产生对应的戳一戳事件。
 
-A light, harmless nudge — use it to playfully get someone's attention, react to being mentioned, or add a bit of warmth to the chat. It shows up as the standard QQ poke animation for that member. Cheap and friendly, so it's fine for ordinary banter. Don't spam it (repeated pokes are annoying), and don't keep poking someone who has asked to be left alone.
-
-## Arguments
+## 参数
 
 ```json
 {
-  "tool_name": "poke",
-  "arguments": {
-    "user_id": 12345
-  }
+  "user_id": 12345
 }
 ```
 
-- `user_id` (required, int) — the QQ number of the member to poke. Read it from a `<message sender_qq="USER_QQ">` row in the timeline, or from an inline `<at qq="USER_QQ"/>` segment. Don't invent ids.
+`user_id` 为必填整数，表示目标成员的 QQ 号。`group_id` 从当前
+`scope_key` 注入，参数中不存在 `group_id`。
 
-The target group is **always the current one** — `group_id` is taken from your scope automatically; you cannot poke someone in another group and there is no `group_id` argument.
+## 权限与作用域
 
-## Permissions
+`allowed_scopes=("group",)`，`required_permission=GUEST`，不要求机器人
+群角色。
 
-- **Triggering user**: this is an ordinary GUEST-level action — any group member can prompt it; no special tier is required, so you don't need a `triggered_by_event_id` for permission's sake.
-- **The bot itself**: no admin role is needed; a regular member can poke.
+## 返回
 
-## Result
-
-On success: `{"ok": true, "group_id": <int>, "user_id": <int>}`. On a napcat error (e.g. the target isn't in the group) you get a `tool_failed` with a human-readable reason — read it, explain or abort, do **not** blindly retry the same call.
+成功返回 `ok`、`group_id` 和 `user_id`。参数无效时返回
+`invalid_arguments`；OneBot 调用失败时返回 `upstream_action_failed`。

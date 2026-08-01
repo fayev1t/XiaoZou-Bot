@@ -75,15 +75,10 @@ class GetPendingJoinRequestsTool(BaseTool):
     required_bot_role = "admin"  # 非管理员 bot 收不到入群申请，前置拦成明确失败
     usage_prompt = _USAGE_PROMPT
     description = (
-        "Count and list the join requests currently PENDING for the CURRENT "
-        "group. Read-only, takes no arguments — group_id comes from your "
-        "scope. Returns pending_count plus per-request user_id / nickname / "
-        "comment (never the napcat flag) and handled_recent_count. To approve "
-        "or reject one, match the applicant to a <request kind=\"group.add\"> "
-        "row in the timeline by user_id and call "
-        "respond_to_group_join_request; a pending request with no timeline "
-        "row (arrived while the bot was offline) must be handled by an admin "
-        "in the QQ client. The bot itself must be a group admin."
+        "查询当前群的待处理入群申请。无需参数，group_id 从当前 scope 注入。返回 "
+        "pending_count、requests、handled_recent_count 和 may_be_incomplete；"
+        "requests 不包含 napcat flag。该调用为只读操作，要求机器人群角色不低于 "
+        "admin。"
     )
     arguments_schema = {
         "type": "object",

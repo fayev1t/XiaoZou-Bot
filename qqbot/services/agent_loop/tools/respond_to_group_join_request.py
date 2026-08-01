@@ -68,15 +68,10 @@ class RespondToGroupJoinRequestTool(BaseTool):
     required_bot_role = "admin"  # set_group_add_request 需要 bot 自己是群管理员
     usage_prompt = _USAGE_PROMPT
     description = (
-        "Approve or reject a pending join request to the CURRENT group (a "
-        "<request kind=\"group.add\"/> row in the timeline). Pass "
-        "request_event_id copied verbatim from that row's event_id attribute, "
-        "plus approve=true (let them in) or approve=false (turn them away); "
-        "an optional reason is shown to the applicant when rejecting. This is "
-        "an ADMIN-level action: only act on an explicit, unambiguous "
-        "instruction from a group admin/owner, and set triggered_by_event_id "
-        "to that person's message. Never decide on your own, and handle each "
-        "request only once."
+        "处理当前群的待审批入群申请，对应时间线中的 "
+        '<request kind="group.add"/> 事件。request_event_id 指定申请事件；'
+        "approve=true 表示同意，approve=false 表示拒绝。调用要求发起用户权限"
+        "不低于 ADMIN，且机器人群角色不低于 admin。"
     )
     arguments_schema = {
         "type": "object",
@@ -84,21 +79,19 @@ class RespondToGroupJoinRequestTool(BaseTool):
             "request_event_id": {
                 "type": "string",
                 "description": (
-                    "The event_id of the <request kind=\"group.add\"> row to "
-                    "act on (copy it verbatim from the timeline). The tool "
-                    "looks up the napcat flag from this event itself — you "
-                    "never handle the flag."
+                    "目标 <request kind=\"group.add\"> 事件的 event_id。工具会"
+                    "根据该事件在服务端读取 napcat flag，调用参数不包含 flag。"
                 ),
             },
             "approve": {
                 "type": "boolean",
-                "description": "true = accept the applicant; false = reject.",
+                "description": "true 表示同意申请；false 表示拒绝申请。",
             },
             "reason": {
                 "type": "string",
                 "description": (
-                    "Optional. Rejection reason shown to the applicant "
-                    "(ignored when approving)."
+                    "可选的拒绝原因；approve=false 时展示给申请人，"
+                    "approve=true 时忽略。"
                 ),
             },
         },

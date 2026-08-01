@@ -1,29 +1,52 @@
-# search_history — when and how to use
+# 工具：`search_history`
 
-## When to call
+## 功能
 
-The default `timeline` shows you only the most recent ~100 events in this scope. Reach for `search_history` when:
+`search_history` 检索当前 scope 的历史事件。默认时间线只包含近期窗口，本工具
+直接查询 `agent_events`，并使用与正常时间线相同的 XML 渲染格式返回结果。
 
-- A user references something that happened "前天" / "上周" / "昨晚那个 XX" and you don't see it in the current timeline.
-- You're in a long-running task and need to recall what was said when the task was first created (use `task_id` to resolve the anchor automatically).
-- You need to verify whether a topic / question has been asked before in this group.
+## 参数
 
-Do **NOT** call this when the answer is already visible in the timeline (including completed `<tool-call>` rows from earlier ticks).
+所有过滤条件均为可选，多个条件使用 AND 组合：
 
-## Arguments — filters combine with AND
+- `anchor_event_id`：仅返回严格早于该 ULID 事件 ID 的事件。
+- `task_id`：未提供 `anchor_event_id` 时，工具读取该任务创建事件的
+  `triggered_by_event_id` 作为锚点。
+- `start_time`：ISO8601 起始时间，包含边界。
+- `end_time`：ISO8601 结束时间，包含边界。
+- `query`：对消息 `search_text` 执行 pg_trgm 模糊相似度匹配，不要求精确
+  子串匹配。
+- `limit`：可选整数，默认 20，归一到 1–50 范围。
 
-Pick the smallest filter set that gets the job done. Three filter dimensions, all optional but at least one is required:
+查询始终受当前 `scope_key` 隔离：group scope 按 `group_id` 过滤，private
+scope 按 `user_id` 过滤。参数中不存在跨 scope 的目标字段。
 
-- `anchor_event_id` (string): return events strictly OLDER than this event_id. Use when you already know an exact anchor (e.g. from a message id in the timeline).
-- `task_id` (string): if you have a `task_id` but no anchor_event_id, the tool will look up that task's `triggered_by_event_id` and use it as the anchor. Convenient for "what's the context around when I created this task".
-- `start_time` / `end_time` (ISO8601 strings): bound the search to a time window.
-- `query` (string): fuzzy similarity match against message text (pg_trgm), not an exact substring — a close paraphrase or partial phrase can still hit. Use a short, distinctive keyword or phrase — Chinese works fine, but single characters or long sentences match poorly.
-- `limit` (int, default 20, max 50): result cap.
+## 权限与作用域
 
-## Result format
+`required_permission=GUEST`，`allowed_scopes` 不限，不要求机器人群角色。
 
-Same XML envelope as the normal timeline (`<message ...>`, `<notice ... />`, etc.) — easy to read alongside the live context. Empty list means nothing matched.
+## 返回
 
-## After the call
+成功返回：
 
-The result appears on your `<tool-call name="search_history">` timeline row (status="complete") on the next tick. If it answers your current task, proceed to `reply` and/or `task(action="complete")`. If it surfaced more questions, you may chain another `search_history` with tightened filters, but avoid loops — three searches without progress means the information probably isn't in the DB.
+```json
+{
+  "matched": 1,
+  "anchor_event_id": "01...",
+  "items": [
+    {
+      "event_id": "01...",
+      "occurred_at": "2026-07-30T12:00:00+08:00",
+      "kind": "message",
+      "render": "<message ...>...</message>"
+    }
+  ],
+  "warnings": []
+}
+```
+
+`items` 按事件时间正序排列。`task_id` 无法解析出锚点，或时间字符串无法解析
+时，对应过滤条件会被跳过并写入 `warnings`，调用仍可成功。没有匹配项时
+`matched=0` 且 `items=[]`。
+
+缺少或无法解析 `scope_key` 时返回 `invalid_arguments`。

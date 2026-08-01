@@ -40,27 +40,21 @@ class SetCardTool(BaseTool):
     required_bot_role = "admin"  # set_group_card 需要 bot 自己是群管理员
     usage_prompt = _USAGE_PROMPT
     description = (
-        "Set the group nickname / card (群名片) of a member in the CURRENT "
-        "group. Operates on the current group only — group_id comes from your "
-        "scope, you cannot edit cards in another group. Pass user_id (the QQ "
-        "number — read it from a <message sender_id=\"USER_ID\"> in the "
-        "timeline) and card (the new display name); pass card=\"\" (empty) to "
-        "CLEAR the card. This is a sensitive moderation action; requires the "
-        "bot itself to be a group admin/owner — if it isn't, the call fails "
-        "and you'll see the reason next tick."
+        "设置或清空当前群中指定成员的群名片。group_id 从当前 scope 注入，"
+        "user_id 指定成员，card 指定新群名片；空字符串表示清空。调用要求发起"
+        "用户权限不低于 ADMIN，机器人群角色不低于 admin；修改其他成员时"
+        "机器人角色须严格高于目标成员。"
     )
     arguments_schema = {
         "type": "object",
         "properties": {
             "user_id": {
                 "type": "integer",
-                "description": "QQ number of the member whose card to set.",
+                "description": "目标成员的 QQ 号。",
             },
             "card": {
                 "type": "string",
-                "description": (
-                    "New group card text. Empty string clears the card."
-                ),
+                "description": "新的群名片文本；空字符串表示清空群名片。",
                 "default": "",
             },
         },

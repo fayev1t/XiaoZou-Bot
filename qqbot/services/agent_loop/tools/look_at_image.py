@@ -62,10 +62,9 @@ MAX_QUESTION_CHARS = 500
 class LookAtImageTool(BaseTool):
     name = "look_at_image"
     description = (
-        "Look at one image again with a specific question in mind. Timeline "
-        'images already carry an objective desc="..." written when they '
-        "arrived; call this only when that description cannot answer what you "
-        "actually need to know — it costs a fresh vision call. GUEST, any scope."
+        "针对一张已下载图片执行一次视觉问答。image_hash 指定图片，question "
+        "指定需要从图像中识别的信息。该调用会新建一次视觉模型请求；不修改时间线"
+        "中已有的 desc。权限级别为 GUEST，scope 不限。"
     )
     usage_prompt = _USAGE_PROMPT
     arguments_schema = {
@@ -74,18 +73,15 @@ class LookAtImageTool(BaseTool):
             "image_hash": {
                 "type": "string",
                 "description": (
-                    "64-char sha256 hex copied verbatim from an "
-                    '<image hash="..."/> tag in the timeline. Images without '
-                    "a hash= were never downloaded and cannot be looked at."
+                    "时间线 <image hash=\"...\"/> 中的 64 位 sha256 值。"
+                    "未下载且没有 hash 的图片不能查询。"
                 ),
             },
             "question": {
                 "type": "string",
                 "description": (
-                    "The specific thing you need to know about this image. "
-                    "Write in the chat context yourself — the model looking at "
-                    "the image cannot see the conversation. Asking for a "
-                    "general description is wasteful: you already have one."
+                    "需要根据图片回答的具体问题，最长 500 个字符。视觉模型仅接收"
+                    "图片与该问题，不接收群聊时间线。"
                 ),
             },
         },

@@ -37,18 +37,15 @@ class PokeTool(BaseTool):
     # required_bot_role 用 BaseTool 默认 None —— 戳一戳无害，bot 普通成员即可
     usage_prompt = _USAGE_PROMPT
     description = (
-        "Poke (戳一戳) a member in the CURRENT group. Operates on the current "
-        "group only — group_id comes from your scope, you cannot poke someone "
-        "in another group. Pass user_id (the QQ number to poke — read it from "
-        "a <message sender_id=\"USER_ID\"> in the timeline). A light, "
-        "harmless nudge that shows up as a poke animation for that member."
+        "向当前群中的指定成员发送一次戳一戳。group_id 从当前 scope 注入，"
+        "user_id 指定目标成员。调用成功后，QQ 客户端显示对应的戳一戳事件。"
     )
     arguments_schema = {
         "type": "object",
         "properties": {
             "user_id": {
                 "type": "integer",
-                "description": "QQ number of the member to poke.",
+                "description": "目标成员的 QQ 号。",
             },
         },
         "required": ["user_id"],

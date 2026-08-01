@@ -1,25 +1,38 @@
-# webfetch — when and how to use
+# 工具：`webfetch`
 
-## When to call
+## 功能
 
-- Someone pastes a URL in the group and you need its actual content to respond (这是什么文章 / 这仓库是干嘛的 / 链接里说了啥).
-- A `websearch` result you already have is promising but its snippet is insufficient — expand that ONE url. (If you know at search time you'll need bodies, prefer `fetch_top_n` on `websearch` instead of searching then fetching one by one.)
-- You already know the exact page (official docs, an announcement, a release page) and just need to read it — no search step needed.
+`webfetch` 读取一个指定的公开网页，提取标题与可读正文。抓取使用普通 HTTP
+请求，不执行 JavaScript，也不携带登录状态。
 
-Do **NOT** call webfetch for:
-- Finding information when you have no URL — use `websearch`.
-- Pages that need a login (private repos, feeds, QQ-internal links) — you have no login state; you'd only get a shell page.
-- Retrying a URL that just failed or returned near-empty text — JS-rendered single-page apps yield no body over plain HTTP. One attempt is enough; fall back to `websearch` snippets or say you couldn't read it.
+## 参数
 
-## Arguments
+- `url`：必填非空字符串，必须是绝对 HTTP(S) URL。环回地址和私有网络地址会
+  在请求前被拒绝。
+- `max_chars`：可选整数，默认 8000，范围 500–20000，表示返回正文的截断长度。
 
-- `url` (required): absolute http/https URL, exactly as given or as returned by websearch. Loopback / private-network addresses are rejected.
-- `max_chars` (optional, default 8000, max 20000): body truncation length. Raise it only when you truly need more of the page (e.g. a long article you must quote from).
+## 权限与作用域
 
-## Result interpretation
+`required_permission=GUEST`，`allowed_scopes` 不限，不要求机器人群角色。
 
-`title` + `text` are the extracted readable content (scripts/styles stripped, block structure kept as line breaks); `truncated` tells you the body was cut at `max_chars`. `final_url` is where redirects landed. On failure the error message states why (HTTP status / non-text content type / network error / page too large) — treat it as "that site won't show us", not as something to retry in a loop.
+## 返回
 
-## After the call
+成功返回：
 
-The result appears on your `<tool-call name="webfetch">` timeline row (status="complete") on the next tick. When replying with information from the page, cite the URL so users can verify.
+```json
+{
+  "url": "https://example.com/start",
+  "final_url": "https://example.com/final",
+  "status_code": 200,
+  "content_type": "text/html",
+  "title": "页面标题",
+  "text": "提取后的正文",
+  "truncated": false
+}
+```
+
+`final_url` 是重定向后的地址；`truncated=true` 表示正文已按
+`max_chars` 截断。脚本、样式等非正文内容不会包含在 `text` 中。
+
+URL 缺失、协议不支持或目标为非公开地址时返回 `invalid_arguments`。网络错误、
+HTTP 错误、非文本响应或响应体超限时返回 `upstream_action_failed`。

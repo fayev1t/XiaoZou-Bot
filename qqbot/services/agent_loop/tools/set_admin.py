@@ -39,27 +39,20 @@ class SetAdminTool(BaseTool):
     required_bot_role = "owner"  # set_group_admin 是群主专属能力，bot 须是群主
     usage_prompt = _USAGE_PROMPT
     description = (
-        "Grant or revoke group-admin (管理员) for a member of the CURRENT "
-        "group. Operates on the current group only — group_id comes from your "
-        "scope, you cannot change roles in another group. Pass user_id (the QQ "
-        "number — read it from a <message sender_id=\"USER_ID\"> in the "
-        "timeline) and enable=true to make them an admin or enable=false to "
-        "revoke it. This is a sensitive privileged action; requires the bot "
-        "ITSELF to be the group OWNER (群主) — if it isn't, the call fails and "
-        "you'll see the reason next tick."
+        "授予或撤销当前群中指定成员的管理员身份。group_id 从当前 scope 注入，"
+        "user_id 指定成员，enable=true 表示授予，enable=false 表示撤销。调用要求"
+        "发起用户权限不低于 OWNER，且机器人群角色为 owner。"
     )
     arguments_schema = {
         "type": "object",
         "properties": {
             "user_id": {
                 "type": "integer",
-                "description": "QQ number of the member to promote/demote.",
+                "description": "目标成员的 QQ 号。",
             },
             "enable": {
                 "type": "boolean",
-                "description": (
-                    "true = make them a group admin; false = revoke admin."
-                ),
+                "description": "true 表示授予管理员；false 表示撤销管理员。",
                 "default": True,
             },
         },

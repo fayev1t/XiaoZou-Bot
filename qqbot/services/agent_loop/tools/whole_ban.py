@@ -38,22 +38,16 @@ class WholeBanTool(BaseTool):
     required_bot_role = "admin"  # set_group_whole_ban 需要 bot 自己是群管理员
     usage_prompt = _USAGE_PROMPT
     description = (
-        "Enable or lift WHOLE-GROUP mute (全员禁言) for the CURRENT group. "
-        "Operates on the current group only — group_id comes from your scope, "
-        "you cannot affect another group. Pass enable=true to mute everyone "
-        "(no member except admins can speak), enable=false to lift the mute. "
-        "This is a high-impact action affecting every member; requires the bot "
-        "itself to be a group admin/owner — if it isn't, the call fails and "
-        "you'll see the reason next tick."
+        "开启或关闭当前群的全员禁言。group_id 从当前 scope 注入，enable=true "
+        "表示开启，enable=false 表示关闭。调用要求发起用户权限不低于 OWNER，"
+        "机器人群角色不低于 admin。"
     )
     arguments_schema = {
         "type": "object",
         "properties": {
             "enable": {
                 "type": "boolean",
-                "description": (
-                    "true = turn on whole-group mute; false = lift it."
-                ),
+                "description": "true 表示开启全员禁言；false 表示关闭全员禁言。",
                 "default": True,
             },
         },

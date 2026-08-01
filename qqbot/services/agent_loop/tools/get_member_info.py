@@ -47,21 +47,16 @@ class GetMemberInfoTool(BaseTool):
     # required_permission 用 BaseTool 默认 GUEST（查询无副作用）
     usage_prompt = _USAGE_PROMPT
     description = (
-        "Look up one member's profile in the CURRENT group. Operates on the "
-        "current group only — group_id comes from your scope, you cannot query "
-        "another group. Pass user_id (the QQ number — read it from a "
-        "<message sender_id=\"USER_ID\"> in the timeline). Returns the "
-        "member's nickname, group card, role (owner/admin/member), level, "
-        "title, join_time / last_sent_time (Asia/Shanghai ISO) and "
-        "banned_until (ISO when the member is currently muted, else null). "
-        "Read-only, no side effects."
+        "查询当前群中一个成员的资料。group_id 从当前 scope 注入，user_id 指定"
+        "成员 QQ 号。返回 nickname、card、role、level、title、join_time、"
+        "last_sent_time 和 banned_until。该调用为只读操作。"
     )
     arguments_schema = {
         "type": "object",
         "properties": {
             "user_id": {
                 "type": "integer",
-                "description": "QQ number of the member to look up.",
+                "description": "待查询成员的 QQ 号。",
             },
         },
         "required": ["user_id"],

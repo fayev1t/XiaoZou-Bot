@@ -1,41 +1,56 @@
-# Tool: get_member_list
+# 工具：`get_member_list`
 
-`get_member_list` lists members of the **current group**. Maps to the OneBot V11 action `get_group_member_list`.
+## 功能
 
-## When to use
+`get_member_list` 查询当前群的成员列表，对应 OneBot V11
+`get_group_member_list`。该调用为只读操作，返回列表会按参数截断。
 
-This is a **read-only** lookup. Use it when you need a roster of who is in the group — for example to count members, to list all the admins (`role: "admin"`), to find someone by name when you only have a partial nickname, or to see who's been active lately (`include_activity: true`). The full list can be hundreds or thousands of entries, so the result is **truncated** (see Arguments / Result); it is meant for sampling, filtering and counting, not for dumping every member into your reply. If you only need one person's details, prefer `get_member_info` instead.
-
-## Arguments
+## 参数
 
 ```json
 {
-  "tool_name": "get_member_list",
-  "arguments": {
-    "limit": 200,
-    "role": "admin",
-    "include_activity": false
-  }
+  "limit": 200,
+  "role": "admin",
+  "include_activity": false
 }
 ```
 
-- `limit` (optional, int, default `200`, capped at `500`) — the maximum number of member entries to return. Values above 500 are clamped to 500; the *total* member count is still reported separately as `count` regardless of this cap. Omit it to use the default of 200.
-- `role` (optional, one of `"owner"` / `"admin"` / `"member"`) — only return members with this group role. The filter applies **before** truncation, so `role: "admin"` reliably returns every admin even in a huge group.
-- `include_activity` (optional, bool, default `false`) — when true, each entry also carries `join_time` and `last_sent_time` as Asia/Shanghai ISO timestamps. This costs tokens; only enable it when activity actually matters (e.g. "谁最近都不说话？").
+- `limit`：可选整数，默认 200，最小按 1 处理，最大按 500 处理。仅限制
+  `members` 数组长度，不影响完整总数 `count`。
+- `role`：可选字符串，支持 `owner`、`admin`、`member`。角色过滤先于
+  `limit` 截断。
+- `include_activity`：可选布尔值，默认 `false`。为 `true` 时，每个条目
+  增加 `join_time` 和 `last_sent_time`。
 
-The target group is **always the current one** — `group_id` is taken from your scope automatically; you cannot list another group and there is no `group_id` argument.
+`group_id` 从当前 `scope_key` 注入，参数中不存在 `group_id`。
 
-## Permissions
+## 权限与作用域
 
-- **Triggering user**: none required. This is a GUEST-level read with no side effects, so any caller can prompt it and you do **not** need to set `triggered_by_event_id`.
-- **The bot itself**: no special role needed — the bot does **not** have to be a group admin to read the member list.
+`allowed_scopes=("group",)`，`required_permission=GUEST`，不要求机器人
+群角色。
 
-## Result
+## 返回
 
-On success: `{"count": <int>, "matched": <int>, "members": [ {"user_id", "nickname", "card", "role"}, ... ]}`.
+成功返回：
 
-- `count` is the *full* member total of the group (unfiltered); `matched` is how many members pass the `role` filter (equal to `count` when no filter is given).
-- `members` is the (filtered) list **truncated to `limit`**, with each entry slimmed to user_id / nickname / card / role (level, avatar, etc. are dropped). A member who is **currently muted** additionally carries `banned_until` (Asia/Shanghai ISO); the key is absent for everyone else. With `include_activity: true` each entry also has `join_time` / `last_sent_time` (ISO, may be null).
-- If `matched` is larger than `len(members)`, you only have a partial view — don't claim it's the whole roster.
+```json
+{
+  "count": 350,
+  "matched": 4,
+  "members": [
+    {"user_id": 123, "nickname": "昵称", "card": "群名片", "role": "admin"}
+  ]
+}
+```
 
-On a napcat error you get a `tool_failed` with a human-readable reason — read it and explain or move on, do **not** blindly retry the same call.
+- `count` 是未过滤的完整群成员数。
+- `matched` 是通过 `role` 过滤的成员数；未提供 `role` 时等于 `count`。
+- `members` 是过滤后按 `limit` 截断的数组，基础字段为 `user_id`、
+  `nickname`、`card`、`role`。
+- 当前处于禁言状态的成员额外包含 Asia/Shanghai ISO8601 格式的
+  `banned_until`。
+- `include_activity=true` 时额外包含 `join_time` 和 `last_sent_time`；
+  平台缺少时间时对应值可以为 `null`。
+
+`matched > len(members)` 表示返回结果已截断。OneBot 调用失败时返回
+`upstream_action_failed`。

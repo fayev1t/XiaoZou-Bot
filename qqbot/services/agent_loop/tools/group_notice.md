@@ -1,33 +1,35 @@
-# Tool: group_notice
+# 工具：`group_notice`
 
-`group_notice` publishes a group notice (群公告) in the **current group**. Maps to the OneBot V11 extended action `_send_group_notice` — an underscore-prefixed action, so it is invoked through `bot.call_api` rather than a generated method.
+## 功能
 
-## When to use
+`group_notice` 在当前群发布群公告，对应 napcat 扩展 action
+`_send_group_notice`。该 action 通过 `bot.call_api` 调用。
 
-Only for a real, group-wide announcement the owner wants everyone to see — rule changes, event notices, important reminders. A group notice is a high-visibility broadcast shown to the whole group, so it is heavy and intrusive; don't use it for ordinary chatter, casual replies, or anything a normal message would handle. Prefer `send_message` for everyday talk and reserve `group_notice` for things that genuinely warrant a formal notice.
-
-## Arguments
+## 参数
 
 ```json
 {
-  "tool_name": "group_notice",
-  "arguments": {
-    "content": "群规更新：禁止刷屏，违者禁言。",
-    "image": "http://example.com/banner.png"
-  }
+  "content": "公告正文",
+  "image": "https://example.com/banner.png"
 }
 ```
 
-- `content` (required, string, non-empty) — the notice body text. Whitespace-only content is rejected.
-- `image` (optional, string) — a URL or file path of an image to attach to the notice. Omit it for a text-only notice.
+- `content`：必填非空字符串，表示公告正文；仅包含空白字符时参数无效。
+- `image`：可选字符串，表示附图 URL 或文件路径。
+- `group_id` 从当前 `scope_key` 注入，参数中不存在 `group_id`。
 
-The target group is **always the current one** — `group_id` is taken from your scope automatically; you cannot post a notice to another group and there is no `group_id` argument.
+调用成功后公告对当前群成员可见。
 
-## Permissions
+## 权限与作用域
 
-- **Triggering user**: this is an OWNER-level action — the group owner must have asked for it. Set `triggered_by_event_id` on the call to that person's message; if you omit it the caller is treated as GUEST and the notice is refused.
-- **The bot itself** must be a group **admin** (or owner). If it isn't, the call fails and you'll see the reason next tick — relay it, don't keep retrying.
+- `allowed_scopes=("group",)`。
+- `required_permission=OWNER`。`triggered_by_event_id` 所指消息的发送者会在
+  调用时按实时群角色校验。
+- `required_bot_role="admin"`，群主同时满足该条件。
 
-## Result
+## 返回
 
-On success: `{"ok": true, "group_id": <int>}`. On a permission failure (caller not allowed, or the bot isn't admin) or a napcat error you get a `tool_failed` with a human-readable reason — read it, explain or abort, do **not** blindly retry the same call.
+成功返回 `{"ok":true,"group_id":<int>}`。参数无效时返回
+`invalid_arguments`；权限条件不满足时返回 `permission_denied_user_tier`
+或 `permission_denied_bot_role`；OneBot 调用失败时返回
+`upstream_action_failed`。

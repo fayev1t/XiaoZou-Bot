@@ -55,28 +55,21 @@ class KickTool(BaseTool):
     required_bot_role = "admin"  # set_group_kick 需要 bot 自己是群管理员
     usage_prompt = _USAGE_PROMPT
     description = (
-        "Remove (kick) a member from the CURRENT group. Operates on the "
-        "current group only — group_id comes from your scope, you cannot kick "
-        "from another group. Pass user_id (the QQ number to kick — read it "
-        "from a <message sender_qq=\"USER_QQ\"> in the timeline) and "
-        "optionally reject_add_request=true to also block their future join "
-        "requests. This is an ADMIN-level action: only act on an explicit "
-        "instruction from a group admin/owner, and set triggered_by_event_id "
-        "to that person's message. The bot itself must be a group admin and "
-        "strictly outrank the target; it cannot kick itself."
+        "将指定成员移出当前群。group_id 从当前 scope 注入，user_id 指定成员；"
+        "reject_add_request=true 时同时拒绝该成员后续的入群申请。调用要求发起用户"
+        "权限不低于 ADMIN，机器人群角色不低于 admin 且严格高于目标成员；"
+        "user_id 不能是机器人自身账号。"
     )
     arguments_schema = {
         "type": "object",
         "properties": {
             "user_id": {
                 "type": "integer",
-                "description": "QQ number of the member to kick.",
+                "description": "待移出成员的 QQ 号。",
             },
             "reject_add_request": {
                 "type": "boolean",
-                "description": (
-                    "If true, also reject this user's future join requests."
-                ),
+                "description": "为 true 时同时拒绝该成员后续的入群申请。",
                 "default": False,
             },
         },

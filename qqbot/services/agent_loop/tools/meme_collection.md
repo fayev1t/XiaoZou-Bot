@@ -1,78 +1,65 @@
-# Tool: meme_collection
+# 工具：`meme_collection`
 
-`meme_collection` curates the shared saved-meme collection. **It never sends
-anything, and there is no send action to look for.** Sending happens only in
-`send_messages`: when you compose a reply there, `<saved-memes>` is your menu,
-and one bubble may carry one saved meme by its hash.
+## 功能
 
-So what this tool controls is not *whether a meme gets sent* — it is **what
-there will be to choose from at that moment**. An image that never gets saved
-can never be used later; a collection that is thin, stale, or badly described
-is what makes replies fall flat. Curating it is the point.
+`meme_collection` 管理全局共享的表情包收藏夹，支持收录、删除和重新生成
+描述。该工具不发送消息，也不存在发送 action；收藏表情包的发送由
+`send_messages` 的 `kind="meme"` 气泡完成。
 
-## When to save
+收藏记录保存图片 hash、生成的中文描述、可选上下文和媒体类型。图片文件复用
+EventIngest 已落盘的内容寻址文件，不由本工具复制或删除。
 
-Save whenever an image goes past that you would plausibly want to answer with
-some day — a reaction face, a punchline image, a group in-joke, anything with a
-usable expression on it. It costs one call, the collection holds plenty, and the
-image scrolls out of the timeline within the hour and cannot be recovered
-afterwards; a near-miss saved beats a perfect one lost.
+## 参数
 
-Do not save: photos people posted in earnest, screenshots carrying someone's
-personal information, documents, or anything that only makes sense inside the
-one exchange it appeared in.
+```json
+{
+  "action": "save",
+  "image_hash": "<64 位 sha256>",
+  "context_note": "可选上下文"
+}
+```
 
-You are judging from the image's `desc=` in the timeline, not from the picture
-itself — that transcription is enough to tell a reaction face from a document.
-When it genuinely isn't enough to decide, `look_at_image` settles it; saving is
-cheap enough that hesitating usually costs more than saving would.
+- `action`：必填，支持 `save`、`delete`、`recaption`。
+- `image_hash`：必填。`save` 接收一个 64 位 sha256 字符串，或最多 10 个
+  字符串的数组；`delete` 和 `recaption` 仅接收单个字符串。
+- `context_note`：可选字符串，最多 300 个字符，仅适用于 `save` 和
+  `recaption`。该字段作为描述生成的附加上下文，不直接展示给用户。
+  `recaption` 省略该字段时复用收录时保存的上下文。
 
-## Arguments
+`save` 的 hash 对应时间线中的 `<image hash="..."/>`；`delete` 和
+`recaption` 的 hash 对应 `<saved-memes>` 中的 `<meme hash="...">`。
+hash 会归一化为小写。
 
-- `action` (required): `save`, `delete`, or `recaption`.
-- `image_hash` (required): copy the complete 64-character SHA-256 hash verbatim.
-  For `save`, use an `<image hash="..."/>` from the timeline; for `delete` or
-  `recaption`, use a `<meme hash="...">` from `<saved-memes>`.
-- `context_note` (optional, `save`/`recaption` only): short chat context that is
-  not visible in the pixels. It guides the caption model; it is not the saved
-  description itself.
+## action 语义
 
-`save` also accepts an array of at most 10 hashes. The other actions accept one
-hash only.
+### save
 
-## Actions
+读取指定图片文件并调用 caption 模型生成检索描述，然后写入收藏记录。单个
+hash 已存在时返回 `already_saved`，不重复生成描述。数组输入会保序去重并逐项
+处理；结构错误会拒绝整次调用，单张内容错误会记录在对应项回执中。
 
-### `save`
+单张成功返回 `action`、`file_hash`、`saved` 和 `description`。批量输入返回
+`batch=true`、逐项 `results` 以及 `saved_count`、
+`already_saved_count`、`failed_count`。
 
-Collect an image already present in the timeline. The system reads the image
-and writes its searchable Chinese description. Use `context_note` only when
-conversation context materially changes the image's meaning.
+### delete
 
-That description is the **only** thing visible when choosing from
-`<saved-memes>` later — the pixels are not attached to it. Hence you do not
-write it yourself, and hence `context_note` earns its place whenever the
-image's meaning in this group is not on its face (whose reaction face it is,
-what running joke it belongs to).
+删除指定 hash 的收藏元数据，不删除磁盘图片文件。成功返回被删除记录的
+`description`。
 
-### `delete`
+### recaption
 
-Remove the saved entry from the collection. This removes metadata only; it does
-not delete the underlying media cache file.
+重新读取图片并生成描述，只更新 `description` 和 `context_note`。生成失败时
+原描述保持不变。成功返回 `description` 和 `previous_description`。
 
-### `recaption`
+## 权限与作用域
 
-Regenerate a saved meme's description from the image, optionally guided by a
-new `context_note`. The old description remains if captioning fails.
+`allowed_scopes=("group","private")`，`required_permission=GUEST`，不要求
+机器人群角色。收藏夹在所有聊天 scope 之间共享；system scope 不暴露本工具。
 
-Reach for this when a saved meme keeps turning up at the wrong moment, or never
-turns up at all — that is a description problem, not a taste problem, and this
-is the only way to fix it.
+## 失败
 
-## Speaking boundary
-
-Do not look for a meme-send action here. This tool only curates; the moment a
-meme actually goes out is a `send_messages` call, chosen against the latest
-timeline. Do not steer future replies toward or away from memes through
-`reply.analysis` either: that field is only for people/topic/time/content
-analysis — whether a meme is the natural reply is decided at sending time,
-with the collection in front of you, not committed in advance.
+常见错误包括：`bad_action`、`bad_image_hash`、`empty_batch`、
+`too_many_images`、`batch_not_supported`、`image_not_found`、
+`unknown_meme`、`media_file_missing` 和 `caption_failed`。
+这些错误只描述收藏管理结果，不代表任何消息已发送。

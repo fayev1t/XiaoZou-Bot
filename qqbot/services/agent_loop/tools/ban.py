@@ -40,27 +40,21 @@ class BanTool(BaseTool):
     required_bot_role = "admin"  # set_group_ban 需要 bot 自己是群管理员
     usage_prompt = _USAGE_PROMPT
     description = (
-        "Mute (禁言) a member of the CURRENT group for a duration. Operates on "
-        "the current group only — group_id comes from your scope, you cannot "
-        "mute in another group. Pass user_id (the QQ number to mute — read it "
-        "from a <message sender_id=\"USER_ID\"> in the timeline) and "
-        "duration in seconds (default 1800 = 30 minutes); pass duration=0 to "
-        "LIFT an existing mute. This is a sensitive moderation action; requires "
-        "the bot itself to be a group admin/owner — if it isn't, the call "
-        "fails and you'll see the reason next tick."
+        "设置或解除当前群中指定成员的禁言。group_id 从当前 scope 注入，user_id "
+        "指定成员，duration 指定禁言秒数；duration=0 表示解除禁言。调用要求发起"
+        "用户权限不低于 ADMIN，机器人群角色不低于 admin 且严格高于目标成员。"
     )
     arguments_schema = {
         "type": "object",
         "properties": {
             "user_id": {
                 "type": "integer",
-                "description": "QQ number of the member to mute.",
+                "description": "目标成员的 QQ 号。",
             },
             "duration": {
                 "type": "integer",
                 "description": (
-                    "Mute length in seconds. Default 1800 (30 min); 0 lifts "
-                    "the mute."
+                    "禁言时长，单位为秒；默认 1800，取值 0 表示解除禁言。"
                 ),
                 "default": 1800,
             },

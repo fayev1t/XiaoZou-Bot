@@ -77,9 +77,8 @@ _USAGE_PROMPT = load_sibling_md(__file__, "websearch.md")
 class WebsearchTool(BaseTool):
     name = "websearch"
     description = (
-        "Search the web and optionally include the full body text of the top "
-        "results. Use this when you need up-to-date factual information "
-        "beyond your training data."
+        "按关键词检索网页，返回标题、URL 和摘要；可通过 fetch_top_n 为前若干"
+        "条结果附加正文，通过 max_results 限制结果数量。"
     )
     usage_prompt = _USAGE_PROMPT
     # required_permission / required_bot_role 用 BaseTool 默认值（GUEST /
@@ -89,7 +88,7 @@ class WebsearchTool(BaseTool):
         "properties": {
             "query": {
                 "type": "string",
-                "description": "Search keywords. Plain natural language.",
+                "description": "自然语言形式的搜索关键词。",
             },
             "fetch_top_n": {
                 "type": "integer",
@@ -97,9 +96,7 @@ class WebsearchTool(BaseTool):
                 "maximum": _MAX_FETCH_TOP_N,
                 "default": 0,
                 "description": (
-                    "If > 0, also return the full body text of the top N "
-                    "results. Costly — only ask for content when the snippet "
-                    "is insufficient."
+                    "附加正文的前 N 条结果数量；0 表示不附加正文，最大为 5。"
                 ),
             },
             "max_results": {
@@ -107,7 +104,7 @@ class WebsearchTool(BaseTool):
                 "minimum": 1,
                 "maximum": 20,
                 "default": _DEFAULT_MAX_RESULTS,
-                "description": "Upper bound on number of search hits returned.",
+                "description": "返回搜索结果的数量上限，默认 10，最大 20。",
             },
         },
         "required": ["query"],

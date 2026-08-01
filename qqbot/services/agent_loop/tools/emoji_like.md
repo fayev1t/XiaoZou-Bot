@@ -1,35 +1,34 @@
-# Tool: emoji_like
+# 工具：`emoji_like`
 
-`emoji_like` reacts to a single message with a QQ emoji (表情回应) in the **current group**, or removes a reaction you previously added. Maps to the OneBot V11 action `set_msg_emoji_like`.
+## 功能
 
-## When to use
+`emoji_like` 为指定消息添加或移除 QQ 表情回应，对应 OneBot V11
+`set_msg_emoji_like`。
 
-This is a light, friendly way to acknowledge a message without sending a full reply — a thumbs-up on a good answer, a laugh on a joke, a heart on something sweet. Prefer it over a text reply when a one-tap reaction says enough and a sentence would just add noise. Use `set: false` to take back a reaction you added earlier (wrong emoji, no longer apt). It does not notify like a reply and carries no moderation weight.
-
-## Arguments
+## 参数
 
 ```json
 {
-  "tool_name": "emoji_like",
-  "arguments": {
-    "message_id": 123456,
-    "emoji_id": "128",
-    "set": true
-  }
+  "message_id": 123456,
+  "emoji_id": "128",
+  "set": true
 }
 ```
 
-- `message_id` (required, int) — the `onebot_message_id` of the target message. Read it from the `message_id` attribute of a `<message ... message_id="MESSAGE_ID">` row in the timeline (same field name as this argument — copy it verbatim). Don't invent ids.
-- `emoji_id` (required, number or string) — the QQ emoji / face id to react with.
-- `set` (optional, bool, default `true`) — `true` adds the reaction; `false` removes a reaction you previously added.
+- `message_id`：必填整数，目标消息的 `onebot_message_id`，对应时间线消息的
+  `id` 属性。
+- `emoji_id`：必填字符串，QQ 表情或 face 的 ID。执行层也接受可转换为字符串的
+  数值。
+- `set`：可选布尔值，默认 `true`；`true` 表示添加，`false` 表示移除。
+- OneBot 按 `message_id` 定位消息，参数中不存在 `group_id`；工具仍要求当前
+  scope 为 group。
 
-The target message is located by `message_id` alone — there is **no** `group_id` argument. The tool still confirms you are acting inside the current group's scope, but napcat needs only the message id.
+## 权限与作用域
 
-## Permissions
+`allowed_scopes=("group",)`，`required_permission=GUEST`，不要求机器人
+群角色。
 
-- **Triggering user**: none required. This is a GUEST-level interaction, so any caller can prompt it and you do **not** need to set `triggered_by_event_id`.
-- **The bot itself**: no special role needed — the bot does **not** have to be a group admin to react with an emoji.
+## 返回
 
-## Result
-
-On success: `{"ok": true, "message_id": <int>, "emoji_id": <str>, "set": <bool>}`. On a napcat error (invalid emoji id, the message is gone) you get a `tool_failed` with a human-readable reason — read it, explain or move on, do **not** blindly retry the same call.
+成功返回 `ok`、`message_id`、`emoji_id` 和 `set`。参数无效时返回
+`invalid_arguments`；OneBot 调用失败时返回 `upstream_action_failed`。

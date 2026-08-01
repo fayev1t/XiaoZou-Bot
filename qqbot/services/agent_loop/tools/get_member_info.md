@@ -1,31 +1,44 @@
-# Tool: get_member_info
+# 工具：`get_member_info`
 
-`get_member_info` looks up one member's profile in the **current group**. Maps to the OneBot V11 action `get_group_member_info`.
+## 功能
 
-## When to use
+`get_member_info` 查询当前群中一个成员的实时资料，对应 OneBot V11
+`get_group_member_info`，并使用 `no_cache=true`。该调用为只读操作。
 
-This is a **read-only** lookup. Reach for it when you need facts about a specific member that the timeline doesn't already give you: their role (`owner`/`admin`/`member`), their group card / display name, their level or special title, when they joined, or when they last spoke. Typical cases: before doing or relaying an admin action, confirm whether the person who asked is actually an admin/owner; or when someone is referenced and you want their proper card name instead of guessing. Don't call it for someone whose details are already visible in recent messages — prefer what you can already see.
-
-## Arguments
+## 参数
 
 ```json
 {
-  "tool_name": "get_member_info",
-  "arguments": {
-    "user_id": 12345
-  }
+  "user_id": 12345
 }
 ```
 
-- `user_id` (required, int) — the QQ number of the member to look up. Read it from a `<message sender_qq="USER_QQ">` row in the timeline, or from an inline `<at qq="USER_QQ"/>` segment. Don't invent ids.
+- `user_id`：必填整数，表示目标成员的 QQ 号。
+- `group_id` 从当前 `scope_key` 注入，参数中不存在 `group_id`。
 
-The target group is **always the current one** — `group_id` is taken from your scope automatically; you cannot look up a member of another group and there is no `group_id` argument.
+## 权限与作用域
 
-## Permissions
+`allowed_scopes=("group",)`，`required_permission=GUEST`，不要求机器人
+群角色。
 
-- **Triggering user**: none required. This is a GUEST-level read with no side effects, so any caller can prompt it and you do **not** need to set `triggered_by_event_id`.
-- **The bot itself**: no special role needed — the bot does **not** have to be a group admin to read member info.
+## 返回
 
-## Result
+成功返回以下字段：
 
-On success you get the slimmed profile: `{"user_id", "nickname", "card", "role", "level", "title", "join_time", "last_sent_time", "banned_until"}`. `join_time` / `last_sent_time` are Asia/Shanghai ISO timestamps (null when the platform doesn't provide them). `banned_until` is the mute-expiry ISO timestamp when the member is **currently muted**, and null otherwise — a quick way to answer "他是不是被禁言了？". Verbose napcat fields (avatar, area, etc.) are dropped to keep your context small. `card` may be empty when the member has no group nickname; `title` may be empty too. The lookup is live (no_cache), so role/mute state reflect right now. If the user isn't in the group, or napcat errors, you get a `tool_failed` with a human-readable reason — read it and explain or move on, do **not** blindly retry the same call.
+```json
+{
+  "user_id": 12345,
+  "nickname": "昵称",
+  "card": "群名片",
+  "role": "member",
+  "level": "1",
+  "title": "",
+  "join_time": "2026-01-01T12:00:00+08:00",
+  "last_sent_time": "2026-07-31T12:00:00+08:00",
+  "banned_until": null
+}
+```
+
+`join_time`、`last_sent_time` 和非空的 `banned_until` 使用
+Asia/Shanghai 时区的 ISO8601 格式。平台没有对应时间或成员未处于禁言状态时
+值为 `null`。OneBot 调用失败时返回 `upstream_action_failed`。

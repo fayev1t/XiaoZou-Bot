@@ -1,38 +1,51 @@
-# Tool: kick
+# 工具：`kick`
 
-`kick` removes (kicks) a member from the **current group**. Maps to the OneBot V11 action `set_group_kick`.
+## 功能
 
-## When to use
+`kick` 将指定成员移出当前群，对应 OneBot V11 `set_group_kick`。
+`reject_add_request=true` 时同时拒绝该成员后续的入群申请。
 
-Only to remove a genuinely disruptive member — a spammer, an ad/scam bot, or someone a group admin explicitly asked you to remove. Kicking is heavy and not reversible (the person is gone, though they can rejoin unless you also reject future requests). For a temporary problem prefer a mute (`ban`, when it appears in your tool list) instead. Don't kick on a whim, on one tense message, or to "win" an argument.
-
-## Arguments
+## 参数
 
 ```json
 {
-  "tool_name": "kick",
-  "arguments": {
-    "user_id": 12345,
-    "reject_add_request": false
-  }
+  "user_id": 12345,
+  "reject_add_request": false
 }
 ```
 
-- `user_id` (required, int) — the QQ number of the member to kick. Read it from a `<message sender_qq="USER_QQ">` row in the timeline, or from an inline `<at qq="USER_QQ"/>` segment. Don't invent ids.
-- `reject_add_request` (optional, bool, default `false`) — if `true`, also block this user's *future* join requests. Use for persistent ad bots you don't want coming back; leave `false` for ordinary removals.
+- `user_id`：必填整数，表示目标成员的 QQ 号。
+- `reject_add_request`：可选布尔值，默认 `false`。为 `true` 时同时拒绝
+  目标成员后续的入群申请。
+- `group_id` 从当前 `scope_key` 注入，参数中不存在 `group_id`。
+- `user_id` 不能等于机器人自身账号。
 
-The target group is **always the current one** — `group_id` is taken from your scope automatically; you cannot kick someone out of another group and there is no `group_id` argument.
+## 权限与作用域
 
-The target must be someone else: the bot cannot kick itself — that call is rejected with `invalid_arguments` before reaching napcat (leaving the group is a different, separate operation).
+- `allowed_scopes=("group",)`。
+- `required_permission=ADMIN`。`triggered_by_event_id` 所指消息的发送者会在
+  调用时按实时群角色校验。
+- `required_bot_role="admin"`。
+- 机器人群角色必须严格高于目标成员：owner 可操作 admin/member，admin 仅可
+  操作 member。目标角色可查询时会在调用 OneBot 前校验。
 
-## Permissions
+## 返回
 
-- **Triggering user**: this is an ADMIN-level action — a group admin or owner must have asked for it. Set `triggered_by_event_id` on the call to that person's message; if you omit it the caller is treated as GUEST and the kick is refused.
-- **The bot itself** must be a group **admin** (or owner). If it isn't, the call fails and you'll see the reason next tick — relay it, don't keep retrying.
-- **Role hierarchy** is pre-checked: the bot can only kick someone whose role is **strictly lower** than its own (an admin can kick members but not the owner or another admin; nobody can kick the owner). If the target's role is equal-or-higher, you get a deterministic `permission_denied_bot_role` (with `target_role`) before napcat is touched — don't retry.
+成功返回：
 
-## Result
+```json
+{
+  "group_id": 100,
+  "user_id": 12345,
+  "reject_add_request": false,
+  "applied": true
+}
+```
 
-On success: `{"group_id": <int>, "user_id": <int>, "reject_add_request": <bool>, "applied": true}` — `reject_add_request` echoes what was applied, so you can confirm whether future join requests were also blocked. On a permission failure (caller not allowed, bot not admin, or the target's role is equal-or-higher) or a napcat error you get a `tool_failed` with a structured reason — read it, explain or abort, do **not** blindly retry the same call.
+权限条件不满足时返回 `permission_denied_user_tier` 或
+`permission_denied_bot_role`；目标是机器人自身时返回
+`invalid_arguments`；OneBot 调用失败时返回 `upstream_action_failed`。
 
-Shortly after a successful kick (about a second), the timeline also gains `<notice kind="group_decrease" sub_type="kick" user_qq="TARGET_QQ" operator_qq="BOT_QQ"/>` — the definitive "they are gone" fact. When `operator_qq` equals your own `bot_qq` (envelope header), that notice is your *own* kick echoing back, not a new incident — don't react to it as news. The general guidance to stay quiet when members leave targets organic departures; confirming completion to the admin who ordered the kick is a normal reply, not "commenting on someone leaving".
+成功操作后，平台通常会产生
+`<notice kind="group_decrease" sub_type="kick" .../>`。其中
+`operator_qq` 等于当前 `bot_qq` 时，该 notice 是本次调用的回执事件。
