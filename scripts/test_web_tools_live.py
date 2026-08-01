@@ -4,7 +4,8 @@
     python scripts/test_web_tools_live.py "搜索关键词" [fetch_top_n]
     python scripts/test_web_tools_live.py --fetch https://example.com/
 
-websearch 需要 .env（或环境）里配好 TAVILY_API_KEY；webfetch 零配置。
+两个工具默认都零配置：websearch 缺省走 exa（免 key），只有把
+WEBSEARCH_PROVIDER 设成 tavily 时才需要 .env（或环境）里的 TAVILY_API_KEY。
 """
 
 import asyncio

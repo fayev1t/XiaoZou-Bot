@@ -8,10 +8,12 @@ external.message.group.*，有两道闸——
    reportSelfMessage），nonebot 的 on_message 只匹配 type="message"，
    v2_main 的四个 matcher 都不会接到它；
 ② 本 mapper 的 can_map 也只认 post_type=="message"。
-因此 bot 的发言在事件流里只有一种形态：send_message 工具的
+因此 bot 的发言在事件流里只有一种形态：send_messages 工具的
 agent.tool_called/tool_result 对（projection 渲染成 <tool-call
-name="send_message">，author 索引据其 result 里的 message_id+self_id 折出
-reply 段的 from_self="true"）。若未来想让"bot 账号在别的设备上手动发的消息"对模型可见，
+name="send_messages">，那一行本身就是时间线上的发言记录；author 索引据其
+逐条回执里的 message_id+self_id 折出 reply 段的 from_self="true"。旧链路
+遗留的 send_message / runtime.reply_flushed 仍在历史渲染路径里认）。
+若未来想让"bot 账号在别的设备上手动发的消息"对模型可见，
 需要显式开 napcat reportSelfMessage 并新增 message_sent 的 mapper——那是一个
 有意的契约变更，不要顺手放行。
 """

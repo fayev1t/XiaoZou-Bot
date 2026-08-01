@@ -1,7 +1,8 @@
 """Prompt 快照回放 — prompt 改动前后的行为对比（待办 #11 回归评测基线）。
 
-服务器端手动运行（需要 langchain 运行时 + LLM_* env 配置），本地 SFTP 工作
-区跑不了。用法：
+服务器端手动运行（需要 langchain 运行时 + config/model_providers.json；扁平
+LLM_* env 已于 2026-07-28/29 删除，本脚本经 create_llm(role="planner") 走统一
+路由），本地 SFTP 工作区跑不了。用法：
 
     cd qqbot/
     python scripts/replay_snapshots.py                 # 回放 cases 目录全部用例

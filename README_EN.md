@@ -25,7 +25,7 @@
       <b>XiaoZou-Bot</b> is a QQ group chat AI Agent based on an event loop and autonomous decision mechanism (Tick-based Agent Loop).<br><br>
       Unlike traditional bots relying on passive rule triggers or single-turn QA, XiaoZou adopts an <b>Agent Harness</b> architecture that treats group chat as a continuously evolving cognitive domain:<br>
       • <b>Cross-Tick Task State Machine</b>: Built-in task status management supporting multi-turn task tracking, self-correction, and proactive advancement across ticks.<br>
-      • <b>Cognitive & Expression Layering</b>: High-level planning (LLM Planner) handles situational awareness and decisions, while an independent expression engine (Replyer) manages nuanced composition and visual grounding.<br>
+      • <b>Two-Step Speech</b>: Deciding to speak is not the same as speaking — XiaoZou first stores its read of the situation and waits, then re-decides what (and whether) to say against whatever arrived during the wait.<br>
       • <b>Event Sourcing & Full Observability</b>: All session activities are recorded as an immutable causal event stream, providing full-stack snapshot auditing and offline replay capability.<br><br>
       Built on <a href="https://github.com/NapNeko/NapCatQQ">NapCatQQ</a> and <a href="https://nonebot.dev/">NoneBot2</a>, heartfelt thanks to the open-source community ❤️
     </td>
@@ -36,32 +36,40 @@
 </table>
 
 
-## 🏗️ Core Architecture & System Abstractions
+## 🏗️ Core Architecture
 
-The project is built around the **Agent Loop / Harness** philosophy, featuring five core architectural abstractions:
+Every tick follows a fixed rhythm: events land in the store → projection folds them into the current timeline and active tasks → the Planner makes one global decision → actions are dispatched (there are only two, `idle` and `call_tool`; task management and speaking are both tools) → decisions and tool results are appended back into the event stream for the next tick to observe. Around that loop:
 
-- **Event Sourcing & State Projection**  
-  All incoming messages, model decisions, tool execution results, and task state changes are appended as immutable events into `agent_events`. Every tick folds and projects recent events into a decision context (Timeline + Active Tasks), enabling end-to-end causal traceability, auditing, and lossless replay.
+- **Event Sourcing**: Messages, decisions, tool results, and task changes are all appended to an immutable event stream; every tick folds a fresh context out of it via projection. Causality is traceable, auditable, and replayable for the whole lifecycle.
 
-- **Cognitive & Expression Layering (Planner & Replyer)**  
-  - **High-Level Decision Engine (LLM-as-Planner)**: Focuses purely on situational awareness, dialogue comprehension, and tool orchestration, emitting structured Actions (task lifecycle / tool calls / autonomous silence).
-  - **Multimodal Expression & Rendering (Replyer Engine)**: Upgrades "messaging" into an asynchronous composition task (`reply_task`). Persona formatting (Voice), segment layout, and visual multimodal validation (VLM) are handled by a dedicated Replyer, isolating high-level planning from low-level rendering details.
+- **Deliberate Speech (Two Steps)**: Speaking is not a single action. Step one, `reply`, only stores XiaoZou's read of the situation — who is addressing whom, which topic threads are live, what is still unanswered — and starts a short wait. When the wait expires, that analysis returns to the timeline and wakes the Planner; on that tick it re-reads **the messages that arrived during the wait** and decides whether to speak as intended, change its mind, or conclude the moment has passed and stay silent. The actual wording is always chosen against the latest context, never frozen when the wait began.
 
-- **Model Infrastructure Mesh & Resiliency**  
-  Abstracts an LLM routing layer by role (Planner / Replyer / Caption). Supports model-name based load balancing (random distribution across providers), automatic failure backoff, and passive circuit breaking, ensuring the cognitive loop remains provider-agnostic.
+- **Model Mesh**: LLMs are routed by role (planner / vision / caption / memory), with the same model load-balanced randomly across providers, per-role `primary_failover`, and automatic cooldown-based circuit breaking. Images are transcribed into text by the `vision` role at ingest time, so the cognitive loop itself is pure text and free to pick the strongest — or cheapest — text model.
 
-- **Tool Protocol & Sandboxed Isolation (Scoped Tools)**  
-  Abilities like web search (`websearch`/`webfetch`) and group moderation (`kick`) are accessed via a unified `Tool` protocol. Event streams, context, and tool execution are sandboxed by group (`group:<id>`), while shared assets (e.g., sticker collections) operate in a global scope.
+- **Scoped Sandbox**: Event streams, context, and tool permissions are isolated by `group:<id>` by default; shared assets such as the sticker collection live in a global scope.
 
-- **Full-Stack Observability & Replay Evaluation**  
-  Every tick decision supports full-payload Prompt/XML snapshotting (`prompt_snapshot`), enabling offline comparison and regression testing (`replay_snapshots`) against fixed datasets for data-driven prompt and model optimization.
+## 🧰 Capabilities
+
+All abilities are exposed through a unified `Tool` protocol (`qqbot/services/agent_loop/tools/`, each tool shipping a same-named `.md` doc). The 15 tools **currently registered**:
+
+| Category | Tools |
+|---|---|
+| Expression | `reply` (store analysis and wait) `send_messages` (multiple bubbles, stickers included) `meme_collection` (curate and caption stickers) |
+| Pacing | `wait` (autonomous silence — not interrupting is also a decision) |
+| Tasks | `task` (create / note / complete / fail across ticks) |
+| Perception & Retrieval | `look_at_image` (re-examine an image with a question) `search_history` `websearch` `webfetch` |
+| Group Info | `get_group_info` `get_member_list` `get_member_info` |
+| Join Requests | `get_pending_join_requests` `respond_to_group_join_request` |
+| Moderation | `kick` |
+
+> The repository holds 15 more implemented but **currently disabled** tools (`ban`, `poke`, `recall`, `set_card`, `set_essence`, …). Their code, docs, and contract tests are all retained; each will be re-enabled individually once it meets the bar.
 
 ## 🛠️ Roadmap
 
 - [ ] **Cognitive Evolution**: Group profiling & long-term memory (off-peak batch analysis to summarize user preferences and group lore, writing them back to the event stream).
 - [ ] **Expression Enhancement**: Voice message transcribing (introduce `audio_transcribe` tool to complement visual and textual multimodality).
 - [ ] **Infrastructure**: CQRS read model optimization (add dedicated read tables to avoid refolding all recent events every tick).
-- [ ] **Asset Governance**: Prompt registry expansion (add runtime feedback, safety guidelines, and multi-persona hot-swapping).
+- [ ] **Asset Governance**: Prompt asset governance and strict validation (runtime feedback, safety guidelines, and multi-persona hot-swapping).
 
 ## 📸 Screenshots
 
@@ -109,8 +117,8 @@ python -m qqbot
 ### ⚙️ Configuration Notes
 
 - **Connect NapCat**: Add a WebSocket client on the NapCat Web Panel pointing to `ws://<bot-host>:7500/onebot/v11/ws`.
-- **Model Router Config (`config/model_providers.json`)**: Fill in API keys and configure target models for `planner`, `replyer`, and `caption` roles.
-- **Customize Persona (`prompts/voice.md`)**: Edit `qqbot/services/agent_loop/prompts/voice.md` to adjust Replyer's persona card (reboot the process to take effect).
+- **Model Router Config (`config/model_providers.json`)**: Fill in API keys and configure target models for four roles — `planner` (decisions and wording), `vision` (image transcription, must be vision-capable), `caption` (sticker descriptions, must be vision-capable), and `memory` (memory compaction). **Without this file every LLM is unavailable** — there is no fallback path.
+- **Customize Persona (`prompts/planner.md`)**: Edit the `# 你是谁` section of `qqbot/services/agent_loop/prompts/planner.md` to adjust the persona card (read at render time — edits take effect without a restart).
 - **API Lab Debug Entry**: Run `python -m qqbot.main_test` to start an isolated OneBot/NapCat API probe without DB or LLM overhead.
 
 
