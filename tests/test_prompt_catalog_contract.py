@@ -54,7 +54,10 @@ class AssemblyPinningTests(unittest.TestCase):
             CONSUMERS,
             {
                 "planner": "planner.md",
-                "caption": "meme_caption.md",
+                # 2026-08-02：收藏描述改读图片客观转录那张页（原
+                # meme_caption.md 已删除）。同页两个消费者是有意的，改回去
+                # = 加一张 .md + 改 CONSUMERS 一行。
+                "caption": "image_description.md",
                 "image_description": "image_description.md",
                 "image_look": "image_look.md",
                 "memory": "memory_compaction.md",
@@ -463,11 +466,15 @@ class FileAssemblyTests(unittest.TestCase):
                 self.assertNotEqual(match.group(1), "voice")
 
     def test_caption_render_matches_file(self) -> None:
+        """2026-08-02：收藏描述与 timeline 图片转录读同一张页，逐字节相同。
+
+        旧钉法（比对 meme_caption.md + `150 字` 限长锚点）随该文件一并删除：
+        现在这条链的产出上界由 meme_caption.MAX_DESCRIPTION_CHARS 兜底，
+        提示词里不再有字数要求。"""
         rendered = render_system_prompt("caption")
-        self.assertEqual(rendered, self._md("meme_caption.md"))
-        # 限长锚点：2026-07-27 由 120 字放宽到 150（给"适用场景"留篇幅），
-        # 当时漏改这条断言。数字本身不是契约，"有硬限长"才是。
-        self.assertIn("150 字", rendered)
+        self.assertEqual(rendered, self._md("image_description.md"))
+        self.assertEqual(rendered, render_system_prompt("image_description"))
+        self.assertFalse((_PROMPTS_DIR / "meme_caption.md").exists())
 
     def test_image_description_render_matches_file(self) -> None:
         rendered = render_system_prompt("image_description")

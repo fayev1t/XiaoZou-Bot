@@ -1,10 +1,17 @@
 """表情包收录/换描述时的看图写描述（meme 工具 save/recaption 的内部 LLM 调用）。
 
 meme 工具不让 planner 在动作 JSON 里顺手写收藏描述：决策 tick 的主职是决策，
-顺手写的一句话密度和稳定性都不够。这里用专用 prompt 单独调一次多模态 LLM：
-输入 = 图片 bytes（+ planner 可选提供的群聊语境 context_note——纯看图写不出
-"这是谁的名场面/本群怎么用"），输出 = 一段密度优先的中文描述，落进
-agent_memes.description；之后 <saved-memes> 渲染与 meme.send 选图都只看它。
+顺手写的一句话密度和稳定性都不够。这里单独调一次多模态 LLM：输入 = 图片 bytes
+（+ planner 可选提供的群聊语境 context_note——纯看图写不出"这是谁的名场面/本群
+怎么用"），输出 = 一段密度优先的中文描述，落进 agent_memes.description；之后
+<saved-memes> 渲染与 send_messages 选图都只看它。
+
+**2026-08-02 起提示词复用 timeline 图片那张 `image_description.md`**（consumer
+名仍是 `caption`，映射在 prompts/catalog.py），原专属的 `meme_caption.md` 删除：
+那段"≤150 字覆盖画面/文字/情绪/场景"的写法实跑效果不如客观转录页，篇幅一卡死，
+模型就写成一句概括，画面细节与图上文字反而丢了——而选图要的正是这些。取舍与
+共用带来的代价见 catalog.py 模块 docstring。role 仍是独立的 `caption`（路由与
+温度不合并）。
 
 注入方式：caption_image 由 v2_main 传给 LoopSupervisor → ToolWorker，在
 run() context 里以 ``caption_image`` 键到达 meme 工具 —— 工具不直接 import
@@ -36,15 +43,18 @@ from qqbot.services.agent_loop.prompt_snapshot import (
 
 logger = get_logger(__name__)
 
-# 描述上限（字符）。收藏夹整体进 prompt（MAX_SAVED_MEMES 条），单条必须短；
-# prompt 里要求 ≤150 字（2026-07-27 起，给使用场景留篇幅），这里再硬截兜底。
-MAX_DESCRIPTION_CHARS = 300
+# 描述上限（字符）。收藏夹整体进 prompt（MAX_SAVED_MEMES 条 × 本上限 = 每拍
+# 最坏体积），所以必须有上界；但 2026-08-02 换用 image_description.md 之后
+# **提示词里不再有字数要求**（那页要的是"非常详细的描述 + 图上所有文字"），
+# 旧的 300 会把详细转录拦腰截断，故放宽到 600：既留得下画面细节与图上文字，
+# 100 条满仓也就 6 万字符量级。真嫌大就调这里或 meme_store.MAX_SAVED_MEMES，
+# 两个旋钮独立。（ingest 那条链自己的上界是 1200，见 image_description。）
+MAX_DESCRIPTION_CHARS = 600
 
-# 看图写描述的专用 prompt 2026-07-27 外置为 prompts/meme_caption.md（收口，
-# 段目录见 prompts/catalog.py）：只描述、不寒暄、限长；描述要同时可"检索"
-# （画面/文字）与可"使用"（情绪/场景）——meme.send 选图时模型只看这段文本，
-# 且收藏夹全 bot 共享，描述必须自包含。required 段：文件缺失/为空时上抛，
-# caption_image 折成 CaptionError（收藏失败、不落表），不静默用空指令看图。
+# 看图写描述的 prompt 走 prompts/catalog.py 的 consumer 名 `caption`
+# ——2026-08-02 起该名映射到 image_description.md（原 meme_caption.md 已删除，
+# 理由见本模块 docstring）。required 段：文件缺失/为空时上抛，caption_image
+# 折成 CaptionError（收藏失败、不落表），不静默用空指令看图。
 def _load_caption_prompt() -> str:
     from qqbot.services.agent_loop.prompts.catalog import render_system_prompt
 

@@ -137,7 +137,10 @@ _FILES: dict[str, str] = {
 # ── 消费者 → 根页文件名。根页不是槽，不能被别的页引用 ──
 CONSUMERS: dict[str, str] = {
     "planner": "planner.md",
-    "caption": "meme_caption.md",
+    # 收藏描述 2026-08-02 起复用图片客观转录那张页（原 meme_caption.md 已删除，
+    # 理由见模块 docstring）。两个消费者一张页是有意的，不是漏改：想让收藏描述
+    # 重新分家 = 加一张 .md + 改这一行。
+    "caption": "image_description.md",
     "image_description": "image_description.md",
     "image_look": "image_look.md",
     "memory": "memory_compaction.md",
