@@ -13,12 +13,17 @@ Skeleton tick (will grow as projection + real planner come online):
 The loop is awoken by LoopSupervisor.wake(); when idle it parks on an
 asyncio.Event without burning CPU.
 
-唤醒攒批窗口（2026-07-28）：wake() 默认**不立刻**开拍，而是把唤醒推迟
-_WAKE_DEBOUNCE_SECONDS；窗口内再来的唤醒顺延这个 deadline，直到安静下来才
-真正开拍（_WAKE_MAX_DELAY_SECONDS 封顶，防止持续刷屏把 tick 饿死）。
-asyncio.Event 本身已经能把"上一拍还在跑"期间的多次唤醒并成一次，但 loop 空闲
-时第一条消息会立刻开拍——而 QQ 上一句话拆成三条发是常态，那会让 bot 对着半截
-话表态，然后下一拍再看到后半句。窗口堵的是这个洞，不是省 tick。
+唤醒攒批窗口（2026-07-28 引入，2026-08-01 由滑动改固定）：wake() 默认**不立刻**
+开拍，而是由第一次唤醒开一个 _WAKE_BATCH_WINDOW_SECONDS 的窗口；窗口内后续的
+唤醒并入本窗、**不顺延** deadline，到点开一拍。asyncio.Event 本身已经能把"上一
+拍还在跑"期间的多次唤醒并成一次，窗口堵的是另一个洞：loop 空闲时第一条消息会
+立刻开拍——而 QQ 上一句话拆成三条发是常态，那会让 bot 对着半截话表态。
+窗口只负责"别对着刚落地的第一条消息就开拍"这一件事。"等他把话说完再回"不在
+这一层：那是模型经 reply 的等待自己判断的（决定开口时起一段等待，flush 时重读
+时间线再落笔），程序不拿一个常量去猜别人打完字没有。早先的滑动实现每次唤醒都
+顺延 deadline，活跃 scope 的开拍会被无限往后推，只好再加一个封顶常量兜底——
+那个上限是滑动自己造出来的病的药；固定窗口的开拍延迟天然有界（≤ 窗口本身），
+两个常量因此收敛成一个。
 工具批次收口这类"活干完了，来看结果"的唤醒走 immediate=True 直接开拍：那里
 没有什么可攒的，等窗口纯属白白加延迟。
 
@@ -75,11 +80,10 @@ from qqbot.services.agent_loop.tool_registry import (
 
 logger = get_logger(__name__)
 
-# 唤醒攒批窗口（2026-07-28，见模块 docstring）。安静 _WAKE_DEBOUNCE_SECONDS
-# 后才开拍；一串连续唤醒最多把首次唤醒推迟 _WAKE_MAX_DELAY_SECONDS —— 没有这
-# 个上限的话，一个持续刷屏的群会把 deadline 无限往后推，loop 永远不开拍。
-_WAKE_DEBOUNCE_SECONDS = 2.0
-_WAKE_MAX_DELAY_SECONDS = 6.0
+# 唤醒攒批窗口（2026-07-28 引入，2026-08-01 由滑动改固定，见模块 docstring）。
+# 第一次唤醒开窗，窗口内的后续唤醒并入本窗、不顺延 deadline，到点开一拍——
+# 开拍延迟因此天然有界（≤ 窗口本身），不再需要防饿死的封顶常量。
+_WAKE_BATCH_WINDOW_SECONDS = 3.0
 
 SessionFactory = Callable[[], AsyncSession]
 
@@ -119,11 +123,10 @@ class AgentLoop:
         self._stopped = False
         self._tick_seq = 0
         self._task: asyncio.Task[None] | None = None
-        # 攒批窗口状态：deadline 每次 wake() 顺延，burst_started 钉住这一串
-        # 唤醒的起点（用于 _WAKE_MAX_DELAY_SECONDS 封顶）；timer 是当前在睡的
-        # 那个协程，同一时刻至多一个。
+        # 攒批窗口状态：deadline 是当前窗口的到点时刻，开窗时算一次、窗口内
+        # 不再变动（None = 当前没开窗，下一次 wake() 负责开）；timer 是正在睡
+        # 到那个时刻的协程，同一时刻至多一个。
         self._wake_deadline: float | None = None
-        self._wake_burst_started: float | None = None
         self._wake_timer: asyncio.Task[None] | None = None
 
     @property
@@ -157,40 +160,33 @@ class AgentLoop:
         """
         if self._stopped:
             return
-        if immediate or _WAKE_DEBOUNCE_SECONDS <= 0:
+        if immediate or _WAKE_BATCH_WINDOW_SECONDS <= 0:
             self._cancel_wake_timer()
             self._wake_deadline = None
-            self._wake_burst_started = None
             self._wake.set()
             return
 
-        now = time.monotonic()
-        if self._wake_burst_started is None:
-            self._wake_burst_started = now
-        # 新唤醒把 deadline 往后推，但不越过这一串唤醒的硬上限。
-        self._wake_deadline = min(
-            now + _WAKE_DEBOUNCE_SECONDS,
-            self._wake_burst_started + _WAKE_MAX_DELAY_SECONDS,
-        )
+        if self._wake_deadline is not None:
+            # 窗口已开：本次唤醒并入这一拍，**不**顺延 deadline。
+            return
+        self._wake_deadline = time.monotonic() + _WAKE_BATCH_WINDOW_SECONDS
         if self._wake_timer is None or self._wake_timer.done():
             self._wake_timer = asyncio.create_task(
-                self._wake_after_quiet(),
+                self._wake_after_window(),
                 name=f"agent_loop_wake:{self._scope_key}",
             )
 
-    async def _wake_after_quiet(self) -> None:
-        """睡到 deadline 再置位。窗口内又有新唤醒 → wake() 已把
-        _wake_deadline 推后，这里重读后接着睡（不新建 timer）。"""
-        while not self._stopped:
-            deadline = self._wake_deadline
-            if deadline is None:
-                return
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
+    async def _wake_after_window(self) -> None:
+        """睡到窗口到点再置位。deadline 在开窗那一刻就定死、窗口内不会被后续
+        唤醒推后，所以只睡一次即可（旧的滑动实现要在这里重读 deadline 续睡）。
+        """
+        deadline = self._wake_deadline
+        if deadline is None:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
             await asyncio.sleep(remaining)
         self._wake_deadline = None
-        self._wake_burst_started = None
         self._wake.set()
 
     def _cancel_wake_timer(self) -> None:
@@ -337,12 +333,12 @@ class AgentLoop:
         # agent.decision_emitted
         # occurred_at 显式回填为**本拍投影时刻**（tick 开头的 now），不取默认
         # 的写入时刻（2026-07-24，待办#18）：投影读于 planner.decide() 之前，
-        # 事件却写于 LLM 返回之后，而事件流按 occurred_at 排序（_fetch）。用
-        # 写入时刻会把 LLM 往返期间到达的消息排到决策事件**之前**——那些消息
-        # 根本没进本拍 context，却因此被读成"这拍已经看过"，人连发的第二句就
-        # 此被吞。decision_emitted 自身虽不再投影，但仍是 unseen 折叠的决策
-        # 水位线；决策"发生"于开始思考的时刻，回填后水位线才与本拍真正看到的
-        # 内容一致。
+        # 事件却写于 LLM 返回之后，而事件流按 occurred_at 排序（_fetch）。
+        # 决策"发生"于开始思考的时刻，回填后它才与本拍真正看到的内容对齐。
+        # 该事件本身不投影（reasoning 不回显），2026-08-02 删除 unseen 后也
+        # 不再充当任何水位线——回填的现行理由是与同拍其余决策产物
+        # （tool_called / idle_decision / task_*）保持同刻，见事件系统设计.md
+        # §时间戳约束；别因为"看起来没人用了"改回写入时刻。
         decision_id = await write_agent_event(
             self._session_factory,
             event_type="agent.decision_emitted",
@@ -709,7 +705,7 @@ def _validate_decision(decision: DecisionOutput) -> str | None:
 
     工具自己的 arguments / scope / permission 校验全部留在工具边界；这里仅
     校验跨 action 的组合约束。"一 tick 多回复"的旧硬约束已经移除，由
-    planner.md §你需要做什么 的软规范引导。
+    planner.md §人物模型 / §决策要求 的软规范引导。
     """
     actions = decision.actions
     if any(isinstance(a, IdleAction) for a in actions) and len(actions) > 1:

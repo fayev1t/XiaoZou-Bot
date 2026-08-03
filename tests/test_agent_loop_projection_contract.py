@@ -20,8 +20,8 @@ from zoneinfo import ZoneInfo
 from qqbot.services.agent_loop.decision import TimelineItem
 from qqbot.services.agent_loop.projection import (
     Projector,
-    _EventSnapshot,
     _esc_text,
+    _EventSnapshot,
     _safe_json,
     render_timeline_stream,
 )
@@ -2696,7 +2696,7 @@ class ReplyFlushedProjectionTests(unittest.TestCase):
             },
         )
         rendered = Projector.build_timeline([called], tool_views=[])[0].render
-        self.assertIn("&quot;hold_seconds&quot;", rendered)
+        self.assertIn('<args>{"hold_seconds": 8}</args>', rendered)
 
     def test_reply_task_completed_renders_an_empty_row(self) -> None:
         """runtime.reply_task_completed → <reply-task-completed> 空元素行。
@@ -2979,17 +2979,24 @@ class SavedMemesAugmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctx.saved_memes, [meme])
 
 
-class HandledBoundaryByRowOrderTests(unittest.TestCase):
-    """"我处理到哪儿了"由 `<message unseen="true">` 直接表达。
+class UnseenTagRemovedTests(unittest.TestCase):
+    """`<message unseen="true">` 第一拍判定已于 2026-08-02 删除（第三次翻转，
+    2026-07-06 引入 / 07-24 删除 / 07-28 复活）。
 
-    水位线取窗口内最后一条 agent.decision_emitted；该事件本身不投影，但其
-    occurred_at 仍须回填为本拍投影时刻。时间戳护栏在
+    删除后投影层不再有"这几条是本拍第一次看到"的任何显式信号：
+    decision_emitted 与 idle_decision 都不投影，`<my-thought>` 行位置判据已随
+    2026-08-01 reasoning 回显删除退役。这是知情接受的——理由与量化代价见
+    `projection.py` 原 fold_unseen_message_ids 处的删除说明。本类是防回潮
+    护栏：复活前先去那段注释里确认论据已被推翻。
+
+    decision_emitted.occurred_at 的本拍投影时刻回填**没有**随之取消（改由
+    "与同拍其余决策产物同刻"支撑），护栏仍在
     test_agent_loop_skeleton_contract.py::
     test_decision_timestamp_is_tick_start_not_write_time。
     """
 
-    def test_message_after_last_decision_carries_unseen_attribute(self) -> None:
-        """水位线之后到达的消息标 unseen="true"；水位线之前的不标。"""
+    def test_message_never_carries_unseen_attribute(self) -> None:
+        """决策事件前后的消息一律不带 unseen 属性。"""
         evs = [
             _snap(
                 type="external.message.group",
@@ -3030,46 +3037,16 @@ class HandledBoundaryByRowOrderTests(unittest.TestCase):
         )
         messages = [it for it in context.timeline if it.kind == "message"]
         self.assertEqual(len(messages), 2)
-        self.assertNotIn("unseen", messages[0].render)
-        self.assertIn('unseen="true"', messages[1].render)
+        for item in messages:
+            self.assertNotIn("unseen", item.render)
 
-    def test_fold_unseen_message_ids_resets_on_each_decision(self) -> None:
-        """水位线遇 agent.decision_emitted 清零重算：只有最后一次决策之后
-        到达的消息才算未见过，不是全程累加。"""
-        evs = [
-            _snap(type="external.message.group", event_id="M1", seconds_offset=1),
-            _snap(
-                type="agent.decision_emitted",
-                payload={"reasoning": "先看看"},
-                seconds_offset=2,
-            ),
-            _snap(type="external.message.group", event_id="M2", seconds_offset=3),
-            _snap(
-                type="agent.decision_emitted",
-                payload={"reasoning": "还是先等"},
-                seconds_offset=4,
-            ),
-            _snap(type="external.message.group", event_id="M3", seconds_offset=5),
-        ]
-        self.assertEqual(
-            Projector.fold_unseen_message_ids(evs), frozenset({"M3"})
-        )
-
-    def test_fold_unseen_message_ids_all_unseen_without_any_decision(
-        self,
-    ) -> None:
-        """窗口内从没有过决策时，全部消息算未见过——该 scope 真正意义上的
-        第一拍。"""
-        evs = [
-            _snap(type="external.message.group", event_id="M1", seconds_offset=1),
-            _snap(type="external.message.group", event_id="M2", seconds_offset=2),
-        ]
-        self.assertEqual(
-            Projector.fold_unseen_message_ids(evs), frozenset({"M1", "M2"})
-        )
+    def test_fold_unseen_message_ids_is_gone(self) -> None:
+        """折叠函数本身不得残留——留着就会有人重新接上渲染。"""
+        self.assertFalse(hasattr(Projector, "fold_unseen_message_ids"))
 
     def test_hidden_decision_does_not_create_a_timeline_row(self) -> None:
-        """决策事件夹在消息之间时只推进 unseen 水位线，不泄漏 reasoning。"""
+        """决策事件夹在消息之间时不产生任何行，也不泄漏 reasoning——两条消息
+        原样相邻，中间那拍在时间线上零痕迹。"""
         evs = [
             _snap(
                 type="external.message.group",
@@ -3110,7 +3087,6 @@ class HandledBoundaryByRowOrderTests(unittest.TestCase):
             [it.event_id for it in context.timeline], ["M1", "M2"]
         )
         self.assertNotIn("先等", "".join(it.render for it in context.timeline))
-        self.assertIn('unseen="true"', context.timeline[1].render)
 
 
 class DecisionReasoningIsolationTests(unittest.TestCase):

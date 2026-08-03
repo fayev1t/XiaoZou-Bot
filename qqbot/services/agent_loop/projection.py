@@ -14,8 +14,8 @@ Strategy:
   agent-visible runtime hints. Task and tool-result events are folded
   upstream and do NOT produce timeline rows of their own.
 - Keep `agent.decision_emitted` out of the timeline. Its reasoning remains
-  persisted for audit and its timestamp remains the unseen-message watermark,
-  but the free-form note is never fed into a later Planner tick.
+  persisted for audit, but the free-form note is never fed into a later
+  Planner tick and the event produces no row of any kind.
 
 Folding and rendering are split into pure staticmethods so unit tests
 can drive them without a DB.
@@ -467,11 +467,7 @@ class Projector:
         # tool_views 只喂给 timeline 渲染（<tool-call> 行按两态折叠）；不再
         # 另出 pending_tool_results 区——同一调用双重渲染曾是复读的直接诱饵。
         tool_views = Projector.fold_tool_results(events)
-        timeline = Projector.build_timeline(
-            events,
-            tool_views=tool_views,
-            unseen_message_ids=Projector.fold_unseen_message_ids(events),
-        )
+        timeline = Projector.build_timeline(events, tool_views=tool_views)
         # 裁到尾部 max_timeline_items 条 —— fetch 上限给得宽是为了 fold 任务/
         # 工具结果时能看到足够长的事件链，但塞给 LLM 的不必那么多。
         # timeline_anchor（上一拍窗口首行）有效时起点滞回钉住，见
@@ -555,45 +551,26 @@ class Projector:
                 break  # 超出滞回带：一次性前移回朴素起点
         return timeline[naive:]
 
-    @staticmethod
-    def fold_unseen_message_ids(
-        events: Sequence[_EventSnapshot],
-    ) -> frozenset[str]:
-        """第一拍判定（2026-07-06，待办清单#1 群聊拆句观望；2026-07-24 删除、
-        2026-07-28 复活，见下方"复活说明"）：找出"还没有任何一拍决策看过"
-        的新外部消息。
-
-        每条消息入库即 wake(scope)，第一拍常在对方话说到一半时开拍。这里以
-        窗口内**最后一条** agent.decision_emitted 为水位线：其后到达的
-        external.message.* 即"未见过"，渲染时标 `unseen="true"`（见
-        _render_message），把"这拍是这些消息的第一拍"变成结构性事实——
-        不靠模型从自由工作笔记推断。窗口内从没有过决策时全部消息算未见过
-        （该 scope 真正意义上的第一拍）。
-
-        planner 抛异常的残拍不写 decision_emitted（loop._tick 直接收尾），
-        不推进水位线——那一拍确实没"看到"消息，语义自洽。bot 自己的发言
-        不会误触发：reply 走 agent.tool_called，不产生 external.message
-        事件。notice / request / runtime hint 亦不参与——这个标签只对
-        "人还在说话"这件事成立。
-
-        复活说明（2026-07-28）：2026-07-24 删除时的两条理由——① 锚定，模型
-        只在带标签的消息里找发言理由；② 一次性，一条消息只享有一拍的
-        "值得看"，那拍若观望就永久降级成历史——都没有被推翻，这次是权衡后
-        认为"能不能一眼看出哪几行是新的"更重要。同时确认过一个新增代价：
-        `unseen="true"` 逐拍变化，消息从 unseen 变为非 unseen 时该行字节
-        改变，会在窗口锚定滞回（见类常量注释）之外额外叠加一个前缀缓存
-        失效点，且集中在消息密集的场景——用同一个 group 的真实 prompt
-        快照估过量级，大致是把"正常拍"的缓存命中率从 65-68% 拉到接近
-        "窗口锚点跳动那几拍"的 38-43%。这个取舍是知情做出的，不要当成
-        没考虑过的疏漏又删一遍。
-        """
-        unseen: list[str] = []
-        for ev in events:
-            if ev.type == "agent.decision_emitted":
-                unseen.clear()
-            elif ev.type.startswith("external.message."):
-                unseen.append(ev.event_id)
-        return frozenset(unseen)
+    # fold_unseen_message_ids / `<message unseen="true">` 的第一拍判定
+    # **2026-08-02 删除**（2026-07-06 引入、07-24 删除、07-28 复活，这是第
+    # 三次翻转；勿再复活，除非带着下面没被覆盖的新论据）。
+    #
+    # 删除时明知系统里不再有任何"这几条是本拍第一次看到"的显式信号：
+    # decision_emitted 与 idle_decision 都不投影，`<my-thought>` 行位置判据
+    # 已随 2026-08-01 reasoning 回显删除退役，`<current unread="N">` 聚合
+    # 计数 07-28 复活本机制时一并删掉。idle 拍因此在时间线上零痕迹。
+    #
+    # 论据：① 07-24 删除时的两条理由从未被推翻，07-28 只是权衡压过——
+    # 二值标签造成锚定（模型只在带标签的行里找发言理由），且一次性（一条
+    # 消息只享有一拍的"值得看"，那拍观望就永久降级）；② 前缀缓存代价当时
+    # 是知情接受的：逐拍翻转把密集聊天的命中率从 65-68% 压到 38-43%，而
+    # 密集聊天正是它想服务的场景；③ 08-01 planner.md 重构后 `# 决策要求`
+    # 的"回看"条目已在政策层承担同一职责，不再需要投影层的结构性标记。
+    #
+    # 连带说明：agent.decision_emitted.occurred_at 仍回填为本拍投影时刻
+    # （loop._tick），理由已不再是水位线，而是与同拍其他决策产物
+    # （tool_called / idle_decision / task_*）保持同刻——见
+    # 事件系统设计.md §时间戳约束。别顺手改回写入时刻。
 
     @staticmethod
     def fold_bot_role(
@@ -737,7 +714,6 @@ class Projector:
         events: Sequence[_EventSnapshot],
         *,
         tool_views: Sequence[ToolResultView],
-        unseen_message_ids: frozenset[str] | set[str] = frozenset(),
     ) -> list[TimelineItem]:
         tool_view_by_id = {tv.tool_call_id: tv for tv in tool_views}
         # 预扫一遍构建 reply 段引用所需的索引（被回复消息摘要 + 用户名映射），
@@ -834,7 +810,6 @@ class Projector:
                     excerpt_by_msg_id,
                     name_by_user_id,
                     author_by_msg_id,
-                    unseen=ev.event_id in unseen_message_ids,
                 )
                 items.append(
                     TimelineItem(
@@ -917,8 +892,6 @@ class Projector:
         excerpt_by_msg_id: dict[str, str],
         name_by_user_id: dict[str, str],
         author_by_msg_id: "dict[str, _AuthorRef] | None" = None,
-        *,
-        unseen: bool = False,
     ) -> tuple[str, list[ImageRef]]:
         sender = ev.payload.get("sender") or {}
         name = sender.get("card") or sender.get("nickname")
@@ -974,11 +947,6 @@ class Projector:
         # recall / set_essence 等工具参数同名直抄），与 task_id / event_id 区分。
         if msg_id:
             attrs.append(f'message_id="{_esc_attr(str(msg_id))}"')
-        # unseen="true"：该消息在最后一条 agent.decision_emitted 之后到达，
-        # 还没有任何一拍处理过（fold_unseen_message_ids）。缺失 = 已经历过
-        # 至少一拍。属性总语义"缺失=默认"的又一实例。
-        if unseen:
-            attrs.append('unseen="true"')
         attr_str = f" {' '.join(attrs)}" if attrs else ""
         return f"<message{attr_str}>{body}</message>", images
 

@@ -138,7 +138,7 @@ class SupervisorBatchWakeTests(unittest.IsolatedAsyncioTestCase):
         await sup.notify_tool_batch_completed("group:1", "B1")
         self.assertEqual(fake.wakes, 1)
 
-    async def test_batch_completed_wake_bypasses_debounce(self) -> None:
+    async def test_batch_completed_wake_bypasses_batch_window(self) -> None:
         """2026-07-28 攒批窗口：批次收口的唤醒必须 immediate。工具结果已经
         落库、模型正等着看，窗口里没有任何可攒的东西，等它纯属白加延迟。"""
         sup, fake = self._supervisor_with_fake_loop("group:1")

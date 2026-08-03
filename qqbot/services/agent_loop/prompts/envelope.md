@@ -89,8 +89,6 @@ ID 空间：后缀标识值域，各空间互不通用，也不可互相推导
   @anonymous     true。匿名群消息：@sender_name 是匿名马甲而非真实成员身份，
                  @sender_qq 若存在也是匿名伪 ID，两者都不指向稳定的人。
   @message_id    这条消息的 OneBot 消息 ID。
-  @unseen        true。该消息到达于本 scope 上一次决策之后，尚未被任何一拍处理。
-                 缺失 = 它至少经历过一次决策。
 
 <my-reply>  父 <time>
   仅旧记录：历史链路中一次回复投递的最终结果，

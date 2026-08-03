@@ -200,9 +200,10 @@ class LoopSupervisor:
     async def wake(self, scope_key: str, *, immediate: bool = False) -> None:
         """唤醒某个 scope 的 loop。
 
-        默认走 AgentLoop 的攒批窗口（2026-07-28）：新消息不立刻开拍，安静下来
-        才开，避免对着拆成几条发的半截话表态。immediate=True 直接开拍，留给
-        "活干完了，来看结果"类唤醒（工具批次收口）——那里没有可攒的东西。
+        默认走 AgentLoop 的攒批窗口（2026-07-28 引入，2026-08-01 改固定窗口）：
+        新消息不立刻开拍，第一条开一个固定窗口，这段时间内到的一起在窗口到点
+        那一拍看到，避免对着拆成几条发的半截话表态。immediate=True 直接开拍，
+        留给"活干完了，来看结果"类唤醒（工具批次收口）——那里没有可攒的东西。
         """
         if self._stopped:
             return

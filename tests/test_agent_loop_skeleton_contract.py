@@ -15,8 +15,9 @@ Also verifies:
 - EventIngest.wake is dispatched to supervisor on inserted external events
   and not dispatched for private / no-mapper events.
 - scope_key parser handles all three scopes.
-- 唤醒攒批窗口（2026-07-28）：默认 wake() 等安静后才开拍，一串唤醒并成一拍，
-  immediate=True 绕过窗口，持续刷屏被 max delay 兜住。
+- 唤醒攒批窗口（2026-07-28 引入，2026-08-01 改固定窗口）：默认 wake() 由第一次
+  唤醒开窗、到点才开拍，窗口内的唤醒并入同一拍且不顺延，immediate=True 绕过
+  窗口，持续唤醒下每个窗口到点照常开拍（不会被顺延饿死）。
 """
 
 from __future__ import annotations
@@ -273,10 +274,13 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
 
         投影读于 planner.decide() 之前、事件却写于 LLM 返回之后，而事件流按
         occurred_at 排序（Projector._fetch）。若取写入时刻，LLM 往返期间到达
-        的消息会排到决策事件**之前**——那些消息根本没进本拍 context，却被读
-        成"这拍已经看过"（人连发的第二句因此被吞）。decision_emitted 虽不再
-        投影，其时间戳仍是 `<message unseen="true">` 的水位线；取错时刻会
-        直接误标，因此本条护栏仍是第一拍判定的地基。
+        的消息会排到决策事件**之前**，事件流的因果顺序即与本拍真实看到的内容
+        不符。
+
+        2026-08-02 删除 `<message unseen="true">` 后本条护栏**不随之取消**：
+        decision_emitted 虽不再投影、也不再充当水位线，但它与同拍其余决策
+        产物（tool_called / idle_decision / task_*）必须同刻，那几个是要上
+        时间线的（事件系统设计.md §时间戳约束）。
         """
         captured: list[Any] = []
         loop = AgentLoop(
@@ -430,14 +434,17 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("runtime.tick_ended", types)
 
 
-class WakeDebounceTests(unittest.IsolatedAsyncioTestCase):
-    """唤醒攒批窗口（2026-07-28）。
+class WakeBatchWindowTests(unittest.IsolatedAsyncioTestCase):
+    """唤醒攒批窗口（2026-07-28 引入，2026-08-01 由滑动改固定）。
 
     存在的理由不是省 tick —— asyncio.Event 早就能把"上一拍还在跑"期间的多次
     唤醒并成一次。堵的是 loop **空闲**时第一条消息立刻开拍这个洞：QQ 上一句话
     拆成三条发是常态，不等一等就会对着半截话表态。
 
-    窗口值用 patch 压到毫秒级跑，避免测试挂在真实的 2s 上。
+    固定窗口：第一次唤醒开窗，窗口内的唤醒并入本窗、不顺延 deadline。开拍延迟
+    因此有界，不再需要（也不再有）防饿死的封顶常量。
+
+    窗口值用 patch 压到毫秒级跑，避免测试挂在真实的 3s 上。
     """
 
     @staticmethod
@@ -454,7 +461,7 @@ class WakeDebounceTests(unittest.IsolatedAsyncioTestCase):
             if _values_of(stmt).get("type") == "runtime.tick_started"
         )
 
-    async def test_plain_wake_waits_for_quiet_window(self) -> None:
+    async def test_plain_wake_waits_for_batch_window(self) -> None:
         captured: list[Any] = []
         loop = AgentLoop(
             scope_key="group:12345",
@@ -462,7 +469,7 @@ class WakeDebounceTests(unittest.IsolatedAsyncioTestCase):
             session_factory=_factory_for(captured),
         )
         with patch(
-            "qqbot.services.agent_loop.loop._WAKE_DEBOUNCE_SECONDS", 0.2
+            "qqbot.services.agent_loop.loop._WAKE_BATCH_WINDOW_SECONDS", 0.2
         ):
             loop.start()
             loop.wake()
@@ -483,12 +490,12 @@ class WakeDebounceTests(unittest.IsolatedAsyncioTestCase):
             session_factory=_factory_for(captured),
         )
         with patch(
-            "qqbot.services.agent_loop.loop._WAKE_DEBOUNCE_SECONDS", 0.2
+            "qqbot.services.agent_loop.loop._WAKE_BATCH_WINDOW_SECONDS", 0.2
         ):
             loop.start()
             for _ in range(3):
                 loop.wake()
-                await asyncio.sleep(0.05)  # 窗口内陆续到达 → 顺延 deadline
+                await asyncio.sleep(0.05)  # 窗口内陆续到达 → 并入本窗，不顺延
             self.assertEqual(await self._tick_count(captured), 0)
             await self._settle(captured, 4, budget=1.0)
             await loop.stop()
@@ -503,7 +510,7 @@ class WakeDebounceTests(unittest.IsolatedAsyncioTestCase):
             session_factory=_factory_for(captured),
         )
         with patch(
-            "qqbot.services.agent_loop.loop._WAKE_DEBOUNCE_SECONDS", 5.0
+            "qqbot.services.agent_loop.loop._WAKE_BATCH_WINDOW_SECONDS", 5.0
         ):
             loop.start()
             loop.wake(immediate=True)
@@ -511,30 +518,27 @@ class WakeDebounceTests(unittest.IsolatedAsyncioTestCase):
             await loop.stop()
         self.assertEqual(await self._tick_count(captured), 1)
 
-    async def test_continuous_wakes_capped_by_max_delay(self) -> None:
-        """持续刷屏不能把 tick 饿死：deadline 顺延有硬上限，到点必开拍。"""
+    async def test_continuous_wakes_tick_once_per_window(self) -> None:
+        """持续刷屏不能把 tick 饿死：窗口不被顺延，到点就开拍，之后的唤醒开一
+        个新窗口。这也是固定窗口不再需要封顶常量的原因。"""
         captured: list[Any] = []
         loop = AgentLoop(
             scope_key="group:12345",
             planner=_FakeIdlePlanner(),
             session_factory=_factory_for(captured),
         )
-        with (
-            patch(
-                "qqbot.services.agent_loop.loop._WAKE_DEBOUNCE_SECONDS", 0.2
-            ),
-            patch(
-                "qqbot.services.agent_loop.loop._WAKE_MAX_DELAY_SECONDS", 0.3
-            ),
+        with patch(
+            "qqbot.services.agent_loop.loop._WAKE_BATCH_WINDOW_SECONDS", 0.2
         ):
             loop.start()
-            # 每 50ms 一次唤醒，始终不让窗口安静下来，持续 0.6s（> max delay）
+            # 每 50ms 一次唤醒持续 0.6s：旧的滑动实现会一路顺延到封顶才开一拍，
+            # 固定窗口下 0.2s 的窗口在这段时间里至少轮到两次。
             for _ in range(12):
                 loop.wake()
                 await asyncio.sleep(0.05)
             await self._settle(captured, 4, budget=1.0)
             await loop.stop()
-        self.assertGreaterEqual(await self._tick_count(captured), 1)
+        self.assertGreaterEqual(await self._tick_count(captured), 2)
 
 
 class LoopSupervisorContractTests(unittest.IsolatedAsyncioTestCase):
