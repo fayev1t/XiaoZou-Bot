@@ -54,7 +54,7 @@ class WaitTool(BaseTool):
         "在指定秒数后为当前 scope 安排一次唤醒。计时器触发时写入包含 note 的 "
         '<system-hint kind="wait_elapsed"> 并启动新 tick。计时器仅保存在进程'
         "内存中，进程重启后不会恢复；工具调用记录仍保留在时间线中。本工具不"
-        "修改 reply 草稿或其 hold_seconds。"
+        "读取或修改 reply 等待及其 hold_seconds。"
     )
     usage_prompt = _USAGE_PROMPT
     arguments_schema = {

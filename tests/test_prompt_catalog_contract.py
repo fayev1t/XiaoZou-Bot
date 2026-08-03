@@ -8,19 +8,24 @@
 三份文件已并进 `planner.md`（删除 Replyer 后它们只剩 Planner 一个消费者），页里
 只剩 `{{envelope}}`（纯格式规范，与投影层成对维护，故留成独立文件）与动态的
 `{{tools_usage}}`。所以本文件的"两份副本会漂移"这条防线换了钉法：不再比对
-"卡片文件 vs 渲染结果"，而是从 `planner.md` 的人格段现取锚点，钉它**没有第二
+"卡片文件 vs 渲染结果"，而是从 `planner.md` 的人物模型段现取锚点，钉它**没有第二
 份**（别的根页、`envelope.md`、`tools/*.md` 里都不许出现）。
+
+2026-08-02 收藏描述换页：`caption` 消费者改读 `image_description.md`（原
+`meme_caption.md` 删除），于是 CONSUMERS 里第一次出现**两个消费者共用一张根页**。
+钉法照旧走第 1 条（登记表逐字节对账）+ 第 4 条（渲染产物与文件对账），额外钉两个
+消费者渲染结果相同——共用是有意的，不是漏改。
 
 钉住四件事：
 1. 根页登记与各页的槽序列——它们是五个 LLM 调用点的 prompt 组成的唯一权威，
    改动必须是有意的（2026-07-31 删除 Replyer 后 Planner 是唯一对话消费者）；
-2. 分工的**语义**边界：角色卡正文以第二人称直接开在 Planner 页首、且全系统只此
-   一份；纯记录/观察层的根页无槽。2026-07-30 删掉
+2. 分工的**语义**边界：Planner 先声明角色模拟职责，角色卡正文只在后续人物模型段
+   出现一份；纯记录/观察层的根页无槽。2026-07-30 删掉
    kind/_FORBIDDEN_KINDS/_validate_assembly 之后，这类断言是唯一还抓得到内容
    漂移的手段——结构校验的粒度是"哪个文件进哪个消费者"，而真实发生过的事故是
    "人格正文被抄进另一个文件"，那种它一声不响；
 3. 空文件 fail loudly（部署坏了不静默跑残缺 prompt），动态段求值为空则跳过；
-4. 装配产物与 prompts/*.md 文件逐字节对账（重构不改内容的护栏）。
+4. 装配产物与 prompts/*.md 文件逐字节对账。
 
 文件读取走真实 prompts/ 目录（与部署同源）；库内核语义用内联 fake source，
 不依赖文件系统。
@@ -139,8 +144,8 @@ class AssemblyPinningTests(unittest.TestCase):
 class LayerBoundaryTests(unittest.TestCase):
     """分工的语义边界 —— kind 结构校验删除之后的唯一防线。"""
 
-    #: 人格段的边界：planner.md 页首 `# 你是谁` 起、到下一个一级标题为止。
-    PERSONA_HEADING = "# 你是谁"
+    #: 人物模型段的边界：`# 人物模型` 起、到下一个一级标题为止。
+    PERSONA_HEADING = "# 人物模型"
 
     @classmethod
     def _persona_block(cls) -> str:
@@ -160,11 +165,12 @@ class LayerBoundaryTests(unittest.TestCase):
 
     @classmethod
     def _persona_anchors(cls) -> list[str]:
-        """卡片里的第二人称长句——写死原句的话卡片一改断言就假通过，所以现取。"""
+        """卡片里的角色长句——写死原句的话卡片一改断言就假通过，所以现取。"""
         return [
             line.strip()
             for line in cls._persona_block().splitlines()
-            if len(line.strip()) > 24 and line.strip().startswith("你")
+            if len(line.strip()) > 24
+            and line.strip().startswith(("你要持续模拟", "小奏", "她", "QQ 号"))
         ]
 
     def test_persona_card_reaches_the_planner(self) -> None:
@@ -172,23 +178,23 @@ class LayerBoundaryTests(unittest.TestCase):
         与措辞同归一层）。钉的是**卡片还在、且渲染没被槽残渣污染**：段被删空、
         标题被改名都要在这里当场红。"""
         anchors = self._persona_anchors()
-        self.assertTrue(anchors, "planner.md 人格段没有第二人称锚点，断言会假通过")
+        self.assertTrue(anchors, "planner.md 人物模型段没有角色锚点，断言会假通过")
         rendered = build_library("planner").render(scope="group")
         for line in anchors:
             self.assertIn(line, rendered)
         self.assertIsNone(SLOT_PATTERN.search(rendered))
 
-    def test_planner_owns_the_card_first_person(self) -> None:
-        """卡片在页首、以第二人称直接对 Planner 说话——那就是她自己。旧的
-        「这个qq号背后的人格是…」第三方框定引导语随 Replyer 一并退役：它存在
-        的唯一理由是把卡片框成对下游角色的描述，而下游角色已不存在。"""
+    def test_planner_frames_the_card_as_character_model(self) -> None:
+        """Planner 先钉角色模拟职责，再读取第三人称人物模型；最终措辞仍由
+        Planner 同层完成，不恢复 Replyer。"""
         rendered = build_library("planner").render(scope="group")
         first = self._persona_anchors()[0]
-        self.assertNotIn("这个qq号背后的人格", rendered)
-        # 卡片正文先于页面其余部分出现（页首即人格）。
+        self.assertIn("角色决策规划器，不是通用问答助手", rendered)
+        self.assertNotIn("\n你是小奏，", rendered)
         self.assertLess(
-            rendered.index(first), rendered.index("# 你所处的系统")
+            rendered.index("# 身份与核心任务"), rendered.index(first)
         )
+        self.assertIn("只能是小奏本人此刻会说的话", rendered)
 
     def test_persona_body_has_no_second_copy(self) -> None:
         """人格正文全系统只此一份。真实发生过的事故是"卡片被抄进另一个文件"
@@ -197,7 +203,7 @@ class LayerBoundaryTests(unittest.TestCase):
         自相矛盾。2026-07-31 把卡片并进 planner.md 之后，这条防线只剩这里：
         锚点现取，扫遍别的根页、文件槽与全部工具用法文档。"""
         anchors = self._persona_anchors()
-        self.assertTrue(anchors, "planner.md 人格段没有第二人称锚点，断言会假通过")
+        self.assertTrue(anchors, "planner.md 人物模型段没有角色锚点，断言会假通过")
         others = [
             _PROMPTS_DIR / filename
             for consumer, filename in CONSUMERS.items()
@@ -364,8 +370,8 @@ class FileAssemblyTests(unittest.TestCase):
 
     def _expand(self, consumer: str) -> str:
         """独立复算一遍装配：根页原文里每个槽换成对应资产（已 strip），求值为空
-        的动态槽连它前面那条分隔线一起去掉（槽在页中时同样成立，2026-08-01 起
-        两个槽位于行为规范之前的页中），首尾再 strip。与 catalog 的实现互为
+        的动态槽连它前面那条分隔线一起去掉（槽在页中时同样成立），首尾再
+        strip。与 catalog 的实现互为
         对照——两边同时写错才可能假通过。"""
         page = (_PROMPTS_DIR / CONSUMERS[consumer]).read_text(encoding="utf-8")
         page = re.sub(
@@ -380,30 +386,32 @@ class FileAssemblyTests(unittest.TestCase):
 
     def test_planner_render_matches_md_files(self) -> None:
         """渲染结果 = planner.md 正文 + 就地展开的 envelope.md（无注册表时页中的
-        tools_usage 连同它前面那条分隔线一起消失）。2026-08-01 维护者定稿：两个
-        槽位于 §你所处的系统 与 §你需要做什么 之间——先给定义再给纪律，输出
-        契约收尾。"""
+        tools_usage 连同它前面那条分隔线一起消失）。envelope 归输入数据段，
+        tools_usage 归工具段。"""
         rendered = build_library("planner").render(scope="group")
         self.assertEqual(rendered, self._expand("planner"))
         page = self._md("planner.md")
         self.assertIn("\n---\n{{tools_usage}}\n", page)
         self.assertLess(
-            page.index("{{tools_usage}}"), page.index("# 你需要做什么")
+            page.index("# 决策要求"), page.index("{{tools_usage}}")
         )
+        self.assertLess(page.index("{{tools_usage}}"), page.index("# 输出协议"))
         self.assertIn(self._md("envelope.md"), rendered)
 
     def test_planner_page_carries_every_merged_topic(self) -> None:
         """并页的主题必须逐个还在，且顺序即模型的阅读顺序：
-        你是谁 → 所处系统 → 输入信封（槽） → 需要做什么 → 如何输出。
-        2026-08-01 维护者定稿：协议参考位于系统事实与行为规范之间——先给定义
-        再给纪律，输出契约收尾。掉一段就是掉一整块语境，而渲染不会报错。"""
+        身份任务 → 系统运行 → 人物模型 → 输入信封 → 决策要求 → 工具 → 输出。
+        掉一段就是掉一整块语境，而渲染不会报错。"""
         rendered = build_library("planner").render(scope="group")
         anchors = [
-            "# 你是谁",  # 原 persona.md
-            "# 你所处的系统",  # 原 system.md（机器事实+行动纪律+两步发言）
+            "# 身份与核心任务",
+            "# 系统运行方式",  # 原 system.md（机器事实+行动纪律+两步发言）
+            "# 人物模型",  # 原 persona.md
+            "# 输入数据",
             "输入信封格式规范",  # envelope.md 槽（仍是独立文件）
-            "# 你需要做什么",  # 职责与表达倾向
-            "# 你的输出",  # 动作契约（现标题「# 你的输出是什么样子的」前缀）
+            "# 决策要求",
+            "# 工具",
+            "# 输出协议",
         ]
         positions = []
         for anchor in anchors:
@@ -444,8 +452,8 @@ class FileAssemblyTests(unittest.TestCase):
         self.assertIn("tools_usage", names)
         idx = names.index("tools_usage")
         self.assertTrue(sections[idx].text)
-        # 槽在页中：其后还有行为规范正文（职责与输出契约）
-        self.assertIn("# 你需要做什么", sections[-1].text)
+        # 槽在页中：其后还有输出协议正文。
+        self.assertIn("# 输出协议", sections[-1].text)
 
     def test_tools_usage_skipped_without_registry(self) -> None:
         names = [
@@ -454,7 +462,7 @@ class FileAssemblyTests(unittest.TestCase):
         self.assertNotIn("tools_usage", names)
 
     def test_legacy_voice_asset_is_absent(self) -> None:
-        """角色卡的居所只能有一处（planner.md 页首）：voice.md / replyer.md /
+        """角色卡的居所只能有一处（planner.md 人物模型段）：voice.md / replyer.md /
         persona.md 都不得复活——两份都在时 prompt 里会前后各读一遍人格，改一处
         就当场自相矛盾。（正文层面的"没有第二份副本"钉在
         LayerBoundaryTests.test_persona_body_has_no_second_copy。）"""

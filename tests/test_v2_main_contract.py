@@ -78,18 +78,19 @@ class V2MainPluginContractTests(unittest.TestCase):
 
     def test_plugin_has_no_persona_plumbing(self) -> None:
         # 钉的是 **plugin 层**没有人格管线：角色卡的装配全部由
-        # prompts/catalog.py 负责（planner.md 页首那一段），插件不碰——
+        # prompts/catalog.py 负责（planner.md 人物模型段），插件不碰——
         # plugin_text 里出现 persona 字样依然是接线倒退。角色卡历经
         # tools/send_message.md Voice 节、prompts/voice.md、prompts/replyer.md
         # （三者均已删除）、prompts/persona.md（2026-07-31 并回根页），现居
-        # prompts/planner.md 页首。
+        # prompts/planner.md。
         self.assertNotIn("persona", self.plugin_text)
         # 职责与角色卡同页（planner.md），必须存在且非空
         prompts_dir = ROOT / "qqbot" / "services" / "agent_loop" / "prompts"
         identity_text = (prompts_dir / "planner.md").read_text(encoding="utf-8")
-        self.assertIn("# 你所处的系统", identity_text)
-        self.assertIn("# 你需要做什么", identity_text)
-        self.assertIn("# 你是谁", identity_text)
+        self.assertIn("# 身份与核心任务", identity_text)
+        self.assertIn("# 系统运行方式", identity_text)
+        self.assertIn("# 人物模型", identity_text)
+        self.assertIn("# 决策要求", identity_text)
         self.assertIn("小奏", identity_text)
         self.assertIn("最重要的人", identity_text)
         # 旧居所不得复活（防两处副本漂移；send_message.md / replyer.md 随

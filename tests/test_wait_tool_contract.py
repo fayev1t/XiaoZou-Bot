@@ -50,13 +50,13 @@ def _values(stmt: Any) -> dict:
 class WaitToolPromptContractTests(unittest.TestCase):
     def test_description_uses_append_only_reply_semantics(self) -> None:
         description = WaitTool.description
-        self.assertIn("不修改 reply 草稿", description)
+        self.assertIn("不读取或修改 reply 等待", description)
         self.assertIn("计时器仅保存在进程内存", description)
 
     def test_usage_prompt_uses_append_only_reply_semantics(self) -> None:
         usage_prompt = WaitTool.usage_prompt
         self.assertIn("相互独立", usage_prompt)
-        self.assertIn("最新完整修订替换旧修订", usage_prompt)
+        self.assertIn("最新修订替换旧修订", usage_prompt)
 
 
 class WaitToolScheduleTests(unittest.IsolatedAsyncioTestCase):

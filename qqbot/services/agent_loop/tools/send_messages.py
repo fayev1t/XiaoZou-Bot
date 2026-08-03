@@ -122,8 +122,8 @@ class SendMessagesTool(BaseTool):
     # 目标——不照抄旧 send_message.py 的 ("group", "private")。
     allowed_scopes = ("group",)
     description = (
-        "向当前群发送多条有序气泡。messages 中每项可为 OneBot V11 聊天气泡或"
-        "收藏表情包气泡。标准发言链路先由 reply 保存分析并等待，再在 "
+        "向当前群发送一条或多条有序气泡。messages 中每项可为 OneBot V11 聊天气泡或"
+        "收藏表情包气泡。标准发言链路先由 reply 表示正在输入并启动等待，再在 "
         "<reply-task-completed> 出现后调用本工具；运行时不强制该顺序。返回值中的"
         "逐气泡回执是送达状态记录；status=uncertain 表示至少一条气泡可能已经"
         "送达。"
@@ -137,8 +137,8 @@ class SendMessagesTool(BaseTool):
                 "minItems": 1,
                 "maxItems": MAX_OUTBOUND_MESSAGES,
                 "description": (
-                    "按发送顺序排列的气泡数组。每项是一个 chat 气泡或一个 "
-                    "meme 气泡，两者平级、可任意穿插。"
+                    "按发送顺序排列的气泡数组，一条或多条均可。每项是一个 "
+                    "chat 气泡或一个 meme 气泡，两者平级、可任意穿插。"
                 ),
                 "items": {
                     "oneOf": [_CHAT_BUBBLE_SCHEMA, _MEME_BUBBLE_SCHEMA]

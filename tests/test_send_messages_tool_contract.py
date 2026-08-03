@@ -292,7 +292,7 @@ class SendMessagesMetadataTests(unittest.TestCase):
         self.assertIn("可能已经送达", doc)
         self.assertIn("再次调用会产生新的独立发送命令", doc)
         self.assertIn("逐气泡回执", doc)
-        self.assertIn("不会另外生成", doc)
+        self.assertRegex(doc, r"不会\s*另外生成")
         for forbidden in ("授权", "兑换", "消费", "领取"):
             self.assertNotIn(forbidden, doc)
 
@@ -308,16 +308,27 @@ class SendMessagesMetadataTests(unittest.TestCase):
         for leak in ("运行时允许独立调用", "不会检查", "不校验"):
             self.assertNotIn(leak, doc)
 
+    def test_usage_doc_allows_loose_meme_association(self) -> None:
+        """表情包是与文字平级的随手表达，不以精准语义匹配为发送门槛。"""
+        doc = SendMessagesTool.usage_prompt
+        self.assertIn("不要求与当前话题精确对应", doc)
+        self.assertIn("弱关联", doc)
+        self.assertIn("轻微无厘头", doc)
+        self.assertIn("无须增加文字解释", doc)
+
     def test_description_names_the_two_step_flow(self) -> None:
         desc = SendMessagesTool.description
+        self.assertIn("reply 表示正在输入并启动等待", desc)
         self.assertIn("<reply-task-completed>", desc)
         self.assertIn("逐气泡回执", desc)
         self.assertIn("可能已经送达", desc)
+        self.assertNotIn("保存分析", desc)
 
     def test_bubble_cap_lives_in_schema_and_usage_doc_only(self) -> None:
         """条数上限只有一处真相（outbound_messages），schema 直接引用它；
         具体数字只在工具介绍（usage doc）里写明，description 与其它提示词
-        层一律只说"多条"（2026-07-31 放宽到 10、meme 不再限量）。"""
+        层一律只说"一条或多条"（2026-07-31 放宽到 10、meme 不再限量；
+        2026-08-02 由"多条"改口，光秃秃的"多条"读起来像下限是两条）。"""
         schema = SendMessagesTool.arguments_schema
         self.assertEqual(
             schema["properties"]["messages"]["maxItems"], MAX_OUTBOUND_MESSAGES
@@ -326,6 +337,13 @@ class SendMessagesMetadataTests(unittest.TestCase):
             f"1–{MAX_OUTBOUND_MESSAGES} 个有序气泡",
             SendMessagesTool.usage_prompt,
         )
+        # 单条也是完整的一次发送：description / schema 都不得只说"多条"。
+        self.assertIn("一条或多条", SendMessagesTool.description)
+        self.assertIn(
+            "一条或多条",
+            schema["properties"]["messages"]["description"],
+        )
+        self.assertIn("一条或多条", SendMessagesTool.usage_prompt)
         self.assertNotIn("1-4", SendMessagesTool.description)
         self.assertNotIn("at most one", SendMessagesTool.description)
 

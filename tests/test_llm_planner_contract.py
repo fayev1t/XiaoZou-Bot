@@ -215,24 +215,24 @@ class LLMPlannerContractTest(unittest.TestCase):
         self.assertEqual(out.reasoning, "oops")
 
     def test_planner_section_opens_system_prompt(self) -> None:
-        """planner.md 打头（页首即人格，随后是系统事实）：信封语法与工具用法
-        在系统段之后、行为规范（职责/输出）之前——先给定义再给纪律，输出契约
-        收尾（2026-08-01 维护者定稿）。
-        "决策引擎"的机器视角开场随 2026-07-31 删除 Replyer 一并退役——Planner
-        就是她自己。"""
+        """根页先钉 Planner 身份与核心任务，再给运行机制和人物模型。模型在
+        内部模拟小奏、在 send_messages 中直接呈现她，不回落到通用助手。"""
         llm = _StubLLM(response_content='{"actions":[{"type":"idle","reason":"x"}]}')
         planner = LLMPlanner(llm_client=llm)
         asyncio.run(planner.decide(_ctx()))
         self.assertEqual(len(llm.invocations), 1)
         content = llm.invocations[0][0].content
-        self.assertNotIn("决策引擎", content)
-        self.assertIn("# 你所处的系统", content)
-        self.assertIn("# 你需要做什么", content)
+        self.assertTrue(content.startswith("# 身份与核心任务"))
+        self.assertIn("角色决策规划器，不是通用问答助手", content)
+        self.assertIn("# 系统运行方式", content)
+        self.assertIn("# 人物模型", content)
+        self.assertIn("# 决策要求", content)
         self.assertIn("输入信封格式规范", content)
         self.assertLess(
+            content.index("# 人物模型"),
             content.index("输入信封格式规范"),
-            content.index("# 你需要做什么"),
         )
+        self.assertIn("只能是小奏本人此刻会说的话", content)
 
     def test_planner_carries_the_rules_of_its_own_layer(self) -> None:
         """决策这一环独有的三条纪律只住在 planner.md，没有第三处，掉了就是真
@@ -250,52 +250,89 @@ class LLMPlannerContractTest(unittest.TestCase):
             planner._prompt_library.render(scope="system"),
         )
 
+    def test_planner_carries_social_and_task_feedback_rules(self) -> None:
+        """线上行为校准的四条红线必须留在 Planner 自己这一层：普通交流不以
+        怼人为默认、群消息不自动认领、表情包允许弱关联、受托工具任务有开工/
+        进度/失败反馈和有限重试。"""
+        planner = LLMPlanner(
+            llm_client=_StubLLM(
+                response_content=(
+                    '{"actions":[{"type":"idle","reason":"x"}]}'
+                )
+            )
+        )
+        rendered = planner._prompt_library.render(scope="group")
+        for anchor in (
+            "默认态度是平和、好奇、顺着话题随口接两句",
+            "戏谑只是偶尔的调味",
+            "表情包不需要精准符合当前场景",
+            "轻微无厘头地插一张",
+            "都不足以单独证明它是发给小奏的",
+            "无法判断时默认不认领",
+            "不要沉默开工",
+            "不要沉默重试",
+            "同一工具加同一参数",
+            "默认最多尝试两种有实质差异的方案",
+            "成功、失败和放弃都要收口",
+        ):
+            with self.subTest(anchor=anchor):
+                self.assertIn(anchor, rendered)
+        self.assertIn("只有 `send_messages` 的成功回执", rendered)
+        self.assertIn("不能让 active task 无限悬着", rendered)
+
     def test_system_mechanics_reach_the_planner(self) -> None:
-        """"这个系统怎么转"的唯一出处是 planner.md §你所处的系统
-        （2026-07-31 由 system.md 并入）。锚点 2026-08-01 重钉到维护者的
-        现行措辞：时间线唯一且只增不改、按拍存在。"""
+        """“这个系统怎么转”的唯一出处是 planner.md §系统运行方式
+        （2026-07-31 由 system.md 并入）。
+
+        后两条是 2026-08-01 补上的“沉默的可读性”：段里原先只单向教了“被叫醒
+        不等于该出声”，把不动写成零成本，于是被要求收敛时最省事的输出就是
+        `idle`。补的是价格而不是命令——它只要求把沉默和开口放在同一杆秤上称，
+        不得写成“该出声时要出声”，那会与 §决策要求的参与门槛打架。"""
         from qqbot.services.agent_loop.prompts.catalog import build_library
 
         planner_text = build_library("planner").render(scope="group")
         for anchor in (
-            "这个世界对你而言只有一条时间线",
-            "你不是一直醒着的，你以拍为单位存在",
+            "系统只向你提供一条属于小奏的时间线",
+            "你不是一直醒着的，而是以拍为单位运行",
+            "不会把沉默当成空白",
+            "和开口放在同一杆秤上称",
         ):
             with self.subTest(anchor=anchor):
                 self.assertIn(anchor, planner_text)
 
-    def test_persona_card_opens_the_planner_page(self) -> None:
-        """角色卡就写在 planner.md 页首（2026-07-31 由 persona.md 并入，
+    def test_persona_card_reaches_planner_as_character_model(self) -> None:
+        """角色卡写在 planner.md 的人物模型段（2026-07-31 由 persona.md 并入，
         persona / system / group_chat_rules 三个文件槽一并删除）——`persona` /
         `voice` / `disposition` 这些历史段名都不该再作为槽存在，页里只剩
         envelope（信封语法，仍是独立文件）与动态的 tools_usage。
 
-        2026-07-31 删除 Replyer 后 Planner 是卡片唯一的消费者：卡片正文必须
-        在。锚点从页里现取（写死原句的话，卡片一改断言就变成假通过），逐句对账
-        与"没有第二份副本"在 test_prompt_catalog_contract.LayerBoundaryTests。"""
+        Planner 是卡片唯一的消费者；2026-08-01 改成第三人称心理模型，但仍由
+        同一个 Planner 直接完成最终措辞。"""
         llm = _StubLLM(response_content='{"actions":[{"type":"idle","reason":"x"}]}')
         planner = LLMPlanner(llm_client=llm)
         self.assertEqual(
             planner._prompt_library.slot_names(), ["envelope", "tools_usage"]
         )
         from qqbot.services.agent_loop.prompts.catalog import (
-            SLOT_PATTERN,
             _PROMPTS_DIR,
+            SLOT_PATTERN,
         )
 
         rendered = planner._prompt_library.render(scope="group")
         page = (_PROMPTS_DIR / "planner.md").read_text(encoding="utf-8")
         lines = page.splitlines()
-        start = lines.index("# 你是谁") + 1
+        start = lines.index("# 人物模型") + 1
         end = next(i for i in range(start, len(lines)) if lines[i].startswith("# "))
         anchors = [
             line.strip()
             for line in lines[start:end]
-            if len(line.strip()) > 24 and line.strip().startswith("你")
+            if len(line.strip()) > 24
+            and line.strip().startswith(("你要持续模拟", "小奏", "她", "QQ 号"))
         ]
-        self.assertTrue(anchors, "planner.md 人格段没有第二人称锚点，断言会假通过")
+        self.assertTrue(anchors, "planner.md 人物模型段没有角色锚点，断言会假通过")
         for line in anchors:
             self.assertIn(line, rendered)
+        self.assertNotIn("\n你是小奏，", rendered)
         self.assertIsNone(SLOT_PATTERN.search(rendered))
 
     def test_reply_usage_scoped_without_persona_card(self) -> None:
@@ -405,7 +442,7 @@ class LLMPlannerContractTest(unittest.TestCase):
 
     def test_system_prompt_teaches_two_step_speaking(self) -> None:
         """发言两步的红线（2026-07-31 删除 Replyer）：reply 不承载最终字句、
-        只存解析并等待；措辞发生在 send_messages；该工具调用自身的逐气泡回执
+        只启动纯等待；措辞发生在 send_messages；该工具调用自身的逐气泡回执
         是现行发送事实，<my-reply> 仅表示旧链路记录。三处正文各钉一句——
         planner.md 的运行段、tools/reply.md 与 tools/send_messages.md 的接口页
         （后两者随 tools_usage 段进 Planner prompt，所以本用例必须带工具注册表
@@ -434,10 +471,8 @@ class LLMPlannerContractTest(unittest.TestCase):
         self.assertIn("其中成功的子元素即实际到达 QQ 的内容", content)
 
     def test_default_prompt_section_order(self) -> None:
-        """段序按根页写定的顺序：人格 < 系统 < 信封 < tools_usage
-        < 职责 < 输出。LLM 先读"你是谁→处在哪里→输入长什么样→手里有什么"，
-        再读"要做什么→怎么输出"——输出契约离真实输入最近
-        （2026-08-01 维护者定稿）。"""
+        """段序按根页写定：身份任务 < 系统 < 人物模型 < 输入信封 < 决策要求
+        < 工具说明 < 输出协议。"""
         from qqbot.services.agent_loop.tool_registry import ToolRegistry
 
         class _StubTool:
@@ -462,34 +497,43 @@ class LLMPlannerContractTest(unittest.TestCase):
         asyncio.run(planner.decide(_ctx()))
         content = llm.invocations[0][0].content
 
-        # 两个槽的先后：系统段之后依次是信封与工具用法，随后才是行为规范。
+        # 两个槽仍按 envelope → tools_usage 装配，只是分别归入输入与工具段。
         self.assertEqual(
             planner._prompt_library.slot_names(), ["envelope", "tools_usage"]
         )
         # 段序用段标题对账，不拿会迭代的正文措辞当排序锚点。
-        idx_persona = content.index("# 你是谁")
-        idx_system = content.index("# 你所处的系统")
+        idx_identity = content.index("# 身份与核心任务")
+        idx_system = content.index("# 系统运行方式")
+        idx_persona = content.index("# 人物模型")
+        idx_input = content.index("# 输入数据")
         idx_envelope = content.index("输入信封格式规范")
+        idx_decision = content.index("# 决策要求")
+        idx_tool_heading = content.index("# 工具")
         idx_tools = content.index("STUB-TOOL-ORDER-MARKER")
-        idx_purpose = content.index("# 你需要做什么")
-        idx_output = content.index("# 你的输出")
+        idx_output = content.index("# 输出协议")
 
         self.assertEqual(
             [
-                idx_persona,
+                idx_identity,
                 idx_system,
+                idx_persona,
+                idx_input,
                 idx_envelope,
+                idx_decision,
+                idx_tool_heading,
                 idx_tools,
-                idx_purpose,
                 idx_output,
             ],
             sorted(
                 [
-                    idx_persona,
+                    idx_identity,
                     idx_system,
+                    idx_persona,
+                    idx_input,
                     idx_envelope,
+                    idx_decision,
+                    idx_tool_heading,
                     idx_tools,
-                    idx_purpose,
                     idx_output,
                 ]
             ),
@@ -512,9 +556,9 @@ class LLMPlannerContractTest(unittest.TestCase):
         # 按工具名分段的标题：发言两步各一段
         self.assertIn("## 工具：reply", content)
         self.assertIn("## 工具：send_messages", content)
-        # 锚点随 reply.md 的现行接口语义：保存分析并等待，不直接发送。
-        self.assertIn("保存当前 scope 的完整会话分析并启动短时等待", content)
-        self.assertIn("成功仅表示修订已保存并进入等待状态", content)
+        # 锚点随 reply.md 的现行接口语义：只等待，不保存内容、不直接发送。
+        self.assertIn("该工具不发送消息，也不保存任何内容", content)
+        self.assertIn("成功仅表示等待已开始，不表示任何消息已发送", content)
         # 退役的单数 send_message 不得再有自己的分段（注意它是复数名的前缀，
         # 用段标题加换行精确匹配）。
         self.assertNotIn("## 工具：send_message\n", content)

@@ -8,8 +8,9 @@ System prompt 不再硬编码 —— 完全交给 prompts/catalog.py 装配。�
 Planner 是唯一的对话消费者，原先切成 `persona` / `system` / `group_chat_rules`
 三个文件槽的共享资产已并回该页，页里只剩 `{{envelope}}`（信封语法，纯格式规范，
 与投影层成对维护故仍是独立文件）与动态的 `{{tools_usage}}`（内容来自
-ToolRegistry，按 scope 过滤）。角色卡在页首（那就是她自己），分析与最终措辞同归
-一层。需要迭代人格、职责或参与规则时直接改 `planner.md`，改信封语法改
+ToolRegistry，按 scope 过滤）。2026-08-01 起根页改用“角色决策规划器”框架：
+Planner 内部建立第三人称人物模型，最终措辞仍由同一层直接通过工具呈现。需要迭代
+人格、职责或参与规则时直接改 `planner.md`，改信封语法改
 `envelope.md`，改工具说明改 `tools/<name>.md`，都不需要碰 planner。
 
 错误兜底：LLM 不可用 / 接口报错 / JSON 不可解析 / schema 不符
@@ -44,7 +45,6 @@ from qqbot.services.agent_loop.projection import (
     _safe_json,
     render_timeline_stream,
 )
-from qqbot.services.agent_loop.prompts.catalog import PromptLibrary
 from qqbot.services.agent_loop.prompt_snapshot import (
     PromptSnapshot,
     extract_usage,
@@ -52,15 +52,15 @@ from qqbot.services.agent_loop.prompt_snapshot import (
     should_snapshot,
     write_snapshot,
 )
+from qqbot.services.agent_loop.prompts.catalog import PromptLibrary
 from qqbot.services.agent_loop.tool_registry import ToolRegistry
 
 logger = get_logger(__name__)
 
 
-# Planner 的正文与顺序全部写在根页 planner.md 里 —— 逻辑递进：你是谁 →
-# 你所处的系统 → 输入信封（{{envelope}} 槽）→ 可调工具（{{tools_usage}} 槽）
-# → 你需要做什么 → 你的输出。协议参考先给定义，行为规范随后，输出契约收尾
-# （2026-08-01 维护者定稿）。分工理由写在 catalog 的 docstring。
+# Planner 的正文与顺序全部写在根页 planner.md 里 —— 逻辑递进：身份与核心任务
+# → 系统运行方式 → 人物模型 → 输入数据（{{envelope}} 槽）→ 决策要求 → 工具
+# （{{tools_usage}} 槽）→ 输出协议。分工理由写在 catalog 的 docstring。
 
 
 def build_default_prompt_library(
@@ -69,11 +69,11 @@ def build_default_prompt_library(
 ) -> PromptLibrary:
     """v2 默认 system prompt 装配 —— 委托 prompts/catalog.py。
 
-    正文、顺序、分隔全写在根页 `planner.md` 里（两个槽 `{{envelope}}` /
-    `{{tools_usage}}` 位于系统段与行为规范之间）；这里只是 Planner 侧的入口。页与
-    槽都在 render 时才读盘：改 .md 即生效、新增/下架工具立即反映。根页或文件槽
-    读出来为空、槽名未登记都直接 raise（部署坏了不静默跑残缺 prompt）；
-    tools_usage 未注入注册表时整槽跳过。
+    正文、顺序、分隔全写在根页 `planner.md` 里（`{{envelope}}` 位于输入数据段，
+    `{{tools_usage}}` 位于工具段）；这里只是 Planner 侧的入口。页与槽都在 render
+    时才读盘：改 .md 即生效、新增/下架工具立即反映。根页或文件槽读出来为空、
+    槽名未登记都直接 raise（部署坏了不静默跑残缺 prompt）；tools_usage 未注入
+    注册表时整槽跳过。
     """
     from qqbot.services.agent_loop.prompts.catalog import build_library
 
@@ -250,7 +250,8 @@ def _build_messages(
     None）。langchain_core.messages 在 langchain_openai 已是必依赖。
 
     System prompt 完全由提示词库输出 —— 默认装配是根页 `planner.md` 的正文，
-    其后依次展开 `envelope.md` 与 tools_usage 段（逐工具 `tools/<name>.md`）。
+    并在页内指定位置展开 `envelope.md` 与 tools_usage 段（逐工具
+    `tools/<name>.md`）。
 
     HumanMessage 的 text block 用 XML 信封而非 JSON 拼装：timeline 里每条
     item 的 render 字段本身就是 `<message ...>` / `<tool-call ...>` /

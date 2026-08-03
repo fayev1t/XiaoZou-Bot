@@ -675,7 +675,7 @@ class LatestRevisionContractTests(unittest.TestCase):
 class PersonaCardHomeTests(unittest.TestCase):
     """角色卡的居所与注入路径（2026-07-31 删除 Replyer 后重锚）。
 
-    卡片唯一真相源是 prompts/planner.md 的 §你是谁 段（同日由 persona.md 并回
+    卡片唯一真相源是 prompts/planner.md 的 §人物模型 段（同日由 persona.md 并回
     根页——删除 Replyer 之后它只剩 Planner 一个消费者，切文件已无收益）；历史
     居所（tools/send_message.md Voice 节 → prompts/voice.md →
     prompts/replyer.md → prompts/persona.md）全部不复存在。工具用法文档不得再
@@ -693,11 +693,12 @@ class PersonaCardHomeTests(unittest.TestCase):
 
     def test_card_home_is_the_planner_page(self) -> None:
         """旧居所都不得复活：replyer.md / voice.md / send_message.md 已随各自
-        宿主删除，persona.md 并回根页，卡片只住 planner.md 页首。"""
+        宿主删除，persona.md 并回根页，卡片只住 planner.md 人物模型段。"""
         from qqbot.services.agent_loop.prompts.catalog import _PROMPTS_DIR
 
         page = (_PROMPTS_DIR / "planner.md").read_text(encoding="utf-8")
-        self.assertIn("# 你是谁", page)
+        self.assertIn("# 人物模型", page)
+        self.assertIn("角色决策规划器", page)
         self.assertIn("小奏", page)
         self.assertIn("最重要的人", page)
         self.assertFalse((_PROMPTS_DIR / "voice.md").exists())
