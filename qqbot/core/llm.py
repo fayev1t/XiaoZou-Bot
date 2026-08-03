@@ -213,6 +213,19 @@ def _log_route_event(kind: str, **info: Any) -> None:
                 info.get("endpoint"), info.get("role"), info.get("latency_ms")
             )
         )
+    elif kind == "body_rejected":
+        # 体级失败：HTTP 成功但正文不可用（内容策略拦截 / 网关错误页当正文 /
+        # 稳定吐非目标格式），由调用方回报后补记熔断。单独一档而不并进
+        # call_failed：它没有 latency 语义（那次调用是"成功"的，延迟已经计过
+        # 一次），并进去会让按 latency_ms 做的统计凭空多出一批 None。
+        logger.warning(
+            "[llm] body rejected endpoint={} role={} cooldown={}s reason={}".format(
+                info.get("endpoint"),
+                info.get("role"),
+                info.get("cooldown_seconds"),
+                info.get("error"),
+            )
+        )
     elif kind == "call_cancelled":
         # 取消（绝大多数是调用方 wait_for 超时，少数是停机）不计端点失败、不
         # 进冷却，但必须留痕：否则被砍掉的慢调用在 [llm] 日志里完全不存在，

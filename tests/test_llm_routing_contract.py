@@ -15,7 +15,9 @@
 - 三种策略与冷却分区（冷却端点排尾不剔除）；
 - 被动熔断：失败进冷却、连续失败指数退避封顶、成功清零；
 - RoutedChatModel.ainvoke：逐端点尝试、失败切换、全败重抛最后异常、
-  CancelledError 透传不计失败、尝试数受 max_attempts_per_call 封顶。
+  CancelledError 透传不计失败、尝试数受 max_attempts_per_call 封顶；
+- RoutedChatModel.mark_last_call_failed：体级失败（HTTP 200 但正文不可用）
+  由调用方回报，补记熔断 + 发 body_rejected 事件，无成功调用时是空操作。
 
 本模块与被测模块均零三方依赖，可在本地裸环境直接跑。
 """
@@ -964,6 +966,39 @@ class RoutedChatModelTests(unittest.IsolatedAsyncioTestCase):
             on_event=bad_event,
         )
         self.assertEqual(await model.ainvoke(["msg"]), "fine")
+
+    async def test_mark_last_call_failed_cools_endpoint_and_rotates(self) -> None:
+        """体级失败（200 + 正文不可用）由调用方回报后照样进熔断：下一次
+        解析把它排到候选序尾部，回退链自动落到下一个目标。"""
+        model, router, events, _ = self._make(
+            {"a/m": _StubClient(result="拒答文本"), "b/m": _StubClient(result="ok")},
+            model="m",
+        )
+
+        self.assertEqual(await model.ainvoke(["msg"]), "拒答文本")
+        self.assertEqual([e.spec for e in router.resolve(model="m")], ["a/m", "b/m"])
+
+        self.assertEqual(model.mark_last_call_failed("json_error:ValueError"), "a/m")
+
+        self.assertEqual([e.spec for e in router.resolve(model="m")], ["b/m", "a/m"])
+        self.assertEqual([kind for kind, _ in events], ["call_ok", "body_rejected"])
+        kind, info = events[-1]
+        self.assertEqual(info["endpoint"], "a/m")
+        self.assertEqual(info["error"], "json_error:ValueError")
+        self.assertGreater(info["cooldown_seconds"], 0)
+        # 与传输层失败共用同一个计数器：连续两次即指数退避
+        self.assertEqual(await model.ainvoke(["msg"]), "ok")
+        self.assertEqual(model.mark_last_call_failed("again"), "b/m")
+
+    async def test_mark_last_call_failed_before_any_call_is_noop(self) -> None:
+        model, router, events, _ = self._make(
+            {"a/m": _StubClient(result="ok"), "b/m": _StubClient(result="ok")},
+            model="m",
+        )
+
+        self.assertIsNone(model.mark_last_call_failed("nothing to blame"))
+        self.assertEqual(events, [])
+        self.assertEqual([e.spec for e in router.resolve(model="m")], ["a/m", "b/m"])
 
     async def test_kwargs_passthrough_to_client(self) -> None:
         class _KwargsClient:

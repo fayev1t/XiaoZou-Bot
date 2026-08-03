@@ -930,6 +930,65 @@ class JsonParseRetryTests(unittest.TestCase):
         self.assertTrue(str(out.actions[0].reason).startswith("llm_json_error"))
 
 
+class _RoutedSequenceLLM(_SequenceLLM):
+    """带 mark_last_call_failed 的 stub——模拟 RoutedChatModel 的体级失败回报口。"""
+
+    def __init__(self, responses: list[str]) -> None:
+        super().__init__(responses)
+        self.body_failures: list[str] = []
+
+    def mark_last_call_failed(self, reason: str) -> str | None:
+        self.body_failures.append(reason)
+        return "stub/endpoint"
+
+
+class BodyRejectedReportTests(unittest.TestCase):
+    """LLM 路由契约 §4（2026-08-02）：正文不是 JSON 时 planner 把这次调用回报
+    成端点体级失败——路由层只把异常算失败，不回报就会让同一拍的三次重试反复
+    打在同一个端点上（上游内容策略拦截时实测如此）。回报口缺失（老 stub /
+    注入的裸客户端）必须静默跳过，不影响重试与降级。"""
+
+    def test_each_parse_failure_reports_body_rejection(self) -> None:
+        llm = _RoutedSequenceLLM([
+            "被内容策略拦了（不是 JSON）",
+            '{"actions":[{"type":"idle","reason":"fixed"}]}',
+        ])
+        out = asyncio.run(LLMPlanner(llm_client=llm).decide(_ctx()))
+        self.assertEqual(out.actions[0].reason, "fixed")
+        self.assertEqual(len(llm.body_failures), 1)
+        self.assertTrue(llm.body_failures[0].startswith("json_error:"))
+
+    def test_final_failure_is_reported_too(self) -> None:
+        """给下一拍留下冷却态：本拍降级 idle 后，下一拍从别的端点起步。"""
+        llm = _RoutedSequenceLLM(["x", "y", "z"])
+        out = asyncio.run(LLMPlanner(llm_client=llm).decide(_ctx()))
+        self.assertTrue(str(out.actions[0].reason).startswith("llm_json_error"))
+        self.assertEqual(len(llm.body_failures), 3)
+
+    def test_successful_parse_reports_nothing(self) -> None:
+        llm = _RoutedSequenceLLM(['{"actions":[{"type":"idle","reason":"ok"}]}'])
+        asyncio.run(LLMPlanner(llm_client=llm).decide(_ctx()))
+        self.assertEqual(llm.body_failures, [])
+
+    def test_client_without_report_hook_is_skipped(self) -> None:
+        llm = _SequenceLLM(["x", "y", "z"])
+        out = asyncio.run(LLMPlanner(llm_client=llm).decide(_ctx()))
+        self.assertEqual(len(llm.invocations), 3)
+        self.assertTrue(str(out.actions[0].reason).startswith("llm_json_error"))
+
+    def test_report_hook_exception_never_breaks_decision(self) -> None:
+        class _Exploding(_RoutedSequenceLLM):
+            def mark_last_call_failed(self, reason: str) -> str | None:
+                raise RuntimeError("router bookkeeping crashed")
+
+        llm = _Exploding([
+            "不是 JSON",
+            '{"actions":[{"type":"idle","reason":"fixed"}]}',
+        ])
+        out = asyncio.run(LLMPlanner(llm_client=llm).decide(_ctx()))
+        self.assertEqual(out.actions[0].reason, "fixed")
+
+
 class SavedMemesEnvelopeTests(unittest.TestCase):
     """<saved-memes> 渲染契约（表情包工具黑盒设计 §prompt 注入）：
     有收藏才渲染整段；每条 <meme> 带 hash / saved_at 属性 + 描述正文

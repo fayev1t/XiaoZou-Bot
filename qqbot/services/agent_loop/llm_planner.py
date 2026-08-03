@@ -179,6 +179,20 @@ class LLMPlanner:
                         snapshot.attempts[-1].error = (
                             f"json_error:{type(exc).__name__}"
                         )
+                    # 体级失败回报（2026-08-02）：模型 HTTP 200 返回了内容但
+                    # 不是要求的 JSON——上游内容策略拦截、网关把纯文本错误页
+                    # 当正文返回都长这样，路由层只把异常算失败，看到的是
+                    # call_ok。不回报的话本拍三次重试会反复打在同一个端点上
+                    # （实测：Gemini 被 Google 内容策略拦截时无一次换端点）。
+                    # 回报后该端点进冷却排到候选序尾部，重试自动落到 role
+                    # 配的下一个回退目标；只有一个候选时冷却只是排序降权，
+                    # 行为不变。最后一次失败也照记——让下一拍从别的端点起步。
+                    mark_failed = getattr(llm, "mark_last_call_failed", None)
+                    if callable(mark_failed):
+                        try:
+                            mark_failed(f"json_error:{type(exc).__name__}")
+                        except Exception:  # 路由记账绝不反噬决策
+                            pass
                     if attempt >= max_attempts:
                         if snapshot is not None:
                             snapshot.outcome = "json_error_giveup"

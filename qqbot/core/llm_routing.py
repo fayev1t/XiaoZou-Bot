@@ -14,7 +14,8 @@
   primary_failover / round_robin）+ 被动熔断（失败进冷却、连续失败指数
   退避、成功清零；不做主动探活）。
 - ``RoutedChatModel``：暴露给调用方的「模型请求类」——只实现
-  ``ainvoke``，每次调用现场解析候选端点，失败自动切换下一个。
+  ``ainvoke``，每次调用现场解析候选端点，失败自动切换下一个；调用方发现
+  「返回了但内容不可用」时用 ``mark_last_call_failed`` 把它补记成端点失败。
 
 端点标识 spec 串 ``provider/model``（服务商名不含 ``/``，模型名允许含
 ``/``，如 ``sf/deepseek-ai/DeepSeek-V3``）——仅用于注册表键、熔断状态与
@@ -740,6 +741,9 @@ class RoutedChatModel:
 
     ``model_name`` 是 best-effort 观测标注（prompt 快照 / 日志用）：
     有过成功调用后是最近一次实际使用的模型，否则是首选端点的模型。
+
+    传输层之外的失败（200 + 内容不可用）由调用方回报：见
+    ``mark_last_call_failed``。
     """
 
     def __init__(
@@ -783,6 +787,36 @@ class RoutedChatModel:
     @property
     def last_endpoint_spec(self) -> str | None:
         return self._last_endpoint.spec if self._last_endpoint else None
+
+    def mark_last_call_failed(self, reason: str) -> str | None:
+        """把上一次「HTTP 成功但内容不可用」的调用补记成端点失败（体级失败）。
+
+        传输层看不出的失败在这里补齐：上游内容策略拦截、网关把纯文本错误页
+        当正文返回、模型稳定地吐非目标格式——都是 200 + 一段废话，
+        ``ainvoke`` 只能记成 ``call_ok`` + ``mark_success``，端点不进冷却。
+        后果是同一拍里的重试反复打在同一个端点上（2026-08-02 Gemini 被
+        Google 内容策略拦截时实测：Planner 三次 JSON 重试全落在同一端点）。
+
+        只有调用方知道正文该长什么样，所以由调用方回报；本方法只做熔断记账
+        （+ 一条 ``body_rejected`` 观测事件），不改任何重试语义。记账后下一次
+        ``ainvoke`` 的 ``resolve`` 会把该端点排到候选序尾部——role 配了
+        ``targets`` 回退链就自动落到下一个目标；只有一个候选时冷却只是排序
+        降权（冷却端点不剔除），行为不变。
+
+        返回被记账的 spec；还没有过成功调用时返回 None（无副作用）。
+        """
+        spec = self.last_endpoint_spec
+        if spec is None:
+            return None
+        cooldown = self._router.mark_failure(spec)
+        self._emit(
+            "body_rejected",
+            endpoint=spec,
+            role=self._role,
+            error=str(reason)[:300],
+            cooldown_seconds=cooldown,
+        )
+        return spec
 
     async def ainvoke(self, messages: Any, **kwargs: Any) -> Any:
         candidates = self._router.resolve(
