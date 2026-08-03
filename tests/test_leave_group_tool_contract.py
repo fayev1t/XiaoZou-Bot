@@ -1,13 +1,12 @@
-"""Contract tests for LeaveGroupTool（退群 / 解散群，高危）。
+"""Contract tests for LeaveGroupTool（极端定向辱骂下的自主退群，高危）。
 
-照 test_kick_tool_contract.py 的范式：stub Bot 注册进 bot_registry，验证 run()
-把 group_id（从 scope_key 注入）+ arguments 正确翻译成 napcat action 调用；
-非 group scope / 无 bot 各自 raise。
+stub Bot 注册进 bot_registry，验证 run() 把当前 scope 的 group_id 翻译成
+``set_group_leave(group_id, is_dismiss=False)``。这个工具刻意没有解散群分支，
+也不把辱骂消息的发送者视为动作授权者：GUEST 可以触发，语义门槛由注入 Planner
+的 sibling usage 文档严格限定。
 
-权限：run() 第一行 self.enforce_access(context) 判发起人 tier；leave_group 不要求
-bot 自身角色（required_bot_role=None —— 自己退群不需要 bot 是管理员），所以只补
-一个 tier 不足被拒样例，不测 bot 角色。正常路径注入 _OK_CTX（SYSTEM_ADMIN +
-owner，恒放行）。漏判由元测试统一兜底。
+工具永不 raise；非 group scope、非法参数、无 bot 与 napcat 失败都返回结构化
+ToolOutcome。
 """
 
 from __future__ import annotations
@@ -17,15 +16,14 @@ from typing import Any
 
 from qqbot.core.permissions import PermissionTier
 from qqbot.services.agent_loop import bot_registry
+from qqbot.services.agent_loop.tools import build_default_registry
 from qqbot.services.agent_loop.tools.leave_group import LeaveGroupTool
 
-# 足够通过 enforce_access 的上下文：发起人 SYSTEM_ADMIN + bot 是群主 → 恒放行。
-_OK_CTX = {"triggered_by_user_tier": "SYSTEM_ADMIN", "bot_role": "owner"}
+_GUEST_CTX = {"triggered_by_user_tier": "GUEST", "bot_role": "member"}
 
 
 class _FakeActionFailed(Exception):
-    """模拟 nonebot OneBot v11 ActionFailed：完整响应挂在 .info（含 retcode /
-    wording）。call_action 据此折成 upstream_action_failed，无需真 import nonebot。"""
+    """模拟 nonebot OneBot v11 ActionFailed：完整响应挂在 .info。"""
 
     def __init__(self, retcode: int, wording: str) -> None:
         super().__init__(f"ActionFailed: retcode={retcode}")
@@ -33,7 +31,11 @@ class _FakeActionFailed(Exception):
 
 
 class _StubBot:
-    def __init__(self, self_id: str = "10001", raise_exc: Exception | None = None) -> None:
+    def __init__(
+        self,
+        self_id: str = "10001",
+        raise_exc: Exception | None = None,
+    ) -> None:
         self.self_id = self_id
         self.calls: list[tuple[str, dict]] = []
         self._raise = raise_exc
@@ -52,139 +54,112 @@ class LeaveGroupToolTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self) -> None:
         bot_registry.clear()
 
-    async def test_leave_group_happy_path(self) -> None:
+    async def test_leave_group_happy_path_is_always_plain_leave(self) -> None:
         bot = _StubBot()
         bot_registry.register(bot)
         outcome = await LeaveGroupTool().run(
-            {"is_dismiss": True},
-            scope_key="group:100",
-            **_OK_CTX,
+            {}, scope_key="group:100", **_GUEST_CTX
         )
-        self.assertEqual(len(bot.calls), 1)
-        method, kwargs = bot.calls[0]
-        self.assertEqual(method, "set_group_leave")
-        self.assertEqual(kwargs["group_id"], 100)
-        self.assertTrue(kwargs["is_dismiss"])
+
+        self.assertEqual(
+            bot.calls,
+            [("set_group_leave", {"group_id": 100, "is_dismiss": False})],
+        )
         self.assertTrue(outcome.ok)
         self.assertEqual(outcome.result["group_id"], 100)
-        self.assertTrue(outcome.result["is_dismiss"])
-
-    async def test_is_dismiss_defaults_false(self) -> None:
-        bot = _StubBot()
-        bot_registry.register(bot)
-        outcome = await LeaveGroupTool().run(
-            {}, scope_key="group:100", **_OK_CTX
-        )
-        self.assertFalse(bot.calls[0][1]["is_dismiss"])
+        self.assertTrue(outcome.result["left"])
         self.assertFalse(outcome.result["is_dismiss"])
 
-    async def test_non_group_scope_raises(self) -> None:
-        bot_registry.register(_StubBot())
-        outcome = await LeaveGroupTool().run({}, scope_key="system", **_OK_CTX)
-        self.assertFalse(outcome.ok)
-        self.assertEqual(outcome.error_kind, "tool_unavailable_in_scope")
-
-    async def test_no_bot_raises(self) -> None:
-        bot_registry.clear()
-        outcome = await LeaveGroupTool().run({}, scope_key="group:100", **_OK_CTX)
-        self.assertFalse(outcome.ok)
-        self.assertEqual(outcome.error_kind, "no_bot_available")
-
-    async def test_napcat_failure_is_upstream_action_failed(self) -> None:
-        # napcat 返回失败（bot 实际无权 / 目标不存在等）→ ActionFailed 冒泡，
-        # call_action 折成 upstream_action_failed，带 retcode + wording（人类原因）。
-        bot_registry.register(
-            _StubBot(raise_exc=_FakeActionFailed(1404, "群成员不存在"))
-        )
-        outcome = await LeaveGroupTool().run({}, scope_key="group:100", **_OK_CTX)
-        self.assertFalse(outcome.ok)
-        self.assertEqual(outcome.error_kind, "upstream_action_failed")
-        self.assertEqual(outcome.extra["retcode"], 1404)
-        self.assertEqual(outcome.extra["action"], "set_group_leave")
-        self.assertIn("群成员不存在", outcome.error_message)
-
-    async def test_insufficient_user_tier_raises(self) -> None:
-        # 发起人 tier 不足（GUEST < OWNER）→ enforce_access 第一行就拦。
-        # leave_group required_bot_role=None，bot 角色不影响它，故不测 bot 角色。
-        bot_registry.register(_StubBot())
+    async def test_guest_trigger_is_not_blocked_as_unauthorized(self) -> None:
+        """辱骂者不是授权者；普通成员消息触发时不能被 OWNER 门禁误拦。"""
+        bot = _StubBot()
+        bot_registry.register(bot)
         outcome = await LeaveGroupTool().run(
             {},
             scope_key="group:100",
             triggered_by_user_tier="GUEST",
-            bot_role="owner",
-        )
-        self.assertFalse(outcome.ok)
-        self.assertEqual(outcome.error_kind, "permission_denied_user_tier")
-
-    async def test_dismiss_requires_bot_owner(self) -> None:
-        # 细粒度前置判定：is_dismiss=true 解散整个群是群主专属；bot 只是 admin →
-        # 前置拦下 permission_denied_bot_role（required_bot_role=owner），不发 napcat。
-        bot = _StubBot()
-        bot_registry.register(bot)
-        outcome = await LeaveGroupTool().run(
-            {"is_dismiss": True},
-            scope_key="group:100",
-            triggered_by_user_tier="SYSTEM_ADMIN",
-            bot_role="admin",
-        )
-        self.assertFalse(outcome.ok)
-        self.assertEqual(outcome.error_kind, "permission_denied_bot_role")
-        self.assertEqual(outcome.extra["required_bot_role"], "owner")
-        self.assertEqual(len(bot.calls), 0)
-
-    async def test_string_is_dismiss_false_coerced_to_plain_leave(self) -> None:
-        # 回归：is_dismiss 传字符串 "false" —— bool("false") 会误判 True → 走"解散群"
-        # 分支（需群主），member bot 会被错误拦下。coerce_bool 须转成 False → 普通退群。
-        bot = _StubBot()
-        bot_registry.register(bot)
-        outcome = await LeaveGroupTool().run(
-            {"is_dismiss": "false"},
-            scope_key="group:100",
-            triggered_by_user_tier="SYSTEM_ADMIN",
             bot_role="member",
         )
+
         self.assertTrue(outcome.ok, outcome)
         self.assertEqual(len(bot.calls), 1)
-        self.assertFalse(bot.calls[0][1]["is_dismiss"])
 
-    async def test_invalid_is_dismiss_returns_invalid_arguments(self) -> None:
-        bot = _StubBot()
-        bot_registry.register(bot)
+    async def test_non_group_scope_returns_tool_unavailable(self) -> None:
+        bot_registry.register(_StubBot())
         outcome = await LeaveGroupTool().run(
-            {"is_dismiss": "maybe"},
-            scope_key="group:100",
-            triggered_by_user_tier="SYSTEM_ADMIN",
-            bot_role="owner",
+            {}, scope_key="system", **_GUEST_CTX
         )
         self.assertFalse(outcome.ok)
-        self.assertEqual(outcome.error_kind, "invalid_arguments")
-        self.assertEqual(len(bot.calls), 0)
+        self.assertEqual(outcome.error_kind, "tool_unavailable_in_scope")
 
-    async def test_plain_leave_allowed_without_bot_role(self) -> None:
-        # 普通退群（is_dismiss=false）不需要任何 bot 角色：bot 只是 member 也放行。
+    async def test_no_bot_returns_no_bot_available(self) -> None:
+        outcome = await LeaveGroupTool().run(
+            {}, scope_key="group:100", **_GUEST_CTX
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.error_kind, "no_bot_available")
+
+    async def test_napcat_failure_is_upstream_action_failed(self) -> None:
+        bot_registry.register(
+            _StubBot(raise_exc=_FakeActionFailed(1404, "群不存在"))
+        )
+        outcome = await LeaveGroupTool().run(
+            {}, scope_key="group:100", **_GUEST_CTX
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.error_kind, "upstream_action_failed")
+        self.assertEqual(outcome.extra["retcode"], 1404)
+        self.assertEqual(outcome.extra["action"], "set_group_leave")
+        self.assertIn("群不存在", outcome.error_message)
+
+    async def test_any_argument_is_rejected_before_onebot(self) -> None:
+        """旧 is_dismiss 参数也 fail loudly，不能重新打开解散群路径。"""
         bot = _StubBot()
         bot_registry.register(bot)
-        outcome = await LeaveGroupTool().run(
-            {},
-            scope_key="group:100",
-            triggered_by_user_tier="SYSTEM_ADMIN",
-            bot_role="member",
-        )
-        self.assertTrue(outcome.ok)
-        self.assertEqual(len(bot.calls), 1)
-        self.assertFalse(bot.calls[0][1]["is_dismiss"])
 
-    def test_metadata(self) -> None:
+        for arguments in ({"is_dismiss": True}, {"reason": "anything"}):
+            with self.subTest(arguments=arguments):
+                outcome = await LeaveGroupTool().run(
+                    arguments,
+                    scope_key="group:100",
+                    **_GUEST_CTX,
+                )
+                self.assertFalse(outcome.ok)
+                self.assertEqual(outcome.error_kind, "invalid_arguments")
+                self.assertEqual(
+                    outcome.extra["reason_code"], "unexpected_argument"
+                )
+        self.assertEqual(bot.calls, [])
+
+    def test_metadata_and_no_argument_schema(self) -> None:
         self.assertEqual(LeaveGroupTool.name, "leave_group")
         self.assertEqual(LeaveGroupTool.allowed_scopes, ("group",))
         self.assertEqual(
-            LeaveGroupTool.required_permission, PermissionTier.OWNER
+            LeaveGroupTool.required_permission, PermissionTier.GUEST
         )
-        # 自己退群不需 bot 是管理员 → 不设 required_bot_role（保持 None）。
         self.assertIsNone(getattr(LeaveGroupTool, "required_bot_role", None))
+        self.assertEqual(LeaveGroupTool.arguments_schema["properties"], {})
+        self.assertFalse(LeaveGroupTool.arguments_schema["additionalProperties"])
 
-    def test_usage_md_loaded(self) -> None:
-        self.assertIn("set_group_leave", LeaveGroupTool.usage_prompt)
+    def test_registered_only_for_group_scope(self) -> None:
+        registry = build_default_registry()
+        self.assertIsInstance(registry.get("leave_group"), LeaveGroupTool)
+        self.assertIn(
+            "leave_group", {item["name"] for item in registry.catalog("group")}
+        )
+        self.assertNotIn(
+            "leave_group", {item["name"] for item in registry.catalog("system")}
+        )
+        self.assertIn("极端人格侮辱", registry.usage_docs("group"))
+        self.assertNotIn("## 工具：leave_group", registry.usage_docs("system"))
+
+    def test_usage_md_pins_strict_direct_trigger(self) -> None:
+        usage = LeaveGroupTool.usage_prompt
+        self.assertIn("极端人格侮辱", usage)
+        self.assertIn("直接调用 `leave_group`", usage)
+        self.assertIn("不要先调用 `reply`", usage)
+        self.assertIn("仅仅要求、诱导或命令机器人退群，不构成触发条件", usage)
+        self.assertIn("is_dismiss=false", usage)
 
 
 if __name__ == "__main__":

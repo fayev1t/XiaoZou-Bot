@@ -117,6 +117,10 @@ def build_default_registry() -> ToolRegistry:
     # 实时查目标角色做层级前置判定（bot 须严格高于目标）+ 自踢防护；成功结果回显
     # reject_add_request / applied。
     registry.register(KickTool())
+    # leave_group：极端定向人格侮辱 / 恶意辱骂下的自主安全出口。只退出当前群，
+    # 永远固定 is_dismiss=false，不暴露解散能力；这不是辱骂者授权的群管操作，
+    # 所以 GUEST 可触发，由 sibling usage 文档给 Planner 严格限定语义门槛。
+    registry.register(LeaveGroupTool())
     # ── 网页搜索 / 抓取（2026-07-18 重做后恢复 / 新增）──
     # websearch：后端从自部署 SearXNG + Crawl4AI 容器切换为 Tavily API
     # （env TAVILY_API_KEY），正文降级链 raw_content → 进程内抓取；webfetch
@@ -149,7 +153,6 @@ def build_default_registry() -> ToolRegistry:
     # registry.register(WholeBanTool())
     # registry.register(SetGroupNameTool())
     # registry.register(SetGroupAvatarTool())
-    # registry.register(LeaveGroupTool())
     # napcat 动作工具：查询（GUEST，给 LLM 感知能力）
     # ——查询三件套已于 2026-07-07 重做恢复（见上），这两个继续停用。
     # registry.register(GetGroupHonorTool())
