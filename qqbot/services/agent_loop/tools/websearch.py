@@ -22,7 +22,11 @@
 正文降级链（fetch_top_n>0 时逐条）：
   ① 搜索后端随响应带回的正文（仅 tavily 的 raw_content）命中即用；
   ② 否则进程内 httpx 直接抓（_web_common.fetch_page，stdlib HTML→纯文本，
-     无浏览器）——exa 路径恒走这条。
+     无浏览器）——exa 路径恒走这条；
+  ③ 拿到的正文以 query 为关注点逐条经 web_digest LLM 提炼（≤1500 字，
+     并发跑），2026-08-03 起 fetched_text 是提炼产物而非原文——原文不进
+     程序 ABI，也就不可能被 return 进事件流。提炼不可用时降级为原文截断
+     到同一上限。
 
 返回：
   {
@@ -32,7 +36,8 @@
         "title": str,
         "url": str,
         "snippet": str,
-        "fetched_text": str | None,     # 仅 fetch_top_n>0 命中范围内填充
+        "fetched_text": str | None,     # 仅 fetch_top_n>0 命中范围内填充，
+                                        # 提炼后的短转述（见上 ③）
         "fetch_error": str | None,      # 若该 URL 正文拿不到
     }, ...],
     "warnings": [str, ...]              # 保留字段（形态兼容），当前恒空
@@ -49,6 +54,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from typing import Any
@@ -59,6 +65,7 @@ from qqbot.core.logging import get_logger
 from qqbot.services.agent_loop.prompts import load_sibling_md
 from qqbot.services.agent_loop.tool_registry import BaseTool, ToolOutcome
 from qqbot.services.agent_loop.tools._web_common import clamp_int, fetch_page
+from qqbot.services.agent_loop.web_digest import digest_or_truncate
 
 logger = get_logger(__name__)
 
@@ -67,7 +74,7 @@ _TAVILY_ENDPOINT = "https://api.tavily.com/search"
 _DEFAULT_TIMEOUT_SEC = 20.0
 _DEFAULT_MAX_RESULTS = 10
 _MAX_FETCH_TOP_N = 5  # 单次调用最多给前 N 条附正文，防爆
-_MAX_FETCHED_TEXT_CHARS = 8000  # 单条正文上限，避免一次塞爆 LLM context
+_MAX_FETCHED_TEXT_CHARS = 8000  # 单条抓取正文上限（送入提炼的原文量）
 
 # 模块加载期一次性读 sibling .md；缺失时 usage_prompt 为空串，PromptLibrary
 # 渲染时会跳过该 section 而不是注入空标题。
@@ -76,6 +83,7 @@ _USAGE_PROMPT = load_sibling_md(__file__, "websearch.md")
 
 class WebsearchTool(BaseTool):
     name = "websearch"
+    program_kind = "query"
     description = (
         "按关键词检索网页，返回标题、URL 和摘要；可通过 fetch_top_n 为前若干"
         "条结果附加正文，通过 max_results 限制结果数量。"
@@ -109,6 +117,37 @@ class WebsearchTool(BaseTool):
         },
         "required": ["query"],
     }
+    result_schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "engine": {"type": "string", "enum": ["exa", "tavily"]},
+            "results": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "url": {"type": "string"},
+                        "snippet": {"type": "string"},
+                        "fetched_text": {"type": ["string", "null"]},
+                        "fetch_error": {"type": ["string", "null"]},
+                    },
+                    "required": [
+                        "title",
+                        "url",
+                        "snippet",
+                        "fetched_text",
+                        "fetch_error",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+            "warnings": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["query", "engine", "results", "warnings"],
+        "additionalProperties": False,
+    }
 
     def __init__(
         self,
@@ -122,7 +161,7 @@ class WebsearchTool(BaseTool):
         )
 
     async def execute(self, arguments: dict, **context: Any) -> ToolOutcome:
-        # GUEST + 不限 scope：enforce_access 实为 no-op，但统一保留首行调用。全程无 raise。
+        # GUEST + 不限 scope：enforce_access 实为 no-op，但仍统一保留首行调用。
         if fail := await self.enforce_access(context):
             return fail
 
@@ -186,6 +225,11 @@ class WebsearchTool(BaseTool):
                 else:
                     hit["fetched_text"] = page["text"]
 
+        # 正文降级链 ③：抓到的原文逐条以 query 为关注点提炼（并发；
+        # web_digest 内部有并发闸与单调用超时，失败降级为截断原文——
+        # 无论走哪条路，离开工具的 fetched_text 都是有界短文）。
+        await self._digest_fetched(hits, query)
+
         return ToolOutcome.success(
             {
                 "query": query,
@@ -194,6 +238,29 @@ class WebsearchTool(BaseTool):
                 "warnings": warnings,
             }
         )
+
+    @staticmethod
+    async def _digest_fetched(hits: list[dict], query: str) -> None:
+        targets = [
+            hit
+            for hit in hits
+            if isinstance(hit.get("fetched_text"), str) and hit["fetched_text"]
+        ]
+        if not targets:
+            return
+        digests = await asyncio.gather(
+            *(
+                digest_or_truncate(
+                    hit["fetched_text"],
+                    url=str(hit.get("url") or ""),
+                    title=str(hit.get("title") or ""),
+                    focus=query,
+                )
+                for hit in targets
+            )
+        )
+        for hit, digest in zip(targets, digests):
+            hit["fetched_text"] = digest
 
     async def _search_exa(
         self,

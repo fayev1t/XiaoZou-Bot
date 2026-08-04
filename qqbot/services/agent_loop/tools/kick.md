@@ -47,5 +47,5 @@
 `invalid_arguments`；OneBot 调用失败时返回 `upstream_action_failed`。
 
 成功操作后，平台通常会产生
-`<notice kind="group_decrease" sub_type="kick" .../>`。其中
+`<通知>group_decrease …被…移出` 行。其中
 `operator_qq` 等于当前 `bot_qq` 时，该 notice 是本次调用的回执事件。

@@ -13,32 +13,30 @@ Behaviour:
   agent_events; the loop will see them once it tickets).
 - stop() cancels every running loop with a 5s grace timeout.
 
-工具批次与唤醒（2026-07-02 起无门闩）：ToolWorker 在整批 terminal + 写完
-runtime.tool_batch_completed 后经 notify_tool_batch_completed **批次级唤醒
-一次**（不是每个工具一次）。批次进行期间到达的其它 wake（新消息等）**不再
-被推迟**——AgentLoop 随时开拍，模型自己看 timeline 里的
-<tool-call status="processing"> 行决定等还是先处理新事件（prompt 教它不重拨）。
-这是"模型+prompt 优先"哲学的落地：曾经的批次门闩（tool batch latch，上闩/
-解闩/180s 超时兜底）是替弱模型防复读的程序级闸门，已随 pending_tool_results
-一起拆除；防复读责任回归 prompt（§protocol tool batch 一节）。
+Program API functions all execute inside the current AgentLoop tick. There is
+no ToolWorker, pending-tool notification, or tool-batch completion wake.
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Callable
+from functools import partial
+from typing import Any, Awaitable, Callable
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from qqbot.core.logging import get_logger
 from qqbot.services.agent_loop import bot_registry
 from qqbot.services.agent_loop.decision import Planner
-from qqbot.services.agent_loop.event_writer import RuntimeEventPublisher
+from qqbot.services.agent_loop.event_writer import (
+    RuntimeEventPublisher,
+    WakeMode,
+)
 from qqbot.services.agent_loop.loop import AgentLoop
 from qqbot.services.agent_loop.projection import Projector
 from qqbot.services.agent_loop.reply_executor import ReplyExecutor
+from qqbot.services.agent_loop.silence_watcher import SilenceWatcher
 from qqbot.services.agent_loop.tool_registry import ToolRegistry
-from qqbot.services.agent_loop.tool_worker import ToolWorker
 
 logger = get_logger(__name__)
 
@@ -58,19 +56,21 @@ class LoopSupervisor:
         self._session_factory = session_factory
         self._projector = projector
         self._tool_registry = tool_registry
-        # 看图写描述回调（生产 = meme_caption.caption_image，由 v2_main 注入）：
-        # 原样转发给 ToolWorker，进工具 run() context 供 meme 工具用。
+        # 看图写描述回调（生产 = meme_caption.caption_image，由 v2_main 注入），
+        # 原样转发给每个 AgentLoop 的 ProgramExecutor。
         self._caption_image = caption_image
         self._loops: dict[str, AgentLoop] = {}
         self._lock = asyncio.Lock()
         self._started = False
         self._stopped = False
-        self._tool_worker: ToolWorker | None = None
         self._reply_executor: ReplyExecutor | None = None
         # 滚动记忆压缩器（记忆系统契约 §4）：MEMORY_COMPACTION_ENABLED
         # 打开时 start() 拉起；类型留 Any——模块惰性导入，避免默认关闭时
         # 平白拉进 LLM 依赖链。
         self._memory_compactor: Any | None = None
+        # 静默叫醒（2026-08-03）：群里彻底安静满阈值时落一条事实事件并开一拍，
+        # 给"回想"一个发生的时机。见 silence_watcher.py。
+        self._silence_watcher: SilenceWatcher | None = None
 
     @property
     def started(self) -> bool:
@@ -98,41 +98,26 @@ class LoopSupervisor:
             logger.warning(
                 "[supervisor] task backfill failed (continuing): {}", exc
             )
-        # ToolWorker：只有注入 registry 才启动；start() 即触发一次 catchup。把
-        # 自己注入进去让 worker 在**整批工具收口后**（写完 runtime.
-        # tool_batch_completed）经 notify_tool_batch_completed 批次级唤醒对应
-        # scope 的 AgentLoop——不再是每 drain 一轮就按 scope wake 一次。
         # ReplyExecutor 独立负责 reply_task 的到点生命周期完成（2026-07-31 起
         # 不再组稿发送）：completed 事件经其**专用** RuntimeEventPublisher 落库
         # 后，由这里注入的 wrapper 直接 immediate 唤醒——完成事实已落库、没有
         # 可攒的新消息，等攒批窗口只是白加延迟。publisher 协议本身不变。
-        if self._tool_registry is not None:
-            self._reply_executor = ReplyExecutor(
-                session_factory=self._session_factory,
-                event_publisher=RuntimeEventPublisher(
-                    self._session_factory,
-                    notify_event_available=self._wake_immediate,
-                ),
+        self._reply_executor = ReplyExecutor(
+            session_factory=self._session_factory,
+            event_publisher=RuntimeEventPublisher(
+                self._session_factory,
+                notify_event_available=self.waker(WakeMode.IMMEDIATE),
+            ),
+        )
+        # rescan 与上面的任务回填同属恢复性动作，best-effort：失败只损失
+        # "重挂定时器 / 补 uncertain / 补 wake"，不挡启动。
+        try:
+            await self._reply_executor.start()
+        except Exception as exc:
+            logger.warning(
+                "[supervisor] reply executor rescan failed (continuing): {}",
+                exc,
             )
-            # rescan 与上面的任务回填同属恢复性动作，best-effort：失败只
-            # 损失"重挂定时器 / 补 uncertain / 补 wake"，模型侧仍有
-            # timeline 上的 <tool-call name="reply"> 行作证据链可自愈
-            # （再落一次稿即重新挂表），不挡启动。
-            try:
-                await self._reply_executor.start()
-            except Exception as exc:
-                logger.warning(
-                    "[supervisor] reply executor rescan failed "
-                    "(continuing): {}",
-                    exc,
-                )
-            self._tool_worker = ToolWorker(
-                session_factory=self._session_factory,
-                registry=self._tool_registry,
-                supervisor=self,
-                caption_image=self._caption_image,
-            )
-            self._tool_worker.start()
         # MemoryCompactor（记忆系统契约 §4）：滚动折叠式场景记忆。开关
         # 默认关；启用时只挂起 worker 并给投影装推式探针。worker 启动不
         # 扫描、不 merge；只有 tick 投影报告真正触顶才会唤醒。best-effort：
@@ -156,14 +141,19 @@ class LoopSupervisor:
                 "[supervisor] memory compactor start failed (continuing): {}",
                 exc,
             )
+        # 静默叫醒：构造即可，没有 worker 要拉起——计时器由 wake() 的活动通知
+        # 按需武装。用 IMMEDIATE_NO_ARM：自己的叫醒不能重置自己的计时器，
+        # 否则一段静默里会反复开拍。
+        self._silence_watcher = SilenceWatcher(
+            self._session_factory, self.waker(WakeMode.IMMEDIATE_NO_ARM)
+        )
+        if self._silence_watcher.enabled:
+            logger.info("[supervisor] silence watcher online")
         # SystemAgentLoop wakes up to handle scope=system events
         # (request.*, lifecycle, bot_offline, ...).
         await self._ensure("system")
         self._started = True
-        logger.info(
-            "[supervisor] started, system loop + tool worker={} online",
-            "yes" if self._tool_worker is not None else "no",
-        )
+        logger.info("[supervisor] started, system loop online")
 
     async def stop(self) -> None:
         self._stopped = True
@@ -172,16 +162,16 @@ class LoopSupervisor:
         await asyncio.gather(
             *(loop.stop() for loop in loops), return_exceptions=True
         )
-        if self._tool_worker is not None:
-            try:
-                await self._tool_worker.stop()
-            except Exception as exc:
-                logger.warning("[supervisor] tool_worker.stop failed: {}", exc)
-            finally:
-                self._tool_worker = None
         if self._reply_executor is not None:
             await self._reply_executor.stop()
             self._reply_executor = None
+        if self._silence_watcher is not None:
+            try:
+                await self._silence_watcher.stop()
+            except Exception as exc:
+                logger.warning("[supervisor] silence watcher stop failed: {}", exc)
+            finally:
+                self._silence_watcher = None
         if self._memory_compactor is not None:
             try:
                 await self._memory_compactor.stop()
@@ -193,35 +183,44 @@ class LoopSupervisor:
                 self._memory_compactor = None
         logger.info("[supervisor] stopped, {} loops drained", len(loops))
 
-    async def _wake_immediate(self, scope_key: str) -> None:
-        """ReplyExecutor 专用 publisher 的 notifier：落库后直接开拍。"""
-        await self.wake(scope_key, immediate=True)
+    def waker(self, mode: WakeMode) -> Callable[[str], Awaitable[None]]:
+        """绑定 mode，返回朴素的 ``(scope_key) -> Awaitable[None]`` 回调。
 
-    async def wake(self, scope_key: str, *, immediate: bool = False) -> None:
-        """唤醒某个 scope 的 loop。
+        注入给生产者（ReplyExecutor / SilenceWatcher / `wait` 工具）的一律是
+        这个形状：它们只表达"叫醒这个 scope"，用哪种模式是本处的装配决定。
+        2026-08-04 用它取代了 `_wake_immediate` / `_wake_no_arm` 两个私有方法
+        ——那两个私有方法本身就是被当回调注入出去的，等于三个入口三种形状。
+        """
+        return partial(self.wake, mode=mode)
 
-        默认走 AgentLoop 的攒批窗口（2026-07-28 引入，2026-08-01 改固定窗口）：
-        新消息不立刻开拍，第一条开一个固定窗口，这段时间内到的一起在窗口到点
-        那一拍看到，避免对着拆成几条发的半截话表态。immediate=True 直接开拍，
-        留给"活干完了，来看结果"类唤醒（工具批次收口）——那里没有可攒的东西。
+    async def wake(
+        self, scope_key: str, *, mode: WakeMode = WakeMode.BATCHED
+    ) -> None:
+        """唤醒某个 scope 的 loop。三种模式的语义见 ``WakeMode``。
+
+        默认 BATCHED 走 AgentLoop 的攒批窗口（2026-07-28 引入，2026-08-01 改
+        固定窗口）：新消息不立刻开拍，第一条开一个固定窗口，这段时间内到的一起
+        在窗口到点那一拍看到，避免对着拆成几条发的半截话表态。
         """
         if self._stopped:
             return
         if scope_key.startswith("private:"):
             # 实例化策略 §10.1: private 不实例化 loop
             return
+        # 有动静 → 重排静默计时器。放在 _ensure 之前：即便 loop 创建失败，
+        # "这个 scope 刚才不静默"也是事实。IMMEDIATE_NO_ARM 跳过这一步，
+        # 否则静默叫醒会重置自己的计时器、一段静默里反复开拍。
+        if (
+            mode is not WakeMode.IMMEDIATE_NO_ARM
+            and self._silence_watcher is not None
+        ):
+            self._silence_watcher.notify_activity(scope_key)
         try:
             loop = await self._ensure(scope_key)
         except ValueError:
             logger.warning("[supervisor] invalid scope_key: {}", scope_key)
             return
-        loop.wake(immediate=immediate)
-
-    def notify_tool_pending(self) -> None:
-        """AgentLoop 写完 tool_called 后调，叫醒 ToolWorker 立即执行；未注入
-        tool_registry 时是 no-op。"""
-        if self._tool_worker is not None:
-            self._tool_worker.notify()
+        loop.wake(immediate=mode is not WakeMode.BATCHED)
 
     def notify_compaction(self, scope_key: str, uncovered_events: int) -> None:
         """转发投影计数；压缩器只接受达到阈值的 scope。
@@ -243,25 +242,6 @@ class LoopSupervisor:
             await self._reply_executor.notify(
                 scope_key, reply_task_id, revision, flush_at, event_id
             )
-
-    async def notify_tool_batch_completed(
-        self, scope_key: str, tool_batch_id: str
-    ) -> None:
-        """ToolWorker 在 runtime.tool_batch_completed 落库后调用：批次级唤醒
-        一次（不是每个工具一次——聚合唤醒是效率取舍，与"限制模型"无关）。
-
-        2026-07-02 起没有批次门闩：这里只负责唤醒，不再有解闩/stale 匹配逻辑。
-        批次进行期间的其它 wake 早已随时开拍。
-
-        immediate=True（2026-07-28）：工具结果已经落库，模型正等着看，攒批窗口
-        在这里没有任何东西可攒，等它就是白加延迟。
-        """
-        logger.info(
-            "[supervisor] tool batch completed, waking scope={} batch={}",
-            scope_key,
-            tool_batch_id,
-        )
-        await self.wake(scope_key, immediate=True)
 
     async def _ensure(self, scope_key: str) -> AgentLoop:
         async with self._lock:

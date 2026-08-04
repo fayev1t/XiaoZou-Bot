@@ -40,6 +40,7 @@ _USAGE_PROMPT = load_sibling_md(__file__, "get_group_info.md")
 
 class GetGroupInfoTool(BaseTool):
     name = "get_group_info"
+    program_kind = "query"
     allowed_scopes = ("group",)
     # required_permission 用 BaseTool 默认 GUEST（查询无副作用）
     usage_prompt = _USAGE_PROMPT
@@ -52,6 +53,24 @@ class GetGroupInfoTool(BaseTool):
         "type": "object",
         "properties": {},
         "required": [],
+    }
+    result_schema = {
+        "type": "object",
+        "properties": {
+            "group_id": {"type": ["integer", "string"]},
+            "group_name": {"type": ["string", "null"]},
+            "member_count": {"type": ["integer", "null"]},
+            "max_member_count": {"type": ["integer", "null"]},
+            "group_remark": {"type": ["string", "null"]},
+            "group_create_time": {"type": ["string", "null"]},
+        },
+        "required": [
+            "group_id",
+            "group_name",
+            "member_count",
+            "max_member_count",
+        ],
+        "additionalProperties": False,
     }
 
     async def execute(self, arguments: dict, **context: Any) -> ToolOutcome:

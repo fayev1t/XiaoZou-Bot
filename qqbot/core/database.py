@@ -121,8 +121,8 @@ async def init_db() -> None:
     - agent_events（append-only event stream，唯一真相源）
     - agent_tasks（任务读模型 / CQRS read model，从 agent.task_* 事件派生；
       允许 UPDATE，可从事件流 replay 重建。见 models/agent_task.py）
-    - agent_delivery_claims（worker 投递去重 / 租约表，运维协调用，允许 UPDATE；
-      丢了只退回"无去重"旧行为。见 models/agent_delivery_claim.py）
+    - agent_delivery_claims（历史 worker 的投递租约表；Program Effect 不再使用，
+      为数据库向后兼容保留。见 models/agent_delivery_claim.py）
 
     pg_trgm 扩展先建好，AgentEvent.search_text 上的 GIN trgm 索引才能创建
     （供 search_history 关键字检索使用）。

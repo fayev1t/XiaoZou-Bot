@@ -3,8 +3,8 @@
 到点只 complete + notify，不组稿、不碰 OneBot：
 - 写入前在 scope 锁内复核 open / 最新 revision / 已到期；
 - 同一最新 revision 只产生一条 runtime.reply_task_completed（causation 去重）；
-- 事件先提交、后调注入的 notifier（supervisor 装配的 immediate-wake
-  wrapper——publisher 协议不变，wrapper 内部才是 wake(immediate=True)）；
+- 事件先提交、后调注入的 notifier（supervisor 装配的
+  ``waker(WakeMode.IMMEDIATE)``——publisher 只见朴素的 (scope_key) 回调）；
 - 启动 rescan：重挂 open 定时器（过期立即触发）、升级期旧 flush 补
   uncertain；不建完成事件的消费审计/rescan outbox（best-effort 语义，
   §3.2）。

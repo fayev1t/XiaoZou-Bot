@@ -4,7 +4,7 @@ meme 工具不让 planner 在动作 JSON 里顺手写收藏描述：决策 tick 
 顺手写的一句话密度和稳定性都不够。这里单独调一次多模态 LLM：输入 = 图片 bytes
 （+ planner 可选提供的群聊语境 context_note——纯看图写不出"这是谁的名场面/本群
 怎么用"），输出 = 一段密度优先的中文描述，落进 agent_memes.description；之后
-<saved-memes> 渲染与 send_messages 选图都只看它。
+表情包收藏节渲染与 send_messages 选图都只看它。
 
 **2026-08-02 起提示词复用 timeline 图片那张 `image_description.md`**（consumer
 名仍是 `caption`，映射在 prompts/catalog.py），原专属的 `meme_caption.md` 删除：
@@ -13,7 +13,7 @@ meme 工具不让 planner 在动作 JSON 里顺手写收藏描述：决策 tick 
 共用带来的代价见 catalog.py 模块 docstring。role 仍是独立的 `caption`（路由与
 温度不合并）。
 
-注入方式：caption_image 由 v2_main 传给 LoopSupervisor → ToolWorker，在
+注入方式：caption_image 由 v2_main 传给 LoopSupervisor → ProgramExecutor，在
 run() context 里以 ``caption_image`` 键到达 meme 工具 —— 工具不直接 import
 本模块，契约测试塞假 captioner 即可全离线跑（与 session_factory 的注入/伪造
 方式一致）。

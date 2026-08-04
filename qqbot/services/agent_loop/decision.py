@@ -1,11 +1,4 @@
-"""Decision context / action types / planner protocol.
-
-Contract: 开发文档/v2.0/任务与决策契约.md §2-§4
-
-Planner actions form a deliberately small closed set: idle / call_tool.
-Task lifecycle operations are provided by the inline ``task`` tool rather
-than growing a parallel family of Planner-only actions.
-"""
+"""Decision context and Planner protocol for program-shaped decisions."""
 
 from __future__ import annotations
 
@@ -15,50 +8,20 @@ from typing import Any, Literal, Protocol
 
 
 @dataclass(frozen=True)
-class IdleAction:
-    """LLM (or skeleton planner) decided no work this tick."""
-
-    type: str = "idle"
-    reason: str = ""
-
-
-@dataclass(frozen=True)
-class CallToolAction:
-    """Dispatch a tool call. Either `task_id` or `task_ref` may be used to
-    attach the call to a task; both omitted means a lightweight call.
-
-    `triggered_by_event_id` 是 LLM 显式声明"是哪条事件让我调这个工具"。对
-    敏感工具（required_permission > GUEST）**工具内** enforce_permission 据此
-    **实时**解析触发用户的当前群角色 → tier 做权限校验；缺失时视作 GUEST，敏感
-    工具自然失败。非敏感工具（reply / websearch）可省略，仅作 audit 用。AgentLoop
-    自己不解析 tier、不做任何权限判定——只把这个 anchor 原样注入
-    tool_called.payload 交给工具；CallToolAction 缺省且 task 上挂了
-    triggered_by_event_id 时，由 AgentLoop fall back 到 task 的 anchor 补全因果链。
-    """
-
-    tool_name: str
-    arguments: dict = field(default_factory=dict)
-    task_id: str | None = None
-    task_ref: str | None = None
-    triggered_by_event_id: str | None = None
-    type: str = "call_tool"
-
-
-# Union of every action type the loop translates.
-#
-# 注意：发言不在这里 —— v2 中 Planner 通过 reply 工具落 reply_task，
-# 不再是一类独立的 Action。这是为了让 LLM 把"要不要说话"当成一次工具调
-# 用决策，与调 websearch / search_history 同构，避免被旧 ReplyAction 诱
-# 导成"群里每条消息都要选择回 vs idle"的二分法。
-# Task 生命周期同理：创建、记笔记、完成、失败都走 inline task 工具，Action
-# 不再为某一个业务域复制一套专属协议。
-Action = IdleAction | CallToolAction
-
-
-@dataclass(frozen=True)
 class DecisionOutput:
-    actions: list[Action]
-    reasoning: str | None = None
+    program: str
+    raw_response: str | None = None
+    planner_error: str | None = None
+
+
+@dataclass(frozen=True)
+class ProgramValidationFeedback:
+    attempt: int
+    error_kind: str
+    message: str
+    rejected_program: str
+    line: int | None = None
+    column: int | None = None
 
 
 # ─── Projection-fed view dataclasses (任务与决策契约 §2.3, §4.1, §5.1) ───
@@ -114,6 +77,18 @@ class MemeView:
 
 
 @dataclass(frozen=True)
+class ReflectionView:
+    """最新一版自我认识（agent.reflection_written 折叠，latest-wins）。
+
+    ``at`` 是写下它的时刻，与正文一起渲染——"三小时前想的"和"十分钟前想的"
+    对这段认识还作不作数是两回事，只给正文等于抹掉这个判据。
+    """
+
+    at: datetime
+    text: str
+
+
+@dataclass(frozen=True)
 class TimelineItem:
     """One renderable row in the LLM context (任务与决策契约 §2.3)."""
 
@@ -128,6 +103,7 @@ class TimelineItem:
         "task_closed",
         "my_reply",
         "reply_task_completed",
+        "program",
     ]
     render: str
     related_event_ids: list[str] = field(default_factory=list)
@@ -166,17 +142,14 @@ class ToolResultView:
     """A folded view of an agent.tool_called and its eventual result/failure
     (任务与决策契约 §5.1).
 
-    工具对模型只暴露**两态**：
-    - ``processing`` —— 只有 agent.tool_called，还没等到 terminal 事件；
-    - ``complete``   —— 已 terminal。成功/失败靠内容区分：``error_kind is
-      None`` 为成功（``result`` 有效），非 None 为失败（error_* 有效）。
-    旧三态 pending/succeeded/failed 已收敛：成败是 complete 的两种**内容**，
-    不是两种**状态**——状态只回答"这次调用整体结束没有"。
+    程序形态下工具行投影时必为终态。成功/失败只靠内容区分：
+    ``error_kind is None`` 为成功（``result`` 有效），非 None 为失败
+    （error_* 有效）。若历史数据只有 ``tool_called``，投影层防御性地把它
+    折成 ``interrupted`` / ``uncertain``，不再暴露 processing 状态。
     """
 
     tool_call_id: str
     tool_name: str
-    status: Literal["processing", "complete"]
     arguments: dict
     result: Any | None
     error_kind: str | None
@@ -210,22 +183,36 @@ class DecisionContext:
     # 其中的 hash 精确删除/换描述，并供发言时选图。空 = 不渲染。
     saved_memes: list[MemeView] = field(default_factory=list)
     # 2026-07-02 起不再有独立的 pending_tool_results 字段：工具结果只在
-    # timeline 的 <tool-call status="complete"> 行呈现一次（单一事实源）。
-    # 旧的"待消费工具更新区"实现从未做过消费切割——窗口内所有 complete 每拍
+    # timeline 的终态 <工具> 行呈现一次（单一事实源）。
+    # 旧的"待消费工具更新区"实现从未做过消费切割——窗口内所有结果每拍
     # 重复以"待你处理"的名义出现，是复读的直接诱饵；且同一调用在 timeline
     # 与 pending 区双重渲染，两处语义必然漂移。ToolResultView 仍保留——它是
     # timeline 渲染 tool-call 行时的折叠视图（fold_tool_results）。
 
-    # ─── reasoning 不进入跨拍上下文（2026-08-01）───
-    # DecisionOutput.reasoning 仍随 agent.decision_emitted 落库，供日志、快照与
-    # 审计使用；Projector 对该事件强消隐，不再把自由工作笔记回显给下一拍。
-    # 跨拍的客观事实由 timeline 的消息 / 工具调用 / 结果表达，未完成义务由
-    # active_tasks 表达。旧的 last_reasoning 字段与 <my-thought> 行都不得复活。
+    # ─── 程序源码不进入跨拍上下文（2026-08-03）───
+    # DecisionOutput.program 随 agent.decision_emitted 落库，供日志、快照与审计；
+    # Projector 对源码强消隐，只渲染 program terminal 的查询函数名、return 或错误。
+
+    # ─── 自我认识（2026-08-03，reflect 工具）───
+    # agent.reflection_written 折叠出的最新一版正文，latest-wins；渲染成信封
+    # `## 反思` 一节。None / 空串 = 还没写过，整节不出现。
+    #
+    # 它是**第二个**跨拍连续装置（第一个是 active_tasks），两者分工不同：任务
+    # 承载未竟之事、有收束条件；反思承载对自己的认识、没有终点，只被后来的
+    # 版本整段改写。事件本身在 timeline 里消隐（build_timeline 跳过），避免
+    # 同一段文字两处渲染。
+    #
+    # 与 2026-08-01 删除的 `<my-thought>` 逐拍 reasoning 回显的边界：那次删的是
+    # **每拍自由笔记原样回到下一拍**（快照实证：变成写给自己的高显著度提示词、
+    # 产出模板化台词）。这里回来的不是笔记而是一段被主动整合过的结论，且低频、
+    # 全量替换、有字数上限——中间隔着一次整合，立场不会逐字继承。勿把本字段
+    # 扩展成"最近 K 版反思"，那会退化回被删掉的那个形态。
+    reflection: ReflectionView | None = None
 
     # ─── 同 tick 校验重试的反馈（任务与决策契约 §7.1）───
-    # 上一次 decide() 输出未通过动作校验时，loop 带着错误描述重试；planner
-    # 渲染成 <validation-error>。正常首次调用恒为 None，不进渲染。
-    validation_feedback: str | None = None
+    # 上一次 decide() 输出未通过静态预检时，loop 带着错误与被拒源码重试；
+    # planner 渲染成 <校验拒绝> 行块。正常首次调用恒为 None，不进渲染。
+    validation_feedback: ProgramValidationFeedback | None = None
 
     # 当前 tick 上 bot 自己的 QQ user_id（由 bot_registry 提供,AgentLoop
     # 在 tick() 时 resolve 后注入）。None 表示 bot 还没连接 napcat / 注册
@@ -247,10 +234,11 @@ class Planner(Protocol):
     """Stateless decision function.
 
     Implementations:
-    - LLMPlanner — 现役唯一实现；调 LLM 并解析 DecisionOutput JSON。
-      解析失败一律降级为 IdleAction(llm_*_error)，不抛给循环。
-    测试里用的 always-idle 空实现内联在各测试文件中（`_FakeIdlePlanner`），
-    不再由生产包提供。
+    - LLMPlanner — 现役唯一实现；每次调用模型一次并返回响应源码。
+    - report_invalid_output — 静态预检失败后同步回报路由层，使同拍重试可切换
+      到下一个健康端点。
     """
 
     async def decide(self, context: DecisionContext) -> DecisionOutput: ...
+
+    def report_invalid_output(self, reason: str) -> None: ...

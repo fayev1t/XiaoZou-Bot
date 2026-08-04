@@ -1,14 +1,11 @@
-"""Contract tests for the inline ``task`` tool."""
+"""Contract tests for the effect ``task`` Program API function."""
 
 from __future__ import annotations
 
 import asyncio
 import unittest
 
-from qqbot.services.agent_loop.tool_registry import (
-    ToolOutcome,
-    get_tool_execution_mode,
-)
+from qqbot.services.agent_loop.tool_registry import ToolOutcome
 from qqbot.services.agent_loop.tools import build_default_registry
 from qqbot.services.agent_loop.tools.task import TaskTool
 
@@ -18,11 +15,11 @@ def _run(arguments: dict, **context: object) -> ToolOutcome:
 
 
 class TaskToolContractTests(unittest.TestCase):
-    def test_registered_as_generic_inline_tool(self) -> None:
+    def test_registered_as_effect_program_function(self) -> None:
         registry = build_default_registry()
         tool = registry.get("task")
         self.assertIsNotNone(tool)
-        self.assertEqual(get_tool_execution_mode(tool), "inline")
+        self.assertEqual(registry.spec("task").program_kind, "effect")
         self.assertIn("task", registry.names())
 
     def test_schema_declares_all_four_branches(self) -> None:
@@ -32,18 +29,17 @@ class TaskToolContractTests(unittest.TestCase):
         }
         self.assertEqual(actions, {"create", "note", "complete", "fail"})
 
-    def test_create_returns_id_ref_and_task_created_event(self) -> None:
+    def test_create_returns_id_and_task_created_event(self) -> None:
         outcome = _run(
             {
                 "action": "create",
                 "description": "查天气",
                 "related_tools": ["websearch"],
-                "task_ref": "T1",
             },
             triggered_by_event_id="MSG_1",
         )
         self.assertTrue(outcome.ok)
-        self.assertEqual(outcome.result["task_ref"], "T1")
+        self.assertNotIn("task_ref", outcome.result)
         self.assertEqual(outcome.result["state"], "pending")
         self.assertTrue(outcome.result["task_id"])
         self.assertEqual(len(outcome.emitted_events), 1)

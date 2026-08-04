@@ -20,7 +20,7 @@ scope_key 列固定写 MEME_SCOPE_GLOBAL 哨兵（列保留，表结构不变，
                                    处理），收录语义不做 UPDATE。
   load_saved_memes(factory)        取全局收藏夹（created_at 倒序、封顶
                                    MAX_SAVED_MEMES 条），Projector 渲染
-                                   <saved-memes> 用。
+                                   表情包收藏节用。
   delete_meme(factory, hash)       移除一条收藏（meme.delete，2026-07-12）。
                                    只删 agent_memes 元数据，**不动磁盘
                                    文件**——媒体文件是 EventIngest 的内容
@@ -62,7 +62,7 @@ SessionFactory = Callable[[], AsyncSession]
 # 显式标注就落在这里。列本身保留（见模块 docstring）。
 MEME_SCOPE_GLOBAL = "global"
 
-# <saved-memes> 渲染上限：收藏夹随时间增长，prompt 只带最近收录的 N 条。
+# 表情包收藏节渲染上限：收藏夹随时间增长，prompt 只带最近收录的 N 条。
 # 超限的老表情包仍在表里（meme.send 凭 hash 仍可发送），只是不再进 prompt。
 # 全局共享后所有群共用一个池，比分群时代放宽到 100。
 MAX_SAVED_MEMES = 100
@@ -81,6 +81,38 @@ async def get_meme(
         result = await session.execute(stmt)
         row = result.scalars().first()
     return _row_to_meme_view(row) if row is not None else None
+
+
+async def find_meme_by_prefix(
+    session_factory: SessionFactory, hash_prefix: str
+) -> tuple[MemeView | None, bool]:
+    """按 hash 前缀（≥12 位十六进制，调用方已校验）唯一匹配一条全局收藏。
+
+    行文法 §7：信封展示 12 位前缀，工具回填按前缀查。返回
+    ``(命中的收藏, 是否多义)``：
+    - 唯一命中 → ``(view, False)``；
+    - 无命中 → ``(None, False)``；
+    - 多条命中 → ``(None, True)``（48 bit 前缀碰撞概率可忽略，但语义封死，
+      调用方报 ``ambiguous_hash_prefix``）。
+    完整 64 位输入等价精确查（LIKE 前缀即全等）。前缀已限定 hex 字符集，
+    无 ``%``/``_`` 注入面。
+    """
+    if len(hash_prefix) == 64:
+        return await get_meme(session_factory, hash_prefix), False
+    stmt = (
+        select(AgentMeme)
+        .where(AgentMeme.scope_key == MEME_SCOPE_GLOBAL)
+        .where(AgentMeme.file_hash.like(f"{hash_prefix}%"))
+        .limit(2)
+    )
+    async with session_factory() as session:
+        result = await session.execute(stmt)
+        rows = list(result.scalars().all())
+    if not rows:
+        return None, False
+    if len(rows) > 1:
+        return None, True
+    return _row_to_meme_view(rows[0]), False
 
 
 async def insert_meme(
@@ -150,7 +182,7 @@ async def update_meme_description(
 
     只动 description + context_note（新语境同步留档，供下次 recaption 沿用）；
     created_at / mime / source_event_id 保持收录时的值——created_at 语义是
-    "收录时间"而非"最后修改时间"，<saved-memes> 排序不因换描述而跳动。
+    "收录时间"而非"最后修改时间"，收藏节排序不因换描述而跳动。
     """
     stmt = (
         update(AgentMeme)

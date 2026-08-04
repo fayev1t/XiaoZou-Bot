@@ -116,6 +116,8 @@ _RETIRED_KEYS: dict[str, tuple[str, str]] = {
 
 class ReplyTool(BaseTool):
     name = "reply"
+    program_kind = "effect"
+    max_call_sites = 2
     allowed_scopes = ("group", "private")
     description = (
         "为当前 scope 起一段短时等待，表示正在输入、字尚未发出，不发送消息，也"
@@ -171,6 +173,18 @@ class ReplyTool(BaseTool):
                 "then": {"not": {"required": ["hold_seconds"]}},
             },
         ],
+    }
+    result_schema = {
+        "type": "object",
+        "properties": {
+            "reply_task_id": {"type": ["string", "null"]},
+            "revision": {"type": ["integer", "null"]},
+            "state": {"type": "string"},
+            "flush_at": {"type": ["string", "null"]},
+            "hard_deadline": {"type": ["string", "null"]},
+        },
+        "required": ["reply_task_id", "revision", "state"],
+        "additionalProperties": False,
     }
 
     async def execute(self, arguments: dict, **context: Any) -> ToolOutcome:
@@ -252,7 +266,7 @@ class ReplyTool(BaseTool):
         tool_call_event_id: str,
         notify: Any,
     ) -> ToolOutcome:
-        # ToolWorker 在 domain event 已写、tool_result 未写之间崩溃时的幂等恢复。
+        # 兼容历史执行器或同一调用重入：领域事件已写时直接返回原事实。
         existing_payload = await find_upsert_for_tool_call(
             session_factory, tool_call_event_id
         )

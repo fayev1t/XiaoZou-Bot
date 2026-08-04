@@ -70,6 +70,7 @@ _FALSE_STRINGS = frozenset({"false", "0", "no", ""})
 
 class GetPendingJoinRequestsTool(BaseTool):
     name = "get_pending_join_requests"
+    program_kind = "query"
     allowed_scopes = ("group",)
     # required_permission 用 BaseTool 默认 GUEST（查询无副作用，信息本就进 timeline）
     required_bot_role = "admin"  # 非管理员 bot 收不到入群申请，前置拦成明确失败
@@ -84,6 +85,36 @@ class GetPendingJoinRequestsTool(BaseTool):
         "type": "object",
         "properties": {},
         "required": [],
+    }
+    result_schema = {
+        "type": "object",
+        "properties": {
+            "group_id": {"type": "integer"},
+            "pending_count": {"type": "integer"},
+            "requests": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "user_id": {"type": ["integer", "null"]},
+                        "nickname": {"type": ["string", "null"]},
+                        "comment": {"type": ["string", "null"]},
+                    },
+                    "required": ["user_id", "nickname", "comment"],
+                    "additionalProperties": False,
+                },
+            },
+            "handled_recent_count": {"type": "integer"},
+            "may_be_incomplete": {"type": "boolean"},
+        },
+        "required": [
+            "group_id",
+            "pending_count",
+            "requests",
+            "handled_recent_count",
+            "may_be_incomplete",
+        ],
+        "additionalProperties": False,
     }
 
     async def execute(self, arguments: dict, **context: Any) -> ToolOutcome:

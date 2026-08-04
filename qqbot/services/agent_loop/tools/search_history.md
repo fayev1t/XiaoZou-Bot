@@ -38,7 +38,7 @@ scope 按 `user_id` 过滤。参数中不存在跨 scope 的目标字段。
       "event_id": "01...",
       "occurred_at": "2026-07-30T12:00:00+08:00",
       "kind": "message",
-      "render": "<message ...>...</message>"
+      "render": "<m>名字(QQ) #消息ID: 正文"
     }
   ],
   "warnings": []

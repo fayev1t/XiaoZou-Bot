@@ -1,13 +1,13 @@
-"""AgentLoop: v2 decision/tick layer.
+"""AgentLoop: v2 program-shaped decision/tick layer.
 
 Contracts:
-- 开发文档/v2.0/任务与决策契约.md (DecisionRound, Action, Planner)
+- 开发文档/v2.0/任务与决策契约.md (DecisionRound, Program, Planner)
 - 开发文档/v2.0/事件系统设计.md §10 (实例化策略)
 - 开发文档/v2.0/EventIngest契约.md §5 (LoopSupervisor.wake interface)
 
 包级导入策略(③ 模块解耦,见开发日志 2026-06-23):
   纯数据类(decision)与轻量 bot_registry 保持 eager —— 它们只依赖 stdlib;
-  但 **重模块惰性化**:LLMPlanner / Projector / AgentLoop / 两个 Worker /
+  但 **重模块惰性化**:LLMPlanner / Projector / AgentLoop / ReplyExecutor /
   LoopSupervisor / ToolRegistry 等会拉 sqlalchemy(DB)或 langchain(LLM),
   改用 PEP 562 module `__getattr__` 按需导入。于是 `import qqbot.services.
   agent_loop`(或导入其任一**纯**子模块,如 decision / task_store 的纯函数部分)
@@ -22,14 +22,12 @@ from typing import TYPE_CHECKING
 # 轻量、纯 stdlib 依赖 —— eager 导入无成本,且被测试/类型大量直接引用。
 from qqbot.services.agent_loop import bot_registry
 from qqbot.services.agent_loop.decision import (
-    Action,
-    CallToolAction,
     DecisionContext,
     DecisionOutput,
-    IdleAction,
     ImageRef,
     MemeView,
     Planner,
+    ProgramValidationFeedback,
     ProgressNote,
     TaskView,
     TimelineItem,
@@ -46,7 +44,6 @@ _LAZY: dict[str, str] = {
     "LoopSupervisor": "supervisor",
     "Tool": "tool_registry",
     "ToolRegistry": "tool_registry",
-    "ToolWorker": "tool_worker",
 }
 
 
@@ -74,20 +71,17 @@ if TYPE_CHECKING:  # 静态分析仍看得到惰性符号
     from qqbot.services.agent_loop.prompts.catalog import PromptLibrary
     from qqbot.services.agent_loop.supervisor import LoopSupervisor
     from qqbot.services.agent_loop.tool_registry import Tool, ToolRegistry
-    from qqbot.services.agent_loop.tool_worker import ToolWorker
 
 __all__ = [
-    "Action",
     "AgentLoop",
-    "CallToolAction",
     "DecisionContext",
     "DecisionOutput",
-    "IdleAction",
     "ImageRef",
     "LLMPlanner",
     "LoopSupervisor",
     "MemeView",
     "Planner",
+    "ProgramValidationFeedback",
     "PromptLibrary",
     "build_default_prompt_library",
     "ProgressNote",
@@ -97,6 +91,5 @@ __all__ = [
     "Tool",
     "ToolRegistry",
     "ToolResultView",
-    "ToolWorker",
     "bot_registry",
 ]

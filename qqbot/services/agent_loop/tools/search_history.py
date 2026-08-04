@@ -52,11 +52,12 @@ _USAGE_PROMPT = load_sibling_md(__file__, "search_history.md")
 
 
 class SearchHistoryTool(BaseTool):
-    """实现 Tool 协议。session_factory 从 run() 的 context 进（ToolWorker
-    统一注入），无构造依赖 —— 与 websearch / send_message 同构。
+    """实现 Tool 协议。session_factory 从 run() 的 context 进（ProgramExecutor
+    统一注入），无构造依赖 —— 与 websearch / send_messages 同构。
     """
 
     name = "search_history"
+    program_kind = "query"
     description = (
         "检索当前 scope 中未包含在近期时间线窗口内的历史事件。过滤条件可组合："
         "anchor_event_id 或 task_id 提供锚点，start_time/end_time 提供时间范围，"
@@ -71,8 +72,7 @@ class SearchHistoryTool(BaseTool):
             "anchor_event_id": {
                 "type": "string",
                 "description": (
-                    "仅返回严格早于该 event_id 的事件；event_id 为按时间可排序的 "
-                    "ULID。"
+                    "仅返回严格早于该 event_id 的事件；event_id 为按时间可排序的 ULID。"
                 ),
             },
             "task_id": {
@@ -104,22 +104,46 @@ class SearchHistoryTool(BaseTool):
             },
         },
     }
+    result_schema = {
+        "type": "object",
+        "properties": {
+            "matched": {"type": "integer"},
+            "anchor_event_id": {"type": ["string", "null"]},
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "event_id": {"type": "string"},
+                        "occurred_at": {"type": "string"},
+                        "kind": {"type": "string"},
+                        "render": {"type": "string"},
+                    },
+                    "required": ["event_id", "occurred_at", "kind", "render"],
+                    "additionalProperties": False,
+                },
+            },
+            "warnings": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["matched", "anchor_event_id", "items", "warnings"],
+        "additionalProperties": False,
+    }
 
     async def execute(self, arguments: dict, **context: Any) -> ToolOutcome:
-        # GUEST + 不限 scope：enforce_access 实为 no-op，但统一保留首行调用。全程无 raise。
+        # GUEST + 不限 scope：enforce_access 实为 no-op，但仍统一保留首行调用。
         if fail := await self.enforce_access(context):
             return fail
 
         scope_key = context.get("scope_key")
         if not scope_key or not isinstance(scope_key, str):
-            # 由 ToolWorker 注入。理论上 system / group:N / private:N 总有一个。
+            # 由 ProgramExecutor 注入。理论上 system / group:N / private:N 总有一个。
             return ToolOutcome.failure(
                 "invalid_arguments",
                 "search_history requires scope_key from caller context",
             )
-        # session_factory 同样由 ToolWorker 在 context 里注入。ToolWorker 串行
-        # 执行工具且全局共用同一个 factory，落到 self 上供 _query /
-        # _resolve_task_anchor 复用是安全的（不存在并发 run 互相覆盖）。
+        # session_factory 同样由 ProgramExecutor 在 context 里注入。registry
+        # 每次函数调用都会新建工具实例，落到 self 上供 _query /
+        # _resolve_task_anchor 复用，不会跨调用共享可变状态。
         self._session_factory = context.get("session_factory")
 
         try:

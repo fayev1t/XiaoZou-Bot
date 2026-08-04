@@ -1,7 +1,7 @@
 """SendMessagesTool 合同（2026-07-31 删除 Replyer：Planner 亲自发言的出口）。
 
 钉住四组边界（重构提案-删除Replyer.md §4、§8）：
-- 普通 ToolWorker 工具：不读 ReplyTask、不查完成事件——没有任何完成事件时
+- 普通 Program Effect：不读 ReplyTask、不查完成事件——没有任何完成事件时
   调用照常执行；不写任何领域/runtime 事件（发送事实只活在 terminal 里）；
 - 静态校验与 meme preflight 失败无副作用（不碰 OneBot）；
 - 结果语义：sent → success；partial / failed / uncertain → failure，

@@ -59,10 +59,12 @@ _REQUEST_TYPE = "external.request.group.add"
 
 class RespondToGroupJoinRequestTool(BaseTool):
     """实现 Tool 协议。无构造依赖：session_factory（反查 request 事件）从
-    run() 的 context 进，由 ToolWorker 统一注入；Bot 实例从 bot_registry 取。
+    run() 的 context 进，由 ProgramExecutor 统一注入；Bot 实例从 bot_registry 取。
     """
 
     name = "respond_to_group_join_request"
+    program_kind = "effect"
+    max_call_sites = 2
     allowed_scopes = ("group",)
     required_permission = PermissionTier.ADMIN
     required_bot_role = "admin"  # set_group_add_request 需要 bot 自己是群管理员
@@ -79,7 +81,7 @@ class RespondToGroupJoinRequestTool(BaseTool):
             "request_event_id": {
                 "type": "string",
                 "description": (
-                    "目标 <request kind=\"group.add\"> 事件的 event_id。工具会"
+                    '目标 <request kind="group.add"> 事件的 event_id。工具会'
                     "根据该事件在服务端读取 napcat flag，调用参数不包含 flag。"
                 ),
             },
@@ -96,6 +98,24 @@ class RespondToGroupJoinRequestTool(BaseTool):
             },
         },
         "required": ["request_event_id", "approve"],
+    }
+    result_schema = {
+        "type": "object",
+        "properties": {
+            "request_event_id": {"type": "string"},
+            "group_id": {"type": "integer"},
+            "user_id": {"type": ["integer", "null"]},
+            "approve": {"type": "boolean"},
+            "applied": {"type": "boolean"},
+        },
+        "required": [
+            "request_event_id",
+            "group_id",
+            "user_id",
+            "approve",
+            "applied",
+        ],
+        "additionalProperties": False,
     }
 
     async def execute(self, arguments: dict, **context: Any) -> ToolOutcome:
@@ -124,9 +144,7 @@ class RespondToGroupJoinRequestTool(BaseTool):
             )
         # approve 必填 bool；coerce_bool 稳妥转（"false"/"0"/"no" → False），
         # 防止裸 bool("false") 误判成同意。
-        approve, fail = coerce_bool(
-            arguments.get("approve"), f"{self.name}.approve"
-        )
+        approve, fail = coerce_bool(arguments.get("approve"), f"{self.name}.approve")
         if fail:
             return fail
         reason = _coerce_str(arguments.get("reason")) or ""
@@ -201,11 +219,7 @@ class RespondToGroupJoinRequestTool(BaseTool):
 
         独立成方法便于单测 stub，避免打真 DB（与 search_history._query 同模式）。
         """
-        stmt = (
-            select(AgentEvent)
-            .where(AgentEvent.event_id == event_id)
-            .limit(1)
-        )
+        stmt = select(AgentEvent).where(AgentEvent.event_id == event_id).limit(1)
         async with self._session_factory() as session:
             result = await session.execute(stmt)
             row = result.scalars().first()

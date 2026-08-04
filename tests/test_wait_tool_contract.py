@@ -2,7 +2,7 @@
 
 设计结论：
 - execute() **绝不 sleep**：登记 asyncio 定时器后立刻返回成功（带 wake_at），
-  ToolWorker 串行派发通道不被占用。
+  当前拍的程序执行通道不被 sleep 占用。
 - 到点回调 _fire_wait：**先**写 runtime.wait_elapsed（agent_visible，回显
   note），**再** wake(scope_key)——醒来那拍的投影必能看到 hint。
 - 定时器仅存内存，进程重启即丢（best-effort，契约见 事件系统设计.md §4.3.2）。
@@ -107,7 +107,7 @@ class WaitToolScheduleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_numeric_string_seconds_accepted(self) -> None:
         outcome = await WaitTool().run(
-            {"seconds": "60"}, **self._context([])
+            {"seconds": "60", "note": "一分钟后回来"}, **self._context([])
         )
         self.assertTrue(outcome.ok)
         self.assertEqual(outcome.result["seconds"], 60)
@@ -115,7 +115,9 @@ class WaitToolScheduleTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_wake_scope_fails_gracefully(self) -> None:
         ctx = self._context([])
         ctx["wake_scope"] = None
-        outcome = await WaitTool().run({"seconds": 30}, **ctx)
+        outcome = await WaitTool().run(
+            {"seconds": 30, "note": "半分钟后回来"}, **ctx
+        )
         self.assertFalse(outcome.ok)
         self.assertEqual(outcome.error_kind, "internal_tool_error")
 
@@ -171,11 +173,60 @@ class WaitFireTests(unittest.IsolatedAsyncioTestCase):
             correlation_id="CID",
             causation_id=None,
             seconds=30,
-            note=None,
+            note="事件写失败也要叫醒",
             wake_at_iso="2026-07-02T16:00:00+08:00",
         )
         # 事件写失败不吞唤醒——宁可少一条 hint，不可失约
         self.assertEqual(woke, ["group:100"])
+
+
+class WaitNoteAndBoundsContractTests(unittest.IsolatedAsyncioTestCase):
+    """2026-08-03：note 由可选改必填、上界 3600 → 6000（静默叫醒配套）。
+
+    改动动机见 wait.py docstring —— 本工具现在同时承担"她给自己的回想改期"，
+    而一次没有理由的自我约定到点只回显一个空提示。
+    """
+
+    async def _run(self, arguments: dict) -> Any:
+        async def _wake(scope_key: str) -> None:
+            return None
+
+        def factory() -> _RecordingSession:
+            return _RecordingSession([])
+
+        return await WaitTool().run(
+            arguments,
+            scope_key="group:100",
+            session_factory=factory,
+            wake_scope=_wake,
+            correlation_id="CID",
+            tool_call_event_id="TC_EVENT",
+        )
+
+    def test_note_is_declared_required_in_arguments_schema(self) -> None:
+        self.assertIn("note", WaitTool.arguments_schema["required"])
+        self.assertIn("note", WaitTool.result_schema["required"])
+
+    async def test_missing_note_is_invalid_arguments(self) -> None:
+        outcome = await self._run({"seconds": 30})
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.error_kind, "invalid_arguments")
+        self.assertEqual(outcome.extra.get("reason_code"), "note_not_str")
+
+    async def test_blank_note_is_invalid_arguments(self) -> None:
+        outcome = await self._run({"seconds": 30, "note": "   "})
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.extra.get("reason_code"), "note_empty")
+
+    async def test_upper_bound_is_six_thousand_seconds(self) -> None:
+        self.assertEqual(MAX_WAIT_SECONDS, 6000)
+        ok = await self._run({"seconds": 6000, "note": "一小时四十分后再看"})
+        self.assertTrue(ok.ok)
+        too_long = await self._run({"seconds": 6001, "note": "超了"})
+        self.assertFalse(too_long.ok)
+        self.assertEqual(
+            too_long.extra.get("reason_code"), "seconds_out_of_range"
+        )
 
 
 class WaitTimerIntegrationTests(unittest.IsolatedAsyncioTestCase):

@@ -22,7 +22,6 @@ _CREATE_FIELDS = {
     "description",
     "related_tools",
     "parent_task_id",
-    "task_ref",
 }
 _NOTE_FIELDS = {"action", "task_id", "note"}
 _COMPLETE_FIELDS = {"action", "task_id", "result_summary"}
@@ -30,14 +29,15 @@ _FAIL_FIELDS = {"action", "task_id", "reason"}
 
 
 class TaskTool(BaseTool):
-    """把 Task 生命周期收敛成一个 inline 工具，而非 Planner 专属 action。"""
+    """把 Task 生命周期收敛成一个 effect 程序函数。"""
 
     name = "task"
-    execution_mode = "inline"
+    program_kind = "effect"
+    max_call_sites = 2
     description = (
         "创建并维护可跨 tick 持续存在的任务。action 支持 create、note、"
-        "complete 和 fail。工具在当前 tick 内联执行；create 返回的 task_ref "
-        "可供同一 actions 列表中的后续 call_tool 动作引用。"
+        "complete 和 fail。create 返回的 task_id 可直接存入程序变量，供后续"
+        "effect 的 task_id= 参数使用。"
     )
     usage_prompt = _USAGE_PROMPT
     arguments_schema = {
@@ -64,13 +64,6 @@ class TaskTool(BaseTool):
                         "type": ["string", "null"],
                         "minLength": 1,
                         "description": "父任务 ID；无父任务时可省略或传 null。",
-                    },
-                    "task_ref": {
-                        "type": ["string", "null"],
-                        "minLength": 1,
-                        "description": (
-                            "本次 actions 列表内使用的任务别名；create 结果会原样返回。"
-                        ),
                     },
                 },
                 "required": ["action", "description"],
@@ -141,6 +134,16 @@ class TaskTool(BaseTool):
             },
         ],
     }
+    result_schema = {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string"},
+            "task_id": {"type": "string"},
+            "state": {"type": "string"},
+        },
+        "required": ["action", "task_id", "state"],
+        "additionalProperties": False,
+    }
 
     async def execute(self, arguments: dict, **context: Any) -> ToolOutcome:
         if fail := await self.enforce_access(context):
@@ -187,10 +190,6 @@ def _create(arguments: dict, context: dict) -> ToolOutcome:
     )
     if isinstance(parent_task_id, ToolOutcome):
         return parent_task_id
-    task_ref = _optional_text(arguments.get("task_ref"), "task_ref")
-    if isinstance(task_ref, ToolOutcome):
-        return task_ref
-
     task_id = new_event_id()
     event = ToolGeneratedEvent(
         event_type="agent.task_created",
@@ -206,7 +205,6 @@ def _create(arguments: dict, context: dict) -> ToolOutcome:
         {
             "action": "create",
             "task_id": task_id,
-            "task_ref": task_ref,
             "state": "pending",
         },
         emitted_events=[event],

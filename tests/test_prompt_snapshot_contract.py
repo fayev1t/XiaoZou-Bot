@@ -10,8 +10,7 @@
   hash/mime/bytes 元信息
 - 保留清理：文件数超 PROMPT_SNAPSHOT_KEEP 删最旧
 - usage 归一化：usage_metadata / response_metadata.token_usage 两条来源
-- LLMPlanner 集成：decide() 各 return 路径（解析成功 / JSON 重试放弃 /
-  调用异常）都落一份快照且不改变决策行为
+- LLMPlanner 集成：源码响应与调用异常各落一份快照且不改变决策行为
 - meme_caption 集成：辅助调用落 kind=meme_caption 快照，base64 不落盘
 
 所有用例显式设置 PROMPT_SNAPSHOT_* 环境变量（os.environ 优先于 .env 文件，
@@ -33,7 +32,10 @@ from typing import Any
 from unittest import mock
 
 from qqbot.core.time import china_now
-from qqbot.services.agent_loop.decision import DecisionContext
+from qqbot.services.agent_loop.decision import (
+    DecisionContext,
+    ProgramValidationFeedback,
+)
 from qqbot.services.agent_loop.llm_planner import LLMPlanner
 from qqbot.services.agent_loop.prompt_snapshot import (
     SNAPSHOT_SCHEMA_VERSION,
@@ -198,7 +200,7 @@ class RedactionTests(_SnapshotEnvTestCase):
                 os.environ["LLM_API_KEY"] = saved
 
     def test_model_providers_file_every_api_key_scrubbed(self) -> None:
-        """config/model_providers.json（多服务商注册表）里的每把 api_key 都必须被抹掉。"""
+        """多服务商注册表里的每把 api_key 都必须被抹掉。"""
         config = {
             "providers": [
                 {
@@ -337,7 +339,7 @@ def _ctx(scope_key: str = "group:100") -> DecisionContext:
 class PlannerSnapshotIntegrationTests(_SnapshotEnvTestCase):
     def test_successful_decide_writes_planner_snapshot(self) -> None:
         llm = _StubLLM(
-            response_content='{"actions":[{"type":"idle","reason":"r"}]}',
+            response_content="# idle",
             usage_metadata={
                 "input_tokens": 11,
                 "output_tokens": 3,
@@ -353,7 +355,7 @@ class PlannerSnapshotIntegrationTests(_SnapshotEnvTestCase):
         self.assertEqual(data["tick_seq"], 3)
         self.assertEqual(data["correlation_id"], "CID-9")
         self.assertEqual(data["model"], "stub-model")
-        self.assertEqual(data["outcome"], "parsed")
+        self.assertEqual(data["outcome"], "received")
         # system prompt 分段统计（根页正文挂消费者名，槽挂槽名；2026-07-31
         # 并页后 group scope 只剩 planner / envelope 两种段名）
         section_names = [s["name"] for s in data["sections"]]
@@ -362,33 +364,33 @@ class PlannerSnapshotIntegrationTests(_SnapshotEnvTestCase):
         for sec in data["sections"]:
             self.assertGreater(sec["chars"], 0)
             self.assertEqual(len(sec["sha256"]), 64)
-        # user XML 原文在快照里
-        self.assertIn("<agent-input", data["user_text"])
+        # user 行文法信封原文在快照里
+        self.assertIn("# 决策输入", data["user_text"])
+        self.assertNotIn("## 工具目录", data["user_text"])
         # attempts：latency + usage + 响应原文
         self.assertEqual(len(data["attempts"]), 1)
         attempt = data["attempts"][0]
         self.assertIsInstance(attempt["latency_ms"], int)
         self.assertEqual(attempt["usage"]["total_tokens"], 14)
-        self.assertIn('"idle"', attempt["response_text"])
+        self.assertIn("# idle", attempt["response_text"])
 
-    def test_json_retry_giveup_records_all_attempts(self) -> None:
-        llm = _StubLLM(response_content="NOT JSON AT ALL")
+    def test_body_is_recorded_once_without_planner_side_parsing(self) -> None:
+        llm = _StubLLM(response_content="NOT PYTHON AT ALL")
         planner = LLMPlanner(llm_client=llm)
         out = asyncio.run(planner.decide(_ctx()))
-        # 行为不变：三次仍解析失败 → idle fallback
-        self.assertEqual(out.actions[0].reason, "llm_json_error:JSONDecodeError")
+        self.assertEqual(out.program, "NOT PYTHON AT ALL")
 
         data = self.read_single()
-        self.assertEqual(data["outcome"], "json_error_giveup")
-        self.assertEqual(len(data["attempts"]), 3)
-        for attempt in data["attempts"]:
-            self.assertIn("json_error", attempt["error"])
+        self.assertEqual(data["outcome"], "received")
+        self.assertEqual(len(data["attempts"]), 1)
+        self.assertEqual(data["attempts"][0]["response_text"], "NOT PYTHON AT ALL")
 
     def test_llm_call_error_records_call_error_outcome(self) -> None:
         llm = _StubLLM(raise_exc=RuntimeError("boom"))
         planner = LLMPlanner(llm_client=llm)
         out = asyncio.run(planner.decide(_ctx()))
-        self.assertEqual(out.actions[0].reason, "llm_call_error:RuntimeError")
+        self.assertEqual(out.program, "")
+        self.assertEqual(out.planner_error, "llm_call_error:RuntimeError")
 
         data = self.read_single()
         self.assertEqual(data["outcome"], "call_error")
@@ -397,18 +399,14 @@ class PlannerSnapshotIntegrationTests(_SnapshotEnvTestCase):
 
     def test_disabled_snapshot_leaves_decide_untouched(self) -> None:
         os.environ["PROMPT_SNAPSHOT_ENABLED"] = "false"
-        llm = _StubLLM(
-            response_content='{"actions":[{"type":"idle","reason":"r"}]}'
-        )
+        llm = _StubLLM(response_content="# idle")
         planner = LLMPlanner(llm_client=llm)
         out = asyncio.run(planner.decide(_ctx()))
-        self.assertEqual(out.actions[0].reason, "r")
+        self.assertEqual(out.program, "# idle")
         self.assertEqual(self.files(), [])
 
     def test_private_scope_not_written(self) -> None:
-        llm = _StubLLM(
-            response_content='{"actions":[{"type":"idle","reason":"r"}]}'
-        )
+        llm = _StubLLM(response_content="# idle")
         planner = LLMPlanner(llm_client=llm)
         asyncio.run(planner.decide(_ctx(scope_key="private:55")))
         self.assertEqual(self.files(), [])
@@ -416,11 +414,17 @@ class PlannerSnapshotIntegrationTests(_SnapshotEnvTestCase):
     def test_validation_retry_flag_recorded(self) -> None:
         from dataclasses import replace
 
-        llm = _StubLLM(
-            response_content='{"actions":[{"type":"idle","reason":"r"}]}'
-        )
+        llm = _StubLLM(response_content="# idle")
         planner = LLMPlanner(llm_client=llm)
-        ctx = replace(_ctx(), validation_feedback="attempt 1 rejected: x")
+        ctx = replace(
+            _ctx(),
+            validation_feedback=ProgramValidationFeedback(
+                attempt=1,
+                error_kind="program_syntax_error",
+                message="x",
+                rejected_program="bad",
+            ),
+        )
         asyncio.run(planner.decide(ctx))
         data = self.read_single()
         self.assertTrue(data["validation_retry"])

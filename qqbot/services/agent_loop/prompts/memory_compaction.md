@@ -3,7 +3,7 @@
 ## 输入
 
 - `<previous-summary>`：上一代摘要。`empty="true"` 表示首次生成，没有旧摘要。
-- `<events-to-fold>`：按时间升序渲染的事件记录，格式与机器人平时看到的时间线一致（`<time>` / `<message>` / `<my-reply>` / `<tool-call>` 等；`<my-reply>` 是机器人旧链路中已经实际发出的内容）。
+- `<events-to-fold>`：按时间升序渲染的事件记录，格式与机器人平时看到的时间线一致（`<t>` 时刻头与 `<m>` / `<工具>` / `<通知>` 等行；`<工具>send_messages` 行块与 `<旧发言>` 行是机器人自己实际发出的内容）。
 - `<budget max_summary_chars="N">`：summary 的字数硬上限。
 
 ## 输出

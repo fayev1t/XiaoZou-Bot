@@ -3,17 +3,21 @@
 ## 功能
 
 `wait` 在指定秒数后为当前 scope 安排一次唤醒。调用立即返回；计时器到期后，
-系统写入 `runtime.wait_elapsed` 事件，并在时间线中渲染为
-`<system-hint kind="wait_elapsed">`，随后启动一个新 tick。
+系统写入 `runtime.wait_elapsed` 事件，在时间线中渲染为 `<系统>wait_elapsed`
+行并携带 `note` 原文，随后启动一个新 tick。
+
+用于自我提醒与延迟执行其它动作，其中一个具体用途是给自己的回想改期：系统在
+群里静默满阈值时会落 `<系统>silence_elapsed` 并叫醒一次，本工具是在此之外按
+当前处境自行约定的那一次。
 
 该工具与 `reply` 的等待相互独立，不读取或修改 `hold_seconds` 或 reply task。
-`reply` 的新修订仍按“最新修订替换旧修订”处理。
+`reply` 的新修订仍按"最新修订替换旧修订"处理。
 
 ## 参数
 
-- `seconds`：必填整数，范围为 5–3600，表示唤醒前的等待秒数。
-- `note`：可选字符串，去除首尾空白后最多保留 500 个字符；计时器到期时会
-  原样写入 `wait_elapsed` 提示。
+- `seconds`：必填整数，范围为 5–6000，表示唤醒前的等待秒数。
+- `note`：必填字符串，说明约这一次唤醒是为了什么。去除首尾空白后不得为空，
+  最多保留 500 个字符；计时器到期时原样写入 `wait_elapsed`。
 
 ## 返回
 
@@ -22,13 +26,17 @@
 ```json
 {
   "scheduled": true,
-  "seconds": 60,
-  "wake_at": "2026-07-31T12:01:00+08:00",
-  "note": "可选备忘"
+  "seconds": 1800,
+  "wake_at": "2026-08-03T15:31:00+08:00",
+  "note": "看看那件事有没有下文"
 }
 ```
 
-`note` 为空时不会出现在返回值和到期事件中。
+## 失败
+
+- `invalid_arguments`：`seconds` 非整数或越界（`seconds_not_int` /
+  `seconds_out_of_range`）；`note` 非字符串或去空白后为空（`note_not_str` /
+  `note_empty`）。
 
 ## 生命周期
 

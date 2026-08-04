@@ -80,6 +80,7 @@ def _member_role(member: Any) -> str | None:
 
 class GetMemberListTool(BaseTool):
     name = "get_member_list"
+    program_kind = "query"
     allowed_scopes = ("group",)
     # required_permission 用 BaseTool 默认 GUEST（查询无副作用）
     usage_prompt = _USAGE_PROMPT
@@ -118,6 +119,32 @@ class GetMemberListTool(BaseTool):
             },
         },
         "required": [],
+    }
+    result_schema = {
+        "type": "object",
+        "properties": {
+            "count": {"type": "integer"},
+            "matched": {"type": "integer"},
+            "members": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "user_id": {"type": ["integer", "string", "null"]},
+                        "nickname": {"type": ["string", "null"]},
+                        "card": {"type": ["string", "null"]},
+                        "role": {"type": ["string", "null"]},
+                        "banned_until": {"type": ["string", "null"]},
+                        "join_time": {"type": ["string", "null"]},
+                        "last_sent_time": {"type": ["string", "null"]},
+                    },
+                    "required": ["user_id", "nickname", "card", "role"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["count", "matched", "members"],
+        "additionalProperties": False,
     }
 
     async def execute(self, arguments: dict, **context: Any) -> ToolOutcome:

@@ -9,7 +9,8 @@
   次原图。**没有它，这次改动就是纯降级**；有了它，描述不够用时天花板还在。
 
 参数（刻意只有两个，理由见下）：
-  image_hash  必填，64 位 sha256，从 timeline 的 <image hash="..."/> 原样抄
+  image_hash  必填，12–64 位 sha256 前缀，从 timeline 的 <图 hash12 …> 段
+              原样抄（行文法 §7：信封展示 12 位前缀，磁盘按前缀唯一解析）
   question    必填，自由文本
 
   question 必填不是形式要求：不带问题的调用等于把 ingest 那次转录再跑一遍，
@@ -21,8 +22,9 @@
 返回：{image_hash, question, answer}
 
 失败语义（统一结构化 ToolOutcome，全程无 raise，见契约 §7.2）：
-  invalid_arguments    hash 非 64 位 hex（bad_image_hash）/ question 缺失或
-                       非字符串（bad_question）/ question 超长（question_too_long）
+  invalid_arguments    hash 非 12–64 位 hex（bad_image_hash）/ 前缀多义
+                       （ambiguous_hash_prefix）/ question 缺失或非字符串
+                       （bad_question）/ question 超长（question_too_long）
   image_not_found      hash 合法但盘上没有这个文件（抄错 hash / 图当初没下载
                        成功 / 文件已被媒体 GC 清理）
   upstream_action_failed  VLM 未配置 / 调用失败 / 返回空（retryable —— 对模型
@@ -47,6 +49,7 @@ from qqbot.services.agent_loop.tool_registry import BaseTool, ToolOutcome
 from qqbot.services.agent_loop.tools._meme_common import (
     coerce_image_hash,
     media_path_for_hash,
+    resolve_media_hash,
     sniff_mime,
 )
 
@@ -61,6 +64,7 @@ MAX_QUESTION_CHARS = 500
 
 class LookAtImageTool(BaseTool):
     name = "look_at_image"
+    program_kind = "query"
     description = (
         "针对一张已下载图片执行一次视觉问答。image_hash 指定图片，question "
         "指定需要从图像中识别的信息。该调用会新建一次视觉模型请求；不修改时间线"
@@ -72,9 +76,10 @@ class LookAtImageTool(BaseTool):
         "properties": {
             "image_hash": {
                 "type": "string",
+                "pattern": "^[0-9a-fA-F]{12,64}$",
                 "description": (
-                    "时间线 <image hash=\"...\"/> 中的 64 位 sha256 值。"
-                    "未下载且没有 hash 的图片不能查询。"
+                    "时间线 <图 …> 段中的图片哈希，12 位前缀原样照抄"
+                    "（也接受完整 64 位）。未下载且没有哈希的图片不能查询。"
                 ),
             },
             "question": {
@@ -87,16 +92,41 @@ class LookAtImageTool(BaseTool):
         },
         "required": ["image_hash", "question"],
     }
-
+    result_schema = {
+        "type": "object",
+        "properties": {
+            "image_hash": {"type": "string"},
+            "question": {"type": "string"},
+            "answer": {"type": "string"},
+        },
+        "required": ["image_hash", "question", "answer"],
+        "additionalProperties": False,
+    }
     async def execute(self, arguments: dict, **context: Any) -> ToolOutcome:
         # GUEST + 不限 scope：enforce_access 实为 no-op，但统一保留首行调用。
         if fail := await self.enforce_access(context):
             return fail
 
-        image_hash, failure = coerce_image_hash(arguments.get("image_hash"))
+        prefix, failure = coerce_image_hash(arguments.get("image_hash"))
         if failure is not None:
             return failure
-        assert image_hash is not None
+        assert prefix is not None
+        # 前缀 → 磁盘唯一完整 hash（行文法 §7）。多义 → ambiguous 失败；
+        # 无命中 → 与旧"读文件失败"同一 image_not_found 语义。
+        image_hash, failure = resolve_media_hash(prefix)
+        if failure is not None:
+            return failure
+        if image_hash is None:
+            return ToolOutcome.failure(
+                "image_not_found",
+                f"no image on disk matching hash prefix {prefix}; copy the "
+                "hash from a <图 …> segment in the timeline (images without "
+                "a hash were never downloaded).",
+                image_hash=prefix,
+                retryable=False,
+                transient=False,
+                user_fixable=True,
+            )
 
         raw_question = arguments.get("question")
         if not isinstance(raw_question, str) or not raw_question.strip():
@@ -131,9 +161,9 @@ class LookAtImageTool(BaseTool):
         except OSError:
             return ToolOutcome.failure(
                 "image_not_found",
-                f"no image on disk with hash {image_hash}; copy the hash= "
-                'value from an <image hash="..."/> tag in the timeline '
-                "(images without hash= were never downloaded).",
+                f"no image on disk with hash {image_hash}; copy the hash "
+                "from a <图 …> segment in the timeline (images without a "
+                "hash were never downloaded).",
                 image_hash=image_hash,
                 retryable=False,
                 transient=False,

@@ -50,6 +50,8 @@ _USAGE_PROMPT = load_sibling_md(__file__, "kick.md")
 
 class KickTool(BaseTool):
     name = "kick"
+    program_kind = "effect"
+    max_call_sites = 2
     allowed_scopes = ("group",)
     required_permission = PermissionTier.ADMIN
     required_bot_role = "admin"  # set_group_kick 需要 bot 自己是群管理员
@@ -74,6 +76,22 @@ class KickTool(BaseTool):
             },
         },
         "required": ["user_id"],
+    }
+    result_schema = {
+        "type": "object",
+        "properties": {
+            "group_id": {"type": "integer"},
+            "user_id": {"type": "integer"},
+            "reject_add_request": {"type": "boolean"},
+            "applied": {"type": "boolean"},
+        },
+        "required": [
+            "group_id",
+            "user_id",
+            "reject_add_request",
+            "applied",
+        ],
+        "additionalProperties": False,
     }
 
     async def execute(self, arguments: dict, **context: Any) -> ToolOutcome:

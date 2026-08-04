@@ -2,14 +2,14 @@
 
 职责（v1 已删除，v2 是唯一路径）：
   1. on_message / on_notice / on_request / on_metaevent 四个通道接收 nonebot
-     事件，每次调 bot_registry.register(bot) 让 ToolWorker / 各工具
+     事件，每次调 bot_registry.register(bot) 让各工具
      能反查到对应 bot 实例
   2. 把事件交给 EventIngest 走 mapper → 媒体副作用 → 入库 → 唤醒 supervisor
      的完整流水线（meta_event.heartbeat 走文件旁路，详见 EventIngest契约 §7）
   3. request handler 在入库后调 request_auto_approval：好友申请 / 邀请入群
      自动同意（不走 LLM）；入群申请（group.add）进目标群 timeline 由
      GroupAgentLoop 处理，此处不动作
-  4. 启动期：拉起 LoopSupervisor（含 SystemAgentLoop + ToolWorker）；
+  4. 启动期：拉起 LoopSupervisor（含 SystemAgentLoop + ReplyExecutor）；
      关停期：优雅停止
   5. 任何 handler 异常一律 swallow —— 单条事件失败不能让 napcat 重推爆炸
 
@@ -38,7 +38,9 @@ from qqbot.services.agent_loop.bot_role_sweep import (
 )
 from qqbot.services.agent_loop.image_description import describe_image
 from qqbot.services.agent_loop.meme_caption import caption_image
-from qqbot.services.agent_loop.tools import build_default_registry as build_tool_registry
+from qqbot.services.agent_loop.tools import (
+    build_default_registry as build_tool_registry,
+)
 from qqbot.services.event_ingest import EventIngest, IngestResult
 from qqbot.services.event_ingest.mappers import build_default_registry
 from qqbot.services.request_auto_approval import maybe_auto_approve
@@ -48,16 +50,17 @@ logger = get_logger(__name__)
 _ingest: EventIngest | None = None
 _supervisor: LoopSupervisor | None = None
 
+
 def _get_supervisor() -> LoopSupervisor:
     global _supervisor
     if _supervisor is None:
         projector = Projector(session_factory=AsyncSessionLocal)
-        # 工具无构造依赖：session_factory / scope_key 等系统依赖由 ToolWorker
-        # 在 run() context 里统一注入（见 ToolWorker._process_one）。
+        # 工具无构造依赖：session_factory / scope_key 等系统依赖由当前拍的
+        # ProgramExecutor 在 run() context 里统一注入。
         tool_registry = build_tool_registry()
-        # LLMPlanner 对 LLM 不可用 / JSON 解析失败一律 fallback 为 IdleAction，
-        # 不会让 supervisor 起不来。tool_registry 同时给 planner（prompt
-        # tool_catalog）和 supervisor（ToolWorker 调度查找）共用。
+        # LLMPlanner 对 LLM 不可用 / 调用失败返回空程序，不会让 supervisor
+        # 起不来。tool_registry 同时给 planner 的 Program API 参考与 AgentLoop
+        # 执行器共用。
         # system prompt 由 planner 内部的默认提示词库装配（planner 根页 +
         # 角色卡 / system / envelope / group_chat_rules / tools_usage 槽，
         # 见 prompts/catalog.py；plugin 层不碰任何提示词装配）。
@@ -68,19 +71,16 @@ def _get_supervisor() -> LoopSupervisor:
             session_factory=AsyncSessionLocal,
             projector=projector,
             tool_registry=tool_registry,
-            # meme 工具的看图写描述回调：经 supervisor → ToolWorker 进工具
+            # meme 工具的看图写描述回调：经 supervisor → ProgramExecutor 进工具
             # run() context（与 session_factory 同一条注入链，工具不自己
             # import meme_caption，契约测试可塞假 captioner）。
             caption_image=caption_image,
         )
-        # 无需 supervisor→tool 的反向回调接线：系统依赖（session_factory 等）
-        # 由 ToolWorker 在 run() 的 context 统一注入，工具侧不持有 supervisor。
+        # 系统依赖由 ProgramExecutor 在 run() context 统一注入。
     return _supervisor
 
 
-async def _describe_image(
-    data: bytes, mime: str, file_hash: str
-) -> str | None:
+async def _describe_image(data: bytes, mime: str, file_hash: str) -> str | None:
     """EventIngest → media 的看图描述回调：把 session_factory 绑上，其余交给
     image_description（查缓存 / 限并发 / 落表 / 失败吞成 None 全在那边）。"""
     return await describe_image(
@@ -121,7 +121,7 @@ async def _ingest_event(event: Event) -> IngestResult | None:
 
 
 def _remember_bot(bot: Bot) -> None:
-    """每个 handler 入口缓存 bot；供 ToolWorker / 各工具反查。"""
+    """每个 handler 入口缓存 bot，供各工具反查。"""
     try:
         bot_registry.register(bot)
     except Exception as exc:

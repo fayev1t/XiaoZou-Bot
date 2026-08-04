@@ -1,7 +1,8 @@
 """提示词库 — 每个消费者一张根页 `.md`，动态内容由页内 `{{槽}}` 拼进来。
 
-系统里五个 LLM 调用点（Planner / meme caption / image description /
-look_at_image / 记忆压缩）的 system prompt 都从这里装配。**只有一种装配机制**：
+系统里六个 LLM 调用点（Planner / meme caption / image description /
+look_at_image / 记忆压缩 / 网页正文提炼）的 system prompt 都从这里装配。
+**只有一种装配机制**：
 `CONSUMERS` 把消费者映射到它的根页 `.md`，根页正文里写 `{{name}}` 就把对应资产
 拼在那个位置。改提示词 = 改 `prompts/` 下的 `.md`（render 时才读盘，改完即生效，
 无需重启）；给新消费者配 prompt = 加一张根页 + 在 `CONSUMERS` 里登记。
@@ -36,8 +37,8 @@ save/recaption 的看图调用）此前有自己的 `meme_caption.md`——一�
 提示词，改这里一行即可，不牵动 ingest 那条高频链。共用带来的代价照实记在这里：
 改 `image_description.md` 会同时改掉收藏描述的写法，两处一起验。
 
-**`envelope.md` 不并页**：它和上面三份不是一类东西——20KB 的纯格式规范（每个
-元素/属性的值域与缺省语义），维护它的场合是改投影层渲染时逐条对照，而不是调
+**`envelope.md` 不并页**：它和上面三份不是一类东西——纯格式规范（行文法：
+逐节、逐行型、逐字段的值域与缺省语义），维护它的场合是改投影层渲染时逐条对照，而不是调
 人格或纪律。留成独立文件，改渲染的人打开的是一份字典，读 planner.md 的人看到的
 是一页连贯的行为约定，两种读法不互相淹没。
 
@@ -52,12 +53,13 @@ save/recaption 的看图调用）此前有自己的 `meme_caption.md`——一�
                   两步发言流程（reply 等待 → completed 唤醒 → send_messages
                   落笔）→唯一人物模型→输入信封→决策要求→工具规范→决策 JSON
                   输出协议。
-  - 另外四个小消费者页内无槽，其中 `caption` 与 `image_description` **共用同一
-    张 `image_description.md`**（2026-08-02，见下）。
+  - 另外五个小消费者页内无槽，其中 `caption` 与 `image_description` **共用同一
+    张 `image_description.md`**（2026-08-02，见下）；`web_digest.md` 是
+    webfetch / websearch 内部提炼抓取正文的指令页（2026-08-03）。
 
   槽 —— 页内 `{{name}}` 就地展开：
-  - `envelope`    唯一的文件槽（`envelope.md`）：输入信封语法，`<agent-input>`
-                  每个元素/属性的唯一出处。纯格式规范，与投影层渲染成对维护，
+  - `envelope`    唯一的文件槽（`envelope.md`）：输入信封的行文法语法，每个
+                  行型/字段的唯一出处。纯格式规范，与投影层渲染成对维护，
                   故不并进根页。
   - `tools_usage` 唯一的动态槽：render 时遍历 ToolRegistry，按 scope 过滤，
                   正文来自 `tools/<name>.md`。求值为空时**连同它独占的那一行
@@ -73,9 +75,9 @@ save/recaption 的看图调用）此前有自己的 `meme_caption.md`——一�
     里存过一份与卡片性格段逐字节相同、只差人称的第三人称投影，是不折不扣的第二
     份副本；也曾切成独立的 `voice.md` / `replyer.md` 各存一份。**不要再往任何
     别的文件抄人格正文**——`tools/*.md`、别的根页都不行。
-  - **纯记录/观察层（caption / image_description / image_look / memory）只读
-    自己那一页。** 它们的输出会被永久写进事件正文并被下游反复读取，掺进人格
-    或群规就等于污染所有下游语境，且无法回收。
+  - **纯记录/观察层（caption / image_description / image_look / memory /
+    web_digest）只读自己那一页。** 它们的输出会被永久写进事件正文并被下游
+    反复读取，掺进人格或群规就等于污染所有下游语境，且无法回收。
   以上几条 2026-07-30 之前由 `kind` + `_FORBIDDEN_KINDS` + `_validate_assembly`
   做 build 期结构校验。已删除：它的粒度是"哪个文件进哪个消费者"，而真实发生过
   的事故是"人格正文被抄进另一个文件"，那种它一声不响。守这几条现在靠上面这段
@@ -153,6 +155,9 @@ CONSUMERS: dict[str, str] = {
     "image_description": "image_description.md",
     "image_look": "image_look.md",
     "memory": "memory_compaction.md",
+    # webfetch / websearch 抓取正文的内部提炼（2026-08-03）：原文不进程序 ABI，
+    # 程序拿到的只是这张页指挥产出的短转述。
+    "web_digest": "web_digest.md",
 }
 
 # ── 动态槽名：不读盘，由注入的 source 求值；求值为空则整行跳过 ──

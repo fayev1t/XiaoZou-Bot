@@ -21,9 +21,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class V2MainPluginContractTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.plugin_text = (
-            ROOT / "qqbot" / "plugins" / "v2_main.py"
-        ).read_text(encoding="utf-8")
+        self.plugin_text = (ROOT / "qqbot" / "plugins" / "v2_main.py").read_text(
+            encoding="utf-8"
+        )
         self.main_text = (ROOT / "qqbot" / "__main__.py").read_text(encoding="utf-8")
         self.pyproject_text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         self.ingest_text = (
@@ -54,7 +54,9 @@ class V2MainPluginContractTests(unittest.TestCase):
         )
         self.assertIn("session_factory=AsyncSessionLocal", self.plugin_text)
 
-    def test_plugin_registers_all_four_handler_types_at_priority_10_block_true(self) -> None:
+    def test_plugin_registers_all_four_handler_types_at_priority_10_block_true(
+        self,
+    ) -> None:
         # v2 是唯一消费者：block=True 保证事件不会被任何其他 matcher 二次处理。
         self.assertIn("on_message(priority=10, block=True)", self.plugin_text)
         self.assertIn("on_notice(priority=10, block=True)", self.plugin_text)
@@ -62,7 +64,7 @@ class V2MainPluginContractTests(unittest.TestCase):
         self.assertIn("on_metaevent(priority=10, block=True)", self.plugin_text)
 
     def test_handlers_register_bot_to_registry(self) -> None:
-        # ReplySendWorker / ToolWorker 依赖 bot_registry 反查 Bot 实例
+        # Program Effect 工具依赖 bot_registry 反查 Bot 实例。
         self.assertIn("bot_registry.register(bot)", self.plugin_text)
         self.assertIn("_remember_bot(bot)", self.plugin_text)
 
@@ -100,12 +102,7 @@ class V2MainPluginContractTests(unittest.TestCase):
         self.assertFalse((prompts_dir / "persona.md").exists())
         self.assertFalse(
             (
-                ROOT
-                / "qqbot"
-                / "services"
-                / "agent_loop"
-                / "tools"
-                / "send_message.md"
+                ROOT / "qqbot" / "services" / "agent_loop" / "tools" / "send_message.md"
             ).exists()
         )
 

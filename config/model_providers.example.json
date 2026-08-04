@@ -47,6 +47,7 @@
       "temperature": 0.2
     },
     "memory": "deepseek-chat",
+    "web_digest": "deepseek-chat",
     "default": "deepseek-chat"
   },
   "settings": {

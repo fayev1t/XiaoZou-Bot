@@ -66,6 +66,8 @@ class AssemblyPinningTests(unittest.TestCase):
                 "image_description": "image_description.md",
                 "image_look": "image_look.md",
                 "memory": "memory_compaction.md",
+                # 2026-08-03：webfetch / websearch 抓取正文的内部提炼。
+                "web_digest": "web_digest.md",
             },
         )
 
@@ -422,15 +424,21 @@ class FileAssemblyTests(unittest.TestCase):
 
     def test_envelope_slot_is_the_file_itself(self) -> None:
         """信封语法的唯一出处是 envelope.md——它是 2026-07-31 并页后仅存的文件
-        槽（纯格式规范，与投影层渲染成对维护）。`<replyer-input>` 随 Replyer 删除
-        （2026-07-31），信封只剩 <agent-input> 一种根元素，新增
-        <reply-task-completed> 事件行。"""
+        槽（纯格式规范，与投影层渲染成对维护）。2026-08-03 起信封为行文法：
+        锚点取当前行型标记；XML 时代的元素名（<agent-input> /
+        <reply-task-completed> / <my-reply> / <replyer-input>）不得复现。"""
         planner_env = build_library("planner").get("envelope")
         self.assertEqual(planner_env, self._md("envelope.md"))
-        for tag in ("<agent-input>", "<reply-task-completed>", "<my-reply>"):
+        for tag in ("<t>", "<m>", "<程序>", "<等待结束>", "<校验拒绝>"):
             self.assertIn(tag, planner_env)
-        self.assertNotIn("<replyer-input>", planner_env)
-        self.assertNotIn("<my-thought", planner_env)
+        for stale in (
+            "<agent-input>",
+            "<reply-task-completed>",
+            "<my-reply>",
+            "<replyer-input>",
+            "<my-thought",
+        ):
+            self.assertNotIn(stale, planner_env)
 
     def test_planner_entry_delegates_to_catalog(self) -> None:
         from qqbot.services.agent_loop.llm_planner import (

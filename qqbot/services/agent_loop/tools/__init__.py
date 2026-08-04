@@ -6,15 +6,14 @@
 LoopSupervisor / LLMPlanner。
 
 工具不再有构造依赖：系统级依赖（session_factory 写/查 agent_events、触发身份
-triggered_by_event_id / bot_role 等）一律由执行层在 run() 的 context 里统一
-注入；worker 工具由 ToolWorker 执行，inline 工具由 AgentLoop 当前 tick 执行。
-这样新增工具只要 register 一行，系统也不必按名字特判任何工具。
+triggered_by_event_id / bot_role 等）一律由程序执行器在 run() 的 context 里统一
+注入。registry 保存 factory，每次程序函数调用都创建新的 Tool 实例。
 
 napcat 动作工具集（kick / ban / recall / get_* / ...）把 OneBot V11 能对 QQ
 做的事进一步工具化，公共出站约定收敛在 `_onebot_common.py`：群操作的
 group_id 从 scope_key 注入（隔离契约 §9，不让 LLM 跨群）、经 get_bot() 取
 Bot、napcat 动作失败经 call_action 折成 upstream_action_failed **返回**（全程
-无 raise）。可见性靠 `allowed_scopes`（catalog 按 scope 过滤）；scope / 发起人
+无 raise）。可见性靠 `allowed_scopes`（Program API 按 scope 过滤）；scope / 发起人
 tier（**实时**查群角色）/ bot 自身角色的判定全在工具内 execute() 首行的
 enforce_access，AgentLoop 不再闸门。详见各文件 docstring 与
 `任务与决策契约.md` §2.2、§7.2。
@@ -34,6 +33,9 @@ from qqbot.services.agent_loop.tools.get_member_list import GetMemberListTool
 from qqbot.services.agent_loop.tools.get_pending_join_requests import (
     GetPendingJoinRequestsTool,
 )
+from qqbot.services.agent_loop.tools.get_recent_thoughts import (
+    GetRecentThoughtsTool,
+)
 from qqbot.services.agent_loop.tools.get_stranger_info import GetStrangerInfoTool
 from qqbot.services.agent_loop.tools.group_notice import GroupNoticeTool
 from qqbot.services.agent_loop.tools.kick import KickTool
@@ -42,6 +44,7 @@ from qqbot.services.agent_loop.tools.look_at_image import LookAtImageTool
 from qqbot.services.agent_loop.tools.meme_collection import MemeCollectionTool
 from qqbot.services.agent_loop.tools.poke import PokeTool
 from qqbot.services.agent_loop.tools.recall import RecallTool
+from qqbot.services.agent_loop.tools.reflect import ReflectTool
 from qqbot.services.agent_loop.tools.reply import ReplyTool
 from qqbot.services.agent_loop.tools.respond_to_group_join_request import (
     RespondToGroupJoinRequestTool,
@@ -69,64 +72,74 @@ def build_default_registry() -> ToolRegistry:
     # 即可，无需改别处。（respond_to_request 已于 2026-07-03 拆分删除，见下。）
     registry = ToolRegistry()
     # ── 基础能力（当前在用）──
-    # task：跨 tick 任务生命周期。它是 execution_mode="inline" 的普通工具，
-    # AgentLoop 在当前拍 await 并原子写 called + task 事件 + terminal；create
-    # 结果里的 task_ref 可供同拍后续 call_tool 解析。
-    registry.register(TaskTool())
+    # task：跨 tick 任务生命周期。它是普通 Program Effect；create 返回的
+    # task_id 可直接存在程序变量里，供同拍后续 effect 的 task_id= 参数使用。
+    registry.register(TaskTool)
     # reply：发言的第一步——纯粹起一段等待（"我在输入，字还没发出去"）。
     # 2026-08-01 删除内容参数后普通分支只剩 hold_seconds；撤稿留在 action 分支
-    # 里（曾评估拆成独立工具，因每个工具都要占一条 catalog 条目 + 整段 usage
+    # 里（曾评估拆成独立工具，因每个函数都要占一段 Program API + usage
     # 文档而否决）。
-    registry.register(ReplyTool())
+    registry.register(ReplyTool)
     # send_messages：发言的第二步（2026-07-31 删除 Replyer）——等待到点、
     # runtime.reply_task_completed 唤醒后，Planner 用它把最终措辞真正发出去。
-    # 普通 worker 工具：始终可调（"完成事件之后才发言"是提示词纪律，不是
+    # 普通 Program Effect：始终可调（"完成事件之后才发言"是提示词纪律，不是
     # 权限），发送事实与时间线记录 = 它自己的 tool terminal receipts（调用行
     # 即发言记录，不派生 <my-reply>），见 send_messages.py docstring。
-    registry.register(SendMessagesTool())
-    # wait：模型的时间自主权（自我延迟唤醒），2026-07-02 新增。
-    registry.register(WaitTool())
+    registry.register(SendMessagesTool)
+    # wait：模型的时间自主权（自我延迟唤醒），2026-07-02 新增。2026-08-03 起
+    # note 必填、上界 6000 秒，同时承担"给自己的回想改期"。
+    registry.register(WaitTool)
+    # reflect：第二个跨拍连续装置（2026-08-03）。任务承载未竟之事、有收束
+    # 条件；反思承载对自己的认识、只被后来的版本改写。latest-wins 全量替换，
+    # 渲染成信封 `## 反思` 一节。与 2026-08-01 删除的 <my-thought> 逐拍回显
+    # 的区别（低频 / 全量替换 / 有上限）见 reflect.py docstring。
+    registry.register(ReflectTool)
+    # get_recent_thoughts：取回自己最近几拍的程序注释（2026-08-03）。注释本来
+    # 就随 decision_emitted.payload.program 落库，只是从不回显；做成 Query 而
+    # 不是渲进信封，是为了让"不回显"保持字面为真——回显病理在构造上不存在，
+    # 只有她主动回想时才付这笔钱。
+    registry.register(GetRecentThoughtsTool)
     # 入群申请审批（2026-07-03 拆分自已删除的 respond_to_request）：group.add
     # 事件进目标群 timeline，管理员明确授权后由群内 LLM 调它回执；好友申请 /
     # 邀请入群不经工具，由 plugin 层 request_auto_approval 自动同意。
-    registry.register(RespondToGroupJoinRequestTool())
+    registry.register(RespondToGroupJoinRequestTool)
     # 表情包收藏管理：save（描述由 caption LLM 生成）/ delete / recaption。
     # 发送入口已并入 reply_task；Replyer 从 <saved-memes> 决定 0..1 张。
     # 2026-07-25 由 `meme` 改名 `meme_collection`：裸名词 `meme` 读起来像
     # "表情包能力"，而发送 2026-07-19 就不在它参数面上了，新名点明操作对象是
     # 收藏夹本身（历史事件的旧 tool_name 原样保留，投影 author index 仍认）。
-    registry.register(MemeCollectionTool())
+    registry.register(MemeCollectionTool)
     # look_at_image：带着具体问题重看一张图（2026-07-28 新增）。同日 Planner/
     # Replyer 降级为纯文本模型、图片改由 ingest 期 VLM 转录成 desc= 进 timeline，
     # 本工具是那条无语境描述覆盖不到时的兜底 —— 没有它这次改动就是纯降级。
-    # 明知每个注册工具都要占一条 catalog 条目 + 整段 usage 文档仍然收下它，
+    # 明知每个注册函数都要占一段 Program API + usage 文档仍然收下它，
     # 理由就是这个能力天花板（对比 reply 拒绝拆分的取舍，见 reply.py）。
-    registry.register(LookAtImageTool())
+    registry.register(LookAtImageTool)
     # ── 群信息查询（2026-07-07 重做后恢复 / 新增）──
     # 查询三件套按下架备注的路线重做后恢复：get_group_info（no_cache + 可选
     # 字段透传）、get_member_list（role 过滤 / include_activity / banned_until）、
     # get_member_info（时间字段 ISO 化 + banned_until）。
-    registry.register(GetGroupInfoTool())
-    registry.register(GetMemberListTool())
-    registry.register(GetMemberInfoTool())
+    registry.register(GetGroupInfoTool)
+    registry.register(GetMemberListTool)
+    registry.register(GetMemberInfoTool)
     # 待处理入群申请查询（2026-07-07 新增）：纯 napcat get_group_system_msg
     # 查询、不回查 agent_events；审批仍走 respond_to_group_join_request。
-    registry.register(GetPendingJoinRequestsTool())
+    registry.register(GetPendingJoinRequestsTool)
     # ── 群成员管理（2026-07-10 起重做后逐个恢复）──
     # kick：踢人。通用门禁（发起人 ADMIN 实时核验 + bot 须群管理员）之上，动手前
     # 实时查目标角色做层级前置判定（bot 须严格高于目标）+ 自踢防护；成功结果回显
     # reject_add_request / applied。
-    registry.register(KickTool())
+    registry.register(KickTool)
     # leave_group：极端定向人格侮辱 / 恶意辱骂下的自主安全出口。只退出当前群，
     # 永远固定 is_dismiss=false，不暴露解散能力；这不是辱骂者授权的群管操作，
     # 所以 GUEST 可触发，由 sibling usage 文档给 Planner 严格限定语义门槛。
-    registry.register(LeaveGroupTool())
+    registry.register(LeaveGroupTool)
     # ── 网页搜索 / 抓取（2026-07-18 重做后恢复 / 新增）──
     # websearch：后端从自部署 SearXNG + Crawl4AI 容器切换为 Tavily API
     # （env TAVILY_API_KEY），正文降级链 raw_content → 进程内抓取；webfetch
     # 同日新增，读取指定 URL 正文，两者共用 _web_common 抓取层。
-    registry.register(WebsearchTool())
-    registry.register(WebfetchTool())
+    registry.register(WebsearchTool)
+    registry.register(WebfetchTool)
     # ── 历史检索（2026-07-23 重做后恢复）──
     # search_history：timeline 100 条渲染上限之外的按需检索。重做修了两处：
     # query 过滤改走 pg_trgm word_similarity（`<%` 算子）对 search_text 做模糊
@@ -134,7 +147,7 @@ def build_default_registry() -> ToolRegistry:
     # LLM 猜中原话子串）；private scope 补齐按 user_id 过滤（此前只有 group
     # 分支按 group_id 过滤，private 分支不设防——因 PrivateAgentLoop 从未
     # 实例化而未被线上触发）。
-    registry.register(SearchHistoryTool())
+    registry.register(SearchHistoryTool)
     # ── 以下工具暂时下架（2026-07-01），重做后逐一恢复 ──
     # napcat 动作工具：消息操作
     # registry.register(RecallTool())
@@ -169,6 +182,7 @@ __all__ = [
     "GetMemberInfoTool",
     "GetMemberListTool",
     "GetPendingJoinRequestsTool",
+    "GetRecentThoughtsTool",
     "GetStrangerInfoTool",
     "GroupNoticeTool",
     "KickTool",
@@ -177,6 +191,7 @@ __all__ = [
     "MemeCollectionTool",
     "PokeTool",
     "RecallTool",
+    "ReflectTool",
     "RespondToGroupJoinRequestTool",
     "SearchHistoryTool",
     "ReplyTool",

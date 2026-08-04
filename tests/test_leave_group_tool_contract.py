@@ -145,10 +145,10 @@ class LeaveGroupToolTests(unittest.IsolatedAsyncioTestCase):
         registry = build_default_registry()
         self.assertIsInstance(registry.get("leave_group"), LeaveGroupTool)
         self.assertIn(
-            "leave_group", {item["name"] for item in registry.catalog("group")}
+            "leave_group", set(registry.names("group"))
         )
         self.assertNotIn(
-            "leave_group", {item["name"] for item in registry.catalog("system")}
+            "leave_group", set(registry.names("system"))
         )
         self.assertIn("极端人格侮辱", registry.usage_docs("group"))
         self.assertNotIn("## 工具：leave_group", registry.usage_docs("system"))

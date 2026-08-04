@@ -69,7 +69,7 @@ class AgentLoopLazyImportTests(unittest.TestCase):
             "LLMPlanner": "llm_planner",
             "Projector": "projection",
             "LoopSupervisor": "supervisor",
-            "ToolWorker": "tool_worker",
+            "ToolRegistry": "tool_registry",
             "AgentLoop": "loop",
         }.items():
             self.assertEqual(al._LAZY.get(name), submod)

@@ -3,8 +3,8 @@
 Pure unit-level; DB is faked by a recording session, no nonebot needed.
 
 Verifies the skeleton produces the expected sequence of internal events on
-one tick:
-  runtime.tick_started → agent.decision_emitted → agent.idle_decision
+one empty-program tick:
+  runtime.tick_started → agent.decision_emitted → agent.program_completed
   → runtime.tick_ended
 all sharing the same correlation_id.
 
@@ -24,27 +24,29 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from qqbot.services.agent_loop import (
     AgentLoop,
     DecisionOutput,
-    IdleAction,
     LoopSupervisor,
 )
-from qqbot.services.agent_loop.event_writer import parse_scope_key
-from qqbot.services.agent_loop.tool_registry import ToolRegistry
-from qqbot.services.agent_loop.tools.task import TaskTool
+from qqbot.services.agent_loop.event_writer import WakeMode, parse_scope_key
+from qqbot.services.agent_loop.tool_registry import (
+    BaseTool,
+    ToolOutcome,
+    ToolRegistry,
+)
 from qqbot.services.event_ingest.ingest import _scope_key_for_wake
 from qqbot.services.event_ingest.system_event import SystemEvent
-from datetime import datetime
-from zoneinfo import ZoneInfo
 
 
 class _FakeIdlePlanner:
-    """always-idle 空 planner：只验证循环接线（events → tick → events），不碰 LLM。
+    """空程序 planner：只验证循环接线（events → tick → events），不碰 LLM。
 
     原为生产包里的 qqbot/services/agent_loop/planner.py::FakeIdlePlanner，
     2026-07-31 迁入测试——它从来没有生产消费者，LoopSupervisor 装的是
@@ -53,17 +55,16 @@ class _FakeIdlePlanner:
 
     async def decide(self, context: Any) -> DecisionOutput:
         _ = context
-        return DecisionOutput(
-            actions=[IdleAction(reason="bootstrap_skeleton")],
-            reasoning="v2 loop skeleton: no LLM planner in this test",
-        )
+        return DecisionOutput(program="# bootstrap skeleton: intentionally idle")
 
 
 class _EmptyResult:
-    """Mappings-compatible empty result for SELECT statements driven by
-    ReplySendWorker's catchup query — keeps tests DB-free."""
+    """Empty result compatible with the recovery/backfill SELECT consumers."""
 
     def mappings(self) -> "_EmptyResult":
+        return self
+
+    def scalars(self) -> "_EmptyResult":
         return self
 
     def all(self) -> list:
@@ -76,10 +77,9 @@ class _EmptyResult:
 class _RecordingSession:
     """async session double that captures every executed insert statement.
 
-    Reads (sqlalchemy.text(...) clauses, e.g. the ReplySendWorker catchup
-    SELECT scheduled by LoopSupervisor.start()) are ignored by the recorder
-    and return an empty mappings result. Only mutating statements (inserts
-    via pg_insert) are appended to `store`.
+    Reads used by ReplyExecutor, task backfill, and program crash recovery are
+    ignored and return an empty result. Only mutating statements are appended
+    to ``store``.
     """
 
     def __init__(self, store: list[Any]) -> None:
@@ -89,7 +89,7 @@ class _RecordingSession:
         from sqlalchemy.sql.elements import TextClause
 
         _ = params
-        if isinstance(stmt, TextClause):
+        if isinstance(stmt, TextClause) or bool(getattr(stmt, "is_select", False)):
             return _EmptyResult()
         self._store.append(stmt)
         return SimpleNamespace(rowcount=1)
@@ -168,7 +168,7 @@ class IngestScopeRoutingTests(unittest.TestCase):
 
 
 class _SlowIdlePlanner:
-    """模拟 LLM 往返：decide() 里睡一段可观测的时间再返回 idle。
+    """模拟 LLM 往返：decide() 里睡一段可观测的时间再返回空程序。
 
     用来把"投影时刻"和"决策写入时刻"拉开到断言可分辨的距离。
     """
@@ -176,47 +176,38 @@ class _SlowIdlePlanner:
     DELAY = 0.15
 
     async def decide(self, context: Any) -> Any:
-        from qqbot.services.agent_loop import DecisionOutput, IdleAction
-
         _ = context
         await asyncio.sleep(self.DELAY)
-        return DecisionOutput(actions=[IdleAction(reason="slow-planner")])
+        return DecisionOutput(program="# slow idle")
+
+
+class _TimestampEffect(BaseTool):
+    name = "timestamp_effect"
+    program_kind = "effect"
+    arguments_schema = {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    }
+    result_schema = {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "additionalProperties": False,
+    }
+
+    async def execute(self, arguments: dict, **context: Any) -> ToolOutcome:
+        return ToolOutcome.success({"ok": True})
 
 
 class _SlowCallToolPlanner:
-    """模拟 LLM 往返后产出动作的拍：睡完 DELAY 返回 task + reply 调用。
-
-    用来断言 inline task 与普通派发产生的事件（task_created / tool_called /
-    自动推进的 task_state_changed）与 decision_emitted 同步回填投影时刻。
-    """
+    """模拟 LLM 往返后在本拍内执行一个 effect。"""
 
     DELAY = 0.15
 
     async def decide(self, context: Any) -> Any:
-        from qqbot.services.agent_loop import (
-            CallToolAction,
-            DecisionOutput,
-        )
-
         _ = context
         await asyncio.sleep(self.DELAY)
-        return DecisionOutput(
-            actions=[
-                CallToolAction(
-                    tool_name="task",
-                    arguments={
-                        "action": "create",
-                        "description": "慢拍任务",
-                        "task_ref": "ref-1",
-                    },
-                ),
-                CallToolAction(
-                    tool_name="reply",
-                    arguments={"hold_seconds": 0},
-                    task_ref="ref-1",
-                ),
-            ]
-        )
+        return DecisionOutput(program="timestamp_effect()")
 
 
 class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
@@ -236,32 +227,32 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
                 break
         await loop.stop()
 
-        # 期望事件序列：tick_started, decision_emitted, idle_decision, tick_ended
+        # 空程序仍有独立 terminal；不再写 idle_decision。
         types = [_values_of(stmt).get("type") for stmt in captured]
         self.assertEqual(
             types,
             [
                 "runtime.tick_started",
                 "agent.decision_emitted",
-                "agent.idle_decision",
+                "agent.program_completed",
                 "runtime.tick_ended",
             ],
         )
-        # reasoning 只退出 Planner 的后续输入，不退出事件审计链。
         decision_payload = _values_of(captured[1]).get("payload")
         self.assertEqual(
-            decision_payload["reasoning"],
-            "v2 loop skeleton: no LLM planner in this test",
+            decision_payload["program"],
+            "# bootstrap skeleton: intentionally idle",
         )
+        self.assertIn("program_sha256", decision_payload)
 
         # 同一 tick 内 correlation_id 一致
         corrs = {_values_of(stmt).get("correlation_id") for stmt in captured}
         self.assertEqual(len(corrs), 1)
 
-        # decision_emitted → idle_decision 因果链
+        # decision_emitted → program_completed 因果链
         decision_id = _values_of(captured[1]).get("event_id")
-        idle_caus = _values_of(captured[2]).get("causation_id")
-        self.assertEqual(idle_caus, decision_id)
+        terminal_caus = _values_of(captured[2]).get("causation_id")
+        self.assertEqual(terminal_caus, decision_id)
 
         # tick_started → tick_ended 因果链
         tick_started_id = _values_of(captured[0]).get("event_id")
@@ -278,9 +269,9 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
         不符。
 
         2026-08-02 删除 `<message unseen="true">` 后本条护栏**不随之取消**：
-        decision_emitted 虽不再投影、也不再充当水位线，但它与同拍其余决策
-        产物（tool_called / idle_decision / task_*）必须同刻，那几个是要上
-        时间线的（事件系统设计.md §时间戳约束）。
+        decision_emitted 虽不再投影、也不再充当水位线，但它与同拍
+        ``tool_called`` 意图必须同刻，后者要进入时间线（事件系统设计.md
+        §时间戳约束）。
         """
         captured: list[Any] = []
         loop = AgentLoop(
@@ -312,25 +303,19 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(
             (ended - decision).total_seconds(), _SlowIdlePlanner.DELAY
         )
-        # idle_decision 属同拍动作事件，与 decision 同步回填（2026-07-27）。
-        idle = by_type["agent.idle_decision"]["occurred_at"]
-        self.assertEqual(idle, decision)
+        # program terminal 陈述执行完成，取实际完成时刻而非投影锚点。
+        terminal = by_type["agent.program_completed"]["occurred_at"]
+        self.assertGreaterEqual(terminal, decision)
 
-    async def test_action_timestamps_are_tick_start_not_write_time(self) -> None:
-        """_apply_actions 派生的动作事件（task_created / tool_called / 自动
-        推进的 task_state_changed）occurred_at = 本拍投影时刻（2026-07-27，
-        补齐待办清单#18 的另一半）。
+    async def test_effect_intent_timestamp_is_tick_start_not_write_time(self) -> None:
+        """程序 effect 的意图事件仍锚定本拍投影时刻。
 
-        #18 最初只回填 decision_emitted，但真正携带动作内容的 <tool-call> 行
-        仍取写入时刻，LLM 往返期间到达的消息排在它之前
-        ——下一拍 Planner 与 Replyer（折入条款以授权行位置为参照）都把没进
-        本拍 context 的消息读成"落稿前已看过、有意不接"，连发的后续消息就此
-        既不被补授权也不被折入。可见动作行必须与 decision 同锚，才能正确表达
-        "动作拍板时看到了哪些消息"。
+        ``tool_called`` 是模型拍板的 effect 调用行，必须和 decision 同锚；
+        terminal 与 program terminal 则记录真实完成时刻。
         """
         captured: list[Any] = []
         registry = ToolRegistry()
-        registry.register(TaskTool())
+        registry.register(_TimestampEffect)
         loop = AgentLoop(
             scope_key="group:12345",
             planner=_SlowCallToolPlanner(),
@@ -355,14 +340,12 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
         started = by_type["runtime.tick_started"]["occurred_at"]
         decision = by_type["agent.decision_emitted"]["occurred_at"]
         ended = by_type["runtime.tick_ended"]["occurred_at"]
-        for event_type in (
-            "agent.task_created",
-            "agent.tool_called",
-            "agent.task_state_changed",
-        ):
-            action_at = by_type[event_type]["occurred_at"]
-            self.assertEqual(action_at, decision, event_type)
-            self.assertLessEqual(action_at, started, event_type)
+        called_at = by_type["agent.tool_called"]["occurred_at"]
+        self.assertEqual(called_at, decision)
+        self.assertLessEqual(called_at, started)
+        self.assertGreaterEqual(
+            by_type["agent.tool_result"]["occurred_at"], called_at
+        )
         # 反证 planner 确实慢过一拍（同 decision 测试的护栏语义）。
         self.assertGreaterEqual(
             (ended - decision).total_seconds(), _SlowCallToolPlanner.DELAY
@@ -427,8 +410,7 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
             if len(captured) >= 4:
                 break
         await loop.stop()
-        # 正常 4 条事件链都应当落地（tick_started / decision_emitted /
-        # idle_decision / tick_ended），不被 resolver 异常掐断
+        # 正常空程序事件链应当落地，不被 resolver 异常掐断。
         types = [_values_of(stmt).get("type") for stmt in captured]
         self.assertIn("runtime.tick_started", types)
         self.assertIn("runtime.tick_ended", types)
@@ -502,7 +484,7 @@ class WakeBatchWindowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self._tick_count(captured), 1)
 
     async def test_immediate_wake_bypasses_window(self) -> None:
-        """工具批次收口这类唤醒直接开拍：结果已经落库，没有可攒的东西。"""
+        """reply 到点等完成事实直接开拍：结果已落库，没有可攒的东西。"""
         captured: list[Any] = []
         loop = AgentLoop(
             scope_key="group:12345",
@@ -560,7 +542,7 @@ class LoopSupervisorContractTests(unittest.IsolatedAsyncioTestCase):
             session_factory=_factory_for(captured),
         )
         await sup.start()
-        await sup.wake("group:12345", immediate=True)
+        await sup.wake("group:12345", mode=WakeMode.IMMEDIATE)
         # 等 tick 落库
         for _ in range(50):
             await asyncio.sleep(0.01)
@@ -608,6 +590,66 @@ class LoopSupervisorContractTests(unittest.IsolatedAsyncioTestCase):
         await sup.wake("group:1")
         await asyncio.sleep(0.02)
         self.assertEqual(len(captured), baseline)
+
+
+class SupervisorWakeModeTests(unittest.IsolatedAsyncioTestCase):
+    """唤醒入口统一成 wake(mode=...)（2026-08-04）。
+
+    此前是 wake / _wake_immediate / _wake_no_arm 三个方法，后两个明明是私有
+    却被当回调注入给 ReplyExecutor 与 SilenceWatcher。现在只剩一个入口，
+    模式由 waker(mode) 在装配时 partial 绑定，注入出去的回调统一是
+    (scope_key) -> Awaitable[None]。
+    """
+
+    class _SpyWatcher:
+        """只记录活动通知的静默计时器替身。"""
+
+        def __init__(self) -> None:
+            self.armed: list[str] = []
+            self.enabled = True
+
+        def notify_activity(self, scope_key: str) -> None:
+            self.armed.append(scope_key)
+
+        async def stop(self) -> None:
+            return None
+
+    async def _supervisor(self) -> tuple[Any, "_SpyWatcher"]:
+        sup = LoopSupervisor(
+            planner=_FakeIdlePlanner(),
+            session_factory=_factory_for([]),
+        )
+        await sup.start()
+        watcher = self._SpyWatcher()
+        sup._silence_watcher = watcher
+        return sup, watcher
+
+    async def test_batched_and_immediate_rearm_the_silence_timer(self) -> None:
+        """普通唤醒都算"有动静"，静默计时器必须重排。"""
+        sup, watcher = await self._supervisor()
+        await sup.wake("group:1")
+        await sup.wake("group:2", mode=WakeMode.IMMEDIATE)
+        await sup.stop()
+        self.assertEqual(watcher.armed, ["group:1", "group:2"])
+
+    async def test_no_arm_mode_does_not_rearm_the_silence_timer(self) -> None:
+        """静默叫醒自己不能重置自己的计时器。
+
+        走普通路径会把这次叫醒当成"有动静"重新武装，于是一段静默里每隔一个
+        阈值就响一次；"一段静默只响一次"正是靠这条旁路成立的。
+        """
+        sup, watcher = await self._supervisor()
+        await sup.wake("group:1", mode=WakeMode.IMMEDIATE_NO_ARM)
+        await sup.stop()
+        self.assertEqual(watcher.armed, [])
+
+    async def test_waker_binds_mode_and_hides_it_from_producers(self) -> None:
+        """注入给生产者的回调只接受 scope_key —— 模式是装配决定，不是调用参数。"""
+        sup, watcher = await self._supervisor()
+        wake = sup.waker(WakeMode.IMMEDIATE_NO_ARM)
+        await wake("group:1")  # 单参数调用，生产者不认识 WakeMode
+        await sup.stop()
+        self.assertEqual(watcher.armed, [])
 
 
 class MemoryCompactorWiringTests(unittest.IsolatedAsyncioTestCase):
@@ -794,6 +836,240 @@ class IngestSupervisorIntegrationTests(unittest.IsolatedAsyncioTestCase):
         result = await ingest.ingest(event)
         self.assertEqual(result.status, "duplicate")
         self.assertEqual(wake_calls, [])
+
+
+class _ScriptedPlanner:
+    """按脚本逐拍返回程序；脚本用尽后一律返回空程序。
+
+    空程序收尾是自续拍的不动点，因此即使被测代码有 bug 也不会把测试跑成死循环。
+    """
+
+    def __init__(self, programs: list[str]) -> None:
+        self._programs = list(programs)
+
+    async def decide(self, context: Any) -> DecisionOutput:
+        _ = context
+        if self._programs:
+            return DecisionOutput(program=self._programs.pop(0))
+        return DecisionOutput(program="# nothing left to do")
+
+
+class _AlwaysCallingPlanner:
+    """每拍都调用一次 effect —— 只有上界才能让它停下来。"""
+
+    async def decide(self, context: Any) -> DecisionOutput:
+        _ = context
+        return DecisionOutput(program="timestamp_effect()")
+
+
+class _TimestampQuery(BaseTool):
+    name = "timestamp_query"
+    program_kind = "query"
+    arguments_schema = {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    }
+    result_schema = {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "additionalProperties": False,
+    }
+
+    async def execute(self, arguments: dict, **context: Any) -> ToolOutcome:
+        return ToolOutcome.success({"ok": True})
+
+
+class _FailingEffect(BaseTool):
+    name = "failing_effect"
+    program_kind = "effect"
+    arguments_schema = {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    }
+    result_schema = {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "additionalProperties": False,
+    }
+
+    async def execute(self, arguments: dict, **context: Any) -> ToolOutcome:
+        return ToolOutcome.failure("internal_tool_error", "boom")
+
+
+class ContinuationMaxTicksResolverTests(unittest.TestCase):
+    """``AGENT_CONTINUATION_MAX_TICKS`` 解析（任务与决策契约 §1.2）。"""
+
+    def _resolve(self, raw: str | None) -> int | None:
+        with patch(
+            "qqbot.services.agent_loop.loop.get_env_value", return_value=raw
+        ):
+            from qqbot.services.agent_loop.loop import continuation_max_ticks
+
+            return continuation_max_ticks()
+
+    def test_unset_is_unlimited(self) -> None:
+        self.assertIsNone(self._resolve(None))
+
+    def test_blank_is_unlimited(self) -> None:
+        self.assertIsNone(self._resolve("   "))
+
+    def test_zero_disables(self) -> None:
+        self.assertEqual(self._resolve("0"), 0)
+
+    def test_positive_is_the_cap(self) -> None:
+        self.assertEqual(self._resolve("5"), 5)
+
+    def test_negative_clamps_to_disabled(self) -> None:
+        self.assertEqual(self._resolve("-3"), 0)
+
+    def test_garbage_falls_back_to_unlimited(self) -> None:
+        self.assertIsNone(self._resolve("many"))
+
+
+class ContinuationTickTests(unittest.IsolatedAsyncioTestCase):
+    """自续拍（2026-08-04，任务与决策契约 §1.2）。
+
+    程序调用过函数 → 本拍收尾后自行再开一拍；某一拍一个函数都不调用 → 链条结束。
+    判据是 ``ProgramTrace.calls``：Query 与 Effect 同等、成功与失败同等。
+    """
+
+    @staticmethod
+    def _tick_count(captured: list[Any]) -> int:
+        return sum(
+            1
+            for stmt in captured
+            if _values_of(stmt).get("type") == "runtime.tick_started"
+        )
+
+    async def _run(
+        self,
+        planner: Any,
+        *,
+        registry: ToolRegistry | None = None,
+        expect_ticks: int,
+        max_ticks: int | None = None,
+    ) -> list[Any]:
+        """开一次外部 wake，跑到链条停稳，返回捕获到的语句。
+
+        settle 预算给到期望拍数之后仍多等一截，好让"多续了一拍"这类回归表现为
+        断言失败而不是恰好没观测到。
+        """
+        captured: list[Any] = []
+        with patch(
+            "qqbot.services.agent_loop.loop.continuation_max_ticks",
+            return_value=max_ticks,
+        ):
+            loop = AgentLoop(
+                scope_key="group:12345",
+                planner=planner,
+                session_factory=_factory_for(captured),
+                tool_registry=registry,
+            )
+        loop.start()
+        loop.wake(immediate=True)
+        for _ in range(120):
+            await asyncio.sleep(0.01)
+            if self._tick_count(captured) > expect_ticks:
+                break
+        await asyncio.sleep(0.05)
+        await loop.stop()
+        return captured
+
+    async def test_empty_program_does_not_continue(self) -> None:
+        """空程序是不动点：一次外部唤醒只换来一拍。"""
+        captured = await self._run(_FakeIdlePlanner(), expect_ticks=1)
+        self.assertEqual(self._tick_count(captured), 1)
+
+    async def test_effect_call_continues_until_empty_program(self) -> None:
+        registry = ToolRegistry()
+        registry.register(_TimestampEffect)
+        captured = await self._run(
+            _ScriptedPlanner(["timestamp_effect()"]),
+            registry=registry,
+            expect_ticks=2,
+        )
+        # 第一拍调用 → 自续第二拍 → 第二拍空程序 → 停。
+        self.assertEqual(self._tick_count(captured), 2)
+
+    async def test_query_only_program_continues(self) -> None:
+        """Query 同样续拍 —— 「查完接着办」正是这条机制存在的理由。"""
+        registry = ToolRegistry()
+        registry.register(_TimestampQuery)
+        captured = await self._run(
+            _ScriptedPlanner(["timestamp_query()"]),
+            registry=registry,
+            expect_ticks=2,
+        )
+        self.assertEqual(self._tick_count(captured), 2)
+
+    async def test_failed_call_continues(self) -> None:
+        """失败调用照样续拍：中止余下程序意味着她当拍接不住，得换一拍再判断。"""
+        registry = ToolRegistry()
+        registry.register(_FailingEffect)
+        captured = await self._run(
+            _ScriptedPlanner(["failing_effect()"]),
+            registry=registry,
+            expect_ticks=2,
+        )
+        self.assertEqual(self._tick_count(captured), 2)
+        types = [_values_of(stmt).get("type") for stmt in captured]
+        self.assertIn("agent.program_failed", types)
+
+    async def test_max_ticks_caps_the_chain(self) -> None:
+        """上界只约束一段自转的长度：1 → 外部一拍 + 自续一拍后必须停。"""
+        registry = ToolRegistry()
+        registry.register(_TimestampEffect)
+        captured = await self._run(
+            _AlwaysCallingPlanner(),
+            registry=registry,
+            expect_ticks=2,
+            max_ticks=1,
+        )
+        self.assertEqual(self._tick_count(captured), 2)
+
+    async def test_zero_max_disables_continuation(self) -> None:
+        """0 = 关闭自续拍，退回纯事件驱动。"""
+        registry = ToolRegistry()
+        registry.register(_TimestampEffect)
+        captured = await self._run(
+            _AlwaysCallingPlanner(),
+            registry=registry,
+            expect_ticks=1,
+            max_ticks=0,
+        )
+        self.assertEqual(self._tick_count(captured), 1)
+
+    async def test_external_wake_resets_continuation_depth(self) -> None:
+        """外部唤醒 = 新一段活动，自转计数归零，上界重新起算。"""
+        with patch(
+            "qqbot.services.agent_loop.loop.continuation_max_ticks",
+            return_value=2,
+        ):
+            loop = AgentLoop(
+                scope_key="group:12345",
+                planner=_FakeIdlePlanner(),
+                session_factory=_factory_for([]),
+            )
+        loop._continuation_depth = 2
+        self.assertFalse(loop._wake_continuation())
+        loop.wake(immediate=True)
+        self.assertEqual(loop._continuation_depth, 0)
+        self.assertTrue(loop._wake_continuation())
+
+    async def test_stopped_loop_does_not_continue(self) -> None:
+        with patch(
+            "qqbot.services.agent_loop.loop.continuation_max_ticks",
+            return_value=None,
+        ):
+            loop = AgentLoop(
+                scope_key="group:12345",
+                planner=_FakeIdlePlanner(),
+                session_factory=_factory_for([]),
+            )
+        loop._stopped = True
+        self.assertFalse(loop._wake_continuation())
 
 
 if __name__ == "__main__":

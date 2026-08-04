@@ -149,7 +149,7 @@ async def find_cancel_for_tool_call(
     session_factory: SessionFactory,
     tool_call_event_id: str,
 ) -> dict | None:
-    """ToolWorker 终态落库前崩溃时，重放 cancel 仍返回原成功事实。"""
+    """兼容历史执行器或同一调用重入：已有 cancel 事实直接返回。"""
     stmt = (
         select(AgentEvent)
         .where(AgentEvent.type == "agent.reply_task_cancelled")

@@ -1,4 +1,4 @@
-"""Prompt 快照回放 — prompt 改动前后的行为对比（待办 #11 回归评测基线）。
+"""Prompt 快照回放 — 程序形态 prompt 改动前后的行为对比。
 
 服务器端手动运行（需要 langchain 运行时 + config/model_providers.json；扁平
 LLM_* env 已于 2026-07-28/29 删除，本脚本经 create_llm(role="planner") 走统一
@@ -9,7 +9,7 @@ LLM_* env 已于 2026-07-28/29 删除，本脚本经 create_llm(role="planner") 
     python scripts/replay_snapshots.py --limit 5       # 只回放前 5 个
     python scripts/replay_snapshots.py path/to/a.json  # 回放指定快照文件
     python scripts/replay_snapshots.py --system recorded   # 用录制时的 system prompt
-    python scripts/replay_snapshots.py --with-images   # 从媒体库按 hash 复原图片
+    python scripts/replay_snapshots.py --with-images   # 兼容旧命令；Planner 已不收图片
 
 工作流：
   1. 线上开着 PROMPT_SNAPSHOT_ENABLED 积累快照（runtime_data/prompt_snapshots/）。
@@ -17,13 +17,14 @@ LLM_* env 已于 2026-07-28/29 删除，本脚本经 create_llm(role="planner") 
      复读 / 口吻）**挑出来复制**到 runtime_data/prompt_replay/cases/——这一步
      是人工甄选，固定回放集由此沉淀。
   3. 每次改 prompt 后跑本脚本：默认 --system current 用当前代码重新渲染
-     system prompt、配录制的 user XML 重新请求 LLM，输出与录制行为的对比
-     报告（动作序列 / 发言内容 / token / 延迟）。
+     system prompt、配录制的行文法 user text 重新请求 LLM，输出与录制行为的
+     对比报告（preflight / Query-Effect 调用序列 / 源码 / token / 延迟）。
 
 已知边界（读报告时须心里有数）：
-  - tool-catalog 内嵌在录制的 user XML 里——工具集变更不会反映进回放输入。
-  - --system current 需要工具 .md 与代码同版本；回放对比只对 prompt 改动
-    敏感，投影层改动需要重新采集快照。
+  - Program API 参考位于 system prompt；--system current 会反映当前 registry、
+    schema 与工具 .md，--system recorded 则保留录制版本。
+  - 投影层改动不会重渲录制的 user text，需要重新采集快照。
+  - Planner 自 2026-07-28 起是纯文本模型；--with-images 仅为旧命令兼容，忽略。
   - 回放会真实计费调用 LLM；模型非确定性意味着单次差异要人工复核，
     连续多个用例同向漂移才是信号。
 """
@@ -32,7 +33,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import json
 import sys
 import time
@@ -44,7 +44,6 @@ sys.path.insert(0, str(REPO_ROOT))
 
 DEFAULT_CASES_DIR = REPO_ROOT / "runtime_data" / "prompt_replay" / "cases"
 DEFAULT_RUNS_DIR = REPO_ROOT / "runtime_data" / "prompt_replay" / "runs"
-MEDIA_IMG_DIR = REPO_ROOT / "runtime_data" / "media" / "img"
 
 
 def _load_cases(args: argparse.Namespace) -> list[Path]:
@@ -78,33 +77,6 @@ def _current_system_prompt(scope_key: str | None) -> str:
     return library.render(scope=scope)
 
 
-def _image_blocks(case: dict[str, Any]) -> tuple[list[dict], list[str]]:
-    """按快照记录的 hash 从媒体库（内容寻址）复原图片 blocks。"""
-    from qqbot.services.agent_loop.image_utils import normalize_image_for_llm
-
-    blocks: list[dict] = []
-    missing: list[str] = []
-    for image in case.get("images") or []:
-        file_hash = image.get("hash", "")
-        path = MEDIA_IMG_DIR / file_hash[:2] / file_hash
-        if not path.is_file():
-            missing.append(file_hash)
-            continue
-        data = path.read_bytes()
-        data, mime = normalize_image_for_llm(
-            data, image.get("mime") or "image/png"
-        )
-        b64 = base64.b64encode(data).decode("ascii")
-        blocks.append({"type": "text", "text": f"↓ image hash={file_hash}"})
-        blocks.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{b64}"},
-            }
-        )
-    return blocks, missing
-
-
 def _recorded_response(case: dict[str, Any]) -> str | None:
     """录制快照里最后一次成功往返的响应文本。"""
     for attempt in reversed(case.get("attempts") or []):
@@ -114,20 +86,27 @@ def _recorded_response(case: dict[str, Any]) -> str | None:
     return None
 
 
-def _action_types(response_text: str | None) -> list[str] | None:
-    """响应文本 → 动作类型序列（与 planner 同一解析器）。None = 不可解析。"""
+def _program_shape(
+    response_text: str | None,
+    scope_key: str | None,
+) -> tuple[list[str] | None, str | None]:
+    """响应源码 → Query/Effect 调用序列；非法时返回稳定 preflight 错误。"""
     if not response_text:
-        return None
-    from qqbot.services.agent_loop.llm_planner import (
-        _parse_decision_output,
-        _parse_json,
+        return None, "empty_response"
+    from qqbot.services.agent_loop.program_ast import (
+        ProgramPreflightError,
+        preflight,
     )
+    from qqbot.services.agent_loop.tools import build_default_registry
 
+    scope = (scope_key or "group:0").split(":", 1)[0]
     try:
-        output = _parse_decision_output(_parse_json(response_text))
-    except Exception:
-        return None
-    return [a.type for a in output.actions]
+        prepared = preflight(response_text, build_default_registry(), scope)
+    except ProgramPreflightError as exc:
+        return None, f"{exc.info.error_kind}: {exc.info.message}"
+    return [
+        f"{site.program_kind}:{site.name}" for site in prepared.call_sites
+    ], None
 
 
 async def _replay_one(
@@ -144,17 +123,9 @@ async def _replay_one(
     else:
         system_prompt = _current_system_prompt(case.get("scope_key"))
 
-    human_content: list[dict] = [
-        {"type": "text", "text": case.get("user_text", "")}
-    ]
-    missing_images: list[str] = []
-    if args.with_images:
-        blocks, missing_images = _image_blocks(case)
-        human_content.extend(blocks)
-
     messages = [
         SystemMessage(content=system_prompt),
-        HumanMessage(content=human_content),
+        HumanMessage(content=case.get("user_text", "")),
     ]
 
     started = time.monotonic()
@@ -172,8 +143,14 @@ async def _replay_one(
     latency_ms = int((time.monotonic() - started) * 1000)
 
     recorded_text = _recorded_response(case)
-    recorded_actions = _action_types(recorded_text)
-    replay_actions = _action_types(response_text)
+    recorded_calls, recorded_preflight_error = _program_shape(
+        recorded_text,
+        case.get("scope_key"),
+    )
+    replay_calls, replay_preflight_error = _program_shape(
+        response_text,
+        case.get("scope_key"),
+    )
 
     return {
         "case": case_path.name,
@@ -182,7 +159,6 @@ async def _replay_one(
         "system_mode": args.system,
         "system_prompt_chars": len(system_prompt),
         "recorded_system_prompt_chars": case.get("system_prompt_chars"),
-        "missing_images": missing_images,
         "error": error,
         "latency_ms": latency_ms,
         "recorded_latency_ms": (case.get("attempts") or [{}])[-1].get(
@@ -190,11 +166,13 @@ async def _replay_one(
         ),
         "usage": usage,
         "recorded_usage": (case.get("attempts") or [{}])[-1].get("usage"),
-        "recorded_actions": recorded_actions,
-        "replay_actions": replay_actions,
-        "actions_match": (
-            recorded_actions == replay_actions
-            if recorded_actions is not None and replay_actions is not None
+        "recorded_calls": recorded_calls,
+        "replay_calls": replay_calls,
+        "recorded_preflight_error": recorded_preflight_error,
+        "replay_preflight_error": replay_preflight_error,
+        "calls_match": (
+            recorded_calls == replay_calls
+            if recorded_calls is not None and replay_calls is not None
             else None
         ),
         "recorded_response": recorded_text,
@@ -206,24 +184,26 @@ def _write_report(out_dir: Path, results: list[dict[str, Any]]) -> Path:
     lines = [
         "# Prompt 回放报告",
         "",
-        "| 用例 | scope | 动作一致 | 录制动作 | 回放动作 | 回放耗时 | 回放 tokens |",
+        "| 用例 | scope | 调用一致 | 录制调用 | 回放调用 | preflight | 回放耗时 | 回放 tokens |",
         "|---|---|---|---|---|---|---|",
     ]
     for r in results:
-        match = {True: "✅", False: "❌", None: "—"}[r["actions_match"]]
+        match = {True: "✅", False: "❌", None: "—"}[r["calls_match"]]
         usage = r.get("usage") or {}
+        preflight_status = r.get("replay_preflight_error") or "ok"
         lines.append(
             f"| {r['case']} | {r.get('scope_key') or '-'} | {match} "
-            f"| {','.join(r['recorded_actions'] or []) or '-'} "
-            f"| {','.join(r['replay_actions'] or []) or '-'} "
+            f"| {','.join(r['recorded_calls'] or []) or '-'} "
+            f"| {','.join(r['replay_calls'] or []) or '-'} "
+            f"| {preflight_status} "
             f"| {r['latency_ms']}ms "
             f"| {usage.get('total_tokens', '-')} |"
         )
-    mismatches = [r for r in results if r["actions_match"] is False]
+    mismatches = [r for r in results if r["calls_match"] is False]
     lines += [
         "",
-        f"共 {len(results)} 例，动作不一致 {len(mismatches)} 例。",
-        "动作一致只是第一道闸——发言内容 / 口吻 / 事实保持请打开各用例",
+        f"共 {len(results)} 例，调用序列不一致 {len(mismatches)} 例。",
+        "调用一致只是第一道闸——分支、return、发言内容、口吻与事实保持请打开各用例",
         "result JSON 对比 recorded_response 与 replay_response。",
     ]
     report = out_dir / "report.md"
@@ -260,9 +240,11 @@ async def _amain(args: argparse.Namespace) -> int:
             result = {
                 "case": case_path.name,
                 "error": f"replay crashed: {type(exc).__name__}: {exc}",
-                "actions_match": None,
-                "recorded_actions": None,
-                "replay_actions": None,
+                "calls_match": None,
+                "recorded_calls": None,
+                "replay_calls": None,
+                "recorded_preflight_error": None,
+                "replay_preflight_error": None,
                 "latency_ms": -1,
             }
         results.append(result)
@@ -290,7 +272,7 @@ def main() -> int:
     parser.add_argument(
         "--with-images",
         action="store_true",
-        help="按 hash 从 runtime_data/media/img 复原图片一并发送",
+        help="兼容旧命令；Planner 已是纯文本模型，本参数忽略",
     )
     parser.add_argument("--limit", type=int, default=0, help="至多回放 N 例")
     return asyncio.run(_amain(parser.parse_args()))

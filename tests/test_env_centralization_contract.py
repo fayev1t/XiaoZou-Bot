@@ -64,6 +64,8 @@ class EnvCentralizationContractTests(unittest.TestCase):
             "MEMORY_SUMMARY_MAX_CHARS=1200",
             "MEMORY_COMPACTION_TRIGGER_EVENTS=250",
             "MEMORY_COMPACTION_KEEP_EVENTS=150",
+            # 静默叫醒（2026-08-03）：模板给出代码默认值 600 秒；0/负数关闭
+            "SILENCE_REFLECTION_SECONDS=600",
             # LLM 路由：注册表在 config/model_providers.json（2026-07-28 起是
             # **唯一**来源，无扁平 env 回落），模板只保留路径覆写键的注释示例
             "# MODEL_PROVIDERS_PATH=",

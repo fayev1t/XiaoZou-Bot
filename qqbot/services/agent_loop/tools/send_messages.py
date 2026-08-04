@@ -8,15 +8,12 @@ idle / 查证 / 调本工具把话真正发出去。本工具**始终可调用**
 代码里**：2026-08-01 起 `send_messages.md` 不再向模型主动交底"没人拦你"——
 工具用法文档没有义务告诉模型某条纪律缺少强制力。
 
-它是一个**普通 ToolWorker 工具**（§4.3/§4.5）：走通用租约与 terminal 机制，
-不写任何领域/runtime 事件，不查询或修改 ReplyTask，也不为自己新增 fence 或
-finalizer——发送结果作为结构化 receipts 放进 ToolOutcome，`agent.tool_result
-| tool_failed` 就是发送的唯一持久事实，其 `<tool-call>` 行（args + 结果回执）
-即时间线上的发言记录（2026-07-31 实施后调整：不再派生独立 `<my-reply>` 行，
-同一句话两处渲染是复读诱饵；`<my-reply>` 仅渲染旧链路历史事件）。因此它与
-其它不可逆工具共有同一个已知窗口：OneBot 已成功、terminal 未写成、进程退出
-→ 租约到期后可能重新执行（§4.5 明确接受，观测后按独立基础设施提案统一
-解决）。
+它是一个普通 Program Effect：执行器先写 ``agent.tool_called`` 意图，再调用
+本工具，最后把结构化 receipts 写进 ``agent.tool_result | tool_failed``。它不
+查询或修改 ReplyTask，也不新增 fence / finalizer。若 OneBot 已出手但 terminal
+尚未写成时进程退出，启动收口器会把半截调用标成 ``interrupted`` / ``uncertain``，
+**永不自动重放**。其 `<工具>send_messages` 行块（气泡 + 回执）就是时间线上的
+唯一发言记录；不再派生第二条发言行，`<旧发言>` 只兼容历史链路。
 
 结果语义（status 随 receipts 一起落 terminal payload）：
 
@@ -27,7 +24,7 @@ finalizer——发送结果作为结构化 receipts 放进 ToolOutcome，`agent.
 - ``uncertain`` 至少一条送达与否无法确认 → ``tool_failed``（可能已发出，
   禁止"保险再发一遍"）。
 
-依赖注入：scope_key / session_factory 来自 ToolWorker 的 run() context；
+依赖注入：scope_key / session_factory 来自 ProgramExecutor 的 run() context；
 目标群取自 scope_key，模型不传 target（跨群隔离，§4.1）。
 """
 
@@ -107,8 +104,10 @@ _MEME_BUBBLE_SCHEMA = {
         },
         "image_hash": {
             "type": "string",
-            "pattern": "^[0-9a-fA-F]{64}$",
-            "description": '<saved-memes> 中 <meme hash="..."> 的 sha256。',
+            "pattern": "^[0-9a-fA-F]{12,64}$",
+            "description": (
+                "表情包收藏 <meme> 行中的哈希，12 位前缀原样照抄（也接受完整 64 位）。"
+            ),
         },
     },
     "required": ["kind", "image_hash"],
@@ -118,6 +117,8 @@ _MEME_BUBBLE_SCHEMA = {
 
 class SendMessagesTool(BaseTool):
     name = "send_messages"
+    program_kind = "effect"
+    max_call_sites = 2
     # 私聊没有 AgentLoop（Supervisor 丢弃 private:*），system scope 没有聊天
     # 目标——不照抄旧 send_message.py 的 ("group", "private")。
     allowed_scopes = ("group",)
@@ -140,12 +141,39 @@ class SendMessagesTool(BaseTool):
                     "按发送顺序排列的气泡数组，一条或多条均可。每项是一个 "
                     "chat 气泡或一个 meme 气泡，两者平级、可任意穿插。"
                 ),
-                "items": {
-                    "oneOf": [_CHAT_BUBBLE_SCHEMA, _MEME_BUBBLE_SCHEMA]
-                },
+                "items": {"oneOf": [_CHAT_BUBBLE_SCHEMA, _MEME_BUBBLE_SCHEMA]},
             },
         },
         "required": ["messages"],
+        "additionalProperties": False,
+    }
+    result_schema = {
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "enum": ["sent"]},
+            "message_ids": {
+                "type": "array",
+                "items": {"type": ["integer", "string"]},
+            },
+            "sent_messages": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "index": {"type": "integer"},
+                        "kind": {"type": "string"},
+                        "content": {"type": "array", "items": {}},
+                        "image_hash": {"type": ["string", "null"]},
+                        "status": {"type": "string"},
+                        "message_id": {"type": ["integer", "string", "null"]},
+                        "self_id": {"type": ["string", "null"]},
+                        "receipt": {"type": "object", "properties": {}},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["status", "message_ids", "sent_messages"],
         "additionalProperties": False,
     }
 
@@ -178,9 +206,7 @@ class SendMessagesTool(BaseTool):
             return fail
 
         # ── 动态 preflight：meme 是否仍在收藏、媒体是否可读（仍无副作用）。
-        if session_factory is None and any(
-            item["kind"] == "meme" for item in prepared
-        ):
+        if session_factory is None and any(item["kind"] == "meme" for item in prepared):
             return ToolOutcome.failure(
                 "internal_tool_error",
                 "send_messages requires session_factory to send a meme",
@@ -216,9 +242,7 @@ class SendMessagesTool(BaseTool):
             if status == "uncertain"
             else "no bubble was delivered"
         )
-        logger.warning(
-            "[send_messages] {} delivery {}: {}", scope_key, status, reason
-        )
+        logger.warning("[send_messages] {} delivery {}: {}", scope_key, status, reason)
         return ToolOutcome.failure(
             "upstream_action_failed",
             reason,

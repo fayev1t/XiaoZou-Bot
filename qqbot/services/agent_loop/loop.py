@@ -1,49 +1,24 @@
-"""AgentLoop — long-running per-scope decision loop.
+"""Long-running per-scope loop for program-shaped Planner decisions.
 
-One instance per scope_key (group:<id> or system). PrivateAgentLoop is
-NOT instantiated in v2 第一版 (实例化策略 §10.1); private events are
-ingested but not dispatched here.
+Each tick projects the scope, asks the Planner for one restricted Python
+program, preflights it (up to three same-tick attempts), persists the decision
+root, and executes every query/effect sequentially before the tick ends.
+There is no worker dispatch or tool batch: a completed tick has no pending
+program call.
 
-Skeleton tick (will grow as projection + real planner come online):
-  runtime.tick_started  ──▶  build DecisionContext (stub)
-                       └──▶  planner.decide() ─▶ DecisionOutput
-                       └──▶  translate actions to agent.* events
-                       └──▶  runtime.tick_ended
+The fixed wake batching window remains a conversation-ingest concern. The
+first wake opens one bounded window; later wakes join it without extending the
+deadline, so split QQ messages can land before the next decision starts.
 
-The loop is awoken by LoopSupervisor.wake(); when idle it parks on an
-asyncio.Event without burning CPU.
-
-唤醒攒批窗口（2026-07-28 引入，2026-08-01 由滑动改固定）：wake() 默认**不立刻**
-开拍，而是由第一次唤醒开一个 _WAKE_BATCH_WINDOW_SECONDS 的窗口；窗口内后续的
-唤醒并入本窗、**不顺延** deadline，到点开一拍。asyncio.Event 本身已经能把"上一
-拍还在跑"期间的多次唤醒并成一次，窗口堵的是另一个洞：loop 空闲时第一条消息会
-立刻开拍——而 QQ 上一句话拆成三条发是常态，那会让 bot 对着半截话表态。
-窗口只负责"别对着刚落地的第一条消息就开拍"这一件事。"等他把话说完再回"不在
-这一层：那是模型经 reply 的等待自己判断的（决定开口时起一段等待，flush 时重读
-时间线再落笔），程序不拿一个常量去猜别人打完字没有。早先的滑动实现每次唤醒都
-顺延 deadline，活跃 scope 的开拍会被无限往后推，只好再加一个封顶常量兜底——
-那个上限是滑动自己造出来的病的药；固定窗口的开拍延迟天然有界（≤ 窗口本身），
-两个常量因此收敛成一个。
-工具批次收口这类"活干完了，来看结果"的唤醒走 immediate=True 直接开拍：那里
-没有什么可攒的，等窗口纯属白白加延迟。
-
-工具批次（tool_batch）：同一 tick 派发的全部 call_tool 属于同一个批次
-（tool_batch_id 复用 decision_id），inline/worker 执行方共用收口器，经
-supervisor 批次级唤醒一次。2026-07-02 起**没有批次门闩**：批次进行期间
-的任何唤醒都随时开拍，
-模型自己看 <tool-call status="processing"> 行决定等还是先处理新事件——程序
-不替模型决定"何时可以思考"（模型+prompt 优先哲学）。
-
-无效输出重试（任务与决策契约 §7.1）：planner 输出未通过动作校验时，同 tick
-内带着 validation_feedback 重试至多 2 次（共 3 次调用），每次失败写一条
-runtime.llm_invalid_output（attempt 递增）；三次仍非法才强制
-idle(reason="invalid_output_giveup")——先给模型自我修正的机会，而不是一错就没收
-本拍的响应权。
+A tick whose program actually called something wakes the scope again on its
+own (see ``_CONTINUATION_MAX_ENV``), so a burst of work runs tick by tick until
+one program calls nothing at all.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from dataclasses import replace
 from datetime import datetime
@@ -53,30 +28,36 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from qqbot.core.ids import new_event_id
 from qqbot.core.logging import get_logger
+from qqbot.core.settings import get_env_value
 from qqbot.core.time import china_now
 from qqbot.services.agent_loop.decision import (
-    Action,
-    CallToolAction,
     DecisionContext,
     DecisionOutput,
-    IdleAction,
     Planner,
+    ProgramValidationFeedback,
 )
 from qqbot.services.agent_loop.event_writer import (
-    AgentEventWrite,
     write_agent_event,
-    write_agent_events,
     write_runtime_event,
 )
-from qqbot.services.agent_loop.projection import Projector
-from qqbot.services.agent_loop.tool_batch import maybe_close_tool_batch
-from qqbot.services.agent_loop.tool_registry import (
-    Tool,
-    ToolOutcome,
-    ToolRegistry,
-    coerce_tool_outcome,
-    get_tool_execution_mode,
+from qqbot.services.agent_loop.program_ast import (
+    PreflightResult,
+    ProgramErrorInfo,
+    ProgramPreflightError,
+    preflight,
 )
+from qqbot.services.agent_loop.program_events import (
+    recover_interrupted_programs,
+    write_program_completed,
+    write_program_failed,
+)
+from qqbot.services.agent_loop.program_runtime import (
+    ProgramExecutionError,
+    ProgramExecutor,
+    ProgramTrace,
+)
+from qqbot.services.agent_loop.projection import Projector
+from qqbot.services.agent_loop.tool_registry import ToolRegistry
 
 logger = get_logger(__name__)
 
@@ -85,7 +66,48 @@ logger = get_logger(__name__)
 # 开拍延迟因此天然有界（≤ 窗口本身），不再需要防饿死的封顶常量。
 _WAKE_BATCH_WINDOW_SECONDS = 3.0
 
+# 自续拍（2026-08-04）：一段程序只要真的调用过函数，本拍收尾后立刻再开一拍。
+#
+# 动机——程序是**盲写**的：写下它的那一刻结果还不存在。文法虽有 if/for，那只
+# 够对结果做机械分支；「读懂 search_history 拿回来的二十条再决定说什么」这类
+# 需要判断力的事，当拍无论如何写不出来。而在此之前，那下一拍除非群里恰好又有
+# 人说话否则永远不来，于是所有查完要接着办的链路都断在原地。
+#
+# 终止条件是不动点：某一拍的程序一个函数都没调用（空程序、或只有赋值与注释），
+# 链条自然结束——恰好就是「没什么可做」的既有输出形态，不需要新概念。
+#
+# 抑制规则一条都没有（2026-08-04 明确决定）：wait / reply 这类自带定时器的调用
+# 同样续拍。已知代价有二——她可能在 reply 的 hold 尚未到点时被立刻叫回来，从而
+# 绕过两步发言；也可能反复改期或反复记任务自转。守住这两条的现在只有提示词纪律，
+# 没有结构性保障。上界默认不设，全靠下面这个 env 兜底。
+_CONTINUATION_MAX_ENV = "AGENT_CONTINUATION_MAX_TICKS"
+
 SessionFactory = Callable[[], AsyncSession]
+
+
+def continuation_max_ticks() -> int | None:
+    """连续自续拍上界。env ``AGENT_CONTINUATION_MAX_TICKS``。
+
+    未配置 / 空 → ``None``，即**不限制**（当前默认）；``0`` → 关掉自续拍，
+    退回纯事件驱动；``N > 0`` → 一段活动内最多连续自续 N 拍，之后必须等一次
+    真正的外部唤醒。计数被任何外部唤醒清零，因此约束的是「一次自转能有多长」，
+    不是「一小时能跑多少拍」。
+
+    留这个旋钮是因为默认无界：真在生产里自转起来时，部署侧不改代码就能收。
+    """
+    raw = get_env_value(_CONTINUATION_MAX_ENV)
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        logger.warning(
+            "[loop] invalid {}={!r}, treating as unlimited",
+            _CONTINUATION_MAX_ENV,
+            raw,
+        )
+        return None
+    return max(value, 0)
 
 
 class AgentLoop:
@@ -104,20 +126,19 @@ class AgentLoop:
         self._planner = planner
         self._session_factory = session_factory
         self._projector = projector
-        # supervisor 鸭子类型注入，规避 supervisor → loop 的循环 import。
-        # 用到 notify_tool_pending()（worker 调用落库后叫醒 ToolWorker）以及
-        # notify_tool_batch_completed()（inline 批次收口通知）。批次门闩接口
-        # 已于 2026-07-02 随门闩拆除。
+        # supervisor 鸭子类型注入，规避 supervisor → loop 的循环 import；
+        # 程序内 reply/wait 等工具仍用它的 wake/notify_reply_task 回调。
         self._supervisor = supervisor
         # bot_user_id 每 tick 重新 resolve —— bot 重连后 self_id 不变但实例
         # 会换；启动初期可能返回 None，prompt 渲染层接受 None 优雅降级。
         # None resolver 表示不注入（旧测试 / 早期骨架兼容）。
         self._bot_user_id_resolver = bot_user_id_resolver
-        # registry 只参与通用 execution_mode 路由；权限/scope/role 判定仍全部
-        # 下放工具内 BaseTool.enforce_access。缺 registry 时任何调用都按 worker
-        # 模式派发，保持旧测试 / 早期骨架兼容。
-        self._tool_registry = tool_registry
-        # 与 ToolWorker 相同的可选工具依赖；inline 工具也收到完整 context。
+        # Registry 是唯一 Program API。权限/scope/role 判定仍全部下放工具内
+        # BaseTool.enforce_access；空 registry 只允许空程序与安全 builtin。
+        self._tool_registry = (
+            tool_registry if tool_registry is not None else ToolRegistry()
+        )
+        # 可选的图片描述依赖会随 ProgramExecutor context 注入工具。
         self._caption_image = caption_image
         self._wake = asyncio.Event()
         self._stopped = False
@@ -128,6 +149,12 @@ class AgentLoop:
         # 到那个时刻的协程，同一时刻至多一个。
         self._wake_deadline: float | None = None
         self._wake_timer: asyncio.Task[None] | None = None
+        # 每个 loop 实例的第一拍、投影之前收口一次历史半截程序；成功后不重跑。
+        self._recovery_done = False
+        # 自续拍状态：depth 是本段活动里已经连续自续了几拍，被任何外部唤醒清零；
+        # max 在构造时读一次 env（进程内不会变）。
+        self._continuation_depth = 0
+        self._continuation_max = continuation_max_ticks()
 
     @property
     def scope_key(self) -> str:
@@ -155,11 +182,41 @@ class AgentLoop:
     def wake(self, *, immediate: bool = False) -> None:
         """请求开拍。默认走攒批窗口（见模块 docstring）。
 
-        immediate=True 用于"活干完了，来看结果"类唤醒（工具批次收口）：那里
-        没有后续消息可攒，等窗口只是白加延迟。
+        immediate=True 用于已持久化的到点/完成类 runtime 事件；那里没有后续
+        消息可攒，等窗口只是白加延迟。
+
+        这是**外部**唤醒入口（EventIngest / wait 到点 / reply 完成 / 静默叫醒），
+        因此顺带把自续拍计数清零：外面又有事发生，上一段自转到此为止，新的一段
+        重新起算。自续拍走 ``_wake_continuation``，不经过这里。
         """
         if self._stopped:
             return
+        self._continuation_depth = 0
+        self._arm_wake(immediate=immediate)
+
+    def _wake_continuation(self) -> bool:
+        """本拍程序调用过函数 → 立刻再开一拍。返回是否真的排上。
+
+        用 immediate：自续拍不是在等谁把话说完，攒批窗口在这里只是每跳白加
+        三秒，链条一长就是她「想到一半」卡在那儿而群里已经走远了。
+        """
+        if self._stopped:
+            return False
+        if self._continuation_max is not None:
+            if self._continuation_depth >= self._continuation_max:
+                if self._continuation_max > 0:
+                    logger.info(
+                        "[loop {}] continuation capped at {} tick(s)",
+                        self._scope_key,
+                        self._continuation_max,
+                    )
+                return False
+        self._continuation_depth += 1
+        self._arm_wake(immediate=True)
+        return True
+
+    def _arm_wake(self, *, immediate: bool) -> None:
+        """唤醒排程本体。不碰自续拍计数——由两个入口各自负责。"""
         if immediate or _WAKE_BATCH_WINDOW_SECONDS <= 0:
             self._cancel_wake_timer()
             self._wake_deadline = None
@@ -202,9 +259,6 @@ class AgentLoop:
                 self._wake.clear()
                 if self._stopped:
                     break
-                # 2026-07-02 起任何唤醒都直接开拍（批次门闩已拆除）：上一拍
-                # 工具还在跑时醒来，投影里对应 <tool-call status="processing">
-                # 行，模型自己决定等批次还是先处理新事件。
                 try:
                     await self._tick()
                 except Exception as exc:
@@ -218,8 +272,6 @@ class AgentLoop:
         self._tick_seq += 1
         correlation_id = new_event_id()
         now = china_now()
-
-        # runtime.tick_started
         tick_started_id = await write_runtime_event(
             self._session_factory,
             event_type="runtime.tick_started",
@@ -229,9 +281,110 @@ class AgentLoop:
             causation_id=None,
             payload={"tick_seq": self._tick_seq},
         )
+        if not self._recovery_done:
+            report = await recover_interrupted_programs(
+                self._session_factory,
+                scope_key=self._scope_key,
+            )
+            self._recovery_done = True
+            if report.tool_calls_closed or report.programs_closed:
+                logger.warning(
+                    "[loop {}] recovered interrupted calls={} programs={}",
+                    self._scope_key,
+                    report.tool_calls_closed,
+                    report.programs_closed,
+                )
 
-        # bot_user_id resolve 失败不应让整 tick 翻车：捕一下、降为 None
-        # 走"老行为"（prompt 不渲染 bot_user_id 属性）。
+        context = await self._build_context(correlation_id, now)
+        decision, prepared, preflight_error = await self._decide_program(context)
+        if decision is None:
+            await self._write_tick_ended(
+                correlation_id,
+                tick_started_id,
+                program_status="planner_error",
+            )
+            return
+
+        if prepared is not None:
+            stored_program = prepared.source
+            program_sha256 = prepared.program_sha256
+        else:
+            stored_program = _bounded_program_source(decision.program)
+            program_sha256 = _program_sha256(stored_program)
+
+        decision_id = await write_agent_event(
+            self._session_factory,
+            event_type="agent.decision_emitted",
+            scope_key=self._scope_key,
+            correlation_id=correlation_id,
+            causation_id=None,
+            payload={
+                "program": stored_program,
+                "program_sha256": program_sha256,
+                "tick_seq": self._tick_seq,
+            },
+            occurred_at=now,
+        )
+
+        if prepared is None:
+            info = preflight_error or ProgramErrorInfo(
+                "invalid_program_giveup",
+                "program preflight failed after three attempts",
+            )
+            details = dict(info.details)
+            if info.line is not None:
+                details["line"] = info.line
+            if info.column is not None:
+                details["column"] = info.column
+            await _shield_write(
+                write_program_failed(
+                    self._session_factory,
+                    scope_key=self._scope_key,
+                    correlation_id=correlation_id,
+                    decision_id=decision_id,
+                    program_sha256=program_sha256,
+                    duration_ms=0,
+                    query_calls=[],
+                    effect_call_ids=[],
+                    error_kind="invalid_program_giveup",
+                    error_message=(
+                        "program remained invalid after three attempts: "
+                        f"{info.error_kind}: {info.message}"
+                    ),
+                    failed_call=None,
+                    rejected_error_kind=info.error_kind,
+                    **details,
+                )
+            )
+            await self._write_tick_ended(
+                correlation_id,
+                tick_started_id,
+                program_status="invalid",
+            )
+            return
+
+        status, made_call = await self._execute_program(
+            prepared,
+            context=context,
+            correlation_id=correlation_id,
+            decision_id=decision_id,
+        )
+        await self._write_tick_ended(
+            correlation_id,
+            tick_started_id,
+            program_status=status,
+        )
+        # 自续拍：排在 tick_ended 之后，本拍的事实全部落库才请求下一拍——与
+        # 「wake 不能领先于事实」同序。上面两条提前 return 的路径（planner_error /
+        # invalid）一个函数都没调用过，天然不续，无需另写分支。
+        if made_call:
+            self._wake_continuation()
+
+    async def _build_context(
+        self,
+        correlation_id: str,
+        now: datetime,
+    ) -> DecisionContext:
         bot_user_id: str | None = None
         if self._bot_user_id_resolver is not None:
             try:
@@ -244,11 +397,9 @@ class AgentLoop:
                     self._scope_key,
                     exc,
                 )
-
-        # Projector 可选注入：未注入时回退为空 context（早期骨架兼容）
         if self._projector is not None:
             try:
-                context = await self._projector.build_context(
+                return await self._projector.build_context(
                     scope_key=self._scope_key,
                     correlation_id=correlation_id,
                     tick_seq=self._tick_seq,
@@ -257,361 +408,196 @@ class AgentLoop:
                 )
             except Exception as exc:
                 logger.exception(
-                    "[loop {}] projection failed, falling back to empty context: {}",
+                    "[loop {}] projection failed; using empty context: {}",
                     self._scope_key,
                     exc,
                 )
-                context = DecisionContext(
-                    scope_key=self._scope_key,
-                    correlation_id=correlation_id,
-                    tick_seq=self._tick_seq,
-                    now=now,
-                    bot_user_id=bot_user_id,
-                )
-        else:
-            context = DecisionContext(
-                scope_key=self._scope_key,
-                correlation_id=correlation_id,
-                tick_seq=self._tick_seq,
-                now=now,
-                bot_user_id=bot_user_id,
-            )
+        return DecisionContext(
+            scope_key=self._scope_key,
+            correlation_id=correlation_id,
+            tick_seq=self._tick_seq,
+            now=now,
+            bot_user_id=bot_user_id,
+        )
 
-        # ─── 决策 + 校验重试（任务与决策契约 §7.1）───
-        # 输出非法不没收本拍：带着 validation_feedback 同 tick 重试至多 2 次
-        # （共 3 次调用），把改错的机会还给模型；每次失败写一条
-        # runtime.llm_invalid_output（attempt 递增，agent_visible——即便本拍
-        # 修好了，下一拍模型也能看到自己犯过错）。三次仍非法才强制 idle。
-        decision: DecisionOutput | None = None
-        validation_error: str | None = None
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
+    async def _decide_program(
+        self,
+        context: DecisionContext,
+    ) -> tuple[
+        DecisionOutput | None,
+        PreflightResult | None,
+        ProgramErrorInfo | None,
+    ]:
+        feedback: ProgramValidationFeedback | None = None
+        last_decision: DecisionOutput | None = None
+        last_error: ProgramErrorInfo | None = None
+        scope = self._scope_key.split(":", 1)[0]
+        for attempt in range(1, 4):
             attempt_context = (
                 context
-                if validation_error is None
-                else replace(
-                    context,
-                    validation_feedback=(
-                        f"attempt {attempt - 1} rejected: {validation_error}"
-                    ),
-                )
+                if feedback is None
+                else replace(context, validation_feedback=feedback)
             )
             try:
-                decision = await self._planner.decide(attempt_context)
+                last_decision = await self._planner.decide(attempt_context)
             except Exception as exc:
                 logger.exception(
                     "[loop {}] planner failed: {}", self._scope_key, exc
                 )
-                await self._write_tick_ended(
-                    correlation_id, tick_started_id, actions_count=0
+                return None, None, None
+            try:
+                prepared = preflight(
+                    last_decision.program,
+                    self._tool_registry,
+                    scope,
                 )
-                return
-            validation_error = _validate_decision(decision)
-            if validation_error is None:
-                break
-            await write_runtime_event(
-                self._session_factory,
-                event_type="runtime.llm_invalid_output",
-                scope_key=self._scope_key,
-                visibility="agent_visible",
-                correlation_id=correlation_id,
-                causation_id=None,
-                payload={
-                    "validation_error": validation_error,
-                    "attempt": attempt,
-                },
+            except ProgramPreflightError as exc:
+                last_error = exc.info
+                reason = f"{exc.info.error_kind}:{exc.info.message}"
+                self._report_invalid_output(reason)
+                await write_runtime_event(
+                    self._session_factory,
+                    event_type="runtime.llm_invalid_output",
+                    scope_key=self._scope_key,
+                    visibility="agent_visible",
+                    correlation_id=context.correlation_id,
+                    causation_id=None,
+                    payload={
+                        "attempt": attempt,
+                        "error_kind": exc.info.error_kind,
+                        "error_message": exc.info.message,
+                        "line": exc.info.line,
+                        "column": exc.info.column,
+                    },
+                )
+                feedback = ProgramValidationFeedback(
+                    attempt=attempt,
+                    error_kind=exc.info.error_kind,
+                    message=exc.info.message,
+                    rejected_program=_bounded_program_source(
+                        last_decision.program
+                    ),
+                    line=exc.info.line,
+                    column=exc.info.column,
+                )
+                continue
+            return last_decision, prepared, None
+        return last_decision, None, last_error
+
+    def _report_invalid_output(self, reason: str) -> None:
+        report = getattr(self._planner, "report_invalid_output", None)
+        if not callable(report):
+            return
+        try:
+            report(reason)
+        except Exception as exc:
+            logger.warning(
+                "[loop {}] invalid-output route report failed: {}",
+                self._scope_key,
+                exc,
             )
-        if validation_error is not None or decision is None:
-            decision = DecisionOutput(
-                actions=[IdleAction(reason="invalid_output_giveup")],
-                reasoning=(
-                    f"auto-forced after {max_attempts} invalid attempts: "
-                    f"{validation_error}"
-                ),
-            )
 
-        # agent.decision_emitted
-        # occurred_at 显式回填为**本拍投影时刻**（tick 开头的 now），不取默认
-        # 的写入时刻（2026-07-24，待办#18）：投影读于 planner.decide() 之前，
-        # 事件却写于 LLM 返回之后，而事件流按 occurred_at 排序（_fetch）。
-        # 决策"发生"于开始思考的时刻，回填后它才与本拍真正看到的内容对齐。
-        # 该事件本身不投影（reasoning 不回显），2026-08-02 删除 unseen 后也
-        # 不再充当任何水位线——回填的现行理由是与同拍其余决策产物
-        # （tool_called / idle_decision / task_*）保持同刻，见事件系统设计.md
-        # §时间戳约束；别因为"看起来没人用了"改回写入时刻。
-        decision_id = await write_agent_event(
-            self._session_factory,
-            event_type="agent.decision_emitted",
-            scope_key=self._scope_key,
-            correlation_id=correlation_id,
-            causation_id=None,
-            payload={
-                "reasoning": decision.reasoning,
-                "actions": [{"type": a.type} for a in decision.actions],
-                "tick_seq": self._tick_seq,
-            },
-            occurred_at=now,
-        )
-
-        await self._apply_actions(
-            decision.actions, correlation_id, decision_id, context
-        )
-
-        await self._write_tick_ended(
-            correlation_id, tick_started_id, actions_count=len(decision.actions)
-        )
-
-    async def _apply_actions(
+    async def _execute_program(
         self,
-        actions: list[Action],
+        prepared: PreflightResult,
+        *,
+        context: DecisionContext,
         correlation_id: str,
         decision_id: str,
-        context: DecisionContext,
-    ) -> None:
-        """Translate every action into agent.* events.
+    ) -> tuple[str, bool]:
+        """执行程序。返回 (program_status, 本拍是否调用过函数)。
 
-        Planner action 只剩 idle / call_tool。task 是 execution_mode="inline"
-        的普通工具：当前 tick 内 await，结果里的 task_ref → task_id 映射可供
-        后续 CallToolAction 复用；系统不按工具名写任何特判。
-
-        权限：loop **不做任何业务权限/scope/role 判定，也不解析触发用户 tier**——
-        只把"谁触发"的 anchor（triggered_by_event_id）与已折好的 bot 角色
-        （context.bot_role）原样写进 ``agent.tool_called.payload`` 交给工具。scope、
-        发起人 tier（工具内**实时**查群角色）、bot 自身角色的判定全部下放到工具内
-        （BaseTool.enforce_access = enforce_scope + enforce_permission +
-        enforce_bot_admin），失败由工具返回语义化 error_kind（见 §2.2、§7.2）。
-
+        第二项是自续拍的唯一判据：``trace.calls`` 对 query / effect、成功 / 失败
+        一视同仁地记录（program_runtime._record_call），所以「调用过」按字面成立
+        ——查询也算，失败也算。失败尤其要算：那一拍的价值正是让她看见错误再判断，
+        而中止余下程序意味着她当拍不可能自己接住。
         """
-        ref_to_task_id: dict[str, str] = {}
-
-        # 同拍动作事件的 occurred_at 一律回填为本拍投影时刻（2026-07-27，补齐
-        # 待办#18 的另一半）：这些事件与 decision_emitted 同属快照时刻拍板的
-        # 决策产物，取默认写入时刻会让 LLM 往返期间到达的消息排到
-        # <tool-call> 行之前——下一拍会把没看过的消息读成"落稿前已看过、
-        # 有意不接"。同拍各事件时间戳因此相同，相对先后由 event_id
-        # （ULID 单调）承载。
-        now = context.now
-
-        # ─── 工具批次（tool_batch）───
-        # 同一 tick 派发的全部 call_tool 属于同一批次：tool_batch_id 直接复用
-        # decision_id（同拍唯一即可，不另造 ID 体系），tool_batch_size = 本
-        # actions 里 call_tool 的个数。共享收口器据 (id, size) 判定"整批全部
-        # terminal"后写 runtime.tool_batch_completed 并批次级唤醒一次。批次
-        # 只是"结果聚合 + 单次唤醒"的效率单位——没有门闩，期间任何唤醒随时开拍。
-        tool_batch_size = sum(
-            1 for a in actions if isinstance(a, CallToolAction)
+        executor = ProgramExecutor(
+            registry=self._tool_registry,
+            session_factory=self._session_factory,
+            scope_key=self._scope_key,
+            correlation_id=correlation_id,
+            decision_id=decision_id,
+            context=context,
+            supervisor=self._supervisor,
+            caption_image=self._caption_image,
         )
-
-        for action in actions:
-            if isinstance(action, IdleAction):
-                await write_agent_event(
+        try:
+            result = await executor.execute(prepared)
+        except ProgramExecutionError as exc:
+            trace = exc.trace or ProgramTrace(
+                decision_id=decision_id,
+                program_sha256=prepared.program_sha256,
+                scope_key=self._scope_key,
+            )
+            details = dict(exc.info.details)
+            if exc.info.line is not None:
+                details["line"] = exc.info.line
+            if exc.info.column is not None:
+                details["column"] = exc.info.column
+            await _shield_write(
+                write_program_failed(
                     self._session_factory,
-                    event_type="agent.idle_decision",
                     scope_key=self._scope_key,
                     correlation_id=correlation_id,
-                    causation_id=decision_id,
-                    payload={"reason": action.reason},
-                    occurred_at=now,
+                    decision_id=decision_id,
+                    program_sha256=prepared.program_sha256,
+                    duration_ms=trace.duration_ms,
+                    query_calls=list(trace.query_calls),
+                    effect_call_ids=list(trace.effect_call_ids),
+                    error_kind=exc.info.error_kind,
+                    error_message=exc.info.message,
+                    failed_call=exc.failed_call_payload(),
+                    **details,
                 )
-                continue
-            if isinstance(action, CallToolAction):
-                await self._dispatch_tool_call(
-                    action,
+            )
+            return "failed", bool(trace.calls)
+        except Exception as exc:  # noqa: BLE001
+            # 兜底:执行器契约之外的宿主异常也必须留下 program terminal,
+            # 否则 decision_emitted 悬空、tick_ended 不写,而收口器只在
+            # 进程首拍跑一次,同进程内永远无人补写这一拍。
+            logger.exception(
+                "[loop {}] program host failure escaped executor", self._scope_key
+            )
+            await _shield_write(
+                write_program_failed(
+                    self._session_factory,
+                    scope_key=self._scope_key,
                     correlation_id=correlation_id,
                     decision_id=decision_id,
-                    context=context,
-                    occurred_at=now,
-                    tool_batch_size=tool_batch_size,
-                    ref_to_task_id=ref_to_task_id,
-                )
-                continue
-            logger.warning(
-                "[loop {}] unknown action type: {}",
-                self._scope_key,
-                type(action).__name__,
-            )
-
-    async def _dispatch_tool_call(  # noqa: PLR0913
-        self,
-        action: CallToolAction,
-        *,
-        correlation_id: str,
-        decision_id: str,
-        context: DecisionContext,
-        occurred_at: datetime,
-        tool_batch_size: int,
-        ref_to_task_id: dict[str, str],
-    ) -> None:
-        """按工具声明的 execution_mode 选择当前 tick 或 ToolWorker 执行。"""
-        tool_call_id = new_event_id()
-        called_event_id = new_event_id()
-        task_id = action.task_id or (
-            ref_to_task_id.get(action.task_ref) if action.task_ref else None
-        )
-        triggered_event_id = action.triggered_by_event_id
-        if triggered_event_id is None and task_id is not None:
-            triggered_event_id = _find_task_anchor(context, task_id)
-
-        called_payload = {
-            "tool_call_id": tool_call_id,
-            "tool_name": action.tool_name,
-            "arguments": action.arguments,
-            "task_id": task_id,
-            "triggered_by_event_id": triggered_event_id,
-            "bot_role": context.bot_role,
-            "tool_batch_id": decision_id,
-            "tool_batch_size": tool_batch_size,
-        }
-        writes = [
-            AgentEventWrite(
-                event_type="agent.tool_called",
-                causation_id=decision_id,
-                payload=called_payload,
-                occurred_at=occurred_at,
-                event_id=called_event_id,
-            )
-        ]
-        if task_id is not None:
-            writes.append(
-                AgentEventWrite(
-                    event_type="agent.task_state_changed",
-                    causation_id=called_event_id,
-                    payload={
-                        "task_id": task_id,
-                        "from_state": "pending",
-                        "to_state": "running",
-                        "reason": None,
-                    },
-                    occurred_at=occurred_at,
+                    program_sha256=prepared.program_sha256,
+                    duration_ms=0,
+                    query_calls=[],
+                    effect_call_ids=[],
+                    error_kind="internal_tool_error",
+                    error_message=f"program host failure: {type(exc).__name__}",
                 )
             )
+            # 执行器契约之外的宿主异常：没有 trace，无从证实调用发生过。这里
+            # 保守地不续拍——真有持续性宿主 bug 时，续拍只会把它变成自转。
+            return "failed", False
 
-        tool = (
-            self._tool_registry.get(action.tool_name)
-            if self._tool_registry is not None
-            else None
-        )
-        if tool is None or get_tool_execution_mode(tool) == "worker":
-            await write_agent_events(
+        await _shield_write(
+            write_program_completed(
                 self._session_factory,
                 scope_key=self._scope_key,
                 correlation_id=correlation_id,
-                events=writes,
-            )
-            self._notify_tool_worker()
-            return
-
-        outcome = await self._run_inline_tool(
-            tool,
-            action.arguments,
-            task_id=task_id,
-            correlation_id=correlation_id,
-            triggered_by_event_id=triggered_event_id,
-            bot_role=context.bot_role,
-            tool_call_event_id=called_event_id,
-        )
-        writes.extend(
-            AgentEventWrite(
-                event_type=generated.event_type,
-                causation_id=called_event_id,
-                payload=generated.payload,
-                occurred_at=generated.occurred_at or occurred_at,
-            )
-            for generated in outcome.emitted_events
-        )
-        writes.append(
-            _terminal_event_write(
-                outcome,
-                tool_call_id=tool_call_id,
-                tool_name=action.tool_name,
-                task_id=task_id,
-                called_event_id=called_event_id,
+                decision_id=decision_id,
+                program_sha256=prepared.program_sha256,
+                duration_ms=result.trace.duration_ms,
+                query_calls=list(result.trace.query_calls),
+                effect_call_ids=list(result.trace.effect_call_ids),
+                result=result.result,
+                has_result=result.has_result,
             )
         )
-        written_ids = await write_agent_events(
-            self._session_factory,
-            scope_key=self._scope_key,
-            correlation_id=correlation_id,
-            events=writes,
-        )
-        _remember_task_ref(outcome, ref_to_task_id)
-        try:
-            await maybe_close_tool_batch(
-                self._session_factory,
-                supervisor=self._supervisor,
-                scope_key=self._scope_key,
-                tool_batch_id=decision_id,
-                tool_batch_size=tool_batch_size,
-                terminal_event_id=written_ids[-1],
-                correlation_id=correlation_id,
-            )
-        except Exception as exc:
-            logger.exception(
-                "[loop {}] inline batch close failed: batch={}: {}",
-                self._scope_key,
-                decision_id,
-                exc,
-            )
-
-    async def _run_inline_tool(  # noqa: PLR0913
-        self,
-        tool: Tool,
-        arguments: dict,
-        *,
-        task_id: str | None,
-        correlation_id: str,
-        triggered_by_event_id: str | None,
-        bot_role: str | None,
-        tool_call_event_id: str,
-    ) -> ToolOutcome:
-        """在当前 tick await 工具；裸 stub 抛错也收敛成失败 outcome。"""
-        try:
-            raw = await tool.run(
-                arguments,
-                scope_key=self._scope_key,
-                task_id=task_id,
-                correlation_id=correlation_id,
-                session_factory=self._session_factory,
-                triggered_by_event_id=triggered_by_event_id,
-                triggered_by_user_tier=None,
-                bot_role=bot_role,
-                tool_call_event_id=tool_call_event_id,
-                wake_scope=getattr(self._supervisor, "wake", None),
-                caption_image=self._caption_image,
-                notify_reply_task=getattr(
-                    self._supervisor, "notify_reply_task", None
-                ),
-            )
-        except Exception as exc:
-            logger.exception(
-                "[loop {}] inline tool {} crashed: {}",
-                self._scope_key,
-                getattr(tool, "name", "?"),
-                exc,
-            )
-            return ToolOutcome.failure(
-                "internal_tool_error",
-                f"{type(exc).__name__}: {exc}",
-            )
-        return coerce_tool_outcome(raw)
-
-    def _notify_tool_worker(self) -> None:
-        if self._supervisor is None:
-            return
-        try:
-            self._supervisor.notify_tool_pending()
-        except Exception as exc:
-            logger.warning(
-                "[loop {}] notify_tool_pending failed: {}",
-                self._scope_key,
-                exc,
-            )
+        return "completed", bool(result.trace.calls)
 
     async def _write_tick_ended(
         self,
         correlation_id: str,
         tick_started_id: str,
-        actions_count: int,
+        program_status: str,
     ) -> None:
         await write_runtime_event(
             self._session_factory,
@@ -622,92 +608,28 @@ class AgentLoop:
             causation_id=tick_started_id,
             payload={
                 "tick_seq": self._tick_seq,
-                "actions_count": actions_count,
+                "program_status": program_status,
             },
         )
 
 
-def _terminal_event_write(
-    outcome: ToolOutcome,
-    *,
-    tool_call_id: str,
-    tool_name: str,
-    task_id: str | None,
-    called_event_id: str,
-) -> AgentEventWrite:
-    if outcome.ok:
-        return AgentEventWrite(
-            event_type="agent.tool_result",
-            causation_id=called_event_id,
-            payload={
-                "tool_call_id": tool_call_id,
-                "tool_name": tool_name,
-                "task_id": task_id,
-                "result": outcome.result,
-            },
-        )
-    payload = {
-        "tool_call_id": tool_call_id,
-        "tool_name": tool_name,
-        "task_id": task_id,
-        "error_kind": outcome.error_kind,
-        "error_message": outcome.error_message,
-    }
-    if isinstance(outcome.extra, dict):
-        payload.update(outcome.extra)
-    return AgentEventWrite(
-        event_type="agent.tool_failed",
-        causation_id=called_event_id,
-        payload=payload,
-    )
+def _bounded_program_source(value: Any) -> str:
+    from qqbot.services.agent_loop.program_ast import MAX_SOURCE_CHARS
+
+    source = value if isinstance(value, str) else str(value)
+    return source[:MAX_SOURCE_CHARS]
 
 
-def _remember_task_ref(
-    outcome: ToolOutcome,
-    ref_to_task_id: dict[str, str],
-) -> None:
-    """从任意 inline 成功结果学习同拍 task_ref，不按工具名特判。"""
-    if not outcome.ok or not isinstance(outcome.result, dict):
-        return
-    task_id = outcome.result.get("task_id")
-    task_ref = outcome.result.get("task_ref")
-    if (
-        isinstance(task_id, str)
-        and task_id
-        and isinstance(task_ref, str)
-        and task_ref
-    ):
-        ref_to_task_id[task_ref] = task_id
+def _program_sha256(source: str) -> str:
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 
-def _find_task_anchor(
-    context: DecisionContext, task_id: str
-) -> str | None:
-    """从 DecisionContext.active_tasks 里取 task 的 triggered_by_event_id。
-
-    敏感工具调用没填 triggered_by_event_id 时，AgentLoop fall back 到
-    "调用挂的 task 是哪条消息触发的" 补全因果链 —— 这与 task(create) 的 anchor
-    语义一致：task 是"我要给小王查天气"，那 task 内任何敏感操作都视作小王的指
-    令。task 不存在或没填 anchor 时返回 None（工具内 enforce_permission 据此把
-    发起人当 GUEST，敏感工具自然失败）。
-    """
-    for t in context.active_tasks:
-        if t.task_id == task_id:
-            return t.triggered_by_event_id
-    return None
-
-
-def _validate_decision(decision: DecisionOutput) -> str | None:
-    """Return a short error string on invalid output, or None if valid.
-
-    Rules (任务与决策契约 §3.1, §3.2.3):
-    - IdleAction never co-exists with another action.
-
-    工具自己的 arguments / scope / permission 校验全部留在工具边界；这里仅
-    校验跨 action 的组合约束。"一 tick 多回复"的旧硬约束已经移除，由
-    planner.md §人物模型 / §决策要求 的软规范引导。
-    """
-    actions = decision.actions
-    if any(isinstance(a, IdleAction) for a in actions) and len(actions) > 1:
-        return "idle_with_other_actions"
-    return None
+async def _shield_write(awaitable: Any) -> None:
+    """Let a terminal transaction finish even if loop shutdown cancels the tick."""
+    task = asyncio.create_task(awaitable)
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    task.result()

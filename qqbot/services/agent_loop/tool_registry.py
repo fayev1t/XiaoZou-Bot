@@ -1,9 +1,11 @@
-"""Tool 协议与 registry。
+"""Tool 协议与唯一的 Program API registry。
 
 一个 Tool 描述了 agent 可调用的一项能力：
   - name                 工具名（agent.tool_called.payload.tool_name 匹配它）
-  - description          面向 LLM 的客观中文能力简介（写入 tool_catalog）
+  - description          面向 LLM 的客观中文能力简介
+  - program_kind         query | effect；漏标默认 effect
   - arguments_schema     JSON Schema (dict)，字段说明使用客观中文，纯文档用途
+  - result_schema        程序可读取的只读结果 ABI
   - required_permission  (可选) 触发用户最低 tier；默认 GUEST
   - required_bot_role    (可选) 要求 bot 自己在群里的最低角色 "admin"/"owner"；默认
                          None（不限）。旧 require_bot_admin=True 等价 "admin"
@@ -14,14 +16,14 @@
 权限/判定语义（**全部在工具内**，详见 BaseTool 与 core/permissions.py）：
 
 - required_permission / required_bot_role / allowed_scopes 是**纯元数据**，不影响
-  catalog 可见性（scope 隔离除外）—— LLM 总能看见自己 scope 内的全部工具，
+  Program API 可见性（scope 隔离除外）—— LLM 能看见自己 scope 内的全部函数，
   根据接口说明与权限元数据生成调用。
 - execute() 第一行 ``if fail := await self.enforce_access(context): return fail``——
   enforce_access = enforce_scope（越 scope → tool_unavailable_in_scope）+
   enforce_permission（发起人 tier，**实时**查其当前群角色）+ enforce_bot_admin（bot
   自身角色，同样**实时**查 napcat、查不到才回退注入的快照）。AgentLoop **不再做任何
   scope/tier/role 判定或闸门**。
-- ToolRegistry.catalog() 把权限元数据透传出来，让 LLM 的 tool 描述自带它们。
+- ToolRegistry.usage_docs() 把签名、双向 schema 与权限元数据渲染成 Program API 参考。
 
 执行约定（任务与决策契约 §5.1, §6, §7.2）—— **全程无 raise 控制流**：
   - 子类实现 execute()：成功 ``return ToolOutcome.success(result)``；可预期失败把
@@ -36,10 +38,12 @@
 
 from __future__ import annotations
 
+import copy
+import json
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import Any, Callable, Literal, Protocol, runtime_checkable
 
 from qqbot.core.logging import get_logger
 from qqbot.core.permissions import (
@@ -54,7 +58,24 @@ logger = get_logger(__name__)
 # 让 bot 角色一次 execute() 内只实时查一次。
 _UNSET = object()
 
-ToolExecutionMode = Literal["worker", "inline"]
+ProgramKind = Literal["query", "effect"]
+ToolFactory = Callable[[], "Tool"]
+
+
+@dataclass(frozen=True)
+class ProgramFunctionSpec:
+    name: str
+    program_kind: ProgramKind
+    signature: str
+    arguments_schema: dict
+    result_schema: dict
+    allowed_scopes: tuple[str, ...] | None
+    max_call_sites: int
+    required_permission: PermissionTier
+    required_bot_role: str | None
+    description: str
+    usage_prompt: str
+    tool_factory: ToolFactory = field(repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -164,10 +185,6 @@ class Tool(Protocol):
     description: str
     arguments_schema: dict
 
-    # `execution_mode` 是可选调度元数据，故不声明为 Protocol 必填属性：
-    # 缺失默认 worker。inline 工具由 AgentLoop 在当前 tick 内 await，
-    # 不进入 ToolWorker；老 stub 可省略。
-
     # `usage_prompt` 不是必填——老工具或单测里的 stub 可以省略。
     # ToolRegistry.usage_docs() 用 getattr 兜底，缺失等同于空串。
     # 命名约定：把客观中文接口文档（能力、参数、权限与作用域、返回和失败）放在
@@ -175,12 +192,12 @@ class Tool(Protocol):
     # 工具文档中加入人格、情境偏好或调用倾向。
 
     # `required_permission` / `required_bot_role` 都不是必填——老工具或单测
-    # stub 可以省略。catalog() 与工具内 enforce_* 用 getattr 兜底，缺失等同于
+    # stub 可以省略。Program API 参考与工具内 enforce_* 用 getattr 兜底，缺失等同于
     # GUEST / None。
 
     # `allowed_scopes` 同样可选：None（默认）= 不限 scope，任何 AgentLoop 都
     # 可见可调；非空序列 = 仅列出的 scope（"system"/"group"/"private"）可见，
-    # catalog(scope) 在别的 scope 里隐藏它、工具内 enforce_scope 拒绝硬调（返回
+    # registry.specs(scope) 在别的 scope 里隐藏它、工具内 enforce_scope 拒绝硬调（返回
     # tool_unavailable_in_scope）。这是契约 §2.2「scope 限定工具（如群管理类
     # 仅 GroupAgentLoop 可见）」的落地点。
 
@@ -206,7 +223,7 @@ class BaseTool:
     / `required_bot_role`（如踢人工具 = ADMIN + "admin"）。
 
     系统级依赖（session_factory 写/查 agent_events、触发身份 triggered_by_event_id
-    / bot_role 等）一律由 AgentLoop/ToolWorker 执行层在 run() context 里统一注入，
+    / bot_role 等）一律由程序执行器在 run() context 里统一注入，
     不走各工具的 __init__ —— build_default_registry 无参构造所有工具，系统也不必
     按名字特判。
 
@@ -216,7 +233,9 @@ class BaseTool:
     """
 
     usage_prompt: str = ""
-    execution_mode: ToolExecutionMode = "worker"
+    program_kind: ProgramKind = "effect"
+    result_schema: dict = {"type": "object", "properties": {}}
+    max_call_sites: int = 2
     required_permission: PermissionTier = PermissionTier.GUEST
     require_bot_admin: bool = False
     # None = 不限 scope（默认，所有 AgentLoop 可见可调）；非空 tuple 限定
@@ -239,7 +258,7 @@ class BaseTool:
           - ``ToolOutcome`` → 原样；``dict`` / 其它标量 → success（兼容轻量返回）；
           - ``execute`` 里若冒出**预料外**第三方异常（httpx / sqlalchemy / napcat
             适配器 raise 的）→ 收敛成 ``internal_tool_error``（并记 exception 日志）。
-        调用方（AgentLoop / ToolWorker / 测试）拿到的永远是一个 ToolOutcome，
+        调用方（ProgramExecutor / 测试）拿到的永远是一个 ToolOutcome，
         不需要 try/except，也不需要认得任何异常类型。
         """
         try:
@@ -346,9 +365,7 @@ class BaseTool:
         role = await self._fetch_live_member_role(group_id, user_id)
         return tier_from_group_role(role)
 
-    async def _fetch_live_member_role(
-        self, group_id: int, user_id: str
-    ) -> str | None:
+    async def _fetch_live_member_role(self, group_id: int, user_id: str) -> str | None:
         """实时查该 user 在群里的**当前**角色（owner/admin/member）。
 
         经 bot_registry 取 Bot、调 ``get_group_member_info(no_cache=True)`` 强制取
@@ -430,7 +447,7 @@ class BaseTool:
         """scope 闸门：``allowed_scopes`` 限定的工具在别的 scope 被（硬）调用时
         **返回** ``tool_unavailable_in_scope`` 失败；否则 None。
 
-        AgentLoop 不做 scope 判定（契约 §2.2 下放工具）——只按 catalog(scope) 隐藏
+        AgentLoop 不做 scope 判定（契约 §2.2 下放工具）——只按 Program API scope 隐藏
         LLM 看不到的工具；真要硬调由这里在工具内拦下。``allowed_scopes=None`` 不限。
         """
         allowed = get_tool_allowed_scopes(self)
@@ -465,19 +482,28 @@ def _group_id_from_scope_key(scope_key: Any) -> int | None:
         return None
 
 
-def get_tool_execution_mode(tool: Any) -> ToolExecutionMode:
-    """读取工具调度模式；老工具/stub 缺失时保持 ``worker``。
-
-    非法显式值直接报错，避免拼错 ``inline`` 后悄悄落到后台执行，破坏同拍
-    依赖语义。ToolRegistry.register() 会在注册期调用本 helper 提前失败。
-    """
-    raw = getattr(tool, "execution_mode", "worker")
-    if raw in ("worker", "inline"):
+def get_tool_program_kind(tool: Any) -> ProgramKind:
+    """读取程序函数分类；漏标默认 effect，非法值在注册期失败。"""
+    raw = getattr(tool, "program_kind", "effect")
+    if raw in ("query", "effect"):
         return raw
-    raise ValueError(
-        "tool.execution_mode must be 'worker' or 'inline'; "
-        f"got {raw!r}"
-    )
+    raise ValueError(f"tool.program_kind must be 'query' or 'effect'; got {raw!r}")
+
+
+def get_tool_result_schema(tool: Any) -> dict:
+    schema = getattr(tool, "result_schema", None)
+    if not isinstance(schema, dict):
+        raise ValueError(
+            f"tool {getattr(tool, 'name', '?')!r} must declare result_schema"
+        )
+    return copy.deepcopy(schema)
+
+
+def get_tool_max_call_sites(tool: Any) -> int:
+    raw = getattr(tool, "max_call_sites", 2)
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        raise ValueError(f"tool.max_call_sites must be a positive integer; got {raw!r}")
+    return raw
 
 
 def get_tool_required_permission(tool: Any) -> PermissionTier:
@@ -540,97 +566,230 @@ def get_tool_allowed_scopes(tool: Any) -> tuple[str, ...] | None:
     return scopes or None
 
 
-def _tool_visible_in_scope(tool: Any, scope: str | None) -> bool:
-    """catalog / usage_docs 的 per-scope 过滤判据。
-
-    scope=None（调用方没传）→ 不过滤，全部可见（向后兼容旧调用）。
-    工具 allowed_scopes=None → 不限，任何 scope 可见。
-    否则仅当 scope 在白名单内才可见。
-    """
-    if scope is None:
-        return True
-    allowed = get_tool_allowed_scopes(tool)
-    if allowed is None:
-        return True
-    return scope in allowed
-
-
 class ToolRegistry:
-    """name → Tool registry；注册期校验调度模式，渲染期按 scope 过滤。"""
+    """The single name → Program function registry.
+
+    A new Tool instance is created for every invocation. Production code
+    registers no-argument classes/factories; instance registration remains a
+    compatibility convenience for test doubles and uses ``copy.copy``.
+    """
 
     def __init__(self) -> None:
-        self._tools: dict[str, Tool] = {}
+        self._specs: dict[str, ProgramFunctionSpec] = {}
 
-    def register(self, tool: Tool) -> None:
-        name = getattr(tool, "name", None)
-        if not name or not isinstance(name, str):
+    def register(self, candidate: Tool | ToolFactory | type[Tool]) -> None:
+        factory, probe = _coerce_tool_factory(candidate)
+        name = getattr(probe, "name", None)
+        if not isinstance(name, str) or not name:
             raise ValueError("tool.name must be a non-empty string")
-        if name in self._tools:
+        if not name.isidentifier() or name.startswith("_"):
+            raise ValueError(f"tool.name must be a public Python identifier: {name!r}")
+        if name in self._specs:
             raise ValueError(f"tool already registered: {name}")
-        get_tool_execution_mode(tool)
-        self._tools[name] = tool
+        arguments_schema = getattr(probe, "arguments_schema", None)
+        if not isinstance(arguments_schema, dict):
+            raise ValueError(f"tool {name!r} must declare arguments_schema")
+        program_kind = get_tool_program_kind(probe)
+        spec = ProgramFunctionSpec(
+            name=name,
+            program_kind=program_kind,
+            signature=_program_signature(
+                name,
+                arguments_schema,
+                program_kind=program_kind,
+            ),
+            arguments_schema=copy.deepcopy(arguments_schema),
+            result_schema=get_tool_result_schema(probe),
+            allowed_scopes=get_tool_allowed_scopes(probe),
+            max_call_sites=get_tool_max_call_sites(probe),
+            required_permission=get_tool_required_permission(probe),
+            required_bot_role=get_tool_required_bot_role(probe),
+            description=str(getattr(probe, "description", "") or ""),
+            usage_prompt=str(getattr(probe, "usage_prompt", "") or "").strip(),
+            tool_factory=factory,
+        )
+        self._specs[name] = spec
 
     def get(self, name: str) -> Tool | None:
-        return self._tools.get(name)
+        spec = self._specs.get(name)
+        return spec.tool_factory() if spec is not None else None
 
-    def names(self) -> list[str]:
-        return sorted(self._tools.keys())
+    def spec(self, name: str) -> ProgramFunctionSpec | None:
+        return self._specs.get(name)
 
-    def catalog(self, scope: str | None = None) -> list[dict]:
-        """渲染给 LLM 的工具清单。LLMPlanner 把这个塞进 prompt。
-
-        权限元数据（required_permission / required_bot_role）随每个条目透出，
-        **不在这里做权限可见性过滤** —— LLM 始终看见自己 scope 内的全部工具，
-        硬调权限失败由**工具内** enforce_access 返回 permission_denied_*，让 LLM
-        能感知 "我没权限" 然后礼貌回复（AgentLoop 不再做权限闸门）。
-
-        但 **scope 可见性确实在这里过滤**（与权限不同维度）：传入当前
-        AgentLoop 的 scope（"system"/"group"/"private"）时，`allowed_scopes`
-        限定的工具只在白名单 scope 出现。这是契约 §2.2「工具集合按 scope 不同」
-        的落地——群专用工具（ban / respond_to_group_join_request …）不出现在
-        SystemAgentLoop 的 catalog 里，LLM 不知道它存在。scope=None（默认）时
-        不过滤，兼容旧调用。
-        """
+    def specs(self, scope: str | None = None) -> list[ProgramFunctionSpec]:
         return [
-            {
-                "name": t.name,
-                "description": t.description,
-                "arguments_schema": t.arguments_schema,
-                "required_permission": get_tool_required_permission(t).name,
-                "require_bot_admin": get_tool_require_bot_admin(t),
-                "required_bot_role": get_tool_required_bot_role(t),
-            }
-            for t in self._tools.values()
-            if _tool_visible_in_scope(t, scope)
+            self._specs[name]
+            for name in sorted(self._specs)
+            if _spec_visible_in_scope(self._specs[name], scope)
         ]
 
-    def usage_docs(self, scope: str | None = None) -> str:
-        """汇总已注册工具的中文接口文档，提示词库在 system prompt 里
-        作为一段注入。空 usage_prompt 的工具静默跳过 —— 不会出现孤儿
-        `## 工具：foo` 标题。
+    def names(self, scope: str | None = None) -> list[str]:
+        return [spec.name for spec in self.specs(scope)]
 
-        与 catalog() 对称地支持 per-scope 过滤：scope 给定时，allowed_scopes
-        限定的工具的用法文档不进别的 scope 的 prompt（群专用工具的用法不泄漏进
-        system loop 的 prompt，反之亦然）。**生产路径已带
-        scope**：LLMPlanner 把本方法作为 tools_usage section 注入，PromptLibrary
-        .render(scope=...) 在每个 tick 按 `context.scope_key` 的 scope 前缀求值
-        （与 catalog(scope) 同一把尺子），所以群/‌system 专用工具的用法不再互相
-        泄漏。scope=None（默认，旧调用 / 单测）= 不过滤，全部可见。
-        """
-        sections: list[str] = []
-        for name in self.names():
-            tool = self._tools[name]
-            if not _tool_visible_in_scope(tool, scope):
-                continue
-            usage = getattr(tool, "usage_prompt", "") or ""
-            usage = str(usage).strip()
-            if not usage:
-                continue
-            sections.append(f"## 工具：{name}\n\n{usage}")
+    def usage_docs(self, scope: str | None = None) -> str:
+        sections = [
+            "程序函数只能用具名参数调用。query 只在本程序内返回值，不写时间线；"
+            "effect 会写一条终态工具记录。程序结束后，除 effect 调用记录外，只有 "
+            "return 的 JSON 会留到下一拍；需要跨拍保留的查询结论必须 return。"
+        ]
+        for spec in self.specs(scope):
+            meta = [spec.program_kind]
+            if spec.required_permission > PermissionTier.GUEST:
+                meta.append(f"用户权限>={spec.required_permission.name}")
+            if spec.required_bot_role:
+                meta.append(f"本账号群角色>={spec.required_bot_role}")
+            if spec.allowed_scopes:
+                meta.append("scope=" + ",".join(spec.allowed_scopes))
+            if spec.program_kind == "effect":
+                meta.append(f"静态调用点<={spec.max_call_sites}")
+                reserved = (
+                    "额外保留具名参数：task_id=None、triggered_by_event_id=None。"
+                )
+            else:
+                reserved = (
+                    "query 不接受系统保留参数 task_id / "
+                    "triggered_by_event_id（schema 自身同名业务字段除外）。"
+                )
+            block = [
+                f"## 程序函数：{spec.name}",
+                "",
+                f"```python\n{spec.signature}\n```",
+                "",
+                f"类型与权限：{'；'.join(meta)}。{reserved}",
+                "",
+                spec.description,
+                "",
+                "参数 schema：",
+                "```json",
+                _schema_json(spec.arguments_schema),
+                "```",
+                "",
+                "返回 schema：",
+                "```json",
+                _schema_json(spec.result_schema),
+                "```",
+            ]
+            if spec.usage_prompt:
+                block.extend(["", spec.usage_prompt])
+            sections.append("\n".join(block).strip())
         return "\n\n".join(sections)
 
     def __len__(self) -> int:
-        return len(self._tools)
+        return len(self._specs)
 
     def __contains__(self, name: object) -> bool:
-        return isinstance(name, str) and name in self._tools
+        return isinstance(name, str) and name in self._specs
+
+
+def _coerce_tool_factory(
+    candidate: Tool | ToolFactory | type[Tool],
+) -> tuple[ToolFactory, Tool]:
+    if isinstance(candidate, type):
+        return candidate, candidate()
+    if callable(candidate) and not isinstance(getattr(candidate, "name", None), str):
+        probe = candidate()
+        if probe is None:
+            raise ValueError("tool factory returned None")
+        return candidate, probe
+    probe = candidate
+
+    def clone() -> Tool:
+        return copy.copy(probe)
+
+    return clone, probe  # type: ignore[return-value]
+
+
+def _spec_visible_in_scope(spec: ProgramFunctionSpec, scope: str | None) -> bool:
+    return scope is None or spec.allowed_scopes is None or scope in spec.allowed_scopes
+
+
+def _schema_json(schema: dict) -> str:
+    return json.dumps(
+        schema,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _program_signature(
+    name: str,
+    schema: dict,
+    *,
+    program_kind: ProgramKind,
+) -> str:
+    properties = _merged_schema_properties(schema)
+    required = _required_schema_fields(schema)
+    parameters: list[str] = []
+    for field_name, field_schema in properties.items():
+        if field_name in required and "default" not in field_schema:
+            parameters.append(field_name)
+        else:
+            parameters.append(
+                f"{field_name}={_python_literal(field_schema.get('default'))}"
+            )
+    if program_kind == "effect":
+        if "task_id" not in properties:
+            parameters.append("task_id=None")
+        if "triggered_by_event_id" not in properties:
+            parameters.append("triggered_by_event_id=None")
+    if not parameters:
+        return f"{name}()"
+    return f"{name}(*, {', '.join(parameters)})"
+
+
+def _merged_schema_properties(schema: dict) -> dict[str, dict]:
+    merged: dict[str, dict] = {}
+    for key, value in (schema.get("properties") or {}).items():
+        if isinstance(key, str) and isinstance(value, dict):
+            merged[key] = value
+    for branch in schema.get("oneOf") or []:
+        if not isinstance(branch, dict):
+            continue
+        for key, value in (branch.get("properties") or {}).items():
+            if isinstance(key, str) and isinstance(value, dict):
+                merged.setdefault(key, value)
+    return merged
+
+
+def _required_schema_fields(schema: dict) -> set[str]:
+    required = {str(item) for item in schema.get("required") or []}
+    branches = [
+        branch for branch in schema.get("oneOf") or [] if isinstance(branch, dict)
+    ]
+    if branches:
+        branch_required = [
+            {str(item) for item in branch.get("required") or []} for branch in branches
+        ]
+        if branch_required:
+            required |= set.intersection(*branch_required)
+    return required
+
+
+def _python_literal(value: Any) -> str:
+    if value is None:
+        return "None"
+    if value is True:
+        return "True"
+    if value is False:
+        return "False"
+    return repr(value)
+
+
+__all__ = [
+    "BaseTool",
+    "ProgramFunctionSpec",
+    "ProgramKind",
+    "Tool",
+    "ToolGeneratedEvent",
+    "ToolOutcome",
+    "ToolRegistry",
+    "coerce_tool_outcome",
+    "get_tool_allowed_scopes",
+    "get_tool_max_call_sites",
+    "get_tool_program_kind",
+    "get_tool_required_bot_role",
+    "get_tool_required_permission",
+    "get_tool_result_schema",
+]

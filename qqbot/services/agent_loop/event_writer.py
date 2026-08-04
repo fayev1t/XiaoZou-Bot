@@ -3,14 +3,26 @@
 External events go through EventIngest (with idempotency_key + ON CONFLICT).
 Internal events (agent.* / runtime.*) come from the loop and its runtime
 workers; no external dedup is needed because they have unique event_ids
-generated locally. ``RuntimeEventPublisher`` adds the generic
-persist-then-notify boundary for asynchronous agent-visible runtime events.
+generated locally.
+
+``announce()`` is the single "写一条事实，然后叫醒这个 scope" boundary
+(2026-08-04)。此前 wait 工具、SilenceWatcher、ReplyExecutor 各写一遍
+persist-then-notify，连"写失败还叫不叫醒"这种真语义都埋在各自的 try 里；
+现在只有这一个函数，差异全部收敛成它的两个参数。``RuntimeEventPublisher``
+退化成一个绑好配置的薄封装，供 ReplyExecutor 这种要长期持有 publisher 的
+生产者使用。
+
+唤醒模式（``WakeMode``）本身**不在这里判定**——它是 LoopSupervisor 的装配
+决定，由 supervisor 用 partial 绑进注入出去的回调。所以本模块看到的 wake
+永远是朴素的 ``(scope_key) -> Awaitable[None]``，工具上下文与测试替身都不必
+认识 WakeMode。
 
 Contract: 开发文档/v2.0/事件系统设计.md §2, §4.2-4.3
 """
 
 from __future__ import annotations
 
+import enum
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -28,6 +40,23 @@ logger = get_logger(__name__)
 SessionFactory = Callable[[], AsyncSession]
 EventAvailableNotifier = Callable[[str], Awaitable[None]]
 RuntimeEventWriter = Callable[..., Awaitable[str]]
+
+
+class WakeMode(enum.Enum):
+    """LoopSupervisor.wake 的三种语义。取值本身只有 supervisor 会解释。
+
+    - ``BATCHED``：进攒批窗口。留给"后面可能还有同一批要攒"的唤醒，主要是
+      外部消息（QQ 上一句话拆三条发是常态）。
+    - ``IMMEDIATE``：立刻开拍。留给已经落库的到点 / 完成类事实——那里没有
+      可攒的东西，等窗口纯属白加延迟。
+    - ``IMMEDIATE_NO_ARM``：立刻开拍，且**不**重排静默计时器。只有静默叫醒
+      自己用：走普通路径会把自己这次叫醒当成"有动静"重新武装，于是一段静默
+      里每隔一个阈值就响一次；"一段静默只响一次"正是靠这条旁路成立的。
+    """
+
+    BATCHED = "batched"
+    IMMEDIATE = "immediate"
+    IMMEDIATE_NO_ARM = "immediate_no_arm"
 
 
 @dataclass(frozen=True)
@@ -228,14 +257,82 @@ async def write_runtime_event(
     )
 
 
-class RuntimeEventPublisher:
-    """Persist runtime events and notify when an agent-visible event is ready.
+async def announce(  # noqa: PLR0913
+    session_factory: SessionFactory,
+    *,
+    event_type: str,
+    scope_key: str,
+    visibility: str,
+    correlation_id: str,
+    causation_id: str | None,
+    payload: dict,
+    wake: EventAvailableNotifier | None = None,
+    wake_on_write_failure: bool = False,
+    occurred_at: datetime | None = None,
+    write_event: RuntimeEventWriter | None = None,
+) -> str | None:
+    """写一条 runtime 事实，落库后叫醒该 scope。**唯一**的 persist-then-notify 入口。
 
-    Producers depend on this event boundary, not on ``LoopSupervisor`` or
-    ``AgentLoop`` directly. Runtime-only coordination events are persisted
-    silently; an agent-visible event is first committed and then announced to
-    the injected scope notifier. Notification is best-effort and never turns a
-    successfully persisted event into a write failure.
+    顺序不可颠倒（事件系统设计.md §2）：wake 不能领先于事实，否则被叫醒那一拍
+    的投影读不到自己被叫醒的理由。
+
+    ``wake`` 是朴素的 ``(scope_key) -> Awaitable[None]``；用哪种 WakeMode 由装配
+    方（LoopSupervisor）提前 partial 绑好，本函数不解释也不需要知道。传 None =
+    只写不叫（runtime_only 的协调事件本来也不该叫）。
+
+    ``wake_on_write_failure`` 是三个生产者之间**唯一的真差异**，因此留成参数：
+
+    - ``False``（reply 完成）：写失败就不叫。完成事实没落库却把她叫起来，她看
+      不到等待结束、只会以为是被别的事叫醒的。
+    - ``True``（``wait`` / 静默到点）：**写失败仍然叫醒**。这两者的本体是一次
+      「到点我会来」的约定，事件只是醒来后的说明文字；宁可少一行说明，不可失约。
+
+    通知本身永远 best-effort：事件已经落库，叫醒失败不能把它反转成一次写失败。
+    返回 event_id；``wake_on_write_failure=True`` 且写确实失败时返回 None。
+    """
+    writer = write_event or write_runtime_event
+    event_id: str | None = None
+    try:
+        event_id = await writer(
+            session_factory,
+            event_type=event_type,
+            scope_key=scope_key,
+            visibility=visibility,
+            correlation_id=correlation_id,
+            causation_id=causation_id,
+            payload=payload,
+            occurred_at=occurred_at,
+        )
+    except Exception as exc:
+        if not wake_on_write_failure:
+            raise
+        logger.warning(
+            "[announce] write {} for {} failed (still waking): {}",
+            event_type,
+            scope_key,
+            exc,
+        )
+
+    if wake is None:
+        return event_id
+    # runtime_only 事实不进模型视野，为它开一拍没有意义。写失败时不走这条：
+    # 那种情况下叫醒是先前那句约定的兑现，与写成了什么无关。
+    if event_id is not None and visibility != "agent_visible":
+        return event_id
+    try:
+        await wake(scope_key)
+    except Exception as exc:  # noqa: BLE001 — event 已落库，通知必须 best-effort
+        logger.warning(
+            "[announce] wake {} after {} failed: {}", scope_key, event_type, exc
+        )
+    return event_id
+
+
+class RuntimeEventPublisher:
+    """``announce()`` 的绑定配置封装，供需要长期持有发布口的生产者使用。
+
+    ReplyExecutor 在构造时拿到它、之后只管 ``publish(...)``，不必每次重复
+    传 wake 回调与失败策略。语义完全等同于直接调 ``announce()``。
     """
 
     def __init__(
@@ -244,10 +341,12 @@ class RuntimeEventPublisher:
         *,
         notify_event_available: EventAvailableNotifier | None = None,
         write_event: RuntimeEventWriter | None = None,
+        wake_on_write_failure: bool = False,
     ) -> None:
         self._session_factory = session_factory
         self._notify_event_available = notify_event_available
-        self._write_event = write_event or write_runtime_event
+        self._write_event = write_event
+        self._wake_on_write_failure = wake_on_write_failure
 
     async def publish(  # noqa: PLR0913
         self,
@@ -259,8 +358,8 @@ class RuntimeEventPublisher:
         causation_id: str | None,
         payload: dict,
         occurred_at: datetime | None = None,
-    ) -> str:
-        event_id = await self._write_event(
+    ) -> str | None:
+        return await announce(
             self._session_factory,
             event_type=event_type,
             scope_key=scope_key,
@@ -268,20 +367,11 @@ class RuntimeEventPublisher:
             correlation_id=correlation_id,
             causation_id=causation_id,
             payload=payload,
+            wake=self._notify_event_available,
+            wake_on_write_failure=self._wake_on_write_failure,
             occurred_at=occurred_at,
+            write_event=self._write_event,
         )
-        if visibility != "agent_visible" or self._notify_event_available is None:
-            return event_id
-        try:
-            await self._notify_event_available(scope_key)
-        except Exception as exc:  # noqa: BLE001 — event 已落库，通知必须 best-effort
-            logger.warning(
-                "[event_publisher] notify after {} persisted for {} failed: {}",
-                event_type,
-                scope_key,
-                exc,
-            )
-        return event_id
 
 
 async def write_agent_event(

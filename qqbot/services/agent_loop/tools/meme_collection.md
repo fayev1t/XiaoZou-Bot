@@ -14,20 +14,20 @@ EventIngest 已落盘的内容寻址文件，不由本工具复制或删除。
 ```json
 {
   "action": "save",
-  "image_hash": "<64 位 sha256>",
+  "image_hash": "<12 位 hash 前缀>",
   "context_note": "可选上下文"
 }
 ```
 
 - `action`：必填，支持 `save`、`delete`、`recaption`。
-- `image_hash`：必填。`save` 接收一个 64 位 sha256 字符串，或最多 10 个
+- `image_hash`：必填。`save` 接收一个 12–64 位 hash 前缀字符串，或最多 10 个
   字符串的数组；`delete` 和 `recaption` 仅接收单个字符串。
 - `context_note`：可选字符串，最多 300 个字符，仅适用于 `save` 和
   `recaption`。该字段作为描述生成的附加上下文，不直接展示给用户。
   `recaption` 省略该字段时复用收录时保存的上下文。
 
-`save` 的 hash 对应时间线中的 `<image hash="..."/>`；`delete` 和
-`recaption` 的 hash 对应 `<saved-memes>` 中的 `<meme hash="...">`。
+`save` 的 hash 对应时间线 `<图 …>` 段里的 12 位前缀；`delete` 和
+`recaption` 的 hash 对应表情包收藏 `<meme>` 行里的 12 位前缀，原样照抄即可。
 hash 会归一化为小写。
 
 ## action 语义

@@ -210,10 +210,12 @@ def _validate_at(data: dict, i: int) -> ToolOutcome | None:
     return None
 
 
-def _is_sha256_hex(value: Any) -> bool:
+def _is_hash_prefix(value: Any) -> bool:
+    """12–64 位十六进制的 sha256 前缀（行文法 §7：信封展示 12 位前缀，
+    完整 64 位仍接受）。"""
     return (
         isinstance(value, str)
-        and len(value) == 64
+        and 12 <= len(value) <= 64
         and all(c in "0123456789abcdef" for c in value.lower())
     )
 
@@ -272,11 +274,12 @@ def validate_messages(
                     f"messages[{index}] has unknown key(s): {', '.join(extras)}",
                 )
             image_hash = item.get("image_hash")
-            if not _is_sha256_hex(image_hash):
+            if not _is_hash_prefix(image_hash):
                 return [], invalid_args(
                     "bad_image_hash",
-                    f"messages[{index}].image_hash must be a 64-char sha256 "
-                    "hex copied from <saved-memes>",
+                    f"messages[{index}].image_hash must be a 12-64 char "
+                    "sha256 hex prefix copied from a <meme> entry in "
+                    "表情包收藏",
                 )
             normalized.append(
                 {"kind": "meme", "image_hash": str(image_hash).lower()}
@@ -304,8 +307,12 @@ async def preflight_memes(
 
     静态校验之外可能变化的外部事实在这里查；失败返回
     ``([], (reason_code, message))``，一条都不发。
+
+    hash 按前缀唯一匹配（行文法 §7）：命中后把气泡的 ``image_hash`` 归一为
+    收藏记录的**完整** 64 位——回执、事件载荷与 from_self 作者索引继续以
+    完整 hash 为准，只有信封展示是 12 位前缀。
     """
-    from qqbot.services.agent_loop.meme_store import get_meme
+    from qqbot.services.agent_loop.meme_store import find_meme_by_prefix
     from qqbot.services.agent_loop.tools._meme_common import media_path_for_hash
 
     loaded: list[dict] = []
@@ -313,13 +320,21 @@ async def preflight_memes(
         if item["kind"] != "meme":
             loaded.append(item)
             continue
-        image_hash = item["image_hash"]
-        meme = await get_meme(session_factory, image_hash)
+        meme, ambiguous = await find_meme_by_prefix(
+            session_factory, item["image_hash"]
+        )
+        if ambiguous:
+            return [], (
+                "ambiguous_hash_prefix",
+                f"messages[{index}] hash prefix matches more than one saved "
+                "meme; copy more characters to disambiguate",
+            )
         if meme is None:
             return [], (
                 "meme_not_saved",
                 f"messages[{index}] meme is no longer saved",
             )
+        image_hash = meme.file_hash
         try:
             data = media_path_for_hash(image_hash).read_bytes()
         except OSError as exc:

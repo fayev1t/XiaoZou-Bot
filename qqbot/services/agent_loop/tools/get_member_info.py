@@ -43,6 +43,7 @@ _USAGE_PROMPT = load_sibling_md(__file__, "get_member_info.md")
 
 class GetMemberInfoTool(BaseTool):
     name = "get_member_info"
+    program_kind = "query"
     allowed_scopes = ("group",)
     # required_permission 用 BaseTool 默认 GUEST（查询无副作用）
     usage_prompt = _USAGE_PROMPT
@@ -60,6 +61,32 @@ class GetMemberInfoTool(BaseTool):
             },
         },
         "required": ["user_id"],
+    }
+    result_schema = {
+        "type": "object",
+        "properties": {
+            "user_id": {"type": ["integer", "string"]},
+            "nickname": {"type": ["string", "null"]},
+            "card": {"type": ["string", "null"]},
+            "role": {"type": ["string", "null"]},
+            "level": {"type": ["string", "integer", "null"]},
+            "title": {"type": ["string", "null"]},
+            "join_time": {"type": ["string", "null"]},
+            "last_sent_time": {"type": ["string", "null"]},
+            "banned_until": {"type": ["string", "null"]},
+        },
+        "required": [
+            "user_id",
+            "nickname",
+            "card",
+            "role",
+            "level",
+            "title",
+            "join_time",
+            "last_sent_time",
+            "banned_until",
+        ],
+        "additionalProperties": False,
     }
 
     async def execute(self, arguments: dict, **context: Any) -> ToolOutcome:

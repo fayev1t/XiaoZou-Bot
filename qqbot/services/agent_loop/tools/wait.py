@@ -9,8 +9,14 @@
 旧时机；2026-08-01 起 reply 只剩这一个参数）；wait 只保留自我提醒 / 延迟
 执行其它动作的用途，description 与 wait.md 不得再引导用它等分条消息。
 
-执行语义（**绝不在工具内 sleep**——ToolWorker 串行跑工具，长眠会卡死整个
-派发通道）：execute() 只登记一个 asyncio 定时器就立刻返回成功（带 wake_at）。
+用途明确化（2026-08-03，静默叫醒落地）：保留下来的"自我提醒"里现在有一个
+具体主顾——她给自己的回想改期。系统的静默叫醒（silence_watcher.py）是保底，
+本工具是她按处境自定的那一次。同批两处收紧：``note`` 由可选改必填（没有理由
+的约定，到点只回显一个空提示），上界由 3600 提到 6000 秒（回想改期的自然
+量级是一两小时）。
+
+执行语义（**绝不在工具内 sleep**——程序函数按顺序串行执行，长眠会卡住本
+scope 当前拍）：execute() 只登记一个 asyncio 定时器就立刻返回成功（带 wake_at）。
 到点后回调先写 ``runtime.wait_elapsed``（agent_visible，携带模型当时留下的
 note），**再**唤醒 scope——保证醒来那拍的投影必能看到这条 hint（与批次收口
 "先写标记再唤醒"同序）。
@@ -22,7 +28,7 @@ Best-effort：定时器只活在进程内存里，**进程重启即丢**。可�
 自己的 wait 记录。
 
 依赖注入：session_factory / wake_scope / tool_call_event_id / correlation_id
-全部来自 ToolWorker 统一注入的 run() context，无构造依赖（黑盒不变）。
+全部来自 ProgramExecutor 统一注入的 run() context，无构造依赖（黑盒不变）。
 """
 
 from __future__ import annotations
@@ -33,7 +39,7 @@ from typing import Any, Awaitable, Callable
 
 from qqbot.core.logging import get_logger
 from qqbot.core.time import china_now
-from qqbot.services.agent_loop.event_writer import write_runtime_event
+from qqbot.services.agent_loop.event_writer import announce
 from qqbot.services.agent_loop.prompts import load_sibling_md
 from qqbot.services.agent_loop.tool_registry import BaseTool, ToolOutcome
 
@@ -42,7 +48,9 @@ logger = get_logger(__name__)
 _USAGE_PROMPT = load_sibling_md(__file__, "wait.md")
 
 MIN_WAIT_SECONDS = 5
-MAX_WAIT_SECONDS = 3600
+# 2026-08-03 由 3600 提到 6000：静默叫醒落地后，本工具同时承担"她自己给回想
+# 改期"的用途（silence_watcher.py），而那个场景的自然上界是一两小时。
+MAX_WAIT_SECONDS = 6000
 
 
 class WaitTool(BaseTool):
@@ -50,11 +58,13 @@ class WaitTool(BaseTool):
     的自我调度动作，不涉及对任何用户/群的操作，无需触发者授权。"""
 
     name = "wait"
+    program_kind = "effect"
+    max_call_sites = 2
     description = (
         "在指定秒数后为当前 scope 安排一次唤醒。计时器触发时写入包含 note 的 "
-        '<system-hint kind="wait_elapsed"> 并启动新 tick。计时器仅保存在进程'
-        "内存中，进程重启后不会恢复；工具调用记录仍保留在时间线中。本工具不"
-        "读取或修改 reply 等待及其 hold_seconds。"
+        "<系统>wait_elapsed 行并启动新 tick。计时器仅保存在进程内存中，进程"
+        "重启后不会恢复；工具调用记录仍保留在时间线中。本工具不读取或修改 "
+        "reply 等待及其 hold_seconds。"
     )
     usage_prompt = _USAGE_PROMPT
     arguments_schema = {
@@ -72,11 +82,23 @@ class WaitTool(BaseTool):
             "note": {
                 "type": "string",
                 "description": (
-                    "可选备忘文本；计时器触发后会原样写入 wait_elapsed 提示。"
+                    "必填备忘文本，说明约这一次唤醒是为了什么；计时器触发后"
+                    "原样写入 wait_elapsed 行。去除首尾空白后最多 500 字。"
                 ),
             },
         },
-        "required": ["seconds"],
+        "required": ["seconds", "note"],
+    }
+    result_schema = {
+        "type": "object",
+        "properties": {
+            "scheduled": {"type": "boolean"},
+            "seconds": {"type": "integer"},
+            "wake_at": {"type": "string"},
+            "note": {"type": "string"},
+        },
+        "required": ["scheduled", "seconds", "wake_at", "note"],
+        "additionalProperties": False,
     }
 
     async def execute(self, arguments: dict, **context: Any) -> Any:
@@ -96,14 +118,22 @@ class WaitTool(BaseTool):
                 ),
                 reason_code="seconds_out_of_range",
             )
+        # note 2026-08-03 由可选改必填：一次没有理由的自我约定，到点回显的
+        # 只是一个空提示，那一拍除了"我醒了"什么都拿不到。
         note_raw = arguments.get("note")
-        if note_raw is not None and not isinstance(note_raw, str):
+        if not isinstance(note_raw, str):
             return ToolOutcome.failure(
                 "invalid_arguments",
                 "note must be a string",
                 reason_code="note_not_str",
             )
-        note = (note_raw or "").strip()[:500] or None
+        note = note_raw.strip()[:500]
+        if not note:
+            return ToolOutcome.failure(
+                "invalid_arguments",
+                "note must not be empty",
+                reason_code="note_empty",
+            )
 
         scope_key = context.get("scope_key")
         session_factory = context.get("session_factory")
@@ -137,9 +167,8 @@ class WaitTool(BaseTool):
             "scheduled": True,
             "seconds": seconds,
             "wake_at": wake_at.isoformat(timespec="seconds"),
+            "note": note,
         }
-        if note:
-            result["note"] = note
         return ToolOutcome.success(result)
 
 
@@ -151,39 +180,34 @@ async def _fire_wait(
     correlation_id: str | None,
     causation_id: str | None,
     seconds: int,
-    note: str | None,
+    note: str,
     wake_at_iso: str,
 ) -> None:
-    """定时器到点回调：先写 runtime.wait_elapsed 再唤醒 scope。
+    """定时器到点回调：写 runtime.wait_elapsed，再唤醒 scope。
 
-    两步各自兜异常：事件写失败仍要唤醒（宁可模型醒来少一条 hint，不可失约）；
-    唤醒失败只记日志（loop 已停 / 进程收尾中）。causation 指向当初的
-    agent.tool_called，correlation 沿用发起 tick 的——与 tool_result 的因果
-    语义一致。
+    2026-08-04 起走统一的 ``announce()``（event_writer.py），不再在这里手写
+    persist-then-notify。``wake_on_write_failure=True`` 保留本工具原有语义：
+    事件写失败仍要唤醒——宁可模型醒来少一条 hint，不可失约。
+
+    causation 指向当初的 agent.tool_called，correlation 沿用发起 tick 的——
+    与 tool_result 的因果语义一致。
     """
-    payload: dict[str, Any] = {"seconds": seconds, "wake_at": wake_at_iso}
-    if note:
-        payload["note"] = note
-    try:
-        await write_runtime_event(
-            session_factory,
-            event_type="runtime.wait_elapsed",
-            scope_key=scope_key,
-            visibility="agent_visible",
-            correlation_id=correlation_id,
-            causation_id=causation_id,
-            payload=payload,
-        )
-    except Exception as exc:
-        logger.warning(
-            "[wait] write wait_elapsed failed (still waking {}): {}",
-            scope_key,
-            exc,
-        )
-    try:
-        await wake_scope(scope_key)
-    except Exception as exc:
-        logger.warning("[wait] wake {} failed: {}", scope_key, exc)
+    payload: dict[str, Any] = {
+        "seconds": seconds,
+        "wake_at": wake_at_iso,
+        "note": note,
+    }
+    await announce(
+        session_factory,
+        event_type="runtime.wait_elapsed",
+        scope_key=scope_key,
+        visibility="agent_visible",
+        correlation_id=correlation_id,
+        causation_id=causation_id,
+        payload=payload,
+        wake=wake_scope,
+        wake_on_write_failure=True,
+    )
 
 
 def _coerce_seconds(raw: Any) -> int | None:

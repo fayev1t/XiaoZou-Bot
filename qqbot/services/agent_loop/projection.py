@@ -6,37 +6,44 @@ Strategy:
 - Fetch the newest agent_visible events for this scope (count-limited window).
 - Fold `agent.task_*` into TaskView snapshots (active_tasks).
 - Pair `agent.tool_called` with `agent.tool_result | agent.tool_failed`
-  into ToolResultView。工具视图只有两态：processing（还没 terminal）/
-  complete（已 terminal；error_kind 区分成败）。视图**只**用于渲染 timeline
-  的 <tool-call> 行——2026-07-02 起不再有独立的 pending_tool_results 区，
+  into terminal-only ToolResultView；历史半截调用防御性折成 interrupted。
+  视图**只**用于渲染 timeline 的 <工具> 行——2026-07-02 起不再有独立的
+  pending_tool_results 区，
   工具结果在 timeline 单点呈现（旧的双重渲染是复读诱饵）。
 - Build the timeline from messages / notices / tool-call pairs / replies /
   agent-visible runtime hints. Task and tool-result events are folded
   upstream and do NOT produce timeline rows of their own.
-- Keep `agent.decision_emitted` out of the timeline. Its reasoning remains
-  persisted for audit, but the free-form note is never fed into a later
-  Planner tick and the event produces no row of any kind.
+- Keep `agent.decision_emitted` source out of the timeline. Only its separate
+  `agent.program_completed | failed` terminal can produce a source-free
+  <程序> row.
 
 Folding and rendering are split into pure staticmethods so unit tests
 can drive them without a DB.
 
-Renderers emit a compact XML envelope. Each renderer:
-- Properly escapes user-supplied content (`<`, `>`, `&`, `"`) so chat
-  messages cannot inject pseudo-tags into the LLM context.
+Renderers emit compact **line-grammar** rows（行文法，重构提案-信封行文法
+草案二版，2026-08-03 起替换 XML 元素/属性渲染）。Each renderer:
+- 只保留 XML 的承重基因：一切动态文本经 ``_esc_text``（`&`/`<`/`>`）转义，
+  一切渲染器结构（行头 ``<m>``/``<t>``/``<工具>``…、行内段 ``<图 …>``…）
+  以 ``<`` 开头——假行头/假段标记在**字符层**不可伪造。第二层防线是换行
+  处理：多行容忍位缩进续行、单行字段位压平，动态内容到不了列 0。
+- 行头短字段（名字/头衔/摘要）另做定界净化（半角→全角，`_head_field` /
+  `_quote_excerpt`），行头文法内不残留用户可控定界字符。
 - Rows carry **no timestamp of their own**（时间流契约 2026-07-26）：
-  信封层用 ``render_timeline_stream`` 把相邻同秒的行嵌进同一个
-  ``<time when="…">`` 时刻节点——时间是最外层结构，模型对每个事件的第一
-  感知是"何时"，然后才是"谁/什么"。``when=`` 为完整 ISO-8601 带时区
-  （跨天事件可分辨）。
+  信封层用 ``render_timeline_stream`` 给相邻同秒的行共享一个 ``<t>``
+  时刻头——时间是最外层结构，模型对每个事件的第一感知是"何时"。时刻头
+  无闭合标签，同秒追加是纯追加；同日只渲染时分秒，跨日带完整日期，
+  时区全局固定 Asia/Shanghai（envelope.md 约定，不逐节点渲染）。
 - Walks OneBot V11 segments structurally (at / reply / image / face /
   poke / record / video / share / forward / ...) instead of dumping the
   raw CQ-code string — see `_render_segments` for the per-type contract.
+  reply 段不再在正文渲染：上提为消息行头的 ``回复#ID(作者)「摘要」`` 标记。
 - Serializes dict/list values as JSON (not Python repr).
 """
 
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Iterable, Sequence
@@ -51,6 +58,7 @@ from qqbot.services.agent_loop.decision import (
     DecisionContext,
     ImageRef,
     ProgressNote,
+    ReflectionView,
     TaskView,
     TimelineItem,
     ToolResultView,
@@ -124,7 +132,7 @@ def _recap_boundary(recap: _EventSnapshot) -> tuple[datetime, str]:
 class Projector:
     # 单条 tool_result 渲染上限：超过即截断尾部并加 <truncated/>。websearch
     # 等工具的 results 列表很容易爆掉 prompt token，必须兜底。
-    # 2026-07-02 从 2048 上调：timeline 的 <tool-call> 行现在是工具结果的
+    # 2026-07-02 从 2048 上调：timeline 的 <工具> 行现在是工具结果的
     # **唯一**出口（pending-tool-results 区已删除——它曾是不截断的全量渲染，
     # 模型看长结果全靠它），不上调会让长 websearch 结果的可见部分缩水。
     MAX_TOOL_RESULT_CHARS = 6144
@@ -254,12 +262,12 @@ class Projector:
         # 窗口折叠结果），绝不让 tick 因补全失败而崩。
         ctx = await self._augment_with_persisted_tasks(ctx, scope_key)
         # 表情包收藏夹注入：查 agent_memes 挂到 ctx.saved_memes，llm_planner
-        # 渲染成 <saved-memes>（meme 工具凭 hash 操作收藏的选图目录）。同样
+        # 渲染成表情包收藏节（meme 工具凭 hash 前缀操作收藏的选图目录）。同样
         # best-effort 降级——查不到收藏夹只影响本 tick 发不了表情包。
         ctx = await self._augment_with_saved_memes(ctx, scope_key)
         # _augment_with_pending_reply 已于 2026-07-24 删除（待办#19）：它每拍
         # 多查一次 reply_task 事件、只为渲染 <pending-reply>，而那一段的每个
-        # Planner 所需字段都被 timeline 上的 <tool-call name="reply"> 行覆盖
+        # Planner 所需字段都被 timeline 上的 <工具>reply 行覆盖
         # （reply_task_id / revision / flush_at / hard_deadline 在 <result> 里，
         # hold_seconds 在 <args> 里）。reply 成功行不再折叠之后主从关系反转，
         # Planner 信封没有独立状态区。ReplyExecutor 也不走这条投影：它从
@@ -296,7 +304,7 @@ class Projector:
         见 meme_store 模块 docstring），查询不带 scope 过滤；scope_key 只用来
         判断"有没有聊天面"——system scope 没有（meme 工具的
         allowed_scopes 也不含它），跳过查询省一次 SQL。查询失败整段降级
-        （本 tick 不渲染 <saved-memes>，模型只是暂时"想不起收藏"），绝不让
+        （本 tick 不渲染表情包收藏节，模型只是暂时"想不起收藏"），绝不让
         tick 崩。
         """
         if not scope_key.startswith(("group:", "private:")):
@@ -376,9 +384,7 @@ class Projector:
                     return role.strip().lower()
         return None
 
-    async def _fetch_latest_recap(
-        self, group_id: int
-    ) -> _EventSnapshot | None:
+    async def _fetch_latest_recap(self, group_id: int) -> _EventSnapshot | None:
         """查该群最新一条 runtime.context_compacted（滚动记忆载体）。
 
         与 bot_role 同理走独立查询、不受取数 LIMIT 约束：积压超过
@@ -442,9 +448,7 @@ class Projector:
         事件（含更老的 recap 代次），recap 自身保底在场——积压超过取数
         LIMIT 时它会缺席取数结果，此时前插（记忆永不消失）。"""
         boundary = _recap_boundary(recap)
-        kept = [
-            ev for ev in events if (ev.occurred_at, ev.event_id) > boundary
-        ]
+        kept = [ev for ev in events if (ev.occurred_at, ev.event_id) > boundary]
         if all(ev.event_id != recap.event_id for ev in kept):
             kept.insert(0, recap)
         return kept
@@ -464,10 +468,12 @@ class Projector:
         pinned_event_id: str | None = None,
     ) -> DecisionContext:
         active_tasks = Projector.fold_tasks(events, scope_key=scope_key)
-        # tool_views 只喂给 timeline 渲染（<tool-call> 行按两态折叠）；不再
+        # tool_views 只喂给 timeline 渲染（<工具> 行按两态折叠）；不再
         # 另出 pending_tool_results 区——同一调用双重渲染曾是复读的直接诱饵。
         tool_views = Projector.fold_tool_results(events)
-        timeline = Projector.build_timeline(events, tool_views=tool_views)
+        timeline = Projector.build_timeline(
+            events, tool_views=tool_views, bot_user_id=bot_user_id
+        )
         # 裁到尾部 max_timeline_items 条 —— fetch 上限给得宽是为了 fold 任务/
         # 工具结果时能看到足够长的事件链，但塞给 LLM 的不必那么多。
         # timeline_anchor（上一拍窗口首行）有效时起点滞回钉住，见
@@ -479,11 +485,7 @@ class Projector:
             pinned: TimelineItem | None = None
             if pinned_event_id is not None:
                 pinned = next(
-                    (
-                        item
-                        for item in timeline
-                        if item.event_id == pinned_event_id
-                    ),
+                    (item for item in timeline if item.event_id == pinned_event_id),
                     None,
                 )
             if pinned is not None:
@@ -499,9 +501,8 @@ class Projector:
         # 如果 caller 没单独传 bot_role（pure project() 测试常常如此），尝试从
         # 事件列表里 fold 一次——支持纯函数测试不需要 DB 也能验证 fold 逻辑。
         if bot_role is None:
-            bot_role = Projector.fold_bot_role(
-                events, bot_user_id=bot_user_id
-            )
+            bot_role = Projector.fold_bot_role(events, bot_user_id=bot_user_id)
+        reflection = Projector.fold_reflection(events)
         # 类型上 DecisionContext.bot_role 是 Literal[...]，但跑期我们对未知值
         # 一律 None（防止 LLM 拿到"垃圾角色字符串"做判断）。
         normalized_role: str | None = None
@@ -516,9 +517,32 @@ class Projector:
             now=now,
             timeline=timeline,
             active_tasks=active_tasks,
+            reflection=reflection,
             bot_user_id=bot_user_id,
             bot_role=normalized_role,  # type: ignore[arg-type]
         )
+
+    @staticmethod
+    def fold_reflection(events: Sequence[_EventSnapshot]) -> ReflectionView | None:
+        """agent.reflection_written → 最新一版自我认识正文（latest-wins）。
+
+        与 recap 同型的"只认最新一条"折叠：``reflect`` 是全量替换语义，历史
+        版本只作为审计留在事件流里，不参与渲染。窗口里一条都没有（从没写过，
+        或最早那版已经滚出取数窗）时返回 None，整节不渲染。
+
+        注意折叠依据是**窗口内**最后一条：反思滚出窗口后会整节消失，而不是
+        永久沿用最后见到的那版。这与 recap 借 apply_recap_window 钉住下界
+        的处理不同——反思是可再生的（下一次静默叫醒会重写一版），钉住它会
+        让一段过期认识无限期地留在她面前。
+        """
+        latest: ReflectionView | None = None
+        for ev in events:
+            if ev.type != "agent.reflection_written":
+                continue
+            text = (ev.payload or {}).get("text")
+            if isinstance(text, str) and text.strip():
+                latest = ReflectionView(at=ev.occurred_at, text=text.strip())
+        return latest
 
     @staticmethod
     def _trim_timeline(
@@ -590,7 +614,11 @@ class Projector:
                 continue
             payload = ev.payload or {}
             self_id = payload.get("self_id")
-            if bot_user_id is not None and self_id is not None and str(self_id) != bot_user_id:
+            if (
+                bot_user_id is not None
+                and self_id is not None
+                and str(self_id) != bot_user_id
+            ):
                 continue
             role = payload.get("role")
             if isinstance(role, str) and role.strip():
@@ -630,9 +658,7 @@ class Projector:
                 tid = ev.payload.get("task_id")
                 if not tid or tid not in tasks:
                     continue
-                tasks[tid]["state"] = ev.payload.get(
-                    "to_state", tasks[tid]["state"]
-                )
+                tasks[tid]["state"] = ev.payload.get("to_state", tasks[tid]["state"])
                 tasks[tid]["last_changed_at"] = ev.occurred_at
                 tasks[tid]["last_change_reason"] = ev.payload.get("reason")
             elif ev.type == "agent.task_progress_noted":
@@ -658,7 +684,7 @@ class Projector:
         for t in tasks.values():
             notes = t["progress_notes"]
             if len(notes) > Projector.MAX_PROGRESS_NOTES_PER_TASK:
-                t["progress_notes"] = notes[-Projector.MAX_PROGRESS_NOTES_PER_TASK:]
+                t["progress_notes"] = notes[-Projector.MAX_PROGRESS_NOTES_PER_TASK :]
 
         return [
             TaskView(**d)
@@ -670,12 +696,11 @@ class Projector:
     def fold_tool_results(
         events: Iterable[_EventSnapshot],
     ) -> list[ToolResultView]:
-        """All tool calls in window, paired with their result/failure if any.
+        """Pair every tool call with its terminal result/failure.
 
-        两态折叠：tool_called → processing；terminal（tool_result /
-        tool_failed）→ complete。成败不再是独立状态，靠 error_kind 区分
-        （None=成功；tool_failed 缺 error_kind 时兜底 "unknown"，保证
-        "failed ⇒ error_kind 非 None" 的渲染判据成立）。
+        程序形态不再暴露 processing。若历史窗口里只有 ``tool_called``，这里
+        防御性折成 ``interrupted`` / ``uncertain``；正常启动时收口器会在投影
+        前补出同义 terminal。
         """
         calls: dict[str, dict] = {}
         for ev in events:
@@ -687,21 +712,23 @@ class Projector:
                     "tool_call_id": tc_id,
                     "tool_name": ev.payload.get("tool_name", ""),
                     "arguments": dict(ev.payload.get("arguments") or {}),
-                    "status": "processing",
                     "result": None,
-                    "error_kind": None,
-                    "error_message": None,
-                    "error_extra": None,
+                    "error_kind": "interrupted",
+                    "error_message": (
+                        "tool call has no terminal; delivery state is uncertain"
+                    ),
+                    "error_extra": {"status": "uncertain"},
                 }
             elif ev.type == "agent.tool_result":
                 tc_id = ev.payload.get("tool_call_id")
                 if tc_id in calls:
-                    calls[tc_id]["status"] = "complete"
                     calls[tc_id]["result"] = ev.payload.get("result")
+                    calls[tc_id]["error_kind"] = None
+                    calls[tc_id]["error_message"] = None
+                    calls[tc_id]["error_extra"] = None
             elif ev.type == "agent.tool_failed":
                 tc_id = ev.payload.get("tool_call_id")
                 if tc_id in calls:
-                    calls[tc_id]["status"] = "complete"
                     calls[tc_id]["error_kind"] = (
                         ev.payload.get("error_kind") or "unknown"
                     )
@@ -714,7 +741,11 @@ class Projector:
         events: Sequence[_EventSnapshot],
         *,
         tool_views: Sequence[ToolResultView],
+        bot_user_id: str | None = None,
     ) -> list[TimelineItem]:
+        """``bot_user_id`` 用于给行内出现的本账号 QQ 号打 ``*`` 后缀（服务端
+        标注，行文法 §4）；None 时不标（纯函数测试 / 启动初期），此时
+        reply 标记的 ``*`` 仍由 from_self 服务端事实兜底。"""
         tool_view_by_id = {tv.tool_call_id: tv for tv in tool_views}
         # 预扫一遍构建 reply 段引用所需的索引（被回复消息摘要 + 用户名映射），
         # 让单条消息渲染时无需再遍历全部事件。
@@ -733,6 +764,21 @@ class Projector:
 
         items: list[TimelineItem] = []
         for ev in events:
+            if ev.type in (
+                "agent.program_completed",
+                "agent.program_failed",
+            ):
+                rendered = Projector._render_program(ev)
+                if rendered is not None:
+                    items.append(
+                        TimelineItem(
+                            event_id=ev.event_id,
+                            occurred_at=ev.occurred_at,
+                            kind="program",
+                            render=rendered,
+                        )
+                    )
+                continue
             if ev.type == "agent.task_state_changed":
                 # 任务收束（done/failed）渲染为 <task-closed> 行——模型对
                 # "自己刚完成/放弃了什么、结论是什么"的事后记忆（2026-07-02，
@@ -756,7 +802,7 @@ class Projector:
                 # rendered alongside the matching tool_called row。
                 # send_messages 也不例外（2026-07-31 实施后调整，维护者拍板）：
                 # 调用行的 <args> + <result> 逐条回执就是发言记录，不派生
-                # 第二行 <my-reply>——同一句话两处渲染是复读诱饵。终态
+                # 第二行发言记录——同一句话两处渲染是复读诱饵。终态
                 # receipts 仍被 _build_author_index 消费（别人引用 bot 时标
                 # from_self）。
                 continue
@@ -764,10 +810,16 @@ class Projector:
                 "agent.reply_task_upserted",
                 "agent.reply_task_cancelled",
             ):
-                # 领域事件消隐：同一次授权已由它的 <tool-call name="reply"> 行
+                # 领域事件消隐：同一次授权已由它的 <工具>reply 行
                 # 完整呈现（<args> 授权原文 + <result> 调度事实），再渲染一遍
                 # 就是双重渲染。它们仍是 reply_task 折叠的数据源，只是不进
                 # timeline。
+                continue
+            if ev.type == "agent.reflection_written":
+                # 领域事件消隐：正文已由 fold_reflection 折成 `## 反思` 一节
+                # 常驻渲染，再在时间线上出现一次就是双重渲染——而且历史版本
+                # 一并铺开，正好构成被 2026-08-01 删掉的"最近 K 版自我笔记"
+                # 形态。写下这件事本身由它的 <工具>reflect 行呈现。
                 continue
             if ev.type == "agent.decision_emitted":
                 # reasoning 是运行日志与审计信息，不是下一拍的输入。自由笔记
@@ -810,6 +862,7 @@ class Projector:
                     excerpt_by_msg_id,
                     name_by_user_id,
                     author_by_msg_id,
+                    bot_user_id=bot_user_id,
                 )
                 items.append(
                     TimelineItem(
@@ -826,7 +879,9 @@ class Projector:
                         event_id=ev.event_id,
                         occurred_at=ev.occurred_at,
                         kind="notice",
-                        render=Projector._render_notice(ev, name_by_user_id),
+                        render=Projector._render_notice(
+                            ev, name_by_user_id, bot_user_id=bot_user_id
+                        ),
                     )
                 )
             elif ev.type.startswith("external.request."):
@@ -840,7 +895,7 @@ class Projector:
                 )
             elif ev.type == "runtime.reply_flushed":
                 # 旧链路历史事件（2026-07-31 起新链路不写 flushed；现役发言
-                # 记录是 send_messages 的 <tool-call> 行）。
+                # 记录是 send_messages 的 <工具> 行）。
                 items.append(
                     TimelineItem(
                         event_id=ev.event_id,
@@ -892,14 +947,25 @@ class Projector:
         excerpt_by_msg_id: dict[str, str],
         name_by_user_id: dict[str, str],
         author_by_msg_id: "dict[str, _AuthorRef] | None" = None,
+        *,
+        bot_user_id: str | None = None,
     ) -> tuple[str, list[ImageRef]]:
+        """消息行：``<m>名字(QQ[/身份][/匿名][/「头衔」]) #消息ID
+        [回复#ID(作者)「摘要」]: 正文``。
+
+        行头（``<m>`` 到第一个 ``: ``）是渲染器领地：名字/头衔经
+        ``_head_field`` 定界净化，reply 段从正文**上提**为行头标记（行文法
+        §5.2——被引内容属于作者、新文本属于发送者，位置上先于正文更不易
+        误认）。正文 = 其余段的混排，时刻由外层 ``<t>`` 头承载。缺哪个字段
+        省哪个（=未知），不造占位。
+        """
         sender = ev.payload.get("sender") or {}
         name = sender.get("card") or sender.get("nickname")
         qq = sender.get("user_id") or ev.user_id
         # 匿名群消息（OneBot 标准字段；napcat 不支持匿名、恒缺失）：发送者
-        # 顶着匿名马甲，sender_name 退到匿名昵称，并标 anonymous="true" 让
-        # LLM 知道这名字不是真实群成员身份。anonymous.flag 是禁言凭证，
-        # 只入库不渲染（凭证不经 LLM，与 request.flag 同策略）。
+        # 顶着匿名马甲，名字退到匿名昵称，括号槽标「匿名」让 LLM 知道这
+        # 名字不是真实群成员身份。anonymous.flag 是禁言凭证，只入库不渲染
+        # （凭证不经 LLM，与 request.flag 同策略）。
         anonymous = ev.payload.get("anonymous")
         if not isinstance(anonymous, dict):
             anonymous = None
@@ -910,83 +976,86 @@ class Projector:
         msg_id = ev.payload.get("onebot_message_id") or ""
 
         segments = ev.payload.get("segments") or []
+        # reply 段上提：正文渲染前摘出，行头标记与正文分开构造。
+        reply_segs = [
+            seg
+            for seg in segments
+            if isinstance(seg, dict) and seg.get("type") == "reply"
+        ]
+        rest_segs = [
+            seg
+            for seg in segments
+            if not (isinstance(seg, dict) and seg.get("type") == "reply")
+        ]
         body, images = _render_segments(
-            segments, excerpt_by_msg_id, name_by_user_id, author_by_msg_id
+            rest_segs,
+            excerpt_by_msg_id,
+            name_by_user_id,
+            author_by_msg_id,
+            bot_user_id=bot_user_id,
         )
         # raw_message 兜底：mapper 上游异常时 segments 可能为空但 raw_message 还在
-        if not body:
+        if not body and not reply_segs:
             raw = ev.payload.get("raw_message", "")
             if raw:
-                body = _esc_text(str(raw))
+                body = _ml_text(str(raw))
 
-        # 行内不带时间（时间流契约，见模块 docstring）：时刻由外层 <time>
-        # 节点承载。sender_name / sender_qq 是两个独立属性——不再拼 "昵称(QQ)"
-        # 复合串，模型无需拆括号即可拿到 @人 / 工具 user_id 参数要用的号。
-        # _qq 后缀显式标注 ID 空间（QQ 号），与 message_id / event_id 一眼
-        # 可分。缺哪个省哪个（=未知），不造 "?" 占位。
-        attrs = []
-        if name:
-            attrs.append(f'sender_name="{_esc_attr(str(name))}"')
+        # 括号槽：QQ 号（本账号打 *）/ 身份（仅 管理员|群主）/ 匿名 / 头衔。
+        # member 是绝大多数，逐条渲染纯耗 token；缺省语义（普通成员或未知）
+        # 由 envelope.md 写死，无歧义。
+        slots: list[str] = []
         if qq is not None:
-            attrs.append(f'sender_qq="{_esc_attr(str(qq))}"')
-        # sender_role：发送者在本群的角色。只在 owner/admin 时渲染——napcat 的
-        # sender.role 三值 owner/admin/member，member 是绝大多数，逐条渲染纯耗
-        # token；缺省语义（普通成员或未知）在 planner.md §输入信封格式规范
-        # 里写死，无歧义。
+            slots.append(_qq_disp(qq, bot_user_id))
         role = str(sender.get("role") or "").strip().lower()
-        if role in ("owner", "admin"):
-            attrs.append(f'sender_role="{role}"')
-        # sender_title：群专属头衔（napcat 消息事件不上报，其他 OneBot 实现
-        # 可能给）。有才渲染，社交语境线索。
+        if role == "owner":
+            slots.append("群主")
+        elif role == "admin":
+            slots.append("管理员")
+        if anonymous:
+            slots.append("匿名")
         title = str(sender.get("title") or "").strip()
         if title:
-            attrs.append(f'sender_title="{_esc_attr(title)}"')
-        if anonymous:
-            attrs.append('anonymous="true"')
-        # message_id= 而非裸 id=：显式标注这是 OneBot 消息 ID 空间（引用 /
-        # recall / set_essence 等工具参数同名直抄），与 task_id / event_id 区分。
+            slots.append(f"「{_head_field(title)}」")
+        name_part = _head_field(str(name)) if name else ""
+        if slots:
+            name_part += f"({'/'.join(slots)})"
+
+        head = f"<m>{name_part}"
+        # #消息ID：与工具参数 message_id / 出站 reply 段 data.id 同域。
         if msg_id:
-            attrs.append(f'message_id="{_esc_attr(str(msg_id))}"')
-        attr_str = f" {' '.join(attrs)}" if attrs else ""
-        return f"<message{attr_str}>{body}</message>", images
+            head += (" " if name_part else "") + f"#{_head_field(str(msg_id))}"
+        for seg in reply_segs:
+            marker = _render_reply_marker(
+                seg,
+                excerpt_by_msg_id,
+                author_by_msg_id,
+                bot_user_id=bot_user_id,
+            )
+            if marker:
+                head += f" {marker}"
+        return (f"{head}: {body}" if body else f"{head}:"), images
 
     @staticmethod
     def _render_notice(
         ev: _EventSnapshot,
         name_by_user_id: dict[str, str] | None = None,
+        *,
+        bot_user_id: str | None = None,
     ) -> str:
-        """渲染 ``<notice/>``。属性语义（缺失一律表示"未知/不适用"）：
+        """通知行：``<通知>kind 模板句``（行文法 §5.4）。
 
-        - ``user_qq``   事件的当事人 QQ（谁入群/被禁言/被戳/名片被改/消息被回应）
-        - ``operator_qq`` 执行动作的人 QQ（禁言的管理员、撤回的人）
-        - ``target_qq`` 动作的承受方 QQ（poke 里被戳的人）
-        - ``user_name`` / ``operator_name`` / ``target_name``：上述 QQ 在近期
-          消息里出现过时反查到的名字——mapper 只存了裸 QQ 号，不给名字的话
-          LLM 得自己翻 timeline 对号入座，经常对错。
-        - kind 专属明细（duration_seconds / old_card / new_card / file_name /
-          file_size_bytes / message_id / likes / honor_type）见
-          ``_notice_detail_attrs``。这些字段 mapper 早已入库，历史上渲染时全部
-          丢弃，是"事件发生了但 LLM 不知道内容"的主要来源。
+        kind 保留 OneBot 原始枚举词作锚，正文是逐 kind 的模板句——比属性堆
+        可读且更省。人物一律 ``名(QQ)`` 形态（近期消息反查名字，查不到只渲
+        染号；本账号打 ``*``）。mapper 已入库的 kind 专属明细（禁言秒数/
+        新旧名片/文件名/表情统计/被撤回消息 ID…）全部进句子，不丢。模板拼
+        不出（未识别 kind / 关键字段全缺）→ 载荷 JSON 兜底，事实不消失。
         """
         names = name_by_user_id or {}
         kind = ev.type.replace("external.notice.", "")
-        attrs = [f'kind="{_esc_attr(kind)}"']
-        sub = ev.payload.get("sub_type")
-        if sub:
-            attrs.append(f'sub_type="{_esc_attr(str(sub))}"')
-        if ev.user_id is not None:
-            attrs.append(f'user_qq="{ev.user_id}"')
-            _append_name_attr(attrs, "user_name", ev.user_id, names)
-        op = ev.payload.get("operator_id")
-        if op:
-            attrs.append(f'operator_qq="{op}"')
-            _append_name_attr(attrs, "operator_name", op, names)
-        target = ev.payload.get("target_id")
-        if target:
-            attrs.append(f'target_qq="{target}"')
-            _append_name_attr(attrs, "target_name", target, names)
-        attrs.extend(_notice_detail_attrs(kind, ev.payload))
-        return f"<notice {' '.join(attrs)}/>"
+        sentence = _notice_sentence(kind, ev, names, bot_user_id=bot_user_id)
+        if sentence is None:
+            sentence = _esc_text(_safe_json(ev.payload or {}))
+        return f"<通知>{_esc_text(kind)} {sentence}"
 
     @staticmethod
     def _render_request(ev: _EventSnapshot) -> str:
@@ -1002,58 +1071,97 @@ class Projector:
         事件 payload 里的 flag，这样 napcat 的 flag 凭证不经过 LLM 复述，避免
         长串照抄出错。comment 是申请人填的验证留言（提醒/决策的主要依据）。
         """
-        kind = ev.type.replace("external.request.", "")
-        attrs = [
-            f'kind="{_esc_attr(kind)}"',
-            f'event_id="{_esc_attr(str(ev.event_id))}"',
-        ]
+        parts = [f"<加群申请>ev:{_head_field(str(ev.event_id))}"]
         if ev.user_id is not None:
-            attrs.append(f'user_qq="{ev.user_id}"')
-        group_id = ev.payload.get("group_id")
-        if group_id:
-            attrs.append(f'group_id="{group_id}"')
+            parts.append(f"申请人({ev.user_id})")
         comment = ev.payload.get("comment")
         if comment:
-            attrs.append(f'comment="{_esc_attr(str(comment))}"')
-        return f"<request {' '.join(attrs)}/>"
+            parts.append(f"留言{_quote_excerpt(str(comment), limit=200)}")
+        # group_id 恒为当前群（scope=group 进目标群 timeline），不渲染——
+        # 行文法 §5.5 裁定的冗余属性删除。
+        return " ".join(parts)
 
     @staticmethod
-    def _render_tool_call(
-        ev: _EventSnapshot, tv: ToolResultView | None
-    ) -> str:
-        """两态渲染：processing → <processing/>；complete → <result>（成功，
-        error_kind 为 None）或 <error>（失败）。status 属性只回答"结束没有"，
-        成败让 LLM 看子元素——与 ToolResultView 的两态语义一致。
+    def _render_tool_call(ev: _EventSnapshot, tv: ToolResultView | None) -> str:
+        """工具行（行文法 §5.3）：
 
-        发起时刻由外层 <time when="…"> 流节点承载（render_timeline_stream，
-        时间流契约 2026-07-26），行内不带 time= 属性。"""
+        ``<工具>名 完成|失败[ kind k=v …]`` + 缩进的
+        ``参数`` / ``结果``（成功，超限加 ``（截断）``）/ ``原因``（失败）行。
+        发起时刻由外层 ``<t>`` 时刻头承载。
+
+        ``send_messages`` 特例（承接 2026-07-31「一次发送只渲染一处」与
+        2026-08-01 人话渲染两裁定）：参数/结果不渲 JSON，改为逐气泡一行
+        ``「内容」→回执``——回执三态 ``→#消息ID``（送达）/``→失败``/``→存疑``，
+        失败行头是 ``失败 <error_kind> [status=…]``。终态回执缺失（旧事件/
+        形状不识）时退回通用 JSON 行，事实不消失。
+        """
         name = str(ev.payload.get("tool_name", "?"))
         args = ev.payload.get("arguments", {})
-        args_json = _safe_json(args)
+        args_line = f"  参数 {_esc_text(_safe_json(args))}"
+        if tv is None:
+            tv = ToolResultView(
+                tool_call_id=str(ev.payload.get("tool_call_id") or ""),
+                tool_name=name,
+                arguments=dict(args) if isinstance(args, dict) else {},
+                result=None,
+                error_kind="interrupted",
+                error_message=(
+                    "tool call has no terminal; delivery state is uncertain"
+                ),
+                error_extra={"status": "uncertain"},
+            )
+
         if name == "send_messages":
-            spoken = _render_spoken_args(args)
-            if spoken is not None:
-                args_json = spoken
-        if tv is None or tv.status == "processing":
-            inner = "<processing/>"
-            status = "processing"
-        elif tv.error_kind is None:
+            special = _render_send_messages_call(args, tv)
+            if special is not None:
+                return special
+
+        if tv.error_kind is None:
             result_json = _safe_json(tv.result)
             truncated = ""
             if len(result_json) > Projector.MAX_TOOL_RESULT_CHARS:
                 result_json = result_json[: Projector.MAX_TOOL_RESULT_CHARS]
-                truncated = "<truncated/>"
-            inner = f"<result>{_esc_text(result_json)}{truncated}</result>"
-            status = "complete"
-        else:
-            inner = _render_error_element(
-                tv.error_kind, tv.error_message, tv.error_extra
+                truncated = "（截断）"
+            return (
+                f"<工具>{_esc_text(name)} 完成\n{args_line}\n"
+                f"  结果 {_esc_text(result_json)}{truncated}"
             )
-            status = "complete"
-        return (
-            f'<tool-call name="{_esc_attr(name)}" status="{status}">'
-            f"<args>{_esc_text(args_json)}</args>{inner}</tool-call>"
+        head_extra = _error_head_suffix(tv.error_kind, tv.error_extra)
+        lines = [f"<工具>{_esc_text(name)} 失败{head_extra}", args_line]
+        if tv.error_message:
+            lines.append(f"  原因 {_ml_text(str(tv.error_message))}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _render_program(ev: _EventSnapshot) -> str | None:
+        """Program terminal → one source-free ``<程序>`` line block."""
+        payload = ev.payload or {}
+        raw_calls = payload.get("query_calls") or []
+        query_calls = [str(name) for name in raw_calls if str(name)]
+        calls_suffix = (
+            f" 查询 {_esc_text(','.join(query_calls))}" if query_calls else ""
         )
+        if ev.type == "agent.program_completed":
+            has_result = bool(payload.get("has_result"))
+            if not query_calls and not has_result:
+                return None
+            head = f"<程序>完成{calls_suffix}"
+            if not has_result:
+                return head
+            result_json = _safe_json(payload.get("result"))
+            truncated = ""
+            if len(result_json) > Projector.MAX_TOOL_RESULT_CHARS:
+                result_json = result_json[: Projector.MAX_TOOL_RESULT_CHARS]
+                truncated = "（截断）"
+            return f"{head}\n  结果 {_esc_text(result_json)}{truncated}"
+
+        error_kind = str(payload.get("error_kind") or "unknown")
+        extra = _extract_program_error_extra(payload)
+        head = f"<程序>失败{calls_suffix}{_error_head_suffix(error_kind, extra)}"
+        message = payload.get("error_message")
+        if isinstance(message, str) and message:
+            return f"{head}\n  原因 {_ml_text(message)}"
+        return head
 
     @staticmethod
     def _render_task_closed(ev: _EventSnapshot, outcome: str) -> str:
@@ -1066,230 +1174,367 @@ class Projector:
         """
         payload = ev.payload or {}
         task_id = str(payload.get("task_id") or "?")
+        outcome_word = "完成" if outcome == "done" else "失败"
         reason = payload.get("reason")
-        body = ""
+        head = f"<任务收束>{_head_field(task_id)} {outcome_word}"
         if isinstance(reason, str) and reason.strip():
-            body = _esc_text(reason.strip()[:600])
-        return (
-            f'<task-closed task_id="{_esc_attr(task_id)}" '
-            f'outcome="{_esc_attr(outcome)}">'
-            f"{body}</task-closed>"
-        )
+            return f"{head}: {_ml_text(reason.strip()[:600])}"
+        return head
 
     @staticmethod
     def _render_context_recap(ev: _EventSnapshot) -> str:
-        """记忆摘要（runtime.context_compacted）：正文 = 覆盖区间 + 条数 +
-        摘要全文 + 从属脚注；不渲染 recall_cues / 内部字段。"""
+        """回忆行（runtime.context_compacted，行文法 §5.5）：头行 = 覆盖区间
+        + 条数，缩进正文 = 摘要全文 + 从属脚注；不渲染 recall_cues /
+        内部字段。钉住/不占窗口预算等投影行为在裁剪层，不在此处。"""
         payload = ev.payload or {}
         summary = str(payload.get("summary") or "").strip()
-        head = "[早前对话回忆]"
-        frm = str(payload.get("covers_from_occurred_at") or "")[:16]
-        until = str(payload.get("covers_until_occurred_at") or "")[:16]
+        head = "<回忆>"
+        # 头字段虽由可信的 compactor 写入，仍按"一切动态文本先净化"的总则
+        # 走单行净化，不让任何 payload 值裸进列 0 行头。
+        frm = _inline_text(str(payload.get("covers_from_occurred_at") or "")[:16])
+        until = _inline_text(str(payload.get("covers_until_occurred_at") or "")[:16])
         if frm and until:
-            head += f" 覆盖 {frm} 至 {until}"
+            head += f"{frm.replace('T', ' ')} 起至 {until.replace('T', ' ')}"
         count = payload.get("dropped_event_count")
         if isinstance(count, int):
-            head += f" 共 {count} 条"
-        body = (
-            f"{head}\n{summary}\n"
-            "（回忆由更早对话压缩而来，仅供参考；与当前对话冲突时，"
-            "以当前对话为准。）"
+            head += f" 共{count}条"
+        footnote = (
+            "（回忆由更早对话压缩而来，仅供参考；与当前对话冲突时，以当前对话为准。）"
         )
-        return (
-            '<system-hint kind="context_compacted">'
-            f"{_esc_text(body)}</system-hint>"
-        )
+        return f"{head}\n  {_ml_text(summary)}\n  {footnote}"
 
     @staticmethod
     def _render_runtime(ev: _EventSnapshot) -> str:
         kind = ev.type.replace("runtime.", "")
         payload = ev.payload or {}
-        if ev.type == "runtime.tool_batch_completed":
-            # 批次收口标记（agent_visible）：让模型显式看到"上一批工具已
-            # 整体到终态"的边界。payload 里的 tool_batch_id 是内部 ULID，
-            # 只服务于共享工具批次收口查重，对模型零信息量——渲染时剔除，
-            # 只留 tool_count / tool_batch_size。
-            payload = {
-                k: v
-                for k, v in payload.items()
-                if k in ("tool_count", "tool_batch_size") and v is not None
-            }
-        payload_json = _safe_json(payload)
-        return (
-            f'<system-hint kind="{_esc_attr(kind)}">'
-            f"{_esc_text(payload_json)}</system-hint>"
-        )
+        if not payload:
+            return f"<系统>{_esc_text(kind)}"
+        return f"<系统>{_esc_text(kind)} {_esc_text(_safe_json(payload))}"
 
     @staticmethod
     def _render_reply_task_completed(ev: _EventSnapshot) -> str:
-        """runtime.reply_task_completed → <reply-task-completed> 空元素行。
+        """runtime.reply_task_completed → ``<等待结束>`` 极简行。
 
         只陈述"这段等待结束了"这一件事；没有授权 ID、unseen、consumed 或
-        expires_at——元素命名刻意不表达任何发言权限（重构提案-删除Replyer.md
-        §5.4）。2026-08-01 起连 <analysis> 子元素也没有了：这一行的信息量
-        本来就该低到只是一次叫醒，该说什么去读它上面的时间线。
+        expires_at——命名刻意不表达任何发言权限（重构提案-删除Replyer.md
+        §5.4）。2026-08-01 起连 analysis 正文也没有了：这一行的信息量本来
+        就该低到只是一次叫醒，该说什么去读它上面的时间线。
         """
         payload = ev.payload or {}
-        attrs = [
-            f'reply_task_id="{_esc_attr(str(payload.get("reply_task_id") or ""))}"',
-            f'revision="{_esc_attr(str(payload.get("revision") or ""))}"',
-        ]
-        return f"<reply-task-completed {' '.join(attrs)}/>"
+        head = f"<等待结束>{_head_field(str(payload.get('reply_task_id') or ''))}"
+        revision = payload.get("revision")
+        if revision:
+            head += f" r{_head_field(str(revision))}"
+        return head
 
     @staticmethod
     def _render_reply_flushed(ev: _EventSnapshot) -> str:
-        """旧链路 runtime.reply_flushed → <my-reply>（仅历史兼容渲染）。
+        """旧链路 runtime.reply_flushed → ``<旧发言>`` 行块（仅历史兼容渲染）。
 
-        现役发言不产生本行：一次发送的记录就是它的
-        `<tool-call name="send_messages">` 行（args + 结果回执）。
+        现役发言不产生本行：一次发送的记录就是它的 ``<工具>send_messages``
+        行（气泡 + 结果回执）。
         """
         payload = ev.payload or {}
-        attrs = []
+        head = "<旧发言>"
         task_id = payload.get("reply_task_id")
         if task_id:
-            attrs.append(f'reply_task_id="{_esc_attr(str(task_id))}"')
-        attrs.append(
-            f'status="{_esc_attr(str(payload.get("status") or "unknown"))}"'
-        )
-        parts = [f"<my-reply {' '.join(attrs)}>"]
+            head += f"{_head_field(str(task_id))} "
+        head += _esc_text(str(payload.get("status") or "unknown"))
+        parts = [head]
         for item in payload.get("sent_messages") or []:
             if not isinstance(item, dict):
                 continue
-            status = _esc_attr(str(item.get("status") or "unknown"))
-            mid = item.get("message_id")
-            mid_attr = (
-                f' message_id="{_esc_attr(str(mid))}"' if mid is not None else ""
-            )
-            if item.get("kind") == "meme":
-                image_hash = _esc_attr(str(item.get("image_hash") or ""))
-                parts.append(
-                    f'<sent-meme status="{status}"{mid_attr} hash="{image_hash}"/>'
-                )
-            else:
-                body, _ = _render_segments(
-                    item.get("content") or [], {}, {}, {}
-                )
-                parts.append(
-                    f'<sent-message status="{status}"{mid_attr}>{body}</sent-message>'
-                )
+            line = _render_bubble_line(item, receipt=item)
+            if line is not None:
+                parts.append(f"  {line}")
         reason = payload.get("reason")
         if reason:
-            parts.append(f"<reason>{_esc_text(str(reason))}</reason>")
-        parts.append("</my-reply>")
-        return "".join(parts)
+            parts.append(f"  原因 {_ml_text(str(reason))}")
+        return "\n".join(parts)
 
 
 # ─── 时间流渲染（时间流契约 2026-07-26）───
 
 
 def render_timeline_stream(items: Sequence[TimelineItem]) -> list[str]:
-    """timeline 行 → ``<time when="…">`` 时刻节点序列（信封层唯一入口）。
+    """timeline 行 → ``<t>`` 时刻头 + 事件行的行序列（信封层唯一入口）。
 
-    时间是最外层结构：``<timeline>`` 的直接子元素是时刻节点，事件行嵌在
-    节点内、自身不带任何时间属性——模型对每个事件的第一感知是"何时"。
-    相邻且同秒（timespec=seconds，与旧行内 time= 同精度）的行共享同一
-    节点：同拍派发的工具批次、同秒消息 burst 自然聚簇为"这一刻发生了
-    这些"。属性名取 when= 而非 at=——at 与 <at>（@人）标签撞词是已知的
-    模型混淆源。
+    时间是最外层结构：事件行从属于其上方最近的 ``<t>`` 时刻头、自身不带
+    任何时间字段——模型对每个事件的第一感知是"何时"。相邻且同秒
+    （timespec=seconds，与旧行内 time= 同精度）的行共享同一时刻头：同拍
+    派发的工具批次、同秒消息 burst 自然聚簇为"这一刻发生了这些"。
+
+    时刻头无闭合标签（行文法 §5.1）：首个时刻头与跨日的时刻头带完整日期
+    ``<t>YYYY-MM-DD HH:MM:SS``，同日内只 ``<t>HH:MM:SS``；时区全局固定
+    Asia/Shanghai（envelope.md 约定），不逐节点渲染。前缀缓存：同秒追加
+    从旧 XML 的"重写 ``</time>`` 闭合位置"变为**纯追加**，无任何重写点。
 
     信封组装层必须经由本函数渲染 timeline（历史上 Planner 与 Replyer 两个
     组装层靠它保证逐字节同构；2026-07-31 删除 Replyer 后只剩 Planner 一个
-    消费者，单一入口的约定保留）。前缀缓存：新秒的行整块追加；同秒
-    追加只重写上一个 ``</time>`` 闭合位置——破坏面与旧的逐行追加持平。
+    消费者，单一入口的约定保留；memory_compactor 同样走这里）。
     """
     parts: list[str] = []
     open_when: str | None = None
+    open_date: str | None = None
     for item in items:
         when = item.occurred_at.isoformat(timespec="seconds")
         if when != open_when:
-            if open_when is not None:
-                parts.append("</time>")
-            parts.append(f'<time when="{_esc_attr(when)}">')
+            date_part, _, time_part = when.partition("T")
+            # 去掉 isoformat 的时区尾巴（+08:00）——全局约定承载。
+            clock = time_part[:8]
+            if date_part != open_date:
+                parts.append(f"<t>{date_part} {clock}")
+                open_date = date_part
+            else:
+                parts.append(f"<t>{clock}")
             open_when = when
         parts.append(item.render)
-    if open_when is not None:
-        parts.append("</time>")
     return parts
 
 
-# ─── XML escape + JSON helpers ───
+# ─── 转义/净化 + JSON helpers（行文法 §3）───
+#
+# 双层防御：第一层字符级——一切动态文本经 _esc_text，渲染器结构一律 "<"
+# 开头，假结构在字符层不成立；第二层行级——多行容忍位缩进续行、单行位
+# 压平，动态内容到不了列 0。行头短字段另做定界净化（_head_field /
+# _quote_excerpt，半角→全角，不可逆的显示层替换——被换字符在显示名里
+# 出现率低、替换后形近，换来行头文法内无用户可控定界字符）。
 
 
 def _esc_text(s: str) -> str:
-    return (
-        s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    )
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _esc_attr(s: str) -> str:
-    return (
-        s.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-    )
+def _ml_text(s: str) -> str:
+    """多行容忍位的正文净化：字符级转义 + 换行归一为「换行+两空格缩进」。
+
+    缩进续行从属于所在行（行文法 §2），保证动态内容永远到不了列 0。"""
+    normalized = s.replace("\r\n", "\n").replace("\r", "\n")
+    return _esc_text(normalized).replace("\n", "\n  ")
+
+
+def _flatten(s: str) -> str:
+    """单行字段位：空白（含换行）压成单空格。"""
+    return " ".join(s.split())
+
+
+def _inline_text(s: str) -> str:
+    """单行动态字段：先压平空白，再做结构字符转义。"""
+    return _esc_text(_flatten(s))
+
+
+_HEAD_FIELD_TABLE = str.maketrans(
+    {"(": "（", ")": "）", "/": "／", ":": "：", "#": "＃", "@": "＠"}
+)
+
+_EXCERPT_TABLE = str.maketrans({":": "：", "「": "『", "」": "』"})
+
+
+def _head_field(s: str) -> str:
+    """行头短字段（名字/头衔/各类 ID）净化：压平 + 转义 + N1 定界净化
+    （半角 ( ) / : # @ → 全角）。行头的解析终点是第一个 ``: ``，净化后
+    头内不残留用户可控的定界字符。"""
+    return _esc_text(_flatten(s)).translate(_HEAD_FIELD_TABLE)
+
+
+def _quote_excerpt(s: str, *, limit: int = 40) -> str:
+    """摘要/留言的 ``「…」`` 引用位：压平 + 截断 + 转义 + N2 净化
+    （半角冒号→全角、内层「」→『』——冒号防提前终止行头，引号防提前
+    闭合引用位）。"""
+    flat = _clip(_flatten(s), limit)
+    return f"「{_esc_text(flat).translate(_EXCERPT_TABLE)}」"
+
+
+def _qq_disp(qq: object, bot_user_id: str | None) -> str:
+    """QQ 号显示：等于本账号时缀 ``*``（服务端标注，行文法 §4）。"""
+    text = str(qq)
+    if bot_user_id and text == str(bot_user_id):
+        return f"{text}*"
+    return text
+
+
+def _person(
+    qq: object,
+    names: dict[str, str],
+    bot_user_id: str | None,
+) -> str:
+    """人物显示：``名(QQ)``（近期消息可反查到名字）或 ``(QQ)``。"""
+    disp = _qq_disp(qq, bot_user_id)
+    name = names.get(str(qq))
+    if name:
+        return f"{_head_field(str(name))}({disp})"
+    return f"({disp})"
+
+
+_HEX_HASH_RE = re.compile(r"[0-9a-fA-F]{12,64}")
+
+
+def _hash12(value: object) -> str:
+    """图片 sha256 的 12 位展示前缀（行文法 §7；工具按前缀唯一匹配）。
+
+    hash 位也是动态文本——失败路径的气泡参数、上游消息段都可能携带任意
+    字符串——必须先验形：合法十六进制才按前缀截取，否则按单行动态字段
+    净化后截断透出，防止伪造值把字面 ``<`` 或换行带进结构位。"""
+    text = str(value)
+    if _HEX_HASH_RE.fullmatch(text):
+        return text[:12]
+    return _inline_text(text[:24])
+
+
+def _human_size(value: object) -> str | None:
+    """字节数 → 人性化大小（512B / 3.4KB / 2.0MB / 1.1GB）。非数字原样
+    透传（上游给什么显示什么），空白 → None。"""
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        n = float(text)
+    except ValueError:
+        return _inline_text(text)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            if unit == "B":
+                return f"{int(n)}B"
+            return f"{n:.1f}{unit}"
+        n /= 1024
+    return None  # pragma: no cover - unreachable
 
 
 def _safe_json(value) -> str:
-    """JSON 序列化，不可序列化的对象用 str() 兜底，避免 prompt 渲染崩溃。"""
+    """JSON 序列化，不可序列化的对象用 str() 兜底，避免 prompt 渲染崩溃。
+
+    json.dumps 产物内的换行必然是 ``\\n`` 字面；str() 兜底可能带真换行，
+    压平后返回，保证本函数产物永远单行（调用方只再做字符级转义）。"""
     try:
         return json.dumps(value, ensure_ascii=False, default=str)
     except Exception:
-        return str(value)
+        return _flatten(str(value))
 
 
-def _render_spoken_args(args: object) -> str | None:
-    """把 `send_messages` 的参数渲染成人话——一个气泡一行。
+# ─── send_messages 气泡渲染（行文法 §5.3 特例）───
+#
+# 动机（2026-08-01 人话渲染裁定的延伸）：自己说过的话在 timeline 上的唯一
+# 形态就是这一行块，若渲染成 JSON 参数文本，同一份 prompt 里「我」的语言
+# 是转义结构体、「他人」的语言是话，模型对"我刚才是什么语气"几乎无感——
+# 线上实测表现为跨拍复用同一句式。行文法把气泡与逐条回执并进同一行块：
+# 记录仍只有这一处，不派生第二行（不与 2026-07-31「一次发送只渲染一处」
+# 裁定冲突）。
 
-    动机（2026-08-01）：2026-07-31 裁定「一次发送只渲染一行」之后，自己说过
-    的话在 timeline 上的唯一形态就是这一行的 <args>，而它是 JSON 参数文本；
-    别人的话则是自然的 <message> 行。同一份 prompt 里「我」的语言是转义后的
-    结构体、「他人」的语言是话，模型对"我刚才是什么语气"几乎无感——线上实测
-    表现为跨拍复用同一句式（连续三条都是「我看你脑子是…」）。这里只改形态，
-    记录仍是同一份、仍只有这一行，不派生第二行（不与那条裁定冲突）。
 
-    渲染层不做参数校验：形状一旦不认识就返回 None，由调用方退回 JSON 原文。
-    空 `messages`（历史事件里有）同样退回 JSON，避免渲染出一个空 <args>。
-    """
-    if not isinstance(args, dict):
+def _spoken_bubble_text(content: object) -> str | None:
+    """chat 气泡段数组 → 单条人话文本。形状不识 → None（调用方整体退回
+    JSON 通用行）。text 段转义后换行缩进；at/回复/表情用行文法记号。"""
+    if not isinstance(content, list) or not content:
         return None
-    messages = args.get("messages")
-    if not isinstance(messages, list) or not messages:
+    parts: list[str] = []
+    for seg in content:
+        if not isinstance(seg, dict):
+            return None
+        data = seg.get("data")
+        data = data if isinstance(data, dict) else {}
+        seg_type = seg.get("type")
+        if seg_type == "text":
+            parts.append(_ml_text(str(data.get("text", ""))))
+        elif seg_type == "at":
+            parts.append(f"@{_esc_text(str(data.get('qq', '')))}")
+        elif seg_type == "reply":
+            parts.append(f"回复#{_esc_text(str(data.get('id', '')))}")
+        elif seg_type == "face":
+            parts.append(f"<表情{_esc_text(str(data.get('id', '')))}>")
+        else:
+            return None
+    return "".join(parts)
+
+
+def _render_bubble_line(bubble: object, receipt: object = None) -> str | None:
+    """单气泡 → ``「内容」[→回执]`` 一行。气泡形状不识 → None。
+
+    回执（可选）三态：sent+message_id → ``→#ID``；failed → ``→失败``；
+    uncertain → ``→存疑``；其余取值原样透出（历史形状兜底）。"""
+    if not isinstance(bubble, dict):
         return None
-    lines: list[str] = []
-    for bubble in messages:
-        if not isinstance(bubble, dict):
+    if bubble.get("kind") == "meme":
+        image_hash = _nonempty_str(bubble.get("image_hash"))
+        body = f"<meme {_hash12(image_hash)}>" if image_hash else "<meme>"
+    else:
+        spoken = _spoken_bubble_text(bubble.get("content"))
+        if spoken is None:
             return None
-        kind = bubble.get("kind")
-        if kind == "meme":
-            image_hash = _nonempty_str(bubble.get("image_hash"))
-            # 短前缀足够让她认出"这张我刚发过"；完整 hash 在 <result> 回执和
-            # <saved-memes> 里，不必在这条人话行上铺 64 个十六进制字符。
-            lines.append(f"[meme {image_hash[:8]}]" if image_hash else "[meme]")
-            continue
-        if kind != "chat":
+        body = f"「{spoken}」"
+    if not isinstance(receipt, dict):
+        return body
+    status = str(receipt.get("status") or "")
+    if status == "sent":
+        mid = receipt.get("message_id")
+        return f"{body}→#{_esc_text(str(mid))}" if mid is not None else (f"{body}→存疑")
+    if status == "failed":
+        return f"{body}→失败"
+    if status == "uncertain":
+        return f"{body}→存疑"
+    if status:
+        return f"{body}→{_esc_text(status)}"
+    return body
+
+
+def _render_send_messages_call(args: object, tv: "ToolResultView | None") -> str | None:
+    """``<工具>send_messages`` 行块：头行 + 逐气泡行（终态带回执）。
+
+    任一环节形状不识（旧事件 / 空 messages / 回执缺失且参数不识）→ None，
+    调用方退回通用 JSON 渲染，事实不消失。"""
+    arg_bubbles: list | None = None
+    if isinstance(args, dict) and isinstance(args.get("messages"), list):
+        arg_bubbles = args["messages"] or None
+
+    if tv is None:
+        if not arg_bubbles:
             return None
-        content = bubble.get("content")
-        if not isinstance(content, list) or not content:
-            return None
-        parts: list[str] = []
-        for seg in content:
-            if not isinstance(seg, dict):
+        lines = ["<工具>send_messages 失败 interrupted status=uncertain"]
+        for bubble in arg_bubbles:
+            line = _render_bubble_line(bubble)
+            if line is None:
                 return None
-            data = seg.get("data")
-            data = data if isinstance(data, dict) else {}
-            seg_type = seg.get("type")
-            if seg_type == "text":
-                parts.append(str(data.get("text", "")))
-            elif seg_type == "at":
-                parts.append(f"@{data.get('qq', '')}")
-            elif seg_type == "reply":
-                parts.append(f"[回复 {data.get('id', '')}]")
-            elif seg_type == "face":
-                parts.append(f"[表情 {data.get('id', '')}]")
-            else:
+            lines.append(f"  {line}")
+        lines.append("  原因 调用没有终态，投递状态存疑")
+        return "\n".join(lines)
+
+    if tv.error_kind is None:
+        result = tv.result if isinstance(tv.result, dict) else {}
+        receipts = result.get("sent_messages")
+        if not isinstance(receipts, list) or not receipts:
+            return None
+        lines = ["<工具>send_messages 完成"]
+        for receipt in receipts:
+            line = _render_bubble_line(receipt, receipt=receipt)
+            if line is None:
                 return None
-        lines.append("".join(parts))
+            lines.append(f"  {line}")
+        return "\n".join(lines)
+
+    extra = tv.error_extra or {}
+    head_extra = {key: value for key, value in extra.items() if key != "sent_messages"}
+    head = "<工具>send_messages 失败" + _error_head_suffix(
+        tv.error_kind,
+        head_extra,
+    )
+    receipts = extra.get("sent_messages")
+    lines = [head]
+    if isinstance(receipts, list) and receipts:
+        for receipt in receipts:
+            line = _render_bubble_line(receipt, receipt=receipt)
+            if line is None:
+                return None
+            lines.append(f"  {line}")
+    elif arg_bubbles:
+        # 发送前即失败（校验/收藏缺失…）：无回执，渲染参数气泡供回看。
+        for bubble in arg_bubbles:
+            line = _render_bubble_line(bubble)
+            if line is None:
+                return None
+            lines.append(f"  {line}")
+    else:
+        return None
+    if tv.error_message:
+        lines.append(f"  原因 {_ml_text(str(tv.error_message))}")
     return "\n".join(lines)
 
 
@@ -1314,6 +1559,28 @@ def _extract_error_extra(payload: dict) -> dict | None:
     return extra or None
 
 
+_PROGRAM_FAILED_ENVELOPE_KEYS = frozenset(
+    {
+        "decision_id",
+        "program_sha256",
+        "duration_ms",
+        "query_calls",
+        "effect_call_ids",
+        "error_kind",
+        "error_message",
+    }
+)
+
+
+def _extract_program_error_extra(payload: dict) -> dict | None:
+    extra = {
+        key: value
+        for key, value in payload.items()
+        if key not in _PROGRAM_FAILED_ENVELOPE_KEYS and value is not None
+    }
+    return extra or None
+
+
 def _is_safe_attr_key(key: object) -> bool:
     """extra 键能否安全当 XML 属性名：仅允许 ASCII 字母/数字/下划线且非数字开头。
 
@@ -1326,25 +1593,21 @@ def _is_safe_attr_key(key: object) -> bool:
     return all(c.isascii() and (c.isalnum() or c == "_") for c in key)
 
 
-def _render_error_element(
+def _error_head_suffix(
     error_kind: str | None,
-    error_message: str | None,
     error_extra: dict | None = None,
 ) -> str:
-    """渲染失败 ``<error>`` 元素：``kind`` + 结构化 ``error_extra`` 全部作为属性
-    透出，人类可读原因作正文。timeline ``<tool-call>`` 的失败渲染唯一入口
-    （曾与 llm_planner 的 pending-tool-results 区共用；该区已删除）。
+    """工具失败行头的尾缀：`` kind k=v …``。人类可读原因由调用方另起
+    ``原因`` 缩进行。timeline ``<工具>`` 行的失败渲染唯一入口。
 
     ``error_extra``（required_tier / actual_tier / required_bot_role /
     actual_bot_role / retcode / action / allowed_scopes ...）是工具失败时
-    ``ToolOutcome.extra`` 平铺进 ``tool_failed.payload`` 的结构化字段。历史上这里
-    只渲染 kind+message，把它们丢了——planner.md §输入信封格式规范 承诺 payload 带
-    required_tier/actual_tier，却从没真到模型。现在逐个作属性透出：标量原样、
-    列表/字典 JSON 编码，让 LLM 精确解释"差在哪一级权限 / napcat 具体报了什么"。
-
-    键做标识符白名单过滤（``_is_safe_attr_key``）防属性注入；单值超 200 字截断，
-    避免个别工具塞大对象撑爆 prompt。"""
-    attrs = [f'kind="{_esc_attr(str(error_kind or ""))}"']
+    ``ToolOutcome.extra`` 平铺进 ``tool_failed.payload`` 的结构化字段，逐个
+    以 ``k=v`` 透出：标量原样、列表/字典 JSON 编码，让 LLM 精确解释"差在
+    哪一级权限 / napcat 具体报了什么"。键做标识符白名单过滤
+    （``_is_safe_attr_key``）防结构注入；单值超 200 字截断，避免个别工具塞
+    大对象撑爆 prompt。"""
+    parts = [_esc_text(str(error_kind or "unknown"))]
     for key, value in (error_extra or {}).items():
         if value is None or not _is_safe_attr_key(key):
             continue
@@ -1356,14 +1619,66 @@ def _render_error_element(
             rendered = _safe_json(value)
         if len(rendered) > 200:
             rendered = rendered[:200] + "…"
-        attrs.append(f'{key}="{_esc_attr(rendered)}"')
-    return (
-        f"<error {' '.join(attrs)}>"
-        f"{_esc_text(str(error_message or ''))}</error>"
-    )
+        parts.append(f"{key}={_esc_text(_flatten(rendered))}")
+    return " " + " ".join(parts)
 
 
 # ─── Segment-level rendering ───
+
+
+def _render_reply_marker(
+    seg: dict,
+    excerpt_by_msg_id: dict[str, str],
+    author_by_msg_id: "dict[str, _AuthorRef] | None",
+    *,
+    bot_user_id: str | None = None,
+) -> str:
+    """reply 段 → 行头 ``回复#ID(作者)「摘要」`` 标记（行文法 §5.2）。
+
+    作者位/摘要位各自可省（=未知）。作者信息量与旧 from_name/from_qq/
+    from_self 三属性一一对应：``名(QQ)`` / ``(QQ)``，本账号缀 ``*``——这是
+    "别人引用我 ≠ 我在发言"的关键；没有它，LLM 看到被引用内容内联在画面
+    里，容易当成对方刚说的话。
+
+    取值优先级（2026-07-22 出窗引用黑洞修复）：ingest 富化的 segment 顶层
+    quoted 键 > 投影窗口内索引。quoted 在消息到达时由适配器已解析的
+    event.reply 固化（EventIngest契约 §6.4），不随窗口滚动丢失；旧库事件
+    无 quoted，仍靠窗口索引兜底。逐字段回退：quoted 缺个别子键时该字段仍
+    可由索引补上。from_self 是服务端事实标注，bot_user_id 缺失时仍有效。
+    """
+    d = seg.get("data") or {}
+    rid = str(d.get("id", "")).strip()
+    if not rid:
+        return "回复#?"
+    marker = f"回复#{_head_field(rid)}"
+    quoted = seg.get("quoted")
+    if not isinstance(quoted, dict):
+        quoted = {}
+    author = (author_by_msg_id or {}).get(rid)
+    from_name = _nonempty_str(quoted.get("sender_name")) or (
+        author.name if author else None
+    )
+    from_qq = _nonempty_str(quoted.get("sender_qq")) or (
+        author.user_id if author else None
+    )
+    from_self = quoted.get("from_self") is True or (author.is_self if author else False)
+    if from_qq:
+        disp = _qq_disp(from_qq, bot_user_id)
+        if from_self and not disp.endswith("*"):
+            disp += "*"
+        author_str = f"{_head_field(from_name)}({disp})" if from_name else f"({disp})"
+        marker += f"({author_str})"
+    elif from_name:
+        star = "(*)" if from_self else ""
+        marker += f"({_head_field(from_name)}{star})"
+    elif from_self:
+        marker += "((*))"
+    excerpt = _gloss_segments(quoted.get("segments") or []) or excerpt_by_msg_id.get(
+        rid
+    )
+    if excerpt:
+        marker += _quote_excerpt(excerpt)
+    return marker
 
 
 def _render_segments(
@@ -1371,57 +1686,47 @@ def _render_segments(
     excerpt_by_msg_id: dict[str, str],
     name_by_user_id: dict[str, str],
     author_by_msg_id: "dict[str, _AuthorRef] | None" = None,
+    *,
+    bot_user_id: str | None = None,
 ) -> tuple[str, list[ImageRef]]:
-    """把 OneBot V11 段数组翻译成内联 XML 标签 + 收集已落盘的 ImageRef。
+    """把 OneBot V11 段数组翻译成行文法内联段 + 收集已落盘的 ImageRef。
 
-    支持的段类型 → 标签（属性一律"缺失=未知/不适用"，语义与 planner.md
-    §输入信封格式规范 的"内联段"一一对应，两处必须同步改）：
-      text     → 原文（XML escape）
-      at       → <at qq="..." name="..."/> 或 <at-all/>（qq= 与出站段
-                 data.qq 同名同值，模型可直抄）
-      reply    → <reply to_message_id="..." from_name="昵称" from_qq="QQ"
-                        from_self="true" excerpt="..."/>
-                 （作者三属性各自独立、缺哪个省哪个：from_name/from_qq 标注
-                  被引用消息的作者，author_by_msg_id 命中时；from_self 仅在
-                  被引消息是 bot 自己发的时渲染 "true"；excerpt= 在 timeline
-                  内可查时）
-      image    → <image kind="photo|sticker" summary="外显文案" hash="sha256"
-                        desc="VLM 客观描述"/>
-                 kind：napcat data.sub_type 0→photo（相册照片/截图类），
-                 1→sticker（表情包），或 data.emoji_id 存在→sticker（商城
-                 表情——napcat 接收侧 mface 一律折成 image 段到达）；判断
-                 不出则不渲染该属性。summary：QQ 的外显文案（如 "[动画表情]"
-                 或商城表情名 "[赞]"），下载失败时它是唯一语义兜底。
-                 desc：2026-07-28 起 Planner/Replyer 是纯文本模型，这段
-                 ingest 期生成的客观转录是它们看到这张图的**唯一**途径。
-                 描述随消息内联渲染（就在它所属的那条 <message> 里），图文
-                 时序天然对齐，不再需要旧多模态路径的 hash label 对位。
-                 未描述成功（未配置 VLM / 调用失败 / 图没下载下来）则不渲染
-                 该属性——模型知道有图但看不到内容，可调 look_at_image 补看。
-      face     → <face face_id="N" name="[微笑]"/>（QQ 原生黄豆表情；name 取
-                 napcat data.raw.faceText，LLM 背不出表情 id 表，没名字
-                 的 face id 是纯噪声）
-      mface    → <mface summary="[赞]"/>（兼容非 napcat 的 OneBot 实现；
-                 napcat 不会在接收侧产生 mface 段，见 image 行）
-      record   → <voice/>            (LLM 当前不消费语音内容)
-      video    → <video/>            (同上)
-      file     → <file name="..." size_bytes="..." file_id="..."/>
-                 （size_bytes 单位字节；file_id 是 napcat 文件凭证，供
-                  未来的文件下载类工具回填）
-      poke     → <poke target_qq="..."/>（napcat 群内拍一拍段不带目标 → <poke/>）
-      dice     → <dice value="N"/>   (掷骰子结果 1-6)
-      rps      → <rps value="N"/>    (猜拳 1=石头 2=剪刀 3=布)
-      markdown → <markdown>正文</markdown>（napcat 给了 data.content，官方
-                 机器人消息常见；超 _MAX_MARKDOWN_CHARS 截断加 "…"）
-      forward  → <forward forward_id="..."/>
+    支持的段类型 → 形态（一律"缺失=未知/不适用"，语义与 envelope.md 的
+    "内联段"一一对应，两处必须同步改。渲染器结构以 ``<`` 开头、动态文本
+    经 ``_esc_text``——字符级不可伪造；@ 是唯一例外，用户手打的 @ 本就是
+    点名，拟态无害）：
+      text     → 原文（转义 + 换行缩进续行）
+      at       → ``@名字(QQ)`` / ``@(QQ)`` / ``@全体``（QQ 与出站段
+                 data.qq 同域，模型可直抄；本账号缀 *）
+      reply    → 正常路径已在 _render_message 上提为行头标记；此处兜底
+                 内联渲染同一标记（防未上提的调用方）
+      image    → ``<图 hash12 照片|贴图: 描述或外显文案>``
+                 hash 为 12 位展示前缀（§7，工具按前缀唯一匹配）。
+                 kind：napcat data.sub_type 0→照片，1→贴图，或
+                 data.emoji_id 存在→贴图（商城表情——napcat 接收侧 mface
+                 一律折成 image 段到达）；判断不出则不渲染。
+                 正文位描述优先取 desc（ingest 期 VLM 客观转录——纯文本
+                 模型看图的**唯一**途径，未描述成功则退 summary 外显文案，
+                 模型知道有图但看不到内容，可调 look_at_image 补看）。
+      face     → ``<表情N 名>``（QQ 原生黄豆表情；名取 napcat
+                 data.raw.faceText，LLM 背不出表情 id 表）
+      mface    → ``<表情 名>``（兼容非 napcat 实现；无 id）
+      record   → ``<语音>``            (LLM 当前不消费语音内容)
+      video    → ``<视频>``            (同上)
+      file     → ``<文件 名 大小 id:X>``（大小人性化；id 是 napcat 文件
+                 凭证，供未来的文件下载类工具回填）
+      poke     → ``<拍一拍 目标(QQ)>``（napcat 群内拍一拍段不带目标 →
+                 ``<拍一拍>``）
+      dice     → ``<骰子 N>``   (掷骰子结果 1-6)
+      rps      → ``<猜拳 石头|剪刀|布>`` (1/2/3 直接渲染词)
+      markdown → ``<markdown>正文``（超 _MAX_MARKDOWN_CHARS 截断加 "…"）
+      forward  → ``<聊天记录 id:X>``
       json     → ark 卡片，走 _render_card_segment 解析出
-                 <card app/summary/title/desc/url>；B 站分享、小程序、公众号
-                 文章等在 napcat 全部以 json 段到达，解析不出任何字段才回退
-                 <card format="json"/>
-      share    → <card format="share" title="..." desc="..." url="..."/>
-                 （OneBot 标准段；napcat 不产生，兼容保留）
-      xml      → <card format="xml"/>（napcat 收发均不产生，兼容保留）
-      其他     → <misc segment_type="..."/>
+                 ``<卡片 app「外显」标题 描述 url>``；解析不出任何字段才
+                 回退 ``<卡片 原始json>``
+      share    → 同卡片渲染（OneBot 标准段；napcat 不产生，兼容保留）
+      xml      → ``<卡片 原始xml>``（napcat 收发均不产生，兼容保留）
+      其他     → ``<未识别段 类型>``
 
     image segment 的富化字段 (file_hash / local_path / mime / downloaded /
     description) 由 event_ingest/media.py 写在 segment 顶层（不在 data 内），见
@@ -1437,77 +1742,34 @@ def _render_segments(
         t = seg.get("type")
         d = seg.get("data") or {}
         if t == "text":
-            parts.append(_esc_text(str(d.get("text", ""))))
+            parts.append(_ml_text(str(d.get("text", ""))))
         elif t == "at":
             qq = str(d.get("qq", "")).strip()
             if qq == "all":
-                parts.append("<at-all/>")
+                parts.append("@全体")
             elif qq:
+                disp = _qq_disp(qq, bot_user_id)
                 nm = name_by_user_id.get(qq)
                 if nm:
-                    parts.append(
-                        f'<at qq="{_esc_attr(qq)}" name="{_esc_attr(nm)}"/>'
-                    )
+                    parts.append(f"@{_head_field(nm)}({disp})")
                 else:
-                    parts.append(f'<at qq="{_esc_attr(qq)}"/>')
+                    parts.append(f"@({disp})")
             else:
-                parts.append("<at/>")
+                parts.append("@(?)")
         elif t == "reply":
-            rid = str(d.get("id", "")).strip()
-            if rid:
-                attrs = [f'to_message_id="{_esc_attr(rid)}"']
-                # from_name/from_qq/from_self：被引用消息的作者，三个独立属性
-                # （不再拼 "昵称(QQ)" / "我(id)" 复合串，模型无需拆括号）。这是
-                # "别人引用我 ≠ 我在发言"的关键——没有它，LLM 看到被引用内容
-                # 内联在画面里，容易当成对方刚说的话。缺哪个省哪个（=未知）。
-                #
-                # 取值优先级（2026-07-22 出窗引用黑洞修复）：ingest 富化的
-                # segment 顶层 quoted 键 > 投影窗口内索引。quoted 在消息到达
-                # 时由适配器已解析的 event.reply 固化（EventIngest契约 §6.4），
-                # 不随窗口滚动丢失；旧库事件无 quoted，仍靠窗口索引兜底。
-                # 逐字段回退：quoted 缺个别子键时该字段仍可由索引补上。
-                quoted = seg.get("quoted")
-                if not isinstance(quoted, dict):
-                    quoted = {}
-                author = (author_by_msg_id or {}).get(rid)
-                from_name = _nonempty_str(quoted.get("sender_name")) or (
-                    author.name if author else None
+            parts.append(
+                _render_reply_marker(
+                    seg,
+                    excerpt_by_msg_id,
+                    author_by_msg_id,
+                    bot_user_id=bot_user_id,
                 )
-                from_qq = _nonempty_str(quoted.get("sender_qq")) or (
-                    author.user_id if author else None
-                )
-                # 仅确证是 bot 自己的消息渲染 from_self="true"；外部作者不
-                # 渲染 false——"是不是我"的常规判据是 from_qq == bot_qq，
-                # from_self 出现即铁证（服务端标注，不依赖 bot_qq）。
-                from_self = quoted.get("from_self") is True or (
-                    author.is_self if author else False
-                )
-                if from_name:
-                    attrs.append(f'from_name="{_esc_attr(from_name)}"')
-                if from_qq:
-                    attrs.append(f'from_qq="{_esc_attr(from_qq)}"')
-                if from_self:
-                    attrs.append('from_self="true"')
-                excerpt = _gloss_segments(
-                    quoted.get("segments") or []
-                ) or excerpt_by_msg_id.get(rid)
-                if excerpt:
-                    attrs.append(f'excerpt="{_esc_attr(excerpt)}"')
-                parts.append(f'<reply {" ".join(attrs)}/>')
-            else:
-                parts.append("<reply/>")
+            )
         elif t == "image":
-            attrs = []
-            kind = _image_kind(d)
-            if kind:
-                attrs.append(f'kind="{kind}"')
-            summary = str(d.get("summary") or "").strip()
-            if summary:
-                attrs.append(f'summary="{_esc_attr(_clip(summary, 50))}"')
-            # 富化字段写在 segment 顶层（media.py 契约），不在 data 内
+            inner = "<图"
             file_hash = seg.get("file_hash")
             if file_hash:
-                attrs.append(f'hash="{_esc_attr(str(file_hash))}"')
+                inner += f" {_hash12(file_hash)}"
                 # ImageRef 的收集条件只看 downloaded + local_path，与有没有
                 # description 无关（描述失败的图仍是"这条消息带了这张图"）。
                 if seg.get("downloaded") and seg.get("local_path"):
@@ -1518,102 +1780,104 @@ def _render_segments(
                             mime=str(seg.get("mime") or "image/png"),
                         )
                     )
-            # desc：ingest 期 VLM 写的客观转录，模型看图的唯一途径。写时已按
-            # MAX_DESCRIPTION_CHARS 截断，这里再兜一道上界防历史脏数据把整个
-            # timeline 冲垮。空白折成单空格——_esc_attr 不处理换行，多行描述直
-            # 接塞进属性会把 XML 信封排版打散。
+            kind = _image_kind(d)
+            if kind:
+                inner += " 照片" if kind == "photo" else " 贴图"
+            # 描述位：desc（VLM 客观转录，写时已按 MAX_DESCRIPTION_CHARS
+            # 截断，这里再兜一道上界防历史脏数据）优先，缺则 summary 外显。
             description = str(seg.get("description") or "").strip()
+            summary = str(d.get("summary") or "").strip()
             if description:
-                flattened = " ".join(description.split())
-                attrs.append(
-                    f'desc="{_esc_attr(_clip(flattened, _MAX_IMAGE_DESC_CHARS))}"'
+                inner += ": " + _esc_text(
+                    _clip(_flatten(description), _MAX_IMAGE_DESC_CHARS)
                 )
-            parts.append(f"<image {' '.join(attrs)}/>" if attrs else "<image/>")
+            elif summary:
+                inner += f": {_esc_text(_clip(_flatten(summary), 50))}"
+            parts.append(inner + ">")
         elif t == "face":
             fid = str(d.get("id", "")).strip()
             fname = _face_name(d)
             if fid and fname:
-                parts.append(
-                    f'<face face_id="{_esc_attr(fid)}" name="{_esc_attr(fname)}"/>'
-                )
+                parts.append(f"<表情{_inline_text(fid)} {_inline_text(fname)}>")
             elif fid:
-                parts.append(f'<face face_id="{_esc_attr(fid)}"/>')
+                parts.append(f"<表情{_inline_text(fid)}>")
             else:
-                parts.append("<face/>")
+                parts.append("<表情>")
         elif t == "mface":
             # 商城/魔法表情（动图贴纸）。summary 是人类可读释义（如 "[羡慕]"），
-            # 是 LLM 唯一能理解的语义；缺失时退化为无属性 <mface/>。
+            # 是 LLM 唯一能理解的语义；缺失时退化为 <表情>。
             summary = str(d.get("summary", "")).strip()
             if summary:
-                parts.append(f'<mface summary="{_esc_attr(summary)}"/>')
+                parts.append(f"<表情 {_esc_text(_flatten(summary))}>")
             else:
-                parts.append("<mface/>")
+                parts.append("<表情>")
         elif t == "record":
-            parts.append("<voice/>")
+            parts.append("<语音>")
         elif t == "video":
-            parts.append("<video/>")
+            parts.append("<视频>")
         elif t == "file":
-            attrs = []
+            inner = "<文件"
             fname = str(d.get("name", "") or d.get("file", "")).strip()
             if fname:
-                attrs.append(f'name="{_esc_attr(fname)}"')
+                inner += f" {_esc_text(_flatten(fname))}"
             fsize = d.get("file_size")
-            if fsize is not None and str(fsize).strip():
-                attrs.append(f'size_bytes="{_esc_attr(str(fsize))}"')
+            if fsize is not None:
+                human = _human_size(fsize)
+                if human:
+                    inner += f" {human}"
             file_id = d.get("file_id")
             if file_id is not None and str(file_id).strip():
-                attrs.append(f'file_id="{_esc_attr(str(file_id))}"')
-            parts.append(f"<file {' '.join(attrs)}/>" if attrs else "<file/>")
+                inner += f" id:{_inline_text(str(file_id).strip())}"
+            parts.append(inner + ">")
         elif t == "poke":
             target = d.get("qq") or d.get("user_id")
             if target:
-                parts.append(f'<poke target_qq="{_esc_attr(str(target))}"/>')
+                disp = _qq_disp(str(target), bot_user_id)
+                parts.append(f"<拍一拍 目标({disp})>")
             else:
-                parts.append("<poke/>")
+                parts.append("<拍一拍>")
         elif t == "dice":
             val = str(d.get("result", "") or d.get("value", "")).strip()
-            parts.append(f'<dice value="{_esc_attr(val)}"/>' if val else "<dice/>")
+            parts.append(f"<骰子 {_inline_text(val)}>" if val else "<骰子>")
         elif t == "rps":
-            # 猜拳：napcat result 1=石头 2=剪刀 3=布
+            # 猜拳：napcat result 1=石头 2=剪刀 3=布，直接渲染词。
             val = str(d.get("result", "") or d.get("value", "")).strip()
-            parts.append(f'<rps value="{_esc_attr(val)}"/>' if val else "<rps/>")
+            word = {"1": "石头", "2": "剪刀", "3": "布"}.get(val, val)
+            parts.append(f"<猜拳 {_inline_text(word)}>" if word else "<猜拳>")
         elif t == "markdown":
             content = str(d.get("content") or "").strip()
             if content:
                 parts.append(
-                    f"<markdown>{_esc_text(_clip(content, _MAX_MARKDOWN_CHARS))}"
-                    "</markdown>"
+                    f"<markdown>{_ml_text(_clip(content, _MAX_MARKDOWN_CHARS))}"
                 )
             else:
-                parts.append("<markdown/>")
+                parts.append("<markdown>")
         elif t == "forward":
             fid = str(d.get("id", "")).strip()
             if fid:
-                parts.append(f'<forward forward_id="{_esc_attr(fid)}"/>')
+                parts.append(f"<聊天记录 id:{_inline_text(fid)}>")
             else:
-                parts.append("<forward/>")
+                parts.append("<聊天记录>")
         elif t == "json":
             parts.append(_render_card_segment(d))
         elif t == "share":
-            # OneBot 标准 share 段（napcat 不产生，兼容其他实现）。字段名
-            # 与 ark 卡片对齐：content → desc。
-            attrs = ['format="share"']
-            title = str(d.get("title") or "").strip()
+            # OneBot 标准 share 段（napcat 不产生，兼容其他实现）。字段
+            # 语义与 ark 卡片对齐：content → desc。
+            card = {}
+            title = _nonempty_str(d.get("title"))
             if title:
-                attrs.append(f'title="{_esc_attr(_clip(title, 100))}"')
-            desc = str(d.get("content") or "").strip()
+                card["title"] = title
+            desc = _nonempty_str(d.get("content"))
             if desc:
-                attrs.append(f'desc="{_esc_attr(_clip(desc, 200))}"')
-            url = str(d.get("url") or "").strip()
+                card["desc"] = desc
+            url = _nonempty_str(d.get("url"))
             if url:
-                attrs.append(f'url="{_esc_attr(_clip(url, 300))}"')
-            parts.append(f"<card {' '.join(attrs)}/>")
+                card["url"] = url
+            parts.append(_card_line(card, fallback="原始share"))
         elif t == "xml":
-            parts.append('<card format="xml"/>')
+            parts.append("<卡片 原始xml>")
         else:
-            parts.append(
-                f'<misc segment_type="{_esc_attr(str(t or "unknown"))}"/>'
-            )
+            parts.append(f"<未识别段 {_inline_text(str(t or 'unknown'))}>")
     return "".join(parts), images
 
 
@@ -1726,19 +1990,14 @@ def _parse_ark_card(d: dict) -> dict[str, str] | None:
     return card or None
 
 
-def _render_card_segment(d: dict) -> str:
-    """json（ark）段 → ``<card/>``。napcat 接收侧一切富卡片——链接分享、
-    B 站/小程序、公众号文章、位置、群推荐——都以 json 段到达，历史上渲染
-    成 `<card format="json"/>` 等于把"别人分享了什么"整个丢掉。
+def _card_line(card: dict[str, str], *, fallback: str) -> str:
+    """卡片语义字段 → ``<卡片 app「外显」标题 描述 url>``。
 
-    字段语义见 :func:`_parse_ark_card`（全部可缺省，缺失=该字段解析不到）。
-    解析不出任何字段 → 回退 `<card format="json"/>`（format= 表示"未解析的
-    原始段格式"；改名自 type=——与 notice/hint 的 kind= 用词不统一且语义含糊）。
+    字段有则出、按固定顺序空格连排；外显文案（QQ 自己的单行 summary）
+    包 ``「」`` 与自由文本字段区分。全空 → ``<卡片 <fallback>>``（表示
+    "未解析的原始段格式"，内容未知）。
     """
-    card = _parse_ark_card(d)
-    if not card:
-        return '<card format="json"/>'
-    attrs: list[str] = []
+    parts: list[str] = []
     for key, limit in (
         ("app", 60),
         ("summary", 100),
@@ -1747,9 +2006,28 @@ def _render_card_segment(d: dict) -> str:
         ("url", 300),
     ):
         value = card.get(key)
-        if value:
-            attrs.append(f'{key}="{_esc_attr(_clip(value, limit))}"')
-    return f"<card {' '.join(attrs)}/>"
+        if not value:
+            continue
+        clipped = _clip(_flatten(value), limit)
+        if key == "summary":
+            parts.append(_quote_excerpt(value, limit=limit))
+        else:
+            parts.append(_esc_text(clipped))
+    if not parts:
+        return f"<卡片 {fallback}>"
+    return f"<卡片 {' '.join(parts)}>"
+
+
+def _render_card_segment(d: dict) -> str:
+    """json（ark）段 → ``<卡片 …>``。napcat 接收侧一切富卡片——链接分享、
+    B 站/小程序、公众号文章、位置、群推荐——都以 json 段到达，历史上渲染
+    成裸类型占位等于把"别人分享了什么"整个丢掉。
+
+    字段语义见 :func:`_parse_ark_card`（全部可缺省，缺失=该字段解析不到）。
+    解析不出任何字段 → 回退 ``<卡片 原始json>``。
+    """
+    card = _parse_ark_card(d)
+    return _card_line(card or {}, fallback="原始json")
 
 
 def _nonempty_str(value) -> str | None:
@@ -1760,85 +2038,151 @@ def _nonempty_str(value) -> str | None:
     return None
 
 
-def _append_name_attr(
-    attrs: list[str], attr_name: str, user_id, names: dict[str, str]
-) -> None:
-    """user/operator/target 的 QQ 号能在近期消息里反查到名字时，紧跟着追加
-    `<attr_name>="名字"` 属性。查不到就什么都不加（缺失=未知）。"""
-    name = names.get(str(user_id))
-    if name:
-        attrs.append(f'{attr_name}="{_esc_attr(name)}"')
+def _notice_sentence(
+    kind: str,
+    ev: _EventSnapshot,
+    names: dict[str, str],
+    *,
+    bot_user_id: str | None = None,
+) -> str | None:
+    """按 notice kind 生成模板句（行文法 §5.4）。
 
-
-def _notice_detail_attrs(kind: str, payload: dict) -> list[str]:
-    """按 notice kind 透出 mapper 已存储的明细字段（此前渲染时全部丢弃）。
-
-    每个属性一种含义，不复用模糊名：
-    - group_ban    → duration_seconds=禁言秒数（仅 sub_type=ban 且 >0 时给；
-                     lift_ban / 解禁没有时长概念，不渲染）
-    - group_card   → old_card= / new_card=（改名片前后值；空串=没有名片，
-                     与"缺失=mapper 没拿到"区分开，所以空串也渲染）
-    - group_upload → file_name= / file_size_bytes=
-    - poke         → action=动作文案 + action_suffix=后缀（napcat raw_info
-                     提炼，如 拍了拍…的头；缺失=普通戳一戳/未知）
-    - emoji_like   → message_id=被贴表情的消息（对应 timeline 里同 id 的
-                     <message>）+ likes=表情统计（格式见 _emoji_likes_label）
-    - essence      → message_id=被设/取消精华的消息
-    - honor        → honor_type=荣誉类型（talkative 龙王 / performer /
-                     emotion，OneBot 原值透传）
-    - group_recall / friend_recall
-                   → message_id=被撤回的消息（对应 timeline 里同 id 的
-                     <message>；没有它 LLM 只知道"有人撤回了"，不知道撤的
-                     是哪条，会继续引用已撤回的内容）
+    mapper 已存储的明细字段（禁言秒数 / 新旧名片 / 文件名与大小 / 拍一拍
+    文案 / 表情统计 / 被撤回消息 ID / 荣誉类型…）全部进句子——被撤回的
+    message_id 尤其关键：没有它 LLM 只知道"有人撤回了"，不知道撤的是哪条，
+    会继续引用已撤回的内容。人物 = ``名(QQ)``（近期消息反查），本账号缀
+    ``*``。拼不出（关键字段全缺 / 未识别 kind）→ None，调用方走载荷 JSON
+    兜底。
     """
-    attrs: list[str] = []
+    payload = ev.payload or {}
+    user = _person(ev.user_id, names, bot_user_id) if ev.user_id is not None else None
+    op_id = payload.get("operator_id")
+    op = _person(op_id, names, bot_user_id) if op_id else None
+    target_id = payload.get("target_id")
+    target = _person(target_id, names, bot_user_id) if target_id else None
+    sub = str(payload.get("sub_type") or "").strip()
+    mid = payload.get("onebot_message_id")
+    mid_ref = f"消息#{_head_field(str(mid))}" if mid else None
+
+    if kind == "group_increase":
+        if user is None:
+            return None
+        if sub == "invite":
+            return f"{user} 被 {op} 邀请入群" if op else f"{user} 被邀请入群"
+        return f"{user} 入群，由 {op} 通过" if op else f"{user} 入群"
+    if kind == "group_decrease":
+        if sub == "kick_me":
+            return f"本账号被 {op} 移出" if op else "本账号被移出"
+        if user is None:
+            return None
+        if sub == "kick":
+            return f"{user} 被 {op} 移出" if op else f"{user} 被移出"
+        return f"{user} 退群"
+    if kind == "group_recall":
+        what = mid_ref or "一条消息"
+        if op and user and op_id is not None and ev.user_id is not None:
+            if str(op_id) == str(ev.user_id):
+                return f"{user} 撤回了自己的{what}"
+            return f"{op} 撤回了 {user} 的{what}"
+        if op:
+            return f"{op} 撤回了{what}"
+        if user:
+            return f"{user} 的{what}被撤回"
+        return f"{what}被撤回"
+    if kind == "friend_recall":
+        return f"对方撤回了{mid_ref or '一条消息'}"
+    if kind == "poke":
+        if user is None:
+            return None
+        action = _flatten(str(payload.get("action") or "").strip()) or "拍了拍"
+        suffix = _flatten(str(payload.get("action_suffix") or "").strip())
+        if target:
+            return f"{user} {_esc_text(action)} {target}{_esc_text(suffix)}"
+        return f"{user} {_esc_text(action)}"
+    if kind == "group_admin":
+        if user is None:
+            return None
+        if sub == "unset":
+            return f"{user} 被取消管理员"
+        return f"{user} 被设为管理员"
     if kind == "group_ban":
+        whole = ev.user_id is None or str(ev.user_id) == "0"
+        if sub == "lift_ban":
+            if whole:
+                return f"{op} 关闭了全员禁言" if op else "全员禁言被关闭"
+            if user is None:
+                return None
+            return f"{op} 解除了 {user} 的禁言" if op else f"{user} 被解除禁言"
+        if whole:
+            return f"{op} 开启了全员禁言" if op else "全员禁言被开启"
+        if user is None:
+            return None
         duration = payload.get("duration")
         try:
             seconds = int(str(duration).strip())
         except (TypeError, ValueError):
             seconds = 0
-        if seconds > 0:
-            attrs.append(f'duration_seconds="{seconds}"')
-    elif kind == "group_card":
-        for key, attr in (("card_old", "old_card"), ("card_new", "new_card")):
-            value = payload.get(key)
-            if value is not None:
-                attrs.append(f'{attr}="{_esc_attr(str(value))}"')
-    elif kind == "group_upload":
+        span = f" {seconds}秒" if seconds > 0 else ""
+        return f"{op} 将 {user} 禁言{span}" if op else f"{user} 被禁言{span}"
+    if kind == "group_card":
+        if user is None:
+            return None
+        old = payload.get("card_old")
+        new = payload.get("card_new")
+        # 空串=名片被清空，与缺失（未知）不同——空串也渲染成「」。
+        if old is None and new is None:
+            return f"{user} 修改了群名片"
+        old_part = _quote_excerpt(str(old)) if old is not None else "「?」"
+        new_part = _quote_excerpt(str(new)) if new is not None else "「?」"
+        return f"{user} 群名片 {old_part}→{new_part}"
+    if kind == "group_upload":
+        if user is None:
+            return None
         file_info = payload.get("file") or {}
-        if isinstance(file_info, dict):
-            fname = file_info.get("name")
-            if fname:
-                attrs.append(f'file_name="{_esc_attr(_clip(str(fname), 100))}"')
-            fsize = file_info.get("size")
-            if fsize is not None and str(fsize).strip():
-                attrs.append(f'file_size_bytes="{_esc_attr(str(fsize))}"')
-    elif kind == "poke":
-        for key in ("action", "action_suffix"):
-            value = payload.get(key)
-            if value is not None and str(value).strip():
-                attrs.append(f'{key}="{_esc_attr(str(value).strip())}"')
-    elif kind == "emoji_like":
-        mid = payload.get("onebot_message_id")
-        if mid:
-            attrs.append(f'message_id="{_esc_attr(str(mid))}"')
+        if not isinstance(file_info, dict):
+            file_info = {}
+        fname = _nonempty_str(file_info.get("name"))
+        size = file_info.get("size")
+        human = _human_size(size) if size is not None else None
+        sentence = f"{user} 上传了"
+        if fname:
+            sentence += f" {_esc_text(_clip(_flatten(fname), 100))}"
+        else:
+            sentence += "文件"
+        if human:
+            sentence += f" ({human})"
+        return sentence
+    if kind == "essence":
+        if mid_ref is None:
+            return None
+        verb = "移出精华" if sub == "delete" else "设为精华"
+        return f"{op} 将{mid_ref}{verb}" if op else f"{mid_ref}被{verb}"
+    if kind == "emoji_like":
         label = _emoji_likes_label(payload.get("likes") or [])
-        if label:
-            attrs.append(f'likes="{_esc_attr(label)}"')
-    elif kind == "essence":
-        mid = payload.get("onebot_message_id")
-        if mid:
-            attrs.append(f'message_id="{_esc_attr(str(mid))}"')
-    elif kind in ("group_recall", "friend_recall"):
-        mid = payload.get("onebot_message_id")
-        if mid:
-            attrs.append(f'message_id="{_esc_attr(str(mid))}"')
-    elif kind == "honor":
-        honor_type = payload.get("honor_type")
-        if honor_type:
-            attrs.append(f'honor_type="{_esc_attr(str(honor_type))}"')
-    return attrs
+        if user is None or label is None:
+            return None
+        if mid_ref:
+            return f"{user} 对{mid_ref}回应 {_esc_text(label)}"
+        return f"{user} 作出表情回应 {_esc_text(label)}"
+    if kind == "honor":
+        honor_type = _nonempty_str(payload.get("honor_type"))
+        if user is None or honor_type is None:
+            return None
+        return f"{user} 获得群荣誉 {_inline_text(honor_type)}"
+    if kind == "lucky_king":
+        king = target or user
+        if king is None:
+            return None
+        return f"{king} 成为红包运气王"
+    if kind == "friend_add":
+        if user is None:
+            return None
+        return f"新增好友 {user}"
+    if kind == "input_status":
+        return "对方正在输入"
+    if kind == "bot_offline":
+        return "本账号掉线"
+    return None
 
 
 def _emoji_likes_label(likes) -> str | None:
@@ -2003,25 +2347,19 @@ def _build_reply_task_guard(
             if not task_id:
                 continue
             revision = (ev.payload or {}).get("revision")
-            entry = guard.setdefault(
-                task_id, {"max_revision": 0, "cancelled": False}
-            )
+            entry = guard.setdefault(task_id, {"max_revision": 0, "cancelled": False})
             if isinstance(revision, int) and revision > entry["max_revision"]:
                 entry["max_revision"] = revision
         elif ev.type == "agent.reply_task_cancelled":
             task_id = str((ev.payload or {}).get("reply_task_id") or "")
             if not task_id:
                 continue
-            entry = guard.setdefault(
-                task_id, {"max_revision": 0, "cancelled": False}
-            )
+            entry = guard.setdefault(task_id, {"max_revision": 0, "cancelled": False})
             entry["cancelled"] = True
     return guard
 
 
-def _completed_is_stale(
-    ev: _EventSnapshot, guard: dict[str, dict]
-) -> bool:
+def _completed_is_stale(ev: _EventSnapshot, guard: dict[str, dict]) -> bool:
     """过期完成事件判定：revision 低于窗口内最高 upsert，或任务已 cancel。"""
     payload = ev.payload or {}
     task_id = str(payload.get("reply_task_id") or "")

@@ -10,7 +10,7 @@
 
 2026-07-12 起由 save_meme / send_meme 两工具（2026-07-03）+ 当晚先行拆分的
 delete_meme / recaption_meme 合并而来（应用户拍板"能力全集合在一个表情包
-工具中"）：catalog 只暴露一个工具，模型按 `action` 选操作。
+工具中"）：Program API 只暴露一个函数，模型按 `action` 选操作。
 
 三个动作共享同一身份标识：`image_hash`（sha256，与 timeline
 <image hash="..."/>、收藏夹 <meme hash="..."> 同一值空间，LLM 原样照抄）。
@@ -57,7 +57,7 @@ delete_meme / recaption_meme 合并而来（应用户拍板"能力全集合在�
 `{"kind":"meme","image_hash":…}` 气泡（数量不限），与文本一起按序发送。
 
 依赖注入：session_factory / caption_image / tool_call_event_id 全部来自
-ToolWorker 统一注入的 run() context，无构造依赖。
+ProgramExecutor 统一注入的 run() context，无构造依赖。
 """
 
 from __future__ import annotations
@@ -68,6 +68,7 @@ from qqbot.core.logging import get_logger
 from qqbot.core.time import china_now
 from qqbot.services.agent_loop.meme_store import (
     delete_meme,
+    find_meme_by_prefix,
     get_meme,
     insert_meme,
     update_meme_description,
@@ -77,6 +78,7 @@ from qqbot.services.agent_loop.tool_registry import BaseTool, ToolOutcome
 from qqbot.services.agent_loop.tools._meme_common import (
     coerce_image_hash,
     media_path_for_hash,
+    resolve_media_hash,
     sniff_mime,
 )
 
@@ -98,10 +100,26 @@ _NOTE_ACTIONS = ("save", "recaption")
 MAX_SAVE_BATCH = 10
 
 
+def _ambiguous_prefix_failure(prefix: str) -> ToolOutcome:
+    """收藏夹内 hash 前缀多义（行文法 §7，几乎不可能但语义封死）。"""
+    return ToolOutcome.failure(
+        "invalid_arguments",
+        f"hash prefix {prefix} matches more than one saved meme; copy more "
+        "characters of the hash to disambiguate",
+        field="image_hash",
+        reason_code="ambiguous_hash_prefix",
+        retryable=False,
+        transient=False,
+        user_fixable=True,
+    )
+
+
 class MemeCollectionTool(BaseTool):
     """实现 Tool 协议。发送已并入 reply_task；这里只管理收藏。"""
 
     name = "meme_collection"
+    program_kind = "effect"
+    max_call_sites = 2
     description = (
         "管理全局共享的表情包收藏夹，不执行发送。action=save 按 image_hash "
         "收录图片并生成检索描述，支持最多 10 个 hash 的数组；action=delete 删除"
@@ -122,10 +140,12 @@ class MemeCollectionTool(BaseTool):
             },
             "image_hash": {
                 "type": ["string", "array"],
-                "items": {"type": "string"},
+                "items": {"type": "string", "pattern": "^[0-9a-fA-F]{12,64}$"},
                 "description": (
-                    "图片的 64 位 sha256 十六进制值。save 可接收单个字符串或最多 "
-                    "10 个字符串的数组；delete 和 recaption 仅接收单个字符串。"
+                    "图片哈希：时间线 <图 …> 段或表情包收藏 <meme> 行中的 "
+                    "12 位前缀原样照抄（也接受完整 64 位）。save 可接收单个"
+                    "字符串或最多 10 个字符串的数组；delete 和 recaption 仅"
+                    "接收单个字符串。"
                 ),
             },
             "context_note": {
@@ -138,6 +158,41 @@ class MemeCollectionTool(BaseTool):
         },
         "required": ["action", "image_hash"],
     }
+    result_schema = {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string"},
+            "file_hash": {"type": ["string", "null"]},
+            "already_saved": {"type": ["boolean", "null"]},
+            "saved": {"type": ["boolean", "null"]},
+            "deleted": {"type": ["boolean", "null"]},
+            "recaptioned": {"type": ["boolean", "null"]},
+            "description": {"type": ["string", "null"]},
+            "previous_description": {"type": ["string", "null"]},
+            "batch": {"type": ["boolean", "null"]},
+            "saved_count": {"type": ["integer", "null"]},
+            "already_saved_count": {"type": ["integer", "null"]},
+            "failed_count": {"type": ["integer", "null"]},
+            "results": {
+                "type": ["array", "null"],
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "file_hash": {"type": ["string", "null"]},
+                        "already_saved": {"type": ["boolean", "null"]},
+                        "saved": {"type": ["boolean", "null"]},
+                        "description": {"type": ["string", "null"]},
+                        "error_kind": {"type": ["string", "null"]},
+                        "error": {"type": ["string", "null"]},
+                        "retryable": {"type": ["boolean", "null"]},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["action"],
+        "additionalProperties": False,
+    }
 
     async def execute(self, arguments: dict, **context: Any) -> ToolOutcome:
         if fail := await self.enforce_access(context):
@@ -147,8 +202,7 @@ class MemeCollectionTool(BaseTool):
         if action not in _ACTIONS:
             return ToolOutcome.failure(
                 "invalid_arguments",
-                f"action must be one of save/delete/recaption, "
-                f"got {action!r}",
+                f"action must be one of save/delete/recaption, got {action!r}",
                 field="action",
                 reason_code="bad_action",
                 retryable=False,
@@ -220,18 +274,14 @@ class MemeCollectionTool(BaseTool):
             )
         if file_hash is None:
             # 逻辑上不可达（批量只对 save 开放且已在上面分发），纯窄化守卫。
-            return ToolOutcome.failure(
-                "invalid_arguments", "image_hash is required"
-            )
+            return ToolOutcome.failure("invalid_arguments", "image_hash is required")
         if action == "save":
             return await self._save(
                 file_hash, context_note, scope_key, session_factory, context
             )
         if action == "delete":
             return await self._delete(file_hash, session_factory)
-        return await self._recaption(
-            file_hash, context_note, session_factory, context
-        )
+        return await self._recaption(file_hash, context_note, session_factory, context)
 
     # ── action=save ──
 
@@ -243,18 +293,33 @@ class MemeCollectionTool(BaseTool):
         session_factory: Any,
         context: dict,
     ) -> ToolOutcome:
-        # 磁盘存在性 = "bot 真的见过这张图"。文件不在 → hash 抄错 / 图当初
-        # 没下载成功（<image> 无 hash= 的那类），给 LLM 可自纠的精确失败。
+        # 前缀 → 磁盘唯一完整 hash（行文法 §7）；磁盘存在性 = "bot 真的见
+        # 过这张图"。无命中 → hash 抄错 / 图当初没下载成功（<图> 无 hash 的
+        # 那类），给 LLM 可自纠的精确失败。
+        resolved, fail = resolve_media_hash(file_hash)
+        if fail is not None:
+            return fail
+        if resolved is None:
+            return ToolOutcome.failure(
+                "image_not_found",
+                f"no downloaded image matching hash prefix {file_hash}; "
+                "copy the hash exactly from a <图 …> segment in the "
+                "timeline (images without a hash were never downloaded and "
+                "cannot be saved)",
+                file_hash=file_hash,
+                retryable=False,
+                transient=False,
+                user_fixable=True,
+            )
+        file_hash = resolved
         path = media_path_for_hash(file_hash)
         try:
             data = path.read_bytes()
         except OSError:
             return ToolOutcome.failure(
                 "image_not_found",
-                f"no downloaded image with hash {file_hash}; copy the hash= "
-                'value exactly from an <image hash="..."/> tag in the '
-                "timeline (images without hash= were never downloaded and "
-                "cannot be saved)",
+                f"no downloaded image with hash {file_hash}; copy the hash "
+                "exactly from a <图 …> segment in the timeline",
                 file_hash=file_hash,
                 retryable=False,
                 transient=False,
@@ -357,8 +422,7 @@ class MemeCollectionTool(BaseTool):
         if not raw_hashes:
             return ToolOutcome.failure(
                 "invalid_arguments",
-                "image_hash array is empty; pass 1..%d hashes"
-                % MAX_SAVE_BATCH,
+                "image_hash array is empty; pass 1..%d hashes" % MAX_SAVE_BATCH,
                 field="image_hash",
                 reason_code="empty_batch",
                 retryable=False,
@@ -382,8 +446,8 @@ class MemeCollectionTool(BaseTool):
             if fail or normalized is None:
                 return ToolOutcome.failure(
                     "invalid_arguments",
-                    f"image_hash[{i}] must be 64 hex chars (sha256), "
-                    f"got {value!r}; copy each hash= value verbatim",
+                    f"image_hash[{i}] must be 12-64 hex chars (sha256 "
+                    f"prefix), got {value!r}; copy each hash verbatim",
                     field="image_hash",
                     reason_code="bad_image_hash",
                     batch_index=i,
@@ -453,22 +517,24 @@ class MemeCollectionTool(BaseTool):
 
     # ── action=delete ──
 
-    async def _delete(
-        self, file_hash: str, session_factory: Any
-    ) -> ToolOutcome:
-        # 前查为了两件事：未收录给精确的 unknown_meme（而不是"删了 0 条"的
-        # 含混成功）；命中时把描述带回结果，确认话术能点名删的是哪张。
-        meme = await get_meme(session_factory, file_hash)
+    async def _delete(self, file_hash: str, session_factory: Any) -> ToolOutcome:
+        # 前查（前缀唯一匹配）为了三件事：未收录给精确的 unknown_meme（而
+        # 不是"删了 0 条"的含混成功）；前缀多义给 ambiguous_hash_prefix；
+        # 命中时把描述带回结果，确认话术能点名删的是哪张。
+        meme, ambiguous = await find_meme_by_prefix(session_factory, file_hash)
+        if ambiguous:
+            return _ambiguous_prefix_failure(file_hash)
         if meme is None:
             return ToolOutcome.failure(
                 "unknown_meme",
                 f"hash {file_hash} is not a saved meme; nothing to delete — "
-                "copy the hash from a <meme> entry in <saved-memes>",
+                "copy the hash from a <meme> entry in 表情包收藏",
                 file_hash=file_hash,
                 retryable=False,
                 transient=False,
                 user_fixable=True,
             )
+        file_hash = meme.file_hash
 
         # 并发窗口：前查之后别的删除先到 → rowcount=0。结果状态与本次意图
         # 一致（该 hash 已不在收藏夹），照常回执 deleted。
@@ -493,19 +559,22 @@ class MemeCollectionTool(BaseTool):
         context: dict,
     ) -> ToolOutcome:
         # 只给收录过的换描述：收藏是本动作的操作边界——timeline 里见过
-        # 但没收录的图没有描述可换。
-        meme = await get_meme(session_factory, file_hash)
+        # 但没收录的图没有描述可换。前缀唯一匹配，多义 → ambiguous。
+        meme, ambiguous = await find_meme_by_prefix(session_factory, file_hash)
+        if ambiguous:
+            return _ambiguous_prefix_failure(file_hash)
         if meme is None:
             return ToolOutcome.failure(
                 "unknown_meme",
                 f"hash {file_hash} is not a saved meme; only saved memes "
                 "have a description to regenerate — copy the hash from a "
-                "<meme> entry in <saved-memes>",
+                "<meme> entry in 表情包收藏",
                 file_hash=file_hash,
                 retryable=False,
                 transient=False,
                 user_fixable=True,
             )
+        file_hash = meme.file_hash
 
         # 语境：新 note 优先；未提供沿用收录时留档的旧 note（"留档备将来
         # 重生成"的兑现点）。
@@ -542,9 +611,7 @@ class MemeCollectionTool(BaseTool):
         try:
             description = await captioner(data, mime, context_note)
         except Exception as exc:  # noqa: BLE001 —— caption 失败折结构化 outcome
-            logger.warning(
-                "[meme.recaption] caption failed for {}: {}", file_hash, exc
-            )
+            logger.warning("[meme.recaption] caption failed for {}: {}", file_hash, exc)
             return ToolOutcome.failure(
                 "caption_failed",
                 f"description regeneration failed: {exc}; the old "

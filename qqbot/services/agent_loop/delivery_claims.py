@@ -1,4 +1,7 @@
-"""delivery_claims —— worker 投递去重的 claim-with-lease 实现。
+"""delivery_claims —— 历史 worker 投递去重的 claim-with-lease 实现。
+
+ProgramExecutor 不调用本模块；程序 Effect 采用 ``tool_called`` 意图先行与启动
+收口，半截调用标 uncertain 后永不重放。本模块只为数据库/历史兼容保留。
 
 对外接口：
 - `try_claim`：只关心"有没有抢到"的轻量布尔接口

@@ -6,7 +6,7 @@
 一条气泡就够时发一条，不必为了凑数拆句。`messages` 是唯一业务参数，目标群由
 当前 `scope_key` 注入，不存在 `target` 或 `group_id` 参数。
 
-标准发言链路由 `reply` 起一段等待、`<reply-task-completed>` 唤醒以及
+标准发言链路由 `reply` 起一段等待、`<等待结束>` 行唤醒以及
 `send_messages` 发送组成。落笔依据是唤醒那一刻的时间线，不是决定开口时的
 判断。
 
@@ -21,7 +21,7 @@
         {"type": "text", "data": {"text": "周日会提前关门，最好五点前到"}}
       ]
     },
-    {"kind": "meme", "image_hash": "<saved-memes 中的 64 位 sha256>"}
+    {"kind": "meme", "image_hash": "<表情包收藏中 <meme> 行的 12 位 hash 前缀>"}
   ]
 }
 ```
@@ -39,7 +39,8 @@
 
 - `text`：`{"type":"text","data":{"text":"..."}}`
 - `at`：`{"type":"at","data":{"qq":"10001"}}`
-- `reply`：`{"type":"reply","data":{"id":"<message_id>"}}`
+- `reply`：`{"type":"reply","data":{"id":"<message_id>"}}`（值取时间线
+  `#消息ID` 记号里的号，原样照抄）
 - `face`：`{"type":"face","data":{"id":"178"}}`
 
 所有段字段均位于 `data` 内。`reply` 段最多一个；存在时必须是
@@ -48,25 +49,26 @@
 ### meme 气泡
 
 ```json
-{"kind": "meme", "image_hash": "<saved-memes 中的 64 位 sha256>"}
+{"kind": "meme", "image_hash": "<表情包收藏中 <meme> 行的 12 位 hash 前缀>"}
 ```
 
-`image_hash` 必须存在于当前 `<saved-memes>` 收藏中。每个 meme 气泡
+`image_hash` 必须指向当前表情包收藏中的一张（12 位前缀即可，也接受完整
+64 位）。每个 meme 气泡
 独占一个气泡位置；meme 数量不单独设限，只受 `messages` 总数上限约束。
 发送前会统一检查收藏记录与媒体文件；任一项无效时不会发送任何气泡。
 
-组稿时可扫一遍 `<saved-memes>`。表情包不要求与当前话题精确对应；大致情绪、
+组稿时可扫一遍表情包收藏节。表情包不要求与当前话题精确对应；大致情绪、
 弱关联、画面本身有趣或单纯穿插均可，允许形成轻微无厘头的效果。meme 气泡可
 以单独代替文字，也可与 chat 气泡按数组顺序自由穿插，无须增加文字解释二者
-为何相关。`image_hash` 从 `<meme hash="...">` 整段复制即可；复制无误的 hash
-不会在发送前校验上失败。
+为何相关。`image_hash` 从 `<meme>` 行的 12 位前缀原样照抄即可；照抄无误的
+hash 不会在发送前校验上失败。
 
 ## 执行与记录
 
 同一次调用中的气泡按顺序逐项发送。每次 `send_messages` 调用都是独立发送
 命令；运行时不会合并或去重两次调用。该调用自身
-`<tool-call name="send_messages">` 行中的参数与逐气泡回执构成发送记录，不会
-另外生成当前链路的 `<my-reply>` 行。
+`<工具>send_messages` 行块中的逐气泡内容与回执构成发送记录，不会另外生成
+第二处发言行（`<旧发言>` 仅属旧链路历史）。
 
 ## 返回状态
 

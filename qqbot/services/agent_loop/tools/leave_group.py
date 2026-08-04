@@ -37,6 +37,8 @@ _USAGE_PROMPT = load_sibling_md(__file__, "leave_group.md")
 
 class LeaveGroupTool(BaseTool):
     name = "leave_group"
+    program_kind = "effect"
+    max_call_sites = 1
     allowed_scopes = ("group",)
     # 这是角色面对极端定向辱骂时的自主安全出口，不是由消息发送者授权的群管
     # 操作；辱骂者通常只是普通成员，若要求 OWNER，正确触发也会被权限门禁拦掉。
@@ -53,6 +55,16 @@ class LeaveGroupTool(BaseTool):
         "type": "object",
         "properties": {},
         "required": [],
+        "additionalProperties": False,
+    }
+    result_schema = {
+        "type": "object",
+        "properties": {
+            "group_id": {"type": "integer"},
+            "left": {"type": "boolean"},
+            "is_dismiss": {"type": "boolean"},
+        },
+        "required": ["group_id", "left", "is_dismiss"],
         "additionalProperties": False,
     }
 

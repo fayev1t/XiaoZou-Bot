@@ -100,8 +100,8 @@ def coerce_bool(
       - 真正的 ``bool`` → 原样；
       - 识别的字符串（``true/false/1/0/yes/no/y/n/on/off``，大小写/空白不敏感）
         与整数 ``0/1`` → 对应 bool；
-      - ``value`` 缺省（None，键未给）：``default`` 非 None → 用 ``default``；``default``
-        亦为 None → 视作必填，返回 ``invalid_arguments``；
+      - ``value`` 缺省（None，键未给）：``default`` 非 None → 用 ``default``；
+        ``default`` 亦为 None → 视作必填，返回 ``invalid_arguments``；
       - 其它（``"maybe"`` / ``2`` / list / dict ...）→ ``invalid_arguments``（不猜）。
     """
     if value is None:

@@ -4,7 +4,7 @@
 OneBot。执行器只做一件事——在 scope 锁内复核最新 revision 仍 open 且已到期，
 append 一条 ``runtime.reply_task_completed``（once，去重键 = 该 revision 的
 upsert event_id），提交成功后经注入的 publisher 通知唤醒 Planner（supervisor
-装配时注入的 notifier wrapper 内部执行 ``wake(scope, immediate=True)``，
+装配时注入的是 ``supervisor.waker(WakeMode.IMMEDIATE)``，
 publisher 协议本身不变，§3.1）。发不发、发什么由 Planner 醒来那一拍结合最新
 时间流自己决定（``send_messages`` 工具）；完成事件只表达"等待阶段结束了"，
 **不是**发言授权，也没有消费/TTL 概念（§0.4）。

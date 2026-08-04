@@ -8,8 +8,13 @@ Covers:
 - text/plain 直接透传（不走 HTML 提取）
 - HTTP 404 / 网络错 / 非文本 content-type / 响应超 5MB → upstream_action_failed
 - html_to_text 纯函数：嵌套 skip 子树、<br> 断行
+- 2026-08-03 提炼收口：text 是 digest_or_truncate 的产物、focus 参数闸门在
+  发请求之前、抓取原文与 focus 原样送达提炼层
 
 httpx 网络全部 mock：注入 _FakeHttpClient 工厂（与 websearch 测试同构）。
+web_digest 提炼在模块级替换为记录式透传（setUpModule）：抓取/参数契约的
+既有用例在"提炼=恒等"下语义不变；提炼自身的行为契约在
+test_web_digest_contract.py。
 """
 
 from __future__ import annotations
@@ -17,11 +22,38 @@ from __future__ import annotations
 import asyncio
 import unittest
 from typing import Any
+from unittest import mock
 
 import httpx
 
+import qqbot.services.agent_loop.tools.webfetch as webfetch_module
 from qqbot.services.agent_loop.tools._web_common import html_to_text
 from qqbot.services.agent_loop.tools.webfetch import WebfetchTool
+
+# 模块级透传提炼：记录调用、原文返回。真实 digest 会打 LLM，单测不允许。
+DIGEST_CALLS: list[dict] = []
+
+
+async def _passthrough_digest(
+    text: str, *, url: str, title: str = "", focus: str | None = None
+) -> str:
+    DIGEST_CALLS.append(
+        {"text": text, "url": url, "title": title, "focus": focus}
+    )
+    return text
+
+
+_DIGEST_PATCH = mock.patch.object(
+    webfetch_module, "digest_or_truncate", _passthrough_digest
+)
+
+
+def setUpModule() -> None:
+    _DIGEST_PATCH.start()
+
+
+def tearDownModule() -> None:
+    _DIGEST_PATCH.stop()
 
 
 class _FakeResponse:
@@ -156,6 +188,65 @@ class WebfetchHappyPathTests(unittest.TestCase):
             _build(handler), {"url": "https://site/", "max_chars": 1}
         )
         self.assertEqual(len(outcome2.result["text"]), 500)
+
+
+class WebfetchDigestContractTests(unittest.TestCase):
+    """2026-08-03：抓取正文不进程序 ABI——text 恒为提炼层产物。"""
+
+    def test_text_is_digest_product_not_raw(self) -> None:
+        async def _fixed_digest(
+            text: str, *, url: str, title: str = "", focus: str | None = None
+        ) -> str:
+            return "提炼产物"
+
+        handler = lambda url: _FakeResponse(  # noqa: E731
+            text=_HTML, content_type="text/html", url="https://site/page"
+        )
+        with mock.patch.object(
+            webfetch_module, "digest_or_truncate", _fixed_digest
+        ):
+            outcome = _run(_build(handler), {"url": "https://site/page"})
+        self.assertTrue(outcome.ok, outcome)
+        self.assertEqual(outcome.result["text"], "提炼产物")
+
+    def test_digest_receives_raw_text_title_url_and_focus(self) -> None:
+        DIGEST_CALLS.clear()
+        handler = lambda url: _FakeResponse(  # noqa: E731
+            text=_HTML, content_type="text/html", url="https://site/page"
+        )
+        outcome = _run(
+            _build(handler), {"url": "https://site/page", "focus": "价格"}
+        )
+        self.assertTrue(outcome.ok, outcome)
+        self.assertEqual(len(DIGEST_CALLS), 1)
+        call = DIGEST_CALLS[0]
+        self.assertIn("Hello world", call["text"])
+        self.assertEqual(call["url"], "https://site/page")
+        self.assertEqual(call["title"], "My & Page")
+        self.assertEqual(call["focus"], "价格")
+
+    def test_focus_defaults_to_none(self) -> None:
+        DIGEST_CALLS.clear()
+        handler = lambda url: _FakeResponse(  # noqa: E731
+            text="hi", content_type="text/plain"
+        )
+        outcome = _run(_build(handler), {"url": "https://site/"})
+        self.assertTrue(outcome.ok)
+        self.assertIsNone(DIGEST_CALLS[0]["focus"])
+
+    def test_focus_gate_rejects_before_any_request(self) -> None:
+        for focus, reason in ((123, "bad_focus"), ("长" * 201, "focus_too_long")):
+            with self.subTest(focus=focus):
+                tool = _build(lambda u: _FakeResponse())
+                outcome = _run(
+                    tool, {"url": "https://site/", "focus": focus}
+                )
+                self.assertEqual(outcome.error_kind, "invalid_arguments")
+                self.assertEqual(
+                    (outcome.extra or {}).get("reason_code"), reason
+                )
+                # 闸门在发请求之前——没有任何出站调用
+                self.assertEqual(tool._client_factory().calls, [])
 
 
 class WebfetchUpstreamFailureTests(unittest.TestCase):

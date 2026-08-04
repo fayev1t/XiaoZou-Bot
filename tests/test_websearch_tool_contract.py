@@ -12,8 +12,12 @@ Covers:
   （8KB 截断）、缺失走兜底 GET、失败逐条吞进 fetch_error
 - max_results 透传 + 截断、fetch_top_n 上限钳制
 - _parse_exa_search_text 纯函数：分块/无 URL 丢弃/无 Highlights 退化/上限
+- 2026-08-03 提炼收口：fetched_text 逐条经 digest_or_truncate、focus=query、
+  无正文的结果不进提炼
 
-httpx 网络全部 mock：注入 _FakeHttpClient 工厂。
+httpx 网络全部 mock：注入 _FakeHttpClient 工厂。web_digest 提炼在模块级替换
+为记录式透传（setUpModule）：抓取/解析契约的既有用例在"提炼=恒等"下语义
+不变；提炼自身的行为契约在 test_web_digest_contract.py。
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ from unittest import mock
 
 import httpx
 
+import qqbot.services.agent_loop.tools.websearch as websearch_module
 from qqbot.services.agent_loop.tools.websearch import (
     WebsearchTool,
     _parse_exa_search_text,
@@ -34,6 +39,31 @@ from qqbot.services.agent_loop.tools.websearch import (
 
 _EXA = "https://mcp.exa.ai/mcp"
 _TAVILY = "https://api.tavily.com/search"
+
+# 模块级透传提炼：记录调用、原文返回。真实 digest 会打 LLM，单测不允许。
+DIGEST_CALLS: list[dict] = []
+
+
+async def _passthrough_digest(
+    text: str, *, url: str, title: str = "", focus: str | None = None
+) -> str:
+    DIGEST_CALLS.append(
+        {"text": text, "url": url, "title": title, "focus": focus}
+    )
+    return text
+
+
+_DIGEST_PATCH = mock.patch.object(
+    websearch_module, "digest_or_truncate", _passthrough_digest
+)
+
+
+def setUpModule() -> None:
+    _DIGEST_PATCH.start()
+
+
+def tearDownModule() -> None:
+    _DIGEST_PATCH.stop()
 
 
 def _ok(tool: WebsearchTool, args: dict) -> dict:
@@ -239,6 +269,48 @@ class WebsearchExaContractTest(unittest.TestCase):
         self.assertIsNone(result["results"][1]["fetched_text"])
         # 1 POST + 1 GET（仅 top 1）
         self.assertEqual(len(client.calls), 2)
+
+    def test_fetched_text_digested_with_query_as_focus(self) -> None:
+        """2026-08-03：抓到的正文逐条提炼，focus=query；无正文的结果不提炼。"""
+        html = "<html><body><p>Page body here</p></body></html>"
+        client = _FakeHttpClient(
+            {
+                ("POST", _EXA): lambda req: _FakeResponse(
+                    text=_sse(_exa_result(_EXA_TEXT_TWO_HITS)),
+                    content_type="text/event-stream",
+                ),
+                ("GET", "https://a/"): lambda req: _FakeResponse(
+                    text=html, content_type="text/html", url="https://a/"
+                ),
+            }
+        )
+
+        async def _fixed_digest(
+            text: str, *, url: str, title: str = "", focus: str | None = None
+        ) -> str:
+            DIGEST_CALLS.append(
+                {"text": text, "url": url, "title": title, "focus": focus}
+            )
+            return "转述"
+
+        DIGEST_CALLS.clear()
+        with (
+            _patched_env(WEBSEARCH_PROVIDER="exa"),
+            mock.patch.object(
+                websearch_module, "digest_or_truncate", _fixed_digest
+            ),
+        ):
+            tool = _build(client=client)
+            result = _ok(tool, {"query": "rust async", "fetch_top_n": 1})
+
+        self.assertEqual(result["results"][0]["fetched_text"], "转述")
+        self.assertIsNone(result["results"][1]["fetched_text"])
+        self.assertEqual(len(DIGEST_CALLS), 1)
+        call = DIGEST_CALLS[0]
+        self.assertIn("Page body here", call["text"])
+        self.assertEqual(call["url"], "https://a/")
+        self.assertEqual(call["title"], "T1")
+        self.assertEqual(call["focus"], "rust async")
 
     def test_exa_jsonrpc_error_folds_to_internal_error(self) -> None:
         message = {
