@@ -17,121 +17,114 @@
   <a href="README.md">简体中文</a> | <a href="README_EN.md">English</a>
 </p>
 
-## 🤖 Introduction
+## 😚 Introduction
 
-<table border="0">
+<table border="0" width="100%">
   <tr>
-    <td style="border: none; vertical-align: middle;">
-      <b>XiaoZou-Bot</b> is a QQ group chat AI Agent based on an event loop and autonomous decision mechanism (Tick-based Agent Loop).<br><br>
-      Unlike traditional bots relying on passive rule triggers or single-turn QA, XiaoZou adopts an <b>Agent Harness</b> architecture that treats group chat as a continuously evolving cognitive domain:<br>
-      • <b>Cross-Tick Task State Machine</b>: Built-in task status management supporting multi-turn task tracking, self-correction, and proactive advancement across ticks.<br>
-      • <b>Two-Step Speech</b>: Deciding to speak is not the same as speaking — XiaoZou first starts a short wait, then re-decides what (and whether) to say against the freshest context at the moment the wait expires.<br>
-      • <b>Event Sourcing & Full Observability</b>: All session activities are recorded as an immutable causal event stream, providing full-stack snapshot auditing and offline replay capability.<br><br>
-      Built on <a href="https://github.com/NapNeko/NapCatQQ">NapCatQQ</a> and <a href="https://nonebot.dev/">NoneBot2</a>, heartfelt thanks to the open-source community ❤️
+    <td valign="middle" style="border: none; vertical-align: middle;">
+      This project is built on <a href="https://github.com/NapNeko/NapCatQQ">NapCatQQ</a> and <a href="https://nonebot.dev/">NoneBot2</a>, aiming to create XiaoZou, a bot capable of <b>continuous operation</b>, <b>self-awakening</b>, and driving <b>complex tasks</b> on the QQ event timeline.<br>
+      XiaoZou is driven and awakened by upstream real-time events from NapCat as well as system internal event streams, operating on a <b>Tick-Based</b> <b>AgentLoop</b> architecture, and executing tool calls inside an isolated sandbox via a restricted <b>Python DSL</b>.<br>
+      In addition, the system is deeply specialized for scenarios such as <b>two-step speech</b>, <b>group chat memory</b>, and <b>cross-tick reflection</b>, fully maintaining XiaoZou's interactive experience as an independent entity in group chats.<br>
+      Finally, I am continuously enhancing XiaoZou's behavioral capabilities and expressive traits as an LLM / VLM, hoping XiaoZou can become an agent with richer capabilities and continuous learning, participating deeply in group chat communication in a more natural and human-like manner.
     </td>
-    <td style="border: none; vertical-align: middle;" width="25%">
-      <img src="assets/imgs/xiaozou.png" alt="XiaoZou Character">
+    <td width="200" align="center" valign="middle" style="border: none; vertical-align: middle; text-align: center;">
+      <img src="assets/imgs/xiaozou.png" alt="XiaoZou Character" width="180" style="max-width: 100%; height: auto;">
     </td>
   </tr>
 </table>
 
+## 🤓 System Design
 
-## 🏗️ Core Architecture
+This system is built around **event-driven mechanisms**, a **Tick-Based state machine**, and **programmatic tool calling**, forming a complete closed-loop execution system:
 
-Every tick follows a fixed rhythm: events land in the store → projection folds them into the current timeline and active tasks → the Planner makes one global decision → actions are dispatched (there are only two, `idle` and `call_tool`; task management and speaking are both tools) → decisions and tool results are appended back into the event stream for the next tick to observe. Around that loop:
+- **🌊 Unified Event Stream & Projection**  
+  All external OneBot events (group messages, recalls, join requests, member leaves, etc.) and internal system events (including `runtime.reply_task_completed` scheduled wakeups for human-like speech, background task callbacks, etc.) are uniformly persisted to PostgreSQL. They are formatted into a flat natural Chinese timeline via the Envelope projection mechanism, significantly reducing context loss and token consumption for the model.
 
-- **Event Sourcing**: Messages, decisions, tool results, and task changes are all appended to an immutable event stream; every tick folds a fresh context out of it via projection. Causality is traceable, auditable, and replayable for the whole lifecycle.
+- **🔄 Tick-Based AgentLoop Architecture**  
+  Ticks are awakened to execute when events arrive or internal timers trigger. The loop operates through `Event Ingestion -> State Folding (Projection) -> LLM Code Generation -> Sequential Execution in Sandbox -> Domain Event/Terminal Closure`. It supports same-tick Preflight static syntax and type correction (up to 3 retry attempts), and closes crash or exception events as `interrupted` / `uncertain` during startup recovery, ensuring strong idempotency for the state machine.
 
-- **Deliberate Speech (Two Steps)**: Speaking is not a single action. Step one, `reply`, only **starts a short wait** — "I'm typing, the message hasn't gone out yet" — it writes no content and no plan ahead of time: how long the reply will take is decided on the fly, and it's worth waiting a beat to see whether the other side is still talking. When the wait expires, `<reply-task-completed>` wakes the scope, and on that tick the model re-decides from the full timeline up to that moment — speaking as intended, changing its mind, or concluding the moment has passed and staying silent. The actual wording is always chosen against the latest context, never frozen when the wait began.
+- **🐍 Programmatic Tool Calling Sandbox (Program-Shaped Tool Calling / Python DSL)**  
+  Abandoning traditional JSON Function Calling, the Planner directly generates restricted Python code on each tick (supporting conditional branching, loop control, and multi-tool orchestration). The code runs inside an isolated, restricted Python AST sandbox with security controls on built-in access and quotas.
 
-- **Model Mesh**: LLMs are routed by role (planner / vision / caption / memory), with the same model load-balanced randomly across providers, per-role `primary_failover`, and automatic cooldown-based circuit breaking. Images are transcribed into text by the `vision` role at ingest time, so the cognitive loop itself is pure text and free to pick the strongest — or cheapest — text model.
+## 🥰 Current Capabilities
 
-- **Scoped Sandbox**: Event streams, context, and tool permissions are isolated by `group:<id>` by default; shared assets such as the sticker collection live in a global scope.
+| Category | Core Feature | Corresponding Program API |
+| --- | --- | --- |
+| **🎭 Human-like Interaction** | Two-step human-like speech | `reply` (pause & wait) + `send_messages` (bubble delivery), faithfully recreating typing pause and thinking cadence |
+| **🖼️ Multimodal & Memes** | Meme collection/sending & visual comprehension | `meme_collection` (meme collection & sending) and `look_at_image` (multimodal vision understanding & transcription) |
+| **🌐 Search & History Retrieval** | Real-time search, web fetching & history lookup | `websearch` (Exa/Tavily), `webfetch` (webpage text distillation), and `search_history` (historical context) |
+| **🛡️ Group Moderation** | Member management, join request approval & leaving | `get_pending_join_requests`, `respond_to_group_join_request`, `kick`, `leave_group` |
+| **📌 Task & Control** | Multi-tick task tracking & intra-tick scheduling | `task` (long-term task state tracking) and `wait` (intra-tick delay & scheduling control) |
 
-## 🧰 Capabilities
 
-All abilities are exposed through a unified `Tool` protocol (`qqbot/services/agent_loop/tools/`, each tool shipping a same-named `.md` doc). The 16 tools **currently registered**:
 
-| Category | Tools |
-|---|---|
-| Expression | `reply` (starts a short wait; wording is chosen when it expires) `send_messages` (one or more bubbles, stickers included) `meme_collection` (curate and caption stickers) |
-| Pacing | `wait` (autonomous silence — not interrupting is also a decision) |
-| Tasks | `task` (create / note / complete / fail across ticks) |
-| Perception & Retrieval | `look_at_image` (re-examine an image with a question) `search_history` `websearch` `webfetch` |
-| Group Info | `get_group_info` `get_member_list` `get_member_info` |
-| Join Requests | `get_pending_join_requests` `respond_to_group_join_request` |
-| Moderation | `kick` `leave_group` (immediately leaves after extreme, explicitly targeted personal degradation or abuse) |
+## 😴 TODO
 
-> The repository holds 14 more implemented but **currently disabled** tools (`ban`, `poke`, `recall`, `set_card`, `set_essence`, …). Their code, docs, and contract tests are all retained; each will be re-enabled individually once it meets the bar.
+- [x] Programmatic tool calling based on a restricted Python AST sandbox (Program API)
+- [x] Native NapCat / OneBot event ingestion and group moderation tool wrappers
+- [x] Human-like two-step speech and message bubble delivery control (`reply` + `send_messages`)
+- [ ] Improved long-term Task decomposition and multi-tick tracking mechanism
+- [ ] Long-term memory system and dynamic context compaction (Memory Compaction)
+- [ ] Emotional state machine and proactive group chat social decision-making
 
-## 🛠️ Roadmap
-
-- [ ] **Cognitive Evolution**: Group profiling & long-term memory (off-peak batch analysis to summarize user preferences and group lore, writing them back to the event stream).
-- [ ] **Expression Enhancement**: Voice message transcribing (introduce `audio_transcribe` tool to complement visual and textual multimodality).
-- [ ] **Infrastructure**: CQRS read model optimization (add dedicated read tables to avoid refolding all recent events every tick).
-- [ ] **Asset Governance**: Prompt asset governance and strict validation (runtime feedback, safety guidelines, and multi-persona hot-swapping).
-
-## 📸 Screenshots
+## 🤣 Group Chat Demos
 
 <div align="center">
   <table border="0" style="border-collapse: collapse; margin: 20px 0;">
     <tr>
       <td align="center" style="padding: 10px; border: none; vertical-align: top;">
         <img src="assets/imgs/message1.jpg" width="260" style="border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); border: 1px solid #e2e8f0;" />
-        <p style="margin-top: 10px; font-size: 13px; color: #64748b;">1. Launch Task & Start Counting</p>
+        <p style="margin-top: 10px; font-size: 13px; color: #64748b;">1. Start Task & Launch Count</p>
       </td>
       <td align="center" style="padding: 10px; border: none; vertical-align: top;">
         <img src="assets/imgs/message2.jpg" width="260" style="border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); border: 1px solid #e2e8f0;" />
-        <p style="margin-top: 10px; font-size: 13px; color: #64748b;">2. Concurrent Chat & Task Adjustment</p>
+        <p style="margin-top: 10px; font-size: 13px; color: #64748b;">2. Interleaved Chat & Dynamic Task Adjustment</p>
       </td>
       <td align="center" style="padding: 10px; border: none; vertical-align: top;">
         <img src="assets/imgs/message3.jpg" width="260" style="border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); border: 1px solid #e2e8f0;" />
-        <p style="margin-top: 10px; font-size: 13px; color: #64748b;">3. Task Completion & Multimodal Reply</p>
+        <p style="margin-top: 10px; font-size: 13px; color: #64748b;">3. Task Completion & Autonomous Multimodal Reply</p>
       </td>
     </tr>
   </table>
 </div>
 
 
-## 🚀 Quick Start
+## 😄 Quick Start
 
-Simply invite XiaoZou (1005089717) to your group chat!
+Simply invite XiaoZou (1005089717) to your group chat.
 
 
-## 🐢 Slow Start
+## 😭 Slow Start
 
 ```bash
-# 1. Start NapCat & PostgreSQL containers
+# 1. Start dependency containers (PostgreSQL & NapCat)
 docker compose -f docker/postgres/compose.yml up -d
 docker compose -f docker/napcat/compose.yml up -d
 
-# 2. Initialize configuration files
+# 2. Initialize configuration and launch
 cp .env.example .env
 cp config/model_providers.example.json config/model_providers.json
-
-# 3. Install dependencies and start the bot
-pip install -r requirements.txt
-python -m qqbot
+pip install -r requirements.txt && python -m qqbot
 ```
 
-### ⚙️ Configuration Notes
-
-- **Connect NapCat**: Add a WebSocket client on the NapCat Web Panel pointing to `ws://<bot-host>:7500/onebot/v11/ws`.
-- **Model Router Config (`config/model_providers.json`)**: Fill in API keys and configure target models for four roles — `planner` (decisions and wording), `vision` (image transcription, must be vision-capable), `caption` (sticker descriptions, must be vision-capable), and `memory` (memory compaction). **Without this file every LLM is unavailable** — there is no fallback path.
-- **Customize Persona (`prompts/planner.md`)**: Edit the `# 人物模型` section of `qqbot/services/agent_loop/prompts/planner.md` to adjust the persona card (read at render time — edits take effect without a restart).
-- **API Lab Debug Entry**: Run `python -m qqbot.main_test` to start an isolated OneBot/NapCat API probe without DB or LLM overhead.
+> **📌 Configuration Notes**:
+> - **NapCat Reverse WS**: Add a client connection on the panel pointing to `ws://<bot-host>:7500/onebot/v11/ws`.
+> - **Model Configuration (`config/model_providers.json`)**: Fill in API Keys and configure models for roles: `planner`, `vision`, `caption`, `memory`, and `web_digest`.
+> - **Protocol Probe**: Run `python -m qqbot.main_test` to independently test NapCat / OneBot API connectivity.
 
 
-## 🍓 Community Group
 
-For any questions, feel free to join our QQ group:
+
+## 🥳 Community Group
+
+Feel free to join for any questions.
 **610662657**
 <div align="left">
   <img src="assets/imgs/qqgroup_info.png" width="240" />
 </div>
 
 
-## ⭐ Star History 🤤
+## 🤤 Will It Hit Top Trending Someday?
 <a href="https://www.star-history.com/?repos=fayev1t%2FXiaoZou-Bot&type=date&legend=top-left">
  <picture>
    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=fayev1t/XiaoZou-Bot&type=date&theme=dark&legend=top-left" />

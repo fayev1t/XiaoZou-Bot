@@ -17,57 +17,57 @@
   <a href="README.md">简体中文</a> | <a href="README_EN.md">English</a>
 </p>
 
-## 🤖 项目简介
+## 😚 项目简介
 
-<table border="0">
+<table border="0" width="100%">
   <tr>
-    <td style="border: none; vertical-align: middle;">
-      <b>XiaoZou-Bot</b> 是一个基于事件循环与自主决策机制（Tick-based Agent Loop）的 QQ 群聊 AI Agent。<br><br>
-      不同于传统被动触发或单轮问答的聊天机器人，小奏采用 <b>Agent Harness</b> 架构，将群聊视为连续演进的认知场域：<br>
-      • <b>跨 Tick 持续任务图谱</b>：内置任务状态机，支持多轮对话下的跨拍任务追踪、自我纠偏与主动推进。<br>
-      • <b>两步发言的克制</b>：决定开口不等于立刻说话——先起一段短等待，到点结合那一刻的最新上下文决定说什么、还说不说。<br>
-      • <b>事件溯源与完全可观测</b>：全局会话以不可变因果事件流落盘，具备全链路快照审计与因果离线回放能力。<br><br>
-      本项目基于 <a href="https://github.com/NapNeko/NapCatQQ">NapCatQQ</a> 与 <a href="https://nonebot.dev/">NoneBot2</a> 构建，由衷感谢开源社区 ❤️
+    <td valign="middle" style="border: none; vertical-align: middle;">
+      本项目基于 <a href="https://github.com/NapNeko/NapCatQQ">NapCatQQ</a> 与 <a href="https://nonebot.dev/">NoneBot2</a> 构建，旨在完善一个能在 QQ 事件轴上<b>持续运转</b>、<b>自我唤醒</b>，并且能够推进<b>复杂任务</b>的机器人小奏。<br>
+      小奏由 NapCat 上游实时事件与系统内部事件流共同驱动唤醒，采用 <b>Tick-Based</b> 的 <b>AgentLoop</b> 架构维持运转，并在隔离沙盒内通过受限 <b>Python DSL</b> 执行工具调用。<br>
+      此外，本系统还针对<b>两步发言</b>、<b>群聊记忆</b>、<b>跨拍反思</b>等场景进行了深度特化，充分维护小奏作为群聊独立主体的交互体验。<br>
+      最后，我还在持续提升小奏作为 LLM / VLM 的行为能力以及表达特点，希望小奏能成为一个能力更加丰富且持续学习的智能体，以更自然拟人的方式深度参与群聊沟通。
     </td>
-    <td style="border: none; vertical-align: middle;" width="25%">
-      <img src="assets/imgs/xiaozou.png" alt="XiaoZou Character">
+    <td width="200" align="center" valign="middle" style="border: none; vertical-align: middle; text-align: center;">
+      <img src="assets/imgs/xiaozou.png" alt="XiaoZou Character" width="180" style="max-width: 100%; height: auto;">
     </td>
   </tr>
 </table>
 
-## 🏗️ 核心设计
+## 🤓 系统设计
 
-每个 Tick 的节奏固定：事件落库 → 折叠投影出当前时间线与活跃任务 → Planner 全局决策 → 按 Action 分发（只有 `idle` 与 `call_tool` 两种，任务管理与发言都是工具），工具结果与决策再全部回写事件流，供下一拍观察。围绕这个循环：
+本系统围绕**事件驱动**、**Tick-Based 状态机**与**程序化工具调用**构建，形成完整的闭环运行机制：
 
-- **事件溯源（Event Sourcing）**：消息、决策、工具结果、任务变更全部追加进不可变事件流；每个 Tick 通过投影（projection）折叠出当前上下文。全生命周期因果可追踪、可审计、可离线回放。
-- **两步发言（Deliberate Speech）**：说话不是一个动作。第一步 `reply` 只**起一段短等待**——「我在输入，那条消息还没发出去」——不存内容、不做预案：还要多久才打好字自己心里有数，对方是否还在继续发言也值得先等一等再判断。等待到点写入 `<reply-task-completed>` 并唤醒当前 scope，那一拍模型从到那一刻为止的完整时间线出发，再决定是照原意开口、改口，还是判断时机已过继续沉默。落笔的字句永远是在最新上下文里选的，不是等待开始时就写死的。
-- **模型网格（Model Mesh）**：按角色（planner / vision / caption / memory）路由 LLM，支持同一模型跨多服务商随机分摊负载、按角色切换 `primary_failover`、故障自动冷却熔断。群里的图片在落库期就由 vision 角色转录成文字进事件正文，认知主循环因此是纯文本的，可自由挑选最强或最便宜的文本模型。
-- **群组沙箱（Scoped Sandbox）**：事件流、上下文与工具权限默认按 `group:<id>` 隔离；表情包等公共资产则在全局作用域共享。
+- **🌊 统一事件轴与状态折叠 (Unified Event Stream & Projection)**  
+  所有外部 OneBot 事件（群消息、撤回、入群申请、退群等）与系统内部事件（包括 `runtime.reply_task_completed` 拟人发言定时唤醒、后台任务回调等）统一持久化至 PostgreSQL。通过 Envelope 投影机制将其格式化为平铺的自然中文时间线，大幅降低模型上下文损耗与 Token 消耗。
 
-## 🧰 能力一览
+- **🔄 Tick-Based AgentLoop 驱动架构**  
+  在事件到达或内部定时器到点时唤醒 Tick 运转。按 `事件摄入 -> 状态折叠 -> LLM 代码生成 -> 沙盒顺序执行 -> 领域事件/Terminal 收口` 流程闭环。支持同拍 Preflight 静态语法与类型纠偏（最多 3 次试错），崩溃或异常事件在启动恢复期收口为 `interrupted` / `uncertain`，确保状态机强幂等。
 
-所有能力经统一 `Tool` 接口接入（`qqbot/services/agent_loop/tools/`，每个工具自带同名 `.md` 说明文档）。下表是**当前实际注册**的 16 个工具：
+- **🐍 程序化工具调用沙盒 (Program-Shaped Tool Calling / Python DSL)**  
+  摒弃传统的 JSON Function Call，Planner 在每拍直接生成受限 Python 代码（支持条件分支、循环控制与多工具协同）。代码运行在受限 Python AST 隔离沙盒中，安全管控 built-in 访问与配额。
 
-| 分类 | 工具 |
-|---|---|
-| 表达 | `reply`（起一段短等待，字句在等待结束那一刻落笔） `send_messages`（一条或多条气泡，含表情包） `meme_collection`（表情包收藏与描述） |
-| 节奏控制 | `wait`（自主沉寂，不打扰也是一种决策） |
-| 任务 | `task`（跨拍任务的创建 / 记录 / 完成 / 失败） |
-| 感知与检索 | `look_at_image`（带问题重看图片） `search_history` `websearch` `webfetch` |
-| 群信息 | `get_group_info` `get_member_list` `get_member_info` |
-| 入群审批 | `get_pending_join_requests` `respond_to_group_join_request` |
-| 群管操作 | `kick` `leave_group`（遭受明确指向自身的极端人格侮辱或恶意辱骂时直接退群） |
+## 🥰 当前能力
 
-> 仓库里另有 14 个已实现但**暂未启用**的工具（`ban` `poke` `recall` `set_card` `set_essence` 等），代码、文档与契约测试都在，逐个达标后再单独放行。
+| 分类 | 核心功能 | 对应 Program API |
+| --- | --- | --- |
+| **🎭 拟人交互** | 两段式拟人发言 | `reply`（停顿等待）+ `send_messages`（气泡发送），真实还原打字沉吟与思考节奏 |
+| **🖼️ 多模态与表情包** | 表情包收藏/发送 & 视觉理解 | `meme_collection`（表情包收集与发送）与 `look_at_image`（图文理解与转录） |
+| **🌐 联网与历史检索** | 实时搜索、网页提炼与历史查阅 | `websearch`（Exa/Tavily）、`webfetch`（网页提炼）与 `search_history`（历史上下文） |
+| **🛡️ 自动化群务** | 群成员管理、入群审批与退群 | `get_pending_join_requests`、`respond_to_group_join_request`、`kick`、`leave_group` |
+| **📌 任务与控制** | 多拍 Task 跟踪与拍内调度 | `task`（长程任务状态跟踪）与 `wait`（拍内延时与调度控制） |
 
-## 🛠️ 进化路线 (Roadmap)
 
-- [ ] **认知演进**：群体画像与长期记忆（空闲期批处理分析群内黑话与用户偏好，写回事件流）。
-- [ ] **表达增强**：语音消息转译（引入 `audio_transcribe` 工具补全音频模态认知）。
-- [ ] **基础设施**：CQRS 读模型优化（增加读表以避免每 Tick 重新折叠全量近期事件）。
-- [ ] **资产治理**：Prompt 资产治理与严格校验（运行时反馈、风控指南与多人格热切换）。
 
-## 📸 效果图
+## 😴 待办
+
+- [x] 基于受限 Python AST 沙盒的程序化工具调用 (Program API)
+- [x] NapCat / OneBot 原生事件摄入与群务治理工具封装
+- [x] 拟人化两段式发言与气泡送达控制 (`reply` + `send_messages`)
+- [ ] 更加完善的长程任务 (Task) 拆解与多拍跟踪机制
+- [ ] 长期记忆系统与动态上下文压缩 (Memory Compaction)
+- [ ] 情绪状态机与主动群聊社交决策
+
+## 🤣 群聊表现
 
 <div align="center">
   <table border="0" style="border-collapse: collapse; margin: 20px 0;">
@@ -89,36 +89,33 @@
 </div>
 
 
-## 🚀 快速开始
+## 😄 快速开始
 
-直接把小奏（1005089717）拉到群里！
+把小奏（1005089717）拉到群里。
 
 
-## 🐢 慢速开始
+## 😭 慢速开始
 
 ```bash
-# 1. 启动 NapCat & PostgreSQL 容器
+# 1. 启动依赖容器 (PostgreSQL & NapCat)
 docker compose -f docker/postgres/compose.yml up -d
 docker compose -f docker/napcat/compose.yml up -d
 
-# 2. 初始化配置文件
+# 2. 初始化配置与启动
 cp .env.example .env
 cp config/model_providers.example.json config/model_providers.json
-
-# 3. 安装依赖并启动服务
-pip install -r requirements.txt
-python -m qqbot
+pip install -r requirements.txt && python -m qqbot
 ```
 
-### ⚙️ 配置说明
-
-- **NapCat 协议对接**：在 NapCat Web 面板中添加 WebSocket 客户端，指向 `ws://<bot-host>:7500/onebot/v11/ws`。
-- **模型路由配置 (`config/model_providers.json`)**：填入 API Key，并配置 `planner`（决策与措辞）、`vision`（图片转录，须带 vision 能力）、`caption`（表情包描述，须带 vision 能力）、`memory`（记忆压缩）四个角色的目标模型。**缺这个文件 = LLM 全线不可用**，没有回落。
-- **人设卡自定义 (`prompts/planner.md`)**：编辑 `qqbot/services/agent_loop/prompts/planner.md` 的 `# 人物模型` 段调整人格卡（render 时才读盘，改完即生效，无需重启）。
-- **API Lab 独立调试**：运行 `python -m qqbot.main_test` 可启动无 DB/无 LLM 的单机协议探针，方便测试 OneBot/NapCat 连通性与底层 API。
+> **📌 配置要点**：
+> - **NapCat 反向 WS**：面板添加客户端连接至 `ws://<bot-host>:7500/onebot/v11/ws`。
+> - **模型配置 (`config/model_providers.json`)**：填入 API Key 及 `planner`、`vision`、`caption`、`memory`、`web_digest` 角色模型。
+> - **协议探针**：运行 `python -m qqbot.main_test` 独立调试 NapCat / OneBot 接口连通性。
 
 
-## 🍓 交流群
+
+
+## 🥳 交流群
 
 任何问题，欢迎加入。
 **610662657**
@@ -127,7 +124,7 @@ python -m qqbot
 </div>
 
 
-## ⭐ 难道有一天上热榜了？🤤
+## 🤤 难道有一天上热榜了？
 <a href="https://www.star-history.com/?repos=fayev1t%2FXiaoZou-Bot&type=date&legend=top-left">
  <picture>
    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=fayev1t/XiaoZou-Bot&type=date&theme=dark&legend=top-left" />
