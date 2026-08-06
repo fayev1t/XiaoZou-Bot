@@ -32,6 +32,8 @@ _USAGE_PROMPT = load_sibling_md(__file__, "poke.md")
 
 class PokeTool(BaseTool):
     name = "poke"
+    program_kind = "effect"
+    max_call_sites = 2
     allowed_scopes = ("group",)
     # required_permission 用 BaseTool 默认 GUEST
     # required_bot_role 用 BaseTool 默认 None —— 戳一戳无害，bot 普通成员即可
@@ -49,6 +51,16 @@ class PokeTool(BaseTool):
             },
         },
         "required": ["user_id"],
+        "additionalProperties": False,
+    }
+    result_schema = {
+        "type": "object",
+        "properties": {
+            "group_id": {"type": "integer"},
+            "user_id": {"type": "integer"},
+        },
+        "required": ["group_id", "user_id"],
+        "additionalProperties": False,
     }
 
     async def execute(self, arguments: dict, **context: Any) -> ToolOutcome:

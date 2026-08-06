@@ -23,5 +23,5 @@
 
 ## 返回
 
-成功返回 `ok`、`group_id` 和 `user_id`。参数无效时返回
-`invalid_arguments`；OneBot 调用失败时返回 `upstream_action_failed`。
+成功返回 `group_id` 与 `user_id`。参数无效时返回 `invalid_arguments`；
+OneBot 调用失败时返回 `upstream_action_failed`。

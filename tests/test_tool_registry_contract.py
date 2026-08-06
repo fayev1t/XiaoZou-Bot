@@ -111,7 +111,7 @@ class ToolRegistryContractTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             registry.register(_BadName)
 
-    def test_default_program_api_contains_exactly_active_eighteen_tools(self) -> None:
+    def test_default_program_api_contains_exactly_active_nineteen_tools(self) -> None:
         registry = build_default_registry()
         self.assertEqual(
             set(registry.names()),
@@ -125,6 +125,7 @@ class ToolRegistryContractTest(unittest.TestCase):
                 "leave_group",
                 "look_at_image",
                 "meme_collection",
+                "poke",
                 "reflect",
                 "reply",
                 "respond_to_group_join_request",
@@ -136,7 +137,7 @@ class ToolRegistryContractTest(unittest.TestCase):
                 "websearch",
             },
         )
-        self.assertEqual(len(registry), 18)
+        self.assertEqual(len(registry), 19)
 
     def test_all_active_tools_declare_machine_readable_result_abi(self) -> None:
         registry = build_default_registry()
@@ -179,6 +180,7 @@ class ToolRegistryContractTest(unittest.TestCase):
             "kick": {"applied", "group_id", "reject_add_request", "user_id"},
             "leave_group": {"group_id", "is_dismiss", "left"},
             "look_at_image": {"answer", "image_hash", "question"},
+            "poke": {"group_id", "user_id"},
             "meme_collection": {
                 "action",
                 "already_saved",
@@ -315,6 +317,7 @@ class ToolRegistryContractTest(unittest.TestCase):
             },
         )
         self.assertEqual(get_tool_program_kind(registry.get("send_messages")), "effect")
+        self.assertEqual(get_tool_program_kind(registry.get("poke")), "effect")
         # reflect 写事件、留终态记录 → effect（2026-08-03）。它读起来像"记笔记"，
         # 但产出一条 agent.reflection_written，不能划到无痕的 query 一侧。
         self.assertEqual(get_tool_program_kind(registry.get("reflect")), "effect")

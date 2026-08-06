@@ -134,6 +134,9 @@ def build_default_registry() -> ToolRegistry:
     # 永远固定 is_dismiss=false，不暴露解散能力；这不是辱骂者授权的群管操作，
     # 所以 GUEST 可触发，由 sibling usage 文档给 Planner 严格限定语义门槛。
     registry.register(LeaveGroupTool)
+    # poke：群内戳一戳（2026-08-06 恢复）。轻互动、GUEST 可触发、不要求 bot
+    # 管理员；group_id 从 scope 注入，只收 user_id。OneBot group_poke。
+    registry.register(PokeTool)
     # ── 网页搜索 / 抓取（2026-07-18 重做后恢复 / 新增）──
     # websearch：后端从自部署 SearXNG + Crawl4AI 容器切换为 Tavily API
     # （env TAVILY_API_KEY），正文降级链 raw_content → 进程内抓取；webfetch
@@ -154,7 +157,7 @@ def build_default_registry() -> ToolRegistry:
     # registry.register(SetEssenceTool())
     # registry.register(EmojiLikeTool())
     # napcat 动作工具：互动
-    # registry.register(PokeTool())
+    # ——poke 已于 2026-08-06 恢复（见上），群公告等继续停用。
     # registry.register(GroupNoticeTool())
     # napcat 动作工具：群成员管理
     # ——kick 已于 2026-07-10 重做恢复（见上），其余成员管理工具继续停用。

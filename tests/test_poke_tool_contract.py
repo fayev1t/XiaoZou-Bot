@@ -101,13 +101,24 @@ class PokeToolTests(unittest.IsolatedAsyncioTestCase):
 
     def test_metadata(self) -> None:
         self.assertEqual(PokeTool.name, "poke")
+        self.assertEqual(PokeTool.program_kind, "effect")
+        self.assertEqual(PokeTool.max_call_sites, 2)
         self.assertEqual(PokeTool.allowed_scopes, ("group",))
         self.assertEqual(PokeTool.required_permission, PermissionTier.GUEST)
         # 非敏感互动：bot 自身群角色不设限，保持 BaseTool 默认 None。
         self.assertIsNone(getattr(PokeTool, "required_bot_role", None))
+        self.assertEqual(
+            set((PokeTool.result_schema.get("properties") or {})),
+            {"group_id", "user_id"},
+        )
 
     def test_usage_md_loaded(self) -> None:
         self.assertIn("group_poke", PokeTool.usage_prompt)
+
+    def test_registered_in_default_registry(self) -> None:
+        from qqbot.services.agent_loop.tools import build_default_registry
+
+        self.assertIn("poke", build_default_registry().names())
 
 
 if __name__ == "__main__":
