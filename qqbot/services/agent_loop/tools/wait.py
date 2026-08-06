@@ -145,6 +145,7 @@ class WaitTool(BaseTool):
                 "internal_tool_error",
                 "wait unavailable: missing wake_scope/session context",
             )
+        note_activity = context.get("note_activity")
 
         wake_at = china_now() + timedelta(seconds=seconds)
         loop = asyncio.get_running_loop()
@@ -154,6 +155,7 @@ class WaitTool(BaseTool):
                 _fire_wait(
                     session_factory=session_factory,
                     wake_scope=wake_scope,
+                    note_activity=note_activity,
                     scope_key=scope_key,
                     correlation_id=context.get("correlation_id"),
                     causation_id=context.get("tool_call_event_id"),
@@ -176,6 +178,7 @@ async def _fire_wait(
     *,
     session_factory: Any,
     wake_scope: Callable[[str], Awaitable[None]],
+    note_activity: Callable[[str], None] | None,
     scope_key: str,
     correlation_id: str | None,
     causation_id: str | None,
@@ -206,6 +209,7 @@ async def _fire_wait(
         causation_id=causation_id,
         payload=payload,
         wake=wake_scope,
+        note_activity=note_activity,
         wake_on_write_failure=True,
     )
 

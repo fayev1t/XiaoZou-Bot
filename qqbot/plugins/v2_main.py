@@ -91,14 +91,18 @@ async def _describe_image(data: bytes, mime: str, file_hash: str) -> str | None:
 
 
 async def _notify_committed_event(event: SystemEvent) -> None:
-    """Translate a committed internal event into the current AgentLoop wake."""
+    """Translate a committed internal event into AgentLoop wake + silence arm."""
     if event.scope == "group" and event.group_id is not None:
         scope_key = f"group:{event.group_id}"
     elif event.scope == "system":
         scope_key = "system"
     else:
         return
-    await _get_supervisor().wake(scope_key)
+    sup = _get_supervisor()
+    # 可见事实落库才算动静；runtime_only 不武装静默计时器。
+    if event.visibility == "agent_visible":
+        sup.note_activity(scope_key)
+    await sup.wake(scope_key)
 
 
 def _get_ingest() -> EventIngest:

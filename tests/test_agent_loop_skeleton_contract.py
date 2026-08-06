@@ -15,9 +15,9 @@ Also verifies:
 - EventIngest publishes only newly committed SystemEvent values; duplicate
   inserts publish nothing, and plugin wiring owns scope-to-wake translation.
 - scope_key parser handles all three AgentLoop scopes.
-- 唤醒攒批窗口（2026-07-28 引入，2026-08-01 改固定窗口）：默认 wake() 由第一次
-  唤醒开窗、到点才开拍，窗口内的唤醒并入同一拍且不顺延，immediate=True 绕过
-  窗口，持续唤醒下每个窗口到点照常开拍（不会被顺延饿死）。
+- 唤醒攒批窗口（2026-07-28 引入，2026-08-01 改固定窗口；2026-08-06 外部一律
+  进窗）：wake() 由第一次开窗、到点才开拍，窗口内并入且不顺延；持续唤醒下每
+  个窗口到点照常开拍。自续拍仍是 loop 内部 immediate。
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ from qqbot.services.agent_loop import (
     DecisionOutput,
     LoopSupervisor,
 )
-from qqbot.services.agent_loop.event_writer import WakeMode, parse_scope_key
+from qqbot.services.agent_loop.event_writer import parse_scope_key
 from qqbot.services.agent_loop.tool_registry import (
     BaseTool,
     ToolOutcome,
@@ -181,14 +181,17 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
             planner=_FakeIdlePlanner(),
             session_factory=_factory_for(captured),
         )
-        loop.start()
-        loop.wake(immediate=True)
-        # 给 tick 一点时间跑完
-        for _ in range(50):
-            await asyncio.sleep(0.01)
-            if len(captured) >= 4:
-                break
-        await loop.stop()
+        # 本用例验 tick 事件链，不是攒批时序；窗口置 0 立刻开拍。
+        with patch(
+            "qqbot.services.agent_loop.loop._WAKE_BATCH_WINDOW_SECONDS", 0
+        ):
+            loop.start()
+            loop.wake()
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+                if len(captured) >= 4:
+                    break
+            await loop.stop()
 
         # 空程序仍有独立 terminal；不再写 idle_decision。
         types = [_values_of(stmt).get("type") for stmt in captured]
@@ -242,13 +245,16 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
             planner=_SlowIdlePlanner(),
             session_factory=_factory_for(captured),
         )
-        loop.start()
-        loop.wake(immediate=True)
-        for _ in range(200):
-            await asyncio.sleep(0.01)
-            if len(captured) >= 4:
-                break
-        await loop.stop()
+        with patch(
+            "qqbot.services.agent_loop.loop._WAKE_BATCH_WINDOW_SECONDS", 0
+        ):
+            loop.start()
+            loop.wake()
+            for _ in range(200):
+                await asyncio.sleep(0.01)
+                if len(captured) >= 4:
+                    break
+            await loop.stop()
 
         by_type = {
             _values_of(stmt).get("type"): _values_of(stmt) for stmt in captured
@@ -285,17 +291,20 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
             session_factory=_factory_for(captured),
             tool_registry=registry,
         )
-        loop.start()
-        loop.wake(immediate=True)
-        for _ in range(200):
-            await asyncio.sleep(0.01)
-            if any(
-                _values_of(stmt).get("type") == "runtime.tick_ended"
-                for stmt in captured
-                if getattr(stmt, "table", None) is not None
-            ):
-                break
-        await loop.stop()
+        with patch(
+            "qqbot.services.agent_loop.loop._WAKE_BATCH_WINDOW_SECONDS", 0
+        ):
+            loop.start()
+            loop.wake()
+            for _ in range(200):
+                await asyncio.sleep(0.01)
+                if any(
+                    _values_of(stmt).get("type") == "runtime.tick_ended"
+                    for stmt in captured
+                    if getattr(stmt, "table", None) is not None
+                ):
+                    break
+            await loop.stop()
 
         by_type = {
             _values_of(stmt).get("type"): _values_of(stmt) for stmt in captured
@@ -342,13 +351,16 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
             session_factory=_factory_for(captured),
             bot_user_id_resolver=_resolver,
         )
-        loop.start()
-        loop.wake(immediate=True)
-        for _ in range(50):
-            await asyncio.sleep(0.01)
-            if call_count["n"] >= 1:
-                break
-        await loop.stop()
+        with patch(
+            "qqbot.services.agent_loop.loop._WAKE_BATCH_WINDOW_SECONDS", 0
+        ):
+            loop.start()
+            loop.wake()
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+                if call_count["n"] >= 1:
+                    break
+            await loop.stop()
         # 至少跑了一 tick → resolver 至少被调一次
         self.assertGreaterEqual(call_count["n"], 1)
 
@@ -366,13 +378,16 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
             session_factory=_factory_for(captured),
             bot_user_id_resolver=_broken_resolver,
         )
-        loop.start()
-        loop.wake(immediate=True)
-        for _ in range(50):
-            await asyncio.sleep(0.01)
-            if len(captured) >= 4:
-                break
-        await loop.stop()
+        with patch(
+            "qqbot.services.agent_loop.loop._WAKE_BATCH_WINDOW_SECONDS", 0
+        ):
+            loop.start()
+            loop.wake()
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+                if len(captured) >= 4:
+                    break
+            await loop.stop()
         # 正常空程序事件链应当落地，不被 resolver 异常掐断。
         types = [_values_of(stmt).get("type") for stmt in captured]
         self.assertIn("runtime.tick_started", types)
@@ -446,8 +461,8 @@ class WakeBatchWindowTests(unittest.IsolatedAsyncioTestCase):
             await loop.stop()
         self.assertEqual(await self._tick_count(captured), 1)
 
-    async def test_immediate_wake_bypasses_window(self) -> None:
-        """reply 到点等完成事实直接开拍：结果已落库，没有可攒的东西。"""
+    async def test_external_wake_never_bypasses_window(self) -> None:
+        """外部 wake 一律进攒批窗口（含 reply 完成 / wait 到点 / 静默）。"""
         captured: list[Any] = []
         loop = AgentLoop(
             scope_key="group:12345",
@@ -455,10 +470,12 @@ class WakeBatchWindowTests(unittest.IsolatedAsyncioTestCase):
             session_factory=_factory_for(captured),
         )
         with patch(
-            "qqbot.services.agent_loop.loop._WAKE_BATCH_WINDOW_SECONDS", 5.0
+            "qqbot.services.agent_loop.loop._WAKE_BATCH_WINDOW_SECONDS", 0.3
         ):
             loop.start()
-            loop.wake(immediate=True)
+            loop.wake()
+            await asyncio.sleep(0.05)
+            self.assertEqual(await self._tick_count(captured), 0)
             await self._settle(captured, 4, budget=1.0)
             await loop.stop()
         self.assertEqual(await self._tick_count(captured), 1)
@@ -505,12 +522,14 @@ class LoopSupervisorContractTests(unittest.IsolatedAsyncioTestCase):
             session_factory=_factory_for(captured),
         )
         await sup.start()
-        await sup.wake("group:12345", mode=WakeMode.IMMEDIATE)
-        # 等 tick 落库
-        for _ in range(50):
-            await asyncio.sleep(0.01)
-            if captured:
-                break
+        with patch(
+            "qqbot.services.agent_loop.loop._WAKE_BATCH_WINDOW_SECONDS", 0
+        ):
+            await sup.wake("group:12345")
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+                if captured:
+                    break
 
         # 必须在 stop() 之前断言：stop 会 _loops.clear()，loop_count 归零。
         self.assertEqual(sup.loop_count, 2)  # system + group:12345
@@ -555,18 +574,10 @@ class LoopSupervisorContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(captured), baseline)
 
 
-class SupervisorWakeModeTests(unittest.IsolatedAsyncioTestCase):
-    """唤醒入口统一成 wake(mode=...)（2026-08-04）。
-
-    此前是 wake / _wake_immediate / _wake_no_arm 三个方法，后两个明明是私有
-    却被当回调注入给 ReplyExecutor 与 SilenceWatcher。现在只剩一个入口，
-    模式由 waker(mode) 在装配时 partial 绑定，注入出去的回调统一是
-    (scope_key) -> Awaitable[None]。
-    """
+class SupervisorSilenceArmingTests(unittest.IsolatedAsyncioTestCase):
+    """静默武装挂在 note_activity，不挂在 wake（2026-08-06）。"""
 
     class _SpyWatcher:
-        """只记录活动通知的静默计时器替身。"""
-
         def __init__(self) -> None:
             self.armed: list[str] = []
             self.enabled = True
@@ -587,32 +598,20 @@ class SupervisorWakeModeTests(unittest.IsolatedAsyncioTestCase):
         sup._silence_watcher = watcher
         return sup, watcher
 
-    async def test_batched_and_immediate_rearm_the_silence_timer(self) -> None:
-        """普通唤醒都算"有动静"，静默计时器必须重排。"""
+    async def test_wake_alone_does_not_arm_silence_timer(self) -> None:
+        """纯 wake 只开拍，不算时间线动静。"""
         sup, watcher = await self._supervisor()
         await sup.wake("group:1")
-        await sup.wake("group:2", mode=WakeMode.IMMEDIATE)
+        await sup.wake("group:2")
+        await sup.stop()
+        self.assertEqual(watcher.armed, [])
+
+    async def test_note_activity_rearms_the_silence_timer(self) -> None:
+        sup, watcher = await self._supervisor()
+        sup.note_activity("group:1")
+        sup.note_activity("group:2")
         await sup.stop()
         self.assertEqual(watcher.armed, ["group:1", "group:2"])
-
-    async def test_no_arm_mode_does_not_rearm_the_silence_timer(self) -> None:
-        """静默叫醒自己不能重置自己的计时器。
-
-        走普通路径会把这次叫醒当成"有动静"重新武装，于是一段静默里每隔一个
-        阈值就响一次；"一段静默只响一次"正是靠这条旁路成立的。
-        """
-        sup, watcher = await self._supervisor()
-        await sup.wake("group:1", mode=WakeMode.IMMEDIATE_NO_ARM)
-        await sup.stop()
-        self.assertEqual(watcher.armed, [])
-
-    async def test_waker_binds_mode_and_hides_it_from_producers(self) -> None:
-        """注入给生产者的回调只接受 scope_key —— 模式是装配决定，不是调用参数。"""
-        sup, watcher = await self._supervisor()
-        wake = sup.waker(WakeMode.IMMEDIATE_NO_ARM)
-        await wake("group:1")  # 单参数调用，生产者不认识 WakeMode
-        await sup.stop()
-        self.assertEqual(watcher.armed, [])
 
 
 class MemoryCompactorWiringTests(unittest.IsolatedAsyncioTestCase):
@@ -922,6 +921,8 @@ class ContinuationTickTests(unittest.IsolatedAsyncioTestCase):
         with patch(
             "qqbot.services.agent_loop.loop.continuation_max_ticks",
             return_value=max_ticks,
+        ), patch(
+            "qqbot.services.agent_loop.loop._WAKE_BATCH_WINDOW_SECONDS", 0
         ):
             loop = AgentLoop(
                 scope_key="group:12345",
@@ -929,14 +930,14 @@ class ContinuationTickTests(unittest.IsolatedAsyncioTestCase):
                 session_factory=_factory_for(captured),
                 tool_registry=registry,
             )
-        loop.start()
-        loop.wake(immediate=True)
-        for _ in range(120):
-            await asyncio.sleep(0.01)
-            if self._tick_count(captured) > expect_ticks:
-                break
-        await asyncio.sleep(0.05)
-        await loop.stop()
+            loop.start()
+            loop.wake()
+            for _ in range(120):
+                await asyncio.sleep(0.01)
+                if self._tick_count(captured) > expect_ticks:
+                    break
+            await asyncio.sleep(0.05)
+            await loop.stop()
         return captured
 
     async def test_empty_program_does_not_continue(self) -> None:
@@ -1016,7 +1017,7 @@ class ContinuationTickTests(unittest.IsolatedAsyncioTestCase):
             )
         loop._continuation_depth = 2
         self.assertFalse(loop._wake_continuation())
-        loop.wake(immediate=True)
+        loop.wake()
         self.assertEqual(loop._continuation_depth, 0)
         self.assertTrue(loop._wake_continuation())
 

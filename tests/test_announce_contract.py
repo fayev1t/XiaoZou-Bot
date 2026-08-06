@@ -2,7 +2,10 @@
 
 此前 `wait` 工具、SilenceWatcher、ReplyExecutor 各写一遍"写事实 + 叫醒"，
 连"写失败还叫不叫醒"这种真语义都埋在各自的 try 里。收敛成一个函数之后，
-差异只剩两个参数，本文件冻结的就是这两个参数的语义。
+差异只剩参数语义，本文件冻结的就是这些语义。
+
+2026-08-06：公开唤醒一律进攒批窗口；静默武装改由 `note_activity` 在写成功
+的非 silence_elapsed agent_visible 事实后触发。
 
 不碰 DB：用 `write_event=` 注入假写入器，因此全部是纯函数级断言。
 """
@@ -14,7 +17,6 @@ from typing import Any
 
 from qqbot.services.agent_loop.event_writer import (
     RuntimeEventPublisher,
-    WakeMode,
     announce,
 )
 
@@ -47,6 +49,17 @@ class _RecordingWake:
             raise RuntimeError("loop gone")
 
 
+class _RecordingActivity:
+    def __init__(self, *, order: list[str] | None = None) -> None:
+        self.scopes: list[str] = []
+        self._order = order
+
+    def __call__(self, scope_key: str) -> None:
+        if self._order is not None:
+            self._order.append("note")
+        self.scopes.append(scope_key)
+
+
 def _kwargs(**overrides: Any) -> dict:
     base = {
         "event_type": "runtime.wait_elapsed",
@@ -71,10 +84,7 @@ class AnnounceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(wake.scopes, ["group:1"])
 
     async def test_wake_never_precedes_the_fact(self) -> None:
-        """事件系统设计 §2：wake 不能领先于事实。
-
-        否则被叫醒那一拍的投影读不到自己被叫醒的理由。
-        """
+        """事件系统设计 §2：wake 不能领先于事实。"""
         order: list[str] = []
 
         class _OrderedWriter(_RecordingWriter):
@@ -108,10 +118,7 @@ class AnnounceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(writer.calls), 1)
 
     async def test_write_failure_propagates_and_skips_wake_by_default(self) -> None:
-        """reply 完成的语义：写失败就不叫。
-
-        完成事实没落库却把她叫起来，她看不到等待结束，只会以为是别的事叫醒的。
-        """
+        """reply 完成的语义：写失败就不叫。"""
         wake = _RecordingWake()
         with self.assertRaises(RuntimeError):
             await announce(
@@ -123,10 +130,7 @@ class AnnounceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(wake.scopes, [])
 
     async def test_wake_on_write_failure_keeps_the_appointment(self) -> None:
-        """`wait` / 静默到点的语义：本体是「到点我会来」的约定。
-
-        事件只是醒来后的说明文字，宁可少一行说明，不可失约。
-        """
+        """`wait` / 静默到点的语义：本体是「到点我会来」的约定。"""
         wake = _RecordingWake()
         event_id = await announce(
             None,
@@ -147,6 +151,61 @@ class AnnounceTests(unittest.IsolatedAsyncioTestCase):
             write_event=_RecordingWriter(),
         )
         self.assertEqual(event_id, "evt-1")
+
+    async def test_note_activity_after_visible_write(self) -> None:
+        order: list[str] = []
+        activity = _RecordingActivity(order=order)
+        wake = _RecordingWake(order=order)
+
+        class _OrderedWriter(_RecordingWriter):
+            async def __call__(self, session_factory: Any, **kwargs: Any) -> str:
+                order.append("write")
+                return await super().__call__(session_factory, **kwargs)
+
+        await announce(
+            None,
+            **_kwargs(),
+            wake=wake,
+            note_activity=activity,
+            write_event=_OrderedWriter(),
+        )
+        self.assertEqual(activity.scopes, ["group:1"])
+        self.assertEqual(order, ["write", "note", "wake"])
+
+    async def test_silence_elapsed_does_not_note_activity(self) -> None:
+        """静默事实本身不算动静——一段静默只响一次。"""
+        activity = _RecordingActivity()
+        await announce(
+            None,
+            **_kwargs(event_type="runtime.silence_elapsed"),
+            wake=_RecordingWake(),
+            note_activity=activity,
+            write_event=_RecordingWriter(),
+        )
+        self.assertEqual(activity.scopes, [])
+
+    async def test_write_failure_does_not_note_activity(self) -> None:
+        activity = _RecordingActivity()
+        await announce(
+            None,
+            **_kwargs(),
+            wake=_RecordingWake(),
+            note_activity=activity,
+            wake_on_write_failure=True,
+            write_event=_RecordingWriter(fail=True),
+        )
+        self.assertEqual(activity.scopes, [])
+
+    async def test_runtime_only_does_not_note_activity(self) -> None:
+        activity = _RecordingActivity()
+        await announce(
+            None,
+            **_kwargs(visibility="runtime_only"),
+            wake=_RecordingWake(),
+            note_activity=activity,
+            write_event=_RecordingWriter(),
+        )
+        self.assertEqual(activity.scopes, [])
 
 
 class RuntimeEventPublisherDelegationTests(unittest.IsolatedAsyncioTestCase):
@@ -172,15 +231,16 @@ class RuntimeEventPublisherDelegationTests(unittest.IsolatedAsyncioTestCase):
             await publisher.publish(**_kwargs())
         self.assertEqual(wake.scopes, [])
 
-
-class WakeModeTests(unittest.TestCase):
-    """三种模式必须都在，且互不相等——supervisor.wake 按它们分派。"""
-
-    def test_three_modes_exist(self) -> None:
-        self.assertEqual(
-            {m.value for m in WakeMode},
-            {"batched", "immediate", "immediate_no_arm"},
+    async def test_publish_forwards_note_activity(self) -> None:
+        activity = _RecordingActivity()
+        publisher = RuntimeEventPublisher(
+            None,
+            notify_event_available=_RecordingWake(),
+            note_activity=activity,
+            write_event=_RecordingWriter(),
         )
+        await publisher.publish(**_kwargs())
+        self.assertEqual(activity.scopes, ["group:1"])
 
 
 if __name__ == "__main__":

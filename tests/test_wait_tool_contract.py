@@ -135,6 +135,7 @@ class WaitFireTests(unittest.IsolatedAsyncioTestCase):
         await _fire_wait(
             session_factory=factory,
             wake_scope=_wake,
+            note_activity=None,
             scope_key="group:100",
             correlation_id="CID",
             causation_id="TC_EVENT",
@@ -169,6 +170,7 @@ class WaitFireTests(unittest.IsolatedAsyncioTestCase):
         await _fire_wait(
             session_factory=factory,
             wake_scope=_wake,
+            note_activity=None,
             scope_key="group:100",
             correlation_id="CID",
             causation_id=None,

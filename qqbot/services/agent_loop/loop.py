@@ -179,26 +179,23 @@ class AgentLoop:
             finally:
                 self._task = None
 
-    def wake(self, *, immediate: bool = False) -> None:
-        """请求开拍。默认走攒批窗口（见模块 docstring）。
+    def wake(self) -> None:
+        """请求开拍。外部入口一律走固定攒批窗口（见模块 docstring）。
 
-        immediate=True 用于已持久化的到点/完成类 runtime 事件；那里没有后续
-        消息可攒，等窗口只是白加延迟。
-
-        这是**外部**唤醒入口（EventIngest / wait 到点 / reply 完成 / 静默叫醒），
-        因此顺带把自续拍计数清零：外面又有事发生，上一段自转到此为止，新的一段
-        重新起算。自续拍走 ``_wake_continuation``，不经过这里。
+        EventIngest / wait 到点 / reply 完成 / 静默叫醒都经此入口；统一 3s
+        窗口，不再区分 immediate。顺带把自续拍计数清零：外面又有事发生，上一段
+        自转到此为止。自续拍走 ``_wake_continuation``，不经过这里。
         """
         if self._stopped:
             return
         self._continuation_depth = 0
-        self._arm_wake(immediate=immediate)
+        self._arm_wake(immediate=False)
 
     def _wake_continuation(self) -> bool:
         """本拍程序调用过函数 → 立刻再开一拍。返回是否真的排上。
 
-        用 immediate：自续拍不是在等谁把话说完，攒批窗口在这里只是每跳白加
-        三秒，链条一长就是她「想到一半」卡在那儿而群里已经走远了。
+        自续拍是 loop 内部排程，不走公开 wake：不是在等谁把话说完，攒批窗口
+        在这里只是每跳白加三秒。
         """
         if self._stopped:
             return False
@@ -216,7 +213,10 @@ class AgentLoop:
         return True
 
     def _arm_wake(self, *, immediate: bool) -> None:
-        """唤醒排程本体。不碰自续拍计数——由两个入口各自负责。"""
+        """唤醒排程本体。不碰自续拍计数——由两个入口各自负责。
+
+        ``immediate=True`` 仅供自续拍；外部一律 ``False`` 进攒批窗口。
+        """
         if immediate or _WAKE_BATCH_WINDOW_SECONDS <= 0:
             self._cancel_wake_timer()
             self._wake_deadline = None

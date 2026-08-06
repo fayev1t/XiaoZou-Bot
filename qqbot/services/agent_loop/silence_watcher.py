@@ -11,12 +11,12 @@
 §系统运行方式），这条是现在唯一的防注入结构性保障，运行时自己不能第一个破例。
 
 触发纪律：
-  - 每个 group scope 一个计时器，任何一次 ``wake`` 都重新武装（含她自己动作
-    引发的唤醒）；
+  - 每个 group scope 一个计时器；**可见事实落库**时 ``notify_activity`` 重新
+    武装（announce / EventIngest 提交后，不经 wake）；
   - 一段静默**只响一次**——响过之后不再自动重排，直到下一次活动重新武装；
-  - 到点先**回库复核**真实静默时长再决定响不响。武装钩子挂在 supervisor.wake
-    上，覆盖不到"她在一拍内自己发了消息"这种不经 wake 的活动；复核让钩子
-    的疏漏只表现为推迟，不表现为误报。
+    ``runtime.silence_elapsed`` 自身不算动静，不会 note_activity；
+  - 到点先**回库复核**真实静默时长再决定响不响。复核兜底"计时器与库内最后
+    可见时间不同步"的缝隙，误报只表现为推迟。
 
 只覆盖 ``group:*``：system loop 没有聊天面，"群里安静了"对它没有意义；private
 loop 从不实例化。
@@ -83,8 +83,8 @@ class SilenceWatcher:
         seconds: int | None = None,
     ) -> None:
         self._session_factory = session_factory
-        # 注意：这里拿到的必须是**不重新武装**的唤醒入口，否则自己的叫醒会
-        # 重置自己的计时器，静默期里反复开拍。
+        # wake 只负责开拍；武装由外部在可见事实落库时调用 notify_activity。
+        # silence_elapsed 写成功后不会 note_activity，因此不会自重置。
         self._wake = wake
         self._seconds = silence_seconds() if seconds is None else seconds
         self._timers: dict[str, asyncio.Task[None]] = {}
@@ -95,10 +95,10 @@ class SilenceWatcher:
         return self._seconds > 0
 
     def notify_activity(self, scope_key: str) -> None:
-        """该 scope 有动静：取消旧计时器，重新武装一个。
+        """该 scope 时间线有可见动静：取消旧计时器，重新武装一个。
 
-        非 group scope 与关闭态直接忽略。同步方法——它挂在 wake 的热路径上，
-        不能引入 await。
+        非 group scope 与关闭态直接忽略。同步方法——挂在 announce / ingest 提交
+        后的热路径上，不能引入 await。
         """
         if self._stopped or not self.enabled:
             return

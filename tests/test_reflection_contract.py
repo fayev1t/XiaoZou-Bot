@@ -316,17 +316,19 @@ class SilenceEventShapeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         written: list[dict[str, Any]] = []
-
-        async def _capture(session_factory: Any, **kwargs: Any) -> str:
-            written.append(kwargs)
-            return "EV1"
-
         woke: list[str] = []
 
         async def _wake(scope_key: str) -> None:
             woke.append(scope_key)
 
-        with patch.object(silence_watcher, "write_runtime_event", _capture):
+        async def _fake_announce(session_factory: Any, **kwargs: Any) -> str:
+            written.append(kwargs)
+            wake = kwargs.get("wake")
+            if wake is not None:
+                await wake(kwargs["scope_key"])
+            return "EV1"
+
+        with patch.object(silence_watcher, "announce", _fake_announce):
             watcher = silence_watcher.SilenceWatcher(
                 _NullSession, _wake, seconds=_TINY
             )

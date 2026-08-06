@@ -84,7 +84,8 @@ class V2MainPluginContractTests(unittest.TestCase):
             "async def _notify_committed_event(event: SystemEvent)",
             self.plugin_text,
         )
-        self.assertIn("await _get_supervisor().wake(scope_key)", self.plugin_text)
+        self.assertIn("await sup.wake(scope_key)", self.plugin_text)
+        self.assertIn("sup.note_activity(scope_key)", self.plugin_text)
         self.assertNotIn("supervisor=_get_supervisor()", self.plugin_text)
 
     def test_raw_notice_and_meta_events_do_not_reach_role_reflection(self) -> None:

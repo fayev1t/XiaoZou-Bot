@@ -4,7 +4,7 @@
 - 写入前在 scope 锁内复核 open / 最新 revision / 已到期；
 - 同一最新 revision 只产生一条 runtime.reply_task_completed（causation 去重）；
 - 事件先提交、后调注入的 notifier（supervisor 装配的
-  ``waker(WakeMode.IMMEDIATE)``——publisher 只见朴素的 (scope_key) 回调）；
+  ``supervisor.wake``——publisher 只见朴素的 (scope_key) 回调）；
 - 启动 rescan：重挂 open 定时器（过期立即触发）、升级期旧 flush 补
   uncertain；不建完成事件的消费审计/rescan outbox（best-effort 语义，
   §3.2）。
@@ -129,8 +129,8 @@ class ReplyExecutorCompletionTests(unittest.TestCase):
             self.assertNotIn(gone, payload)
 
     def test_notify_happens_after_persist(self) -> None:
-        """persist-then-notify：wake 到达时投影必然读得到完成事件。immediate
-        与否由 supervisor 注入的 wrapper 决定，不属于执行器的契约面。"""
+        """persist-then-notify：wake 到达时投影必然读得到完成事件。
+        开拍延迟由统一攒批窗口决定，不属于执行器的契约面。"""
         timeline: list[str] = []
 
         async def _write(*_: object, **__: object) -> str:

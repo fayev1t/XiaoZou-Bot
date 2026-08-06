@@ -20,18 +20,14 @@ no ToolWorker, pending-tool notification, or tool-batch completion wake.
 from __future__ import annotations
 
 import asyncio
-from functools import partial
-from typing import Any, Awaitable, Callable
+from typing import Any, Callable
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from qqbot.core.logging import get_logger
 from qqbot.services.agent_loop import bot_registry
 from qqbot.services.agent_loop.decision import Planner
-from qqbot.services.agent_loop.event_writer import (
-    RuntimeEventPublisher,
-    WakeMode,
-)
+from qqbot.services.agent_loop.event_writer import RuntimeEventPublisher
 from qqbot.services.agent_loop.loop import AgentLoop
 from qqbot.services.agent_loop.projection import Projector
 from qqbot.services.agent_loop.reply_executor import ReplyExecutor
@@ -98,15 +94,22 @@ class LoopSupervisor:
             logger.warning(
                 "[supervisor] task backfill failed (continuing): {}", exc
             )
+        # 静默叫醒先于 ReplyExecutor：rescan 补 completed 时 note_activity 已可用。
+        # 计时器由可见事实落库武装；silence_elapsed 本身不算动静。
+        self._silence_watcher = SilenceWatcher(
+            self._session_factory, self.wake
+        )
+        if self._silence_watcher.enabled:
+            logger.info("[supervisor] silence watcher online")
         # ReplyExecutor 独立负责 reply_task 的到点生命周期完成（2026-07-31 起
-        # 不再组稿发送）：completed 事件经其**专用** RuntimeEventPublisher 落库
-        # 后，由这里注入的 wrapper 直接 immediate 唤醒——完成事实已落库、没有
-        # 可攒的新消息，等攒批窗口只是白加延迟。publisher 协议本身不变。
+        # 不再组稿发送）：completed 经 RuntimeEventPublisher 落库后走统一 3s
+        # 攒批窗口唤醒；写成功的 agent_visible 事实顺带 note_activity。
         self._reply_executor = ReplyExecutor(
             session_factory=self._session_factory,
             event_publisher=RuntimeEventPublisher(
                 self._session_factory,
-                notify_event_available=self.waker(WakeMode.IMMEDIATE),
+                notify_event_available=self.wake,
+                note_activity=self.note_activity,
             ),
         )
         # rescan 与上面的任务回填同属恢复性动作，best-effort：失败只损失
@@ -141,14 +144,6 @@ class LoopSupervisor:
                 "[supervisor] memory compactor start failed (continuing): {}",
                 exc,
             )
-        # 静默叫醒：构造即可，没有 worker 要拉起——计时器由 wake() 的活动通知
-        # 按需武装。用 IMMEDIATE_NO_ARM：自己的叫醒不能重置自己的计时器，
-        # 否则一段静默里会反复开拍。
-        self._silence_watcher = SilenceWatcher(
-            self._session_factory, self.waker(WakeMode.IMMEDIATE_NO_ARM)
-        )
-        if self._silence_watcher.enabled:
-            logger.info("[supervisor] silence watcher online")
         # SystemAgentLoop wakes up to handle scope=system events
         # (request.*, lifecycle, bot_offline, ...).
         await self._ensure("system")
@@ -183,44 +178,33 @@ class LoopSupervisor:
                 self._memory_compactor = None
         logger.info("[supervisor] stopped, {} loops drained", len(loops))
 
-    def waker(self, mode: WakeMode) -> Callable[[str], Awaitable[None]]:
-        """绑定 mode，返回朴素的 ``(scope_key) -> Awaitable[None]`` 回调。
+    def note_activity(self, scope_key: str) -> None:
+        """可见时间线有新动静 → 重排该 scope 的静默计时器。
 
-        注入给生产者（ReplyExecutor / SilenceWatcher / `wait` 工具）的一律是
-        这个形状：它们只表达"叫醒这个 scope"，用哪种模式是本处的装配决定。
-        2026-08-04 用它取代了 `_wake_immediate` / `_wake_no_arm` 两个私有方法
-        ——那两个私有方法本身就是被当回调注入出去的，等于三个入口三种形状。
+        挂在事实落库之后（announce / EventIngest 提交），不挂在 wake 上：唤醒
+        只表示"该看一眼"，活动语义属于"时间线多了什么"。
         """
-        return partial(self.wake, mode=mode)
+        if self._stopped or self._silence_watcher is None:
+            return
+        self._silence_watcher.notify_activity(scope_key)
 
-    async def wake(
-        self, scope_key: str, *, mode: WakeMode = WakeMode.BATCHED
-    ) -> None:
-        """唤醒某个 scope 的 loop。三种模式的语义见 ``WakeMode``。
+    async def wake(self, scope_key: str) -> None:
+        """唤醒某个 scope 的 loop。一律走固定攒批窗口（默认 3s）。
 
-        默认 BATCHED 走 AgentLoop 的攒批窗口（2026-07-28 引入，2026-08-01 改
-        固定窗口）：新消息不立刻开拍，第一条开一个固定窗口，这段时间内到的一起
-        在窗口到点那一拍看到，避免对着拆成几条发的半截话表态。
+        第一条开窗，窗口内后续唤醒并入本窗、不顺延 deadline。静默计时器不在
+        这里武装——见 ``note_activity``。
         """
         if self._stopped:
             return
         if scope_key.startswith("private:"):
             # 实例化策略 §10.1: private 不实例化 loop
             return
-        # 有动静 → 重排静默计时器。放在 _ensure 之前：即便 loop 创建失败，
-        # "这个 scope 刚才不静默"也是事实。IMMEDIATE_NO_ARM 跳过这一步，
-        # 否则静默叫醒会重置自己的计时器、一段静默里反复开拍。
-        if (
-            mode is not WakeMode.IMMEDIATE_NO_ARM
-            and self._silence_watcher is not None
-        ):
-            self._silence_watcher.notify_activity(scope_key)
         try:
             loop = await self._ensure(scope_key)
         except ValueError:
             logger.warning("[supervisor] invalid scope_key: {}", scope_key)
             return
-        loop.wake(immediate=mode is not WakeMode.BATCHED)
+        loop.wake()
 
     def notify_compaction(self, scope_key: str, uncovered_events: int) -> None:
         """转发投影计数；压缩器只接受达到阈值的 scope。

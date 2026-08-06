@@ -3,9 +3,8 @@
 2026-07-31 删除 Replyer（重构提案-删除Replyer.md）：到点不再组稿、不再碰
 OneBot。执行器只做一件事——在 scope 锁内复核最新 revision 仍 open 且已到期，
 append 一条 ``runtime.reply_task_completed``（once，去重键 = 该 revision 的
-upsert event_id），提交成功后经注入的 publisher 通知唤醒 Planner（supervisor
-装配时注入的是 ``supervisor.waker(WakeMode.IMMEDIATE)``，
-publisher 协议本身不变，§3.1）。发不发、发什么由 Planner 醒来那一拍结合最新
+upsert event_id），提交成功后经注入的 publisher 通知唤醒 Planner（统一 3s
+攒批窗口；publisher 协议本身不变，§3.1）。发不发、发什么由 Planner 醒来那一拍结合最新
 时间流自己决定（``send_messages`` 工具）；完成事件只表达"等待阶段结束了"，
 **不是**发言授权，也没有消费/TTL 概念（§0.4）。
 
@@ -189,7 +188,7 @@ class ReplyExecutor:
         全部意思就是"这段等待结束了"。它不带内容、也不带授权 ID、可用次数、
         消费状态或 TTL（§0.4/§1.3）——醒来那一拍该说什么，由那时的时间线决
         定。publisher 先 commit 再调注入的 notifier（supervisor 的
-        immediate-wake wrapper），wake 到达时投影必然读得到完成事件；通知失败
+        统一攒批 wake），wake 到达时投影必然读得到完成事件；通知失败
         不回滚事件（best-effort，后续自然 wake 兜底）。
         """
         correlation_id = task.correlation_id or new_event_id()

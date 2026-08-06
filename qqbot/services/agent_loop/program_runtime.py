@@ -843,6 +843,9 @@ class _RuntimeState:
                     bot_role=context.bot_role if context is not None else None,
                     tool_call_event_id=tool_call_event_id,
                     wake_scope=getattr(self.executor._supervisor, "wake", None),
+                    note_activity=getattr(
+                        self.executor._supervisor, "note_activity", None
+                    ),
                     caption_image=self.executor._caption_image,
                     notify_reply_task=getattr(
                         self.executor._supervisor,
