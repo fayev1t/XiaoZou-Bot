@@ -8,7 +8,7 @@
 - **磁盘前缀解析**：``resolve_media_hash`` 把前缀解析为落盘的完整 hash
   （唯一匹配）；多义 → ambiguous_hash_prefix。
 - **磁盘定位**：复用 EventIngest 的内容寻址布局
-  runtime_data/media/img/<hash[:2]>/<hash>（EventIngest契约.md §6.1）。布局的
+  runtime_data/media/img/<hash[:2]>/<hash>（EventIngest契约.md §5.1）。布局的
   唯一权威是 event_ingest.media.MEDIA_IMG_DIR —— 这里 import 它而不是抄一份
   路径常量（跨包 import 先例：event_writer → event_ingest.persistence）。
 - **mime 嗅探**：落盘文件按 hash 命名无扩展名，caption 调用拼 data URL 需要

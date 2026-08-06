@@ -1,6 +1,6 @@
 """Map OneBot V11 GroupMessageEvent → external.message.group.*
 
-Contract: 开发文档/v2.0/事件系统设计.md §4.1
+Contract: 开发文档/v2.0/20-横切契约/EventIngest契约.md §4
 
 Self-message 回流策略（明确不回流）：bot 自己发出的群消息**不会**进入
 external.message.group.*，有两道闸——

@@ -12,9 +12,9 @@ Also verifies:
 - LoopSupervisor lazy-instantiates GroupAgentLoop on wake.
 - LoopSupervisor silently drops private:* wakes.
 - LoopSupervisor.start() spawns the system loop up front.
-- EventIngest.wake is dispatched to supervisor on inserted external events
-  and not dispatched for private / no-mapper events.
-- scope_key parser handles all three scopes.
+- EventIngest publishes only newly committed SystemEvent values; duplicate
+  inserts publish nothing, and plugin wiring owns scope-to-wake translation.
+- scope_key parser handles all three AgentLoop scopes.
 - 唤醒攒批窗口（2026-07-28 引入，2026-08-01 改固定窗口）：默认 wake() 由第一次
   唤醒开窗、到点才开拍，窗口内的唤醒并入同一拍且不顺延，immediate=True 绕过
   窗口，持续唤醒下每个窗口到点照常开拍（不会被顺延饿死）。
@@ -24,11 +24,9 @@ from __future__ import annotations
 
 import asyncio
 import unittest
-from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
-from zoneinfo import ZoneInfo
 
 from qqbot.services.agent_loop import (
     AgentLoop,
@@ -41,8 +39,6 @@ from qqbot.services.agent_loop.tool_registry import (
     ToolOutcome,
     ToolRegistry,
 )
-from qqbot.services.event_ingest.ingest import _scope_key_for_wake
-from qqbot.services.event_ingest.system_event import SystemEvent
 
 
 class _FakeIdlePlanner:
@@ -132,39 +128,6 @@ class ScopeKeyParserTests(unittest.TestCase):
     def test_invalid(self) -> None:
         with self.assertRaises(ValueError):
             parse_scope_key("bogus")
-
-
-class IngestScopeRoutingTests(unittest.TestCase):
-    def _ev(self, scope: str, group_id: int | None = None, user_id: int | None = None):
-        return SystemEvent(
-            event_id="x",
-            occurred_at=datetime.now(ZoneInfo("Asia/Shanghai")),
-            origin="external",
-            type="t",
-            scope=scope,
-            group_id=group_id,
-            user_id=user_id,
-            visibility="agent_visible",
-            correlation_id="x",
-            causation_id=None,
-            idempotency_key=None,
-            payload={},
-            raw=None,
-        )
-
-    def test_group_event_routes_to_group_scope_key(self) -> None:
-        self.assertEqual(
-            _scope_key_for_wake(self._ev("group", group_id=12345)), "group:12345"
-        )
-
-    def test_system_event_routes_to_system_scope_key(self) -> None:
-        self.assertEqual(_scope_key_for_wake(self._ev("system")), "system")
-
-    def test_private_event_does_not_wake(self) -> None:
-        self.assertIsNone(_scope_key_for_wake(self._ev("private", user_id=222)))
-
-    def test_group_event_without_group_id_does_not_wake(self) -> None:
-        self.assertIsNone(_scope_key_for_wake(self._ev("group", group_id=None)))
 
 
 class _SlowIdlePlanner:
@@ -710,15 +673,14 @@ class MemoryCompactorWiringTests(unittest.IsolatedAsyncioTestCase):
 
 
 class IngestSupervisorIntegrationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_ingest_calls_supervisor_wake_on_insert(self) -> None:
+    async def test_ingest_notifies_only_with_committed_internal_event(self) -> None:
         from qqbot.services.event_ingest import EventIngest
         from qqbot.services.event_ingest.mappers import build_default_registry
 
-        wake_calls: list[str] = []
+        committed: list[Any] = []
 
-        class FakeSupervisor:
-            async def wake(self, scope_key: str) -> None:
-                wake_calls.append(scope_key)
+        async def notify(event: Any) -> None:
+            committed.append(event)
 
         class FakeSession:
             async def execute(self, stmt: Any) -> Any:
@@ -736,9 +698,8 @@ class IngestSupervisorIntegrationTests(unittest.IsolatedAsyncioTestCase):
         ingest = EventIngest(
             build_default_registry(),
             session_factory=FakeSession,
-            supervisor=FakeSupervisor(),
+            committed_notifier=notify,
         )
-        # group message → wake group:999
         event = SimpleNamespace(
             post_type="message",
             message_type="group",
@@ -754,17 +715,18 @@ class IngestSupervisorIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         result = await ingest.ingest(event)
         self.assertEqual(result.status, "inserted")
-        self.assertEqual(wake_calls, ["group:999"])
+        self.assertEqual(committed, [result.event])
+        self.assertEqual(committed[0].scope, "group")
+        self.assertEqual(committed[0].group_id, 999)
 
-    async def test_ingest_does_not_wake_for_private_message(self) -> None:
+    async def test_private_event_is_still_published_as_committed(self) -> None:
         from qqbot.services.event_ingest import EventIngest
         from qqbot.services.event_ingest.mappers import build_default_registry
 
-        wake_calls: list[str] = []
+        committed: list[Any] = []
 
-        class FakeSupervisor:
-            async def wake(self, scope_key: str) -> None:
-                wake_calls.append(scope_key)
+        async def notify(event: Any) -> None:
+            committed.append(event)
 
         class FakeSession:
             async def execute(self, stmt: Any) -> Any:
@@ -782,7 +744,7 @@ class IngestSupervisorIntegrationTests(unittest.IsolatedAsyncioTestCase):
         ingest = EventIngest(
             build_default_registry(),
             session_factory=FakeSession,
-            supervisor=FakeSupervisor(),
+            committed_notifier=notify,
         )
         event = SimpleNamespace(
             post_type="message",
@@ -798,17 +760,17 @@ class IngestSupervisorIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         result = await ingest.ingest(event)
         self.assertEqual(result.status, "inserted")
-        self.assertEqual(wake_calls, [])  # private 不唤醒
+        self.assertEqual(committed, [result.event])
+        self.assertEqual(committed[0].scope, "private")
 
-    async def test_ingest_does_not_wake_for_duplicate(self) -> None:
+    async def test_ingest_does_not_notify_for_duplicate(self) -> None:
         from qqbot.services.event_ingest import EventIngest
         from qqbot.services.event_ingest.mappers import build_default_registry
 
-        wake_calls: list[str] = []
+        committed: list[Any] = []
 
-        class FakeSupervisor:
-            async def wake(self, scope_key: str) -> None:
-                wake_calls.append(scope_key)
+        async def notify(event: Any) -> None:
+            committed.append(event)
 
         class FakeSession:
             async def execute(self, stmt: Any) -> Any:
@@ -826,7 +788,7 @@ class IngestSupervisorIntegrationTests(unittest.IsolatedAsyncioTestCase):
         ingest = EventIngest(
             build_default_registry(),
             session_factory=FakeSession,
-            supervisor=FakeSupervisor(),
+            committed_notifier=notify,
         )
         event = SimpleNamespace(
             post_type="message", message_type="group", sub_type="normal",
@@ -835,7 +797,7 @@ class IngestSupervisorIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         result = await ingest.ingest(event)
         self.assertEqual(result.status, "duplicate")
-        self.assertEqual(wake_calls, [])
+        self.assertEqual(committed, [])
 
 
 class _ScriptedPlanner:

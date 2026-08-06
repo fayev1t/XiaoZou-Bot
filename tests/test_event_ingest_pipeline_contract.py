@@ -19,8 +19,8 @@ from qqbot.services.event_ingest import (
     EventIngest,
     MapperRegistry,
     finalize,
+    idempotency,
 )
-from qqbot.services.event_ingest import idempotency
 from qqbot.services.event_ingest.mappers import (
     GroupMessageMapper,
     GroupRecallMapper,
@@ -360,55 +360,150 @@ class IdempotencyHelpersTests(unittest.TestCase):
             "1:unknown:_:_:100:_",
         )
 
+    def test_for_ingest_failure_preserves_message_identity(self) -> None:
+        event = _make_message_event()
+        self.assertEqual(
+            idempotency.for_ingest_failure(event),
+            "10000:msg:12345",
+        )
+
 
 class IngestPipelineTests(unittest.IsolatedAsyncioTestCase):
-    async def test_unknown_event_persists_runtime_fallback(self) -> None:
-        # 契约 EventIngest契约.md §8：没有 mapper 的事件不丢弃——折成
-        # runtime.napcat_unknown_event（agent_visible, scope=system）落库并
-        # 唤醒 system loop；status 仍为 "unknown"（语义：无 mapper）。
+    async def test_notifier_runs_only_after_commit(self) -> None:
+        order: list[str] = []
+
+        class OrderedSession:
+            async def execute(self, stmt: Any) -> Any:
+                order.append("execute")
+                return SimpleNamespace(rowcount=1)
+
+            async def commit(self) -> None:
+                order.append("commit")
+
+            async def __aenter__(self) -> "OrderedSession":
+                return self
+
+            async def __aexit__(self, *args: Any) -> None:
+                return None
+
+        async def notify(event: Any) -> None:
+            _ = event
+            order.append("notify")
+
+        ingest = EventIngest(
+            build_default_registry(),
+            session_factory=OrderedSession,
+            committed_notifier=notify,
+        )
+
+        result = await ingest.ingest(_make_message_event())
+
+        self.assertEqual(result.status, "inserted")
+        self.assertEqual(order, ["execute", "commit", "notify"])
+
+    async def test_commit_failure_never_notifies(self) -> None:
+        class FailingSession:
+            async def execute(self, stmt: Any) -> Any:
+                return SimpleNamespace(rowcount=1)
+
+            async def commit(self) -> None:
+                raise RuntimeError("database unavailable")
+
+            async def __aenter__(self) -> "FailingSession":
+                return self
+
+            async def __aexit__(self, *args: Any) -> None:
+                return None
+
+        notifier = _FakeCommittedNotifier()
+        ingest = EventIngest(
+            build_default_registry(),
+            session_factory=FailingSession,
+            committed_notifier=notifier,
+        )
+
+        result = await ingest.ingest(_make_message_event())
+
+        self.assertEqual(result.status, "error")
+        self.assertEqual(notifier.events, [])
+
+    async def test_unknown_event_persists_terminal_failure(self) -> None:
+        # 无 mapper 也是一种前置处理失败：只落一条安全的终态内部事件，
+        # 原始报文进 raw 审计列，提交后才通知 AgentLoop 侧。
         recorder = _FakeSessionRecorder(rowcount=1)
-        supervisor = _FakeSupervisor()
+        notifier = _FakeCommittedNotifier()
         ingest = EventIngest(
             build_default_registry(),
             session_factory=recorder.factory,
-            supervisor=supervisor,
+            committed_notifier=notifier,
         )
         result = await ingest.ingest(_UnknownEvent())
 
-        self.assertEqual(result.status, "unknown")
+        self.assertEqual(result.status, "processing_failed")
         self.assertEqual(result.reason, "no_mapper")
         ev = result.event
         self.assertIsNotNone(ev)
-        self.assertEqual(ev.type, "runtime.napcat_unknown_event")
+        self.assertEqual(ev.type, "runtime.event_ingest_failed")
         self.assertEqual(ev.origin, "runtime")
         self.assertEqual(ev.scope, "system")
         self.assertIsNone(ev.group_id)
         self.assertEqual(ev.visibility, "agent_visible")
-        self.assertEqual(ev.payload["post_type"], "notice")
-        self.assertEqual(ev.payload["sub_type"], "profile_like")
-        # 原报文全量在 payload.raw；raw 列仅 external 写入（事件系统设计 §3）
-        self.assertEqual(ev.payload["raw"], _UnknownEvent.DUMP)
-        self.assertIsNone(ev.raw)
+        self.assertEqual(ev.payload["source_post_type"], "notice")
+        self.assertEqual(ev.payload["source_sub_type"], "profile_like")
+        self.assertEqual(ev.payload["failures"][0]["error_code"], "no_mapper")
+        self.assertNotIn("raw", ev.payload)
+        self.assertEqual(ev.raw, _UnknownEvent.DUMP)
         self.assertEqual(
             ev.idempotency_key,
-            "10000:unknown:notice:profile_like:1716700000:222",
+            "10000:notice:notify:profile_like:1716700000:222:_",
         )
         self.assertEqual(recorder.executes, 1)
         self.assertEqual(recorder.commits, 1)
-        self.assertEqual(supervisor.woken, ["system"])
+        self.assertEqual(notifier.events, [ev])
 
     async def test_unknown_event_duplicate_on_repush(self) -> None:
         # napcat 重推同一未知报文 → 唯一键兜住，不重复入库、不再唤醒
         recorder = _FakeSessionRecorder(rowcount=0)
-        supervisor = _FakeSupervisor()
+        notifier = _FakeCommittedNotifier()
         ingest = EventIngest(
             build_default_registry(),
             session_factory=recorder.factory,
-            supervisor=supervisor,
+            committed_notifier=notifier,
         )
         result = await ingest.ingest(_UnknownEvent())
         self.assertEqual(result.status, "duplicate")
-        self.assertEqual(supervisor.woken, [])
+        self.assertEqual(notifier.events, [])
+
+    async def test_mapper_exception_becomes_group_failure_event(self) -> None:
+        class BrokenMapper:
+            post_type = "message"
+            sub_type = "broken"
+
+            def can_map(self, event: Any) -> bool:
+                return True
+
+            def map(self, event: Any) -> PartialSystemEvent:
+                raise ValueError("bad payload")
+
+        registry = MapperRegistry()
+        registry.register(BrokenMapper())
+        recorder = _FakeSessionRecorder(rowcount=1)
+        notifier = _FakeCommittedNotifier()
+        ingest = EventIngest(
+            registry,
+            session_factory=recorder.factory,
+            committed_notifier=notifier,
+        )
+
+        result = await ingest.ingest(_make_message_event())
+
+        self.assertEqual(result.status, "processing_failed")
+        self.assertEqual(result.reason, "mapper_failed")
+        self.assertEqual(result.event.type, "runtime.event_ingest_failed")
+        self.assertEqual(result.event.scope, "group")
+        self.assertEqual(result.event.group_id, 999)
+        self.assertEqual(result.event.payload["raw_message"], "hello")
+        self.assertEqual(notifier.events, [result.event])
 
     async def test_ingest_group_message_inserts(self) -> None:
         recorder = _FakeSessionRecorder(rowcount=1)
@@ -473,18 +568,18 @@ class _FakeSessionRecorder:
         return _FakeSession(self._rowcount, self)
 
 
-class _FakeSupervisor:
+class _FakeCommittedNotifier:
     def __init__(self) -> None:
-        self.woken: list[str] = []
+        self.events: list[Any] = []
 
-    async def wake(self, scope_key: str) -> None:
-        self.woken.append(scope_key)
+    async def __call__(self, event: Any) -> None:
+        self.events.append(event)
 
 
 class _UnknownEvent:
     """没有 mapper 的 napcat 报文 fake（如 notify.profile_like）。
 
-    带 dict() 以便 dump_event 走 pydantic v1 路径，验证原报文进 payload.raw。
+    带 dict() 以便 dump_event 走 pydantic v1 路径，验证原报文只进 raw 审计列。
     """
 
     post_type = "notice"

@@ -1,9 +1,9 @@
 """AgentLoop: v2 program-shaped decision/tick layer.
 
 Contracts:
-- 开发文档/v2.0/任务与决策契约.md (DecisionRound, Program, Planner)
-- 开发文档/v2.0/事件系统设计.md §10 (实例化策略)
-- 开发文档/v2.0/EventIngest契约.md §5 (LoopSupervisor.wake interface)
+- 开发文档/v2.0/20-横切契约/任务与决策契约.md
+- 开发文档/v2.0/20-横切契约/事件系统设计.md §11
+- 开发文档/v2.0/20-横切契约/EventIngest契约.md §8
 
 包级导入策略(③ 模块解耦,见开发日志 2026-06-23):
   纯数据类(decision)与轻量 bot_registry 保持 eager —— 它们只依赖 stdlib;

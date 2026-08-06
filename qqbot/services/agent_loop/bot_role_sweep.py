@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from qqbot.core.ids import new_event_id
 from qqbot.core.logging import get_logger
 from qqbot.services.agent_loop.event_writer import write_runtime_event
+from qqbot.services.event_ingest.system_event import SystemEvent
 
 logger = get_logger(__name__)
 
@@ -113,13 +114,14 @@ async def sweep_bot_role(bot: Any, session_factory: SessionFactory) -> int:
 
 async def reflect_bot_role_from_notice(
     bot: Any,
-    event: Any,
+    event: SystemEvent | None,
     session_factory: SessionFactory,
 ) -> None:
-    """对涉及 bot 自身的 notice 写一条 ``runtime.bot_role_observed``。
+    """Reflect a committed internal notice into ``runtime.bot_role_observed``.
 
-    被 v2_main 的 notice handler 调用；任何异常都吞掉，反射失败不应让主消息
-    处理路径炸。三类触发：
+    NapCat/NoneBot objects stop at EventIngest. v2_main passes only the newly
+    committed SystemEvent; duplicates and preprocessing failures are ignored.
+    三类触发：
 
       - notice_type=group_admin, user_id==self_id → role 由 sub_type 决定
         ("set" → admin, "unset" → member)
@@ -129,26 +131,32 @@ async def reflect_bot_role_from_notice(
     其它 notice_type 直接返回。
     """
     try:
-        notice_type = getattr(event, "notice_type", None)
-        if notice_type not in ("group_admin", "group_increase", "group_decrease"):
+        if event is None:
             return
-        target_user_id = getattr(event, "user_id", None)
+        event_type = event.type
+        if event_type not in (
+            "external.notice.group_admin",
+            "external.notice.group_increase",
+            "external.notice.group_decrease",
+        ):
+            return
+        target_user_id = event.user_id
         self_id = getattr(bot, "self_id", None)
         if target_user_id is None or self_id is None:
             return
         if int(target_user_id) != int(self_id):
             return
-        group_id = getattr(event, "group_id", None)
+        group_id = event.group_id
         if group_id is None:
             return
-        if notice_type == "group_admin":
-            sub = (getattr(event, "sub_type", "") or "").strip().lower()
+        if event_type == "external.notice.group_admin":
+            sub = str(event.payload.get("sub_type") or "").strip().lower()
             role = "admin" if sub == "set" else "member"
             source = "group_admin_notice"
-        elif notice_type == "group_increase":
+        elif event_type == "external.notice.group_increase":
             role = _DEFAULT_ROLE_ON_LEAVE
             source = "group_increase_notice"
-        else:  # group_decrease
+        else:
             role = _DEFAULT_ROLE_ON_LEAVE
             source = "group_decrease_notice"
         await observe_bot_role_change(
@@ -166,18 +174,19 @@ async def reflect_bot_role_from_notice(
 
 def reflect_bot_role_from_meta(
     bot: Any,
-    event: Any,
+    event: SystemEvent | None,
     session_factory: SessionFactory,
 ) -> None:
-    """meta_event 的反射：lifecycle.connect → 全量 sweep。其它 sub_type 忽略。
+    """Committed lifecycle.connect → full role sweep; other events are ignored.
 
     同步函数：内部 ``schedule_sweep`` 是 fire-and-forget create_task。
     异常吞掉，理由同 reflect_bot_role_from_notice。
     """
     try:
-        meta_event_type = getattr(event, "meta_event_type", None)
-        sub_type = (getattr(event, "sub_type", "") or "").strip().lower()
-        if meta_event_type == "lifecycle" and sub_type == "connect":
+        if event is None or event.type != "external.meta.lifecycle":
+            return
+        sub_type = str(event.payload.get("sub_type") or "").strip().lower()
+        if sub_type == "connect":
             schedule_sweep(bot, session_factory)
     except Exception as exc:
         logger.warning(

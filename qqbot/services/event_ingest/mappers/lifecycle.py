@@ -1,8 +1,7 @@
 """Map meta_event.lifecycle → external.meta.lifecycle
 
-scope=system，visibility=runtime_only。SystemAgentLoop 据此感知 adapter
-连接窗口；connect 触发 supervisor 的崩溃恢复扫描（见事件层 §10.3 与
-EventIngest契约.md §7.2）。
+scope=system，visibility=runtime_only。提交后 plugin 唤醒 system scope；
+connect 的 bot 角色全量扫描只由刚提交的 SystemEvent 反射触发。
 """
 
 from __future__ import annotations

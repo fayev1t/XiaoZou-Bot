@@ -1,13 +1,18 @@
 """EventIngest: v2 ingress layer.
 
 Contracts:
-- 开发文档/v2.0/EventIngest契约.md (pipeline, mappers, idempotency)
-- 开发文档/v2.0/事件系统设计.md (SystemEvent schema, scopes, visibility)
+- 开发文档/v2.0/20-横切契约/EventIngest契约.md
+- 开发文档/v2.0/20-横切契约/事件系统设计.md
 
-第 2 步范围：mapper + finalize + persist。
-尚未实现：媒体下载 (§6)、heartbeat 旁路 (§7)、唤醒 LoopSupervisor (§5)。
+Every non-heartbeat NapCat input is reduced to exactly one committed terminal
+event: either the mapped ``external.*`` fact or
+``runtime.event_ingest_failed`` when required preprocessing cannot finish.
 """
 
+from qqbot.services.event_ingest.failure import (
+    INGEST_FAILURE_EVENT_TYPE,
+    IngestFailureDetail,
+)
 from qqbot.services.event_ingest.ingest import EventIngest, IngestResult
 from qqbot.services.event_ingest.mapper import EventMapper, MapperRegistry
 from qqbot.services.event_ingest.system_event import (
@@ -19,6 +24,8 @@ from qqbot.services.event_ingest.system_event import (
 __all__ = [
     "EventIngest",
     "IngestResult",
+    "INGEST_FAILURE_EVENT_TYPE",
+    "IngestFailureDetail",
     "EventMapper",
     "MapperRegistry",
     "PartialSystemEvent",

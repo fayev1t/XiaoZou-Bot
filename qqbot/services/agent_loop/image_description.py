@@ -1,11 +1,11 @@
-"""timeline 图片的客观描述（2026-07-28，Planner/Replyer 去多模态化的核心）。
+"""timeline 图片的客观描述（2026-07-28，替代逐拍多模态上传）。
 
 背景：2026-07-28 之前 Planner 与 Replyer 都是 VLM，每一拍把 timeline 窗口里
 **所有**图片重新 base64 上传一遍（llm_planner._build_image_blocks，Replyer 复用
 同一函数）。一张图在窗口里待几十条事件，就被重复上传几十次 × 2 个调用点，还把
 系统里最高频的两个调用点硬绑成必须有 vision 能力。现在改成：每张图在 ingest
-落盘后由专用 VLM 看**一次**，写一段客观描述进事件正文，Planner/Replyer 降级为
-纯文本模型。
+落盘后由专用 VLM 看**一次**，写一段客观描述进事件正文。现役 Planner 保持
+纯文本；Replyer 后续已经退役。
 
 为什么描述里不带聊天语境（关键设计取舍）：
   1. ingest 时刻**语境往往还不存在** —— 群里先甩图、隔几条消息再补一句话是常态，
@@ -25,14 +25,13 @@
   context_note、可 recaption 重写。同一张图这两份描述内容/可变性/存储位置都不同，
   合并会两头不讨好。
 
-失败语义：**全程不 raise**。EventIngest 的"ingest never raises"是硬约束，描述
-只是锦上添花——LLM 未配置 / 调用失败 / DB 失败一律记 warning 并返回 None，该图
-在 timeline 里退化成无 desc 的 <image hash="..."/>（Planner 知道有图但看不到，
-可用 look_at_image 补看）。
+失败语义：本模块仍不向调用方抛可预期的供应商/配置失败，而是记 warning 并返回
+None；但 None 不再表示"可静默跳过描述"。EventIngest 把它解释为前置处理失败，
+最终写一条 ``runtime.event_ingest_failed``，不会同时写半成品消息事件。
 
 注入方式：`describe_image` 由 v2_main 传给 EventIngest → media.attach_media_to_payload，
-event_ingest 侧不静态 import 本模块（保持 ingest 不反向依赖 agent_loop，与
-supervisor 注入 caption_image 同一条路子）；契约测试塞假 describer 即可全离线跑。
+event_ingest 侧不静态 import 本模块（保持 ingest 不反向依赖 agent_loop）；生产依赖
+统一在 plugin 装配，契约测试塞假 describer 即可全离线跑。
 """
 
 from __future__ import annotations
@@ -96,7 +95,7 @@ async def describe_image(
     *,
     session_factory: SessionFactory,
 ) -> str | None:
-    """看图写客观描述。命中缓存直接返回；失败一律返回 None（不 raise）。
+    """看图写客观描述。命中缓存直接返回；失败返回 None（不 raise）。
 
     调用方是 media.attach_media_to_payload 里的每图协程，本函数自己负责查表、
     在途去重、限并发、落表，调用方只管把返回值写进 segment。
@@ -121,7 +120,7 @@ async def describe_image(
     finally:
         # 无论正常返回、异常还是被取消，都必须摘掉登记并给等待者一个结果，
         # 否则同 hash 的后来者会永远挂在这个 Future 上。异常/取消时 result
-        # 仍是 None —— 等待者拿到"没有描述"，与本模块的降级语义一致。
+        # 仍是 None —— 等待者据此生成同样的入站失败终态。
         _inflight.pop(file_hash, None)
         if not future.done():
             future.set_result(result)

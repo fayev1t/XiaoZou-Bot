@@ -1428,26 +1428,38 @@ class BuildTimelineTests(unittest.TestCase):
         r = Projector.build_timeline(evs, tool_views=[])[0].render
         self.assertEqual(r, "<通知>poke (555) 拍了拍 (666)")
 
-    def test_napcat_unknown_event_renders_as_system_hint(self) -> None:
-        # EventIngest契约 §8 兜底事件：agent_visible 的 runtime.* 走
-        # _render_runtime 泛化渲染，SystemAgentLoop 能看到协议外报文
+    def test_ingest_failure_renders_safe_system_hint(self) -> None:
+        # 处理失败事件只渲染安全摘要；raw NapCat 报文位于 AgentEvent.raw，
+        # 不得通过 runtime JSON 兜底进入 Planner 信封。
         evs = [
             _snap(
-                type="runtime.napcat_unknown_event",
+                type="runtime.event_ingest_failed",
                 payload={
-                    "post_type": "notice",
-                    "sub_type": "profile_like",
-                    "raw": {"notice_type": "notify"},
+                    "source_event_type": "external.message.group.normal",
+                    "source_message_id": "12345",
+                    "raw_message": "帮我看看",
+                    "sender": {"user_id": 222, "nickname": "alice"},
+                    "failures": [
+                        {
+                            "stage": "image_description",
+                            "error_code": "image_description_failed",
+                            "reason": "图片描述生成失败",
+                        }
+                    ],
                 },
-                scope="system",
-                group_id=None,
+                scope="group",
+                group_id=999,
             ),
         ]
         items = Projector.build_timeline(evs, tool_views=[])
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0].kind, "system_hint")
-        self.assertTrue(items[0].render.startswith("<系统>napcat_unknown_event "))
-        self.assertIn("profile_like", items[0].render)
+        self.assertTrue(items[0].render.startswith("<系统>event_ingest_failed "))
+        self.assertIn("image_description/image_description_failed", items[0].render)
+        self.assertIn("alice(222)", items[0].render)
+        self.assertIn("#12345", items[0].render)
+        self.assertIn("帮我看看", items[0].render)
+        self.assertNotIn("notice_type", items[0].render)
 
     def test_group_card_notice_renders_old_and_new(self) -> None:
         # new_card 空串=清空名片，与"缺失=mapper 没拿到"区分，所以空串也渲染

@@ -1,6 +1,6 @@
 """EventMapper protocol and in-process registry.
 
-Contract: 开发文档/v2.0/EventIngest契约.md §3
+Contract: 开发文档/v2.0/20-横切契约/EventIngest契约.md §4
 """
 
 from __future__ import annotations
@@ -15,8 +15,8 @@ class EventMapper(Protocol):
     """Map a napcat/onebot event to a PartialSystemEvent.
 
     Mappers should be cheap, deterministic, and side-effect free.
-    Media downloads (image, audio) are not the mapper's responsibility;
-    they happen later in the ingest pipeline (EventIngest契约.md §6).
+    Required media preprocessing is not the mapper's responsibility; it
+    happens later in the ingest pipeline (EventIngest契约.md §5).
     """
 
     post_type: str
@@ -30,7 +30,7 @@ class EventMapper(Protocol):
 class MapperRegistry:
     """In-process registry for EventMapper instances.
 
-    Lookup order (EventIngest契约.md §3):
+    Lookup order (EventIngest契约.md §4):
     1. Exact mappers (sub_type is not None) reporting can_map() = True.
     2. Fallback mappers (sub_type is None) only if no exact match.
     """

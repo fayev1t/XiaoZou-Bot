@@ -1,7 +1,7 @@
 """Built-in EventMappers — full set for napcat / OneBot V11.
 
-事件清单与映射目标见 开发文档/v2.0/事件系统设计.md §4.1。
-heartbeat 不入库（旁路文件原子写，EventIngest契约.md §7.1），不需要 mapper。
+事件映射与失败收束见 EventIngest契约.md §4。
+heartbeat 不入库（旁路文件原子写，EventIngest契约.md §9），不需要 mapper。
 """
 
 from qqbot.services.event_ingest.mapper import MapperRegistry

@@ -1,7 +1,7 @@
 """Contract tests for the heartbeat bypass.
 
 Verifies:
-- serialize_heartbeat() shape matches the contract (EventIngest契约.md §7.1).
+- serialize_heartbeat() shape matches the contract (EventIngest契约.md §9).
 - write_heartbeat() is atomic via tempfile + os.replace.
 - EventIngest.ingest() short-circuits heartbeat events without touching DB.
 """
@@ -91,6 +91,12 @@ class HeartbeatAtomicWriteTests(unittest.IsolatedAsyncioTestCase):
         bad_path = Path("/nonexistent_root/napcat_heartbeat.json")
         # Should not raise even if the path is unwritable.
         await write_heartbeat(_hb(), path=bad_path)
+
+    async def test_serialization_failure_is_swallowed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            target = Path(tmp_dir) / "napcat_heartbeat.json"
+            await write_heartbeat(_hb(time="invalid"), path=target)
+            self.assertFalse(target.exists())
 
 
 class HeartbeatBypassedFromIngestTests(unittest.IsolatedAsyncioTestCase):

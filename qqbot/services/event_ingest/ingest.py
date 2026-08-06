@@ -1,31 +1,36 @@
-"""EventIngest orchestrator: nonebot Event → SystemEvent → agent_events.
+"""EventIngest orchestrator: NapCat input → one terminal SystemEvent.
 
-Contract: 开发文档/v2.0/EventIngest契约.md §2
+Contract: 开发文档/v2.0/20-横切契约/EventIngest契约.md §3
 
 Pipeline:
-  (0) heartbeat short-circuit → write_heartbeat() (§7.1)
-  (1) mapper lookup (§3)；no mapper → runtime.napcat_unknown_event 兜底落库 (§8)
-  (2) PartialSystemEvent
-  (3) attach_media_to_payload — image download side effects (§6)
-  (4) finalize (event_id, occurred_at, self-correlation)
-  (5) persist (ON CONFLICT DO NOTHING)
-  (6) supervisor.wake(scope_key) if a supervisor was injected (§5)
+  (0) heartbeat short-circuit → write_heartbeat() (§9)
+  (1) mapper lookup + mapping (§4)
+  (2) required content preprocessing, including image persistence + VLM (§5)
+  (3) choose exactly one terminal event:
+      success → mapper's external.* event
+      failure → runtime.event_ingest_failed
+  (4) finalize + persist (ON CONFLICT DO NOTHING)
+  (5) notify the committed internal event; only this ingest notification may
+      wake AgentLoop for the current NapCat input
 """
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from qqbot.core.logging import get_logger
-from qqbot.core.time import normalize_china_time
+from qqbot.core.time import china_now, normalize_china_time
+from qqbot.services.event_ingest.failure import (
+    IngestFailureDetail,
+    build_ingest_failure_event,
+)
 from qqbot.services.event_ingest.heartbeat import write_heartbeat
-from qqbot.services.event_ingest.idempotency import for_unknown
 from qqbot.services.event_ingest.mapper import MapperRegistry
-from qqbot.services.event_ingest.media import attach_media_to_payload
-from qqbot.services.event_ingest.napcat_helpers import dump_event
+from qqbot.services.event_ingest.media import ImageDescriber, attach_media_to_payload
 from qqbot.services.event_ingest.persistence import persist_event
 from qqbot.services.event_ingest.system_event import (
     PartialSystemEvent,
@@ -35,8 +40,15 @@ from qqbot.services.event_ingest.system_event import (
 
 logger = get_logger(__name__)
 
-IngestStatus = Literal["inserted", "duplicate", "unknown", "error", "heartbeat"]
+IngestStatus = Literal[
+    "inserted",
+    "duplicate",
+    "processing_failed",
+    "error",
+    "heartbeat",
+]
 SessionFactory = Callable[[], AsyncSession]
+CommittedNotifier = Callable[[SystemEvent], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -57,23 +69,23 @@ class EventIngest:
         self,
         registry: MapperRegistry,
         session_factory: SessionFactory,
-        supervisor: Any | None = None,
-        image_describer: Any | None = None,
+        committed_notifier: CommittedNotifier | None = None,
+        image_describer: ImageDescriber | None = None,
     ) -> None:
         self._registry = registry
         self._session_factory = session_factory
-        # supervisor 是可选注入；骨架前阶段为 None，影子接入时由 plugin
-        # 决定是否注入 LoopSupervisor。EventIngest 仅依赖 .wake(scope_key)
-        # 这一接口，刻意不做静态类型耦合（避免 ingest 反向依赖 agent_loop）。
-        self._supervisor = supervisor
-        # 看图写客观描述的回调（2026-07-28）。与 supervisor 同样是鸭子类型注入：
+        # EventIngest 只发布“内部事件已提交”这一事实，不认识 LoopSupervisor、
+        # scope_key 或 wake 模式。生产装配在 plugin 层把该通知翻译为 AgentLoop wake。
+        self._committed_notifier = committed_notifier
+        # 看图写客观描述的回调（2026-07-28）。以鸭子类型注入，保持 ingest
+        # 不静态依赖 agent_loop；含图片却未注入时会形成处理失败内部事件。
         # 生产实现在 agent_loop.image_description，由 v2_main 绑好 session_factory
-        # 传进来；None = 不描述（早期骨架 / 大量既有测试），图仍照常下载落盘。
+        # 传进来。
         self._image_describer = image_describer
 
     async def ingest(self, event: Any) -> IngestResult:
         # heartbeat 旁路：不入库，仅原子写 runtime_data/napcat_heartbeat.json
-        # 见 EventIngest契约.md §7.1。
+        # 见 EventIngest契约.md §9。
         if (
             getattr(event, "post_type", None) == "meta_event"
             and getattr(event, "meta_event_type", None) == "heartbeat"
@@ -81,27 +93,141 @@ class EventIngest:
             await write_heartbeat(event)
             return IngestResult(status="heartbeat")
 
-        mapper = self._registry.find(event)
+        try:
+            mapper = self._registry.find(event)
+        except Exception as exc:
+            logger.warning("[event_ingest] mapper lookup failed: {}", exc)
+            return await self._commit_failure(
+                event,
+                (
+                    IngestFailureDetail(
+                        stage="event_mapping",
+                        error_code="mapper_lookup_failed",
+                        reason="事件映射器查找失败",
+                    ),
+                ),
+            )
         if mapper is None:
             logger.warning(
                 "[event_ingest] no mapper matched: post_type={} sub_type={}",
                 getattr(event, "post_type", "?"),
                 getattr(event, "sub_type", "?"),
             )
-            return await self._ingest_unknown(event)
+            return await self._commit_failure(
+                event,
+                (
+                    IngestFailureDetail(
+                        stage="event_mapping",
+                        error_code="no_mapper",
+                        reason="未识别的 NapCat 事件类型",
+                    ),
+                ),
+            )
 
-        partial: PartialSystemEvent = mapper.map(event)
+        try:
+            partial: PartialSystemEvent = mapper.map(event)
+        except Exception as exc:
+            logger.warning(
+                "[event_ingest] mapper failed: mapper={} err={}",
+                type(mapper).__name__,
+                exc,
+            )
+            return await self._commit_failure(
+                event,
+                (
+                    IngestFailureDetail(
+                        stage="event_mapping",
+                        error_code="mapper_failed",
+                        reason="NapCat 事件格式化失败",
+                    ),
+                ),
+            )
 
-        # 媒体副作用：图片同步下载、sha256、本地落盘并就地补充 payload.segments
-        # 中 image 段的 file_hash/local_path/downloaded 等字段。见 EventIngest契约.md §6。
-        # 2026-07-28 起同一步里还会调 VLM 写 description（Planner/Replyer 已无
-        # 多模态能力，描述是它们看到图片的唯一途径）。frozen dataclass 不阻止
+        # 媒体副作用：图片同步下载、sha256、本地落盘并就地补充
+        # payload.segments 中的 file_hash/local_path/downloaded 等字段。
+        # 2026-07-28 起同一步里还会调 VLM 写 description（Planner 不直接接收
+        # 图片像素，描述是正常消息进入时间线的必需内容）。frozen dataclass 不阻止
         # dict 字段被 in-place 修改。
-        await attach_media_to_payload(partial.payload, self._image_describer)
+        try:
+            media_result = await attach_media_to_payload(
+                partial.payload,
+                self._image_describer,
+            )
+        except Exception as exc:
+            logger.warning("[event_ingest] media preprocessing failed: {}", exc)
+            return await self._commit_failure(
+                event,
+                (
+                    IngestFailureDetail(
+                        stage="media_processing",
+                        error_code="media_processing_failed",
+                        reason="媒体前置处理失败",
+                    ),
+                ),
+                partial=partial,
+            )
+        if media_result.failures:
+            return await self._commit_failure(
+                event,
+                media_result.failures,
+                partial=partial,
+            )
 
+        try:
+            sys_event = self._finalize(event, partial)
+        except Exception as exc:
+            logger.warning("[event_ingest] event finalization failed: {}", exc)
+            return await self._commit_failure(
+                event,
+                (
+                    IngestFailureDetail(
+                        stage="event_finalization",
+                        error_code="event_finalization_failed",
+                        reason="内部事件定稿失败",
+                    ),
+                ),
+                partial=partial,
+            )
+        return await self._persist_terminal(sys_event, inserted_status="inserted")
+
+    async def _commit_failure(
+        self,
+        event: Any,
+        failures: tuple[IngestFailureDetail, ...],
+        *,
+        partial: PartialSystemEvent | None = None,
+    ) -> IngestResult:
+        failure_partial = build_ingest_failure_event(
+            event,
+            failures,
+            partial=partial,
+        )
+        try:
+            sys_event = self._finalize(event, failure_partial)
+        except Exception as exc:
+            logger.warning(
+                "[event_ingest] failure timestamp invalid; using receive time: {}",
+                exc,
+            )
+            sys_event = finalize(failure_partial, occurred_at=china_now())
+        return await self._persist_terminal(
+            sys_event,
+            inserted_status="processing_failed",
+            reason=failures[0].error_code,
+        )
+
+    @staticmethod
+    def _finalize(event: Any, partial: PartialSystemEvent) -> SystemEvent:
         occurred_at = normalize_china_time(getattr(event, "time", None))
-        sys_event = finalize(partial, occurred_at=occurred_at)
+        return finalize(partial, occurred_at=occurred_at)
 
+    async def _persist_terminal(
+        self,
+        sys_event: SystemEvent,
+        *,
+        inserted_status: Literal["inserted", "processing_failed"],
+        reason: str | None = None,
+    ) -> IngestResult:
         try:
             async with self._session_factory() as session:
                 inserted = await persist_event(session, sys_event)
@@ -121,81 +247,17 @@ class EventIngest:
             )
             return IngestResult(status="duplicate", event=sys_event)
 
-        await self._maybe_wake(sys_event)
-        return IngestResult(status="inserted", event=sys_event)
-
-    async def _ingest_unknown(self, event: Any) -> IngestResult:
-        """没有 mapper 的事件不丢弃——折成 runtime.napcat_unknown_event 落库。
-
-        契约 EventIngest契约.md §8 / 事件系统设计.md §4.3.2：napcat 协议升级、
-        第三方扩展推来的未识别报文要留痕并让 SystemAgentLoop 看到（投影层对
-        agent_visible 的 runtime.* 泛化渲染成 <system-hint>，无需改动）。
-        origin=runtime——协议外报文是基础设施观察，不是可信业务事件；raw 列
-        按 §3 只给 external 写，原报文全量放 payload.raw。status 仍返回
-        "unknown"（语义是"无 mapper"，供 v2_main 日志区分），但 event 已入库。
-        """
-        post_type = getattr(event, "post_type", None)
-        sub_type = getattr(event, "sub_type", None)
-        partial = PartialSystemEvent(
-            origin="runtime",
-            type="runtime.napcat_unknown_event",
-            scope="system",
-            group_id=None,
-            user_id=getattr(event, "user_id", None),
-            visibility="agent_visible",
-            payload={
-                "post_type": post_type,
-                "sub_type": sub_type,
-                "raw": dump_event(event),
-            },
-            raw=None,
-            idempotency_key=for_unknown(
-                getattr(event, "self_id", 0),
-                post_type,
-                sub_type,
-                int(getattr(event, "time", 0) or 0),
-                getattr(event, "user_id", None),
-            ),
+        await self._notify_committed(sys_event)
+        return IngestResult(
+            status=inserted_status,
+            event=sys_event,
+            reason=reason,
         )
-        occurred_at = normalize_china_time(getattr(event, "time", None))
-        sys_event = finalize(partial, occurred_at=occurred_at)
 
-        try:
-            async with self._session_factory() as session:
-                inserted = await persist_event(session, sys_event)
-        except Exception as exc:
-            logger.error(
-                "[event_ingest] unknown-event persist failed: post_type={} err={}",
-                post_type,
-                exc,
-            )
-            return IngestResult(status="error", event=sys_event, reason=str(exc))
-
-        if not inserted:
-            return IngestResult(status="duplicate", event=sys_event)
-
-        await self._maybe_wake(sys_event)
-        return IngestResult(status="unknown", event=sys_event, reason="no_mapper")
-
-    async def _maybe_wake(self, event: SystemEvent) -> None:
-        if self._supervisor is None:
-            return
-        scope_key = _scope_key_for_wake(event)
-        if scope_key is None:
+    async def _notify_committed(self, event: SystemEvent) -> None:
+        if self._committed_notifier is None:
             return
         try:
-            await self._supervisor.wake(scope_key)
+            await self._committed_notifier(event)
         except Exception as exc:
-            logger.warning("[event_ingest] supervisor.wake failed: {}", exc)
-
-
-def _scope_key_for_wake(event: SystemEvent) -> str | None:
-    """Translate event scope → scope_key understood by LoopSupervisor.
-
-    private events never wake a loop in v2 第一版 (实例化策略 §10.1).
-    """
-    if event.scope == "group" and event.group_id is not None:
-        return f"group:{event.group_id}"
-    if event.scope == "system":
-        return "system"
-    return None
+            logger.warning("[event_ingest] committed notifier failed: {}", exc)

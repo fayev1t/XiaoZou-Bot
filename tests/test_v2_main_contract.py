@@ -5,6 +5,7 @@ Static-only. Verifies the plugin is wired up to:
 - register message / notice / request / metaevent handlers at priority=10 block=True
 - register bot to bot_registry inside every handler
 - delegate heartbeat to EventIngest internal bypass
+- translate only committed SystemEvent values into AgentLoop wakes
 - swallow ingest exceptions so napcat doesn't retry-spin
 - launch LoopSupervisor on startup, stop on shutdown
 - be discoverable by both __main__ PLUGIN_MODULES and pyproject plugin_dirs
@@ -73,6 +74,29 @@ class V2MainPluginContractTests(unittest.TestCase):
         self.assertIn("write_heartbeat", self.ingest_text)
         self.assertIn('"heartbeat"', self.ingest_text)
         self.assertIn("meta_event_type", self.ingest_text)
+
+    def test_agent_loop_wake_is_driven_by_committed_system_event(self) -> None:
+        self.assertIn(
+            "committed_notifier=_notify_committed_event",
+            self.plugin_text,
+        )
+        self.assertIn(
+            "async def _notify_committed_event(event: SystemEvent)",
+            self.plugin_text,
+        )
+        self.assertIn("await _get_supervisor().wake(scope_key)", self.plugin_text)
+        self.assertNotIn("supervisor=_get_supervisor()", self.plugin_text)
+
+    def test_raw_notice_and_meta_events_do_not_reach_role_reflection(self) -> None:
+        self.assertIn("_newly_committed_event(result)", self.plugin_text)
+        self.assertNotIn(
+            "reflect_bot_role_from_notice(bot, event",
+            self.plugin_text,
+        )
+        self.assertNotIn(
+            "reflect_bot_role_from_meta(bot, event",
+            self.plugin_text,
+        )
 
     def test_plugin_swallows_handler_exceptions(self) -> None:
         self.assertIn("except Exception", self.plugin_text)

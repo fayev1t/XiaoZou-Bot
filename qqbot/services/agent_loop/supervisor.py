@@ -1,8 +1,8 @@
 """LoopSupervisor — process-wide registry and lifecycle manager for AgentLoops.
 
 Contract:
-- 事件系统设计.md §10.3
-- EventIngest契约.md §5.1
+- 事件系统设计.md §11
+- EventIngest契约.md §8
 
 Behaviour:
 - One SystemAgentLoop is created up front (on start()).

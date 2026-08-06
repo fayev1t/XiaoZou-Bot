@@ -1,7 +1,7 @@
 """Map OneBot V11 GroupRecallNoticeEvent → external.notice.group_recall
 
-Contract: 开发文档/v2.0/事件系统设计.md §4.1
-撤回作为追加事件，不物理改写被撤回的消息事件（事件系统设计.md §5.1）。
+Contract: 开发文档/v2.0/20-横切契约/EventIngest契约.md §4
+撤回作为追加事件，不物理改写被撤回的消息事件。
 """
 
 from __future__ import annotations

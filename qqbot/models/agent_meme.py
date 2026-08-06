@@ -4,7 +4,7 @@
   LLM 在聊天里看到值得收藏的图片时，经 meme 工具（action=save）把它收录为
   表情包。图片文件本身复用 EventIngest 落盘的
   runtime_data/media/img/<hash[:2]>/<hash>
-  （EventIngest契约.md §6.1，sha256 内容寻址，**不复制文件**），本表只存一层
+  （EventIngest契约.md §5.1，sha256 内容寻址，**不复制文件**），本表只存一层
   元数据 —— 其中 description 由 meme 工具内部的 caption LLM 调用看图生成，
   是选图（meme.send）的唯一依据（投影把收藏夹渲染成 <saved-memes> 每 tick
   注入）。

@@ -213,15 +213,13 @@ _REFLECT_MODULE = "qqbot.services.agent_loop.bot_role_sweep"
 
 
 class ReflectFromNoticeContractTest(unittest.IsolatedAsyncioTestCase):
-    """reflect_bot_role_from_notice 是 v2_main notice handler 的核心。
-    不依赖 nonebot 初始化，可直接对 SimpleNamespace 事件做 dispatch。
-    """
+    """Role reflection consumes committed SystemEvent-shaped values only."""
 
     async def test_group_admin_set_writes_admin(self) -> None:
         bot = SimpleNamespace(self_id=9000)
         event = SimpleNamespace(
-            notice_type="group_admin",
-            sub_type="set",
+            type="external.notice.group_admin",
+            payload={"sub_type": "set"},
             user_id=9000,
             group_id=100,
         )
@@ -240,8 +238,8 @@ class ReflectFromNoticeContractTest(unittest.IsolatedAsyncioTestCase):
     async def test_group_admin_unset_writes_member(self) -> None:
         bot = SimpleNamespace(self_id=9000)
         event = SimpleNamespace(
-            notice_type="group_admin",
-            sub_type="unset",
+            type="external.notice.group_admin",
+            payload={"sub_type": "unset"},
             user_id=9000,
             group_id=100,
         )
@@ -255,8 +253,8 @@ class ReflectFromNoticeContractTest(unittest.IsolatedAsyncioTestCase):
     async def test_group_admin_other_user_ignored(self) -> None:
         bot = SimpleNamespace(self_id=9000)
         event = SimpleNamespace(
-            notice_type="group_admin",
-            sub_type="set",
+            type="external.notice.group_admin",
+            payload={"sub_type": "set"},
             user_id=12345,  # 不是 bot
             group_id=100,
         )
@@ -270,8 +268,8 @@ class ReflectFromNoticeContractTest(unittest.IsolatedAsyncioTestCase):
     async def test_group_increase_for_self_writes_member(self) -> None:
         bot = SimpleNamespace(self_id=9000)
         event = SimpleNamespace(
-            notice_type="group_increase",
-            sub_type=None,
+            type="external.notice.group_increase",
+            payload={"sub_type": None},
             user_id=9000,
             group_id=300,
         )
@@ -287,8 +285,8 @@ class ReflectFromNoticeContractTest(unittest.IsolatedAsyncioTestCase):
     async def test_group_decrease_for_self_writes_member(self) -> None:
         bot = SimpleNamespace(self_id=9000)
         event = SimpleNamespace(
-            notice_type="group_decrease",
-            sub_type=None,
+            type="external.notice.group_decrease",
+            payload={"sub_type": None},
             user_id=9000,
             group_id=300,
         )
@@ -304,7 +302,10 @@ class ReflectFromNoticeContractTest(unittest.IsolatedAsyncioTestCase):
     async def test_unrelated_notice_type_ignored(self) -> None:
         bot = SimpleNamespace(self_id=9000)
         event = SimpleNamespace(
-            notice_type="group_recall", user_id=9000, group_id=100
+            type="external.notice.group_recall",
+            payload={},
+            user_id=9000,
+            group_id=100,
         )
         with mock.patch(
             f"{_REFLECT_MODULE}.observe_bot_role_change",
@@ -317,7 +318,10 @@ class ReflectFromNoticeContractTest(unittest.IsolatedAsyncioTestCase):
 class ReflectFromMetaContractTest(unittest.TestCase):
     def test_lifecycle_connect_schedules_sweep(self) -> None:
         bot = SimpleNamespace(self_id=9000)
-        event = SimpleNamespace(meta_event_type="lifecycle", sub_type="connect")
+        event = SimpleNamespace(
+            type="external.meta.lifecycle",
+            payload={"sub_type": "connect"},
+        )
         sf = _factory_for([])
         with mock.patch(f"{_REFLECT_MODULE}.schedule_sweep") as patched:
             reflect_bot_role_from_meta(bot, event, sf)
@@ -325,14 +329,17 @@ class ReflectFromMetaContractTest(unittest.TestCase):
 
     def test_lifecycle_disable_does_not_schedule_sweep(self) -> None:
         bot = SimpleNamespace(self_id=9000)
-        event = SimpleNamespace(meta_event_type="lifecycle", sub_type="disable")
+        event = SimpleNamespace(
+            type="external.meta.lifecycle",
+            payload={"sub_type": "disable"},
+        )
         with mock.patch(f"{_REFLECT_MODULE}.schedule_sweep") as patched:
             reflect_bot_role_from_meta(bot, event, _factory_for([]))
             patched.assert_not_called()
 
     def test_heartbeat_does_not_schedule_sweep(self) -> None:
         bot = SimpleNamespace(self_id=9000)
-        event = SimpleNamespace(meta_event_type="heartbeat", sub_type="")
+        event = None
         with mock.patch(f"{_REFLECT_MODULE}.schedule_sweep") as patched:
             reflect_bot_role_from_meta(bot, event, _factory_for([]))
             patched.assert_not_called()
@@ -354,15 +361,16 @@ class V2MainTextContractTest(unittest.TestCase):
 
     def test_notice_handler_calls_reflect(self) -> None:
         self.assertIn(
-            "reflect_bot_role_from_notice(bot, event, AsyncSessionLocal)",
+            "_newly_committed_event(result)",
             self.text,
         )
 
     def test_meta_handler_calls_reflect(self) -> None:
         self.assertIn(
-            "reflect_bot_role_from_meta(bot, event, AsyncSessionLocal)",
+            "reflect_bot_role_from_meta(",
             self.text,
         )
+        self.assertNotIn("reflect_bot_role_from_meta(bot, event", self.text)
 
     def test_imports_reflect_helpers(self) -> None:
         self.assertIn("reflect_bot_role_from_meta", self.text)

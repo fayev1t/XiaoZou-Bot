@@ -1,6 +1,6 @@
 """Atomic write of napcat heartbeat to runtime_data/napcat_heartbeat.json.
 
-EventIngest契约.md §7.1: heartbeat is NOT persisted into agent_events.
+EventIngest契约.md §9: heartbeat is NOT persisted into agent_events.
 Only the most recent timestamp + status is kept on disk; readers (e.g. an
 external watchdog) decide adapter liveness by file mtime + last_heartbeat_at.
 
@@ -71,8 +71,8 @@ def _write_sync(path: Path, payload: dict) -> None:
 async def write_heartbeat(event: Any, path: Path | None = None) -> None:
     """Atomic snapshot write; never raises (failures are logged)."""
     target = path or HEARTBEAT_FILE
-    payload = serialize_heartbeat(event)
     try:
+        payload = serialize_heartbeat(event)
         await asyncio.to_thread(_write_sync, target, payload)
     except Exception as exc:
         logger.warning("[heartbeat] write failed: {}", exc)

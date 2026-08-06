@@ -1,6 +1,6 @@
 """SystemEvent value objects.
 
-Contract: 开发文档/v2.0/事件系统设计.md §2
+Contract: 开发文档/v2.0/20-横切契约/事件系统设计.md §2
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ Visibility = Literal["agent_visible", "runtime_only"]
 
 @dataclass(frozen=True)
 class PartialSystemEvent:
-    """Mapper output: a SystemEvent without ids, timestamps, or causality links."""
+    """Pre-finalization ingest event without ids, timestamps, or causality."""
 
     origin: Origin
     type: str
@@ -57,8 +57,8 @@ def finalize(
 ) -> SystemEvent:
     """Stamp a PartialSystemEvent with event_id and self-correlation.
 
-    External events are self-correlated: their correlation_id equals their own
-    event_id, so any tick the loop runs in response can reuse it.
+    Ingest terminal events are self-correlated: their correlation_id equals
+    their own event_id, so any tick the loop runs in response can reuse it.
     See 事件系统设计.md §6.
     """
     eid = new_event_id()

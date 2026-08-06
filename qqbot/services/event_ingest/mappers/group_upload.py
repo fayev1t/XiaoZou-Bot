@@ -1,6 +1,6 @@
 """Map notice.group_upload → external.notice.group_upload
 
-群文件上传。媒体落盘策略见 EventIngest契约.md §6.3：v2 第一版仅保留 napcat
+群文件上传。媒体处理策略见 EventIngest契约.md §5.2：当前仅保留 napcat
 元数据 (file.id/name/size/url)，不下载。
 """
 

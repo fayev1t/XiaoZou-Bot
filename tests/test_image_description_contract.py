@@ -129,8 +129,8 @@ class InflightDedupTests(unittest.IsolatedAsyncioTestCase):
     async def test_waiter_gets_none_when_leader_raises(self) -> None:
         """本体抛异常（预料外）时等待者拿到 None 而不是永远挂着。
 
-        describe_image 的降级语义是"没有描述"，等待者按同一套语义收场；异常
-        本身照常上抛给发起者，由 media.py 的兜底 try/except 吞掉。
+        describe_image 用 None 表达描述失败，等待者按同一套语义收场；异常
+        本身照常上抛给发起者，由 media.py 转成处理失败终态。
         """
         gate = asyncio.Event()
 

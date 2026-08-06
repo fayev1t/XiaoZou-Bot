@@ -4,8 +4,9 @@
   1. on_message / on_notice / on_request / on_metaevent 四个通道接收 nonebot
      事件，每次调 bot_registry.register(bot) 让各工具
      能反查到对应 bot 实例
-  2. 把事件交给 EventIngest 走 mapper → 媒体副作用 → 入库 → 唤醒 supervisor
-     的完整流水线（meta_event.heartbeat 走文件旁路，详见 EventIngest契约 §7）
+  2. 把事件交给 EventIngest 完成 mapper / 媒体前置处理并提交唯一入站终态
+     SystemEvent；plugin 只把“事件已提交”翻译成 AgentLoop 唤醒
+     （meta_event.heartbeat 走文件旁路，详见 EventIngest契约 §9）
   3. request handler 在入库后调 request_auto_approval：好友申请 / 邀请入群
      自动同意（不走 LLM）；入群申请（group.add）进目标群 timeline 由
      GroupAgentLoop 处理，此处不动作
@@ -16,7 +17,8 @@
 priority 取较低值（10）以避免与可能存在的调试 plugin 抢先；block=True
 确保事件不再被任何残留 matcher 处理。
 
-契约：开发文档/v2.0/事件系统设计.md, EventIngest契约.md, 任务与决策契约.md
+契约：开发文档/v2.0/20-横切契约/事件系统设计.md、EventIngest契约.md、
+任务与决策契约.md
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ from qqbot.services.agent_loop.meme_caption import caption_image
 from qqbot.services.agent_loop.tools import (
     build_default_registry as build_tool_registry,
 )
-from qqbot.services.event_ingest import EventIngest, IngestResult
+from qqbot.services.event_ingest import EventIngest, IngestResult, SystemEvent
 from qqbot.services.event_ingest.mappers import build_default_registry
 from qqbot.services.request_auto_approval import maybe_auto_approve
 
@@ -88,15 +90,26 @@ async def _describe_image(data: bytes, mime: str, file_hash: str) -> str | None:
     )
 
 
+async def _notify_committed_event(event: SystemEvent) -> None:
+    """Translate a committed internal event into the current AgentLoop wake."""
+    if event.scope == "group" and event.group_id is not None:
+        scope_key = f"group:{event.group_id}"
+    elif event.scope == "system":
+        scope_key = "system"
+    else:
+        return
+    await _get_supervisor().wake(scope_key)
+
+
 def _get_ingest() -> EventIngest:
     global _ingest
     if _ingest is None:
         _ingest = EventIngest(
             registry=build_default_registry(),
             session_factory=AsyncSessionLocal,
-            supervisor=_get_supervisor(),
-            # 图片客观描述（2026-07-28）：Planner/Replyer 降级为纯文本模型后，
-            # 这是它们"看到"群里图片的唯一途径。与 caption_image 同为 VLM 调用
+            committed_notifier=_notify_committed_event,
+            # 图片客观描述（2026-07-28）：Planner 不接收图片像素后，这是正常
+            # 图片消息进入时间线前的必需内容。与 caption_image 同为 VLM 调用
             # 但职责相反——这条是客观转录，那条是收藏用途标注，刻意不合并。
             image_describer=_describe_image,
         )
@@ -108,9 +121,11 @@ async def _ingest_event(event: Event) -> IngestResult | None:
         result = await _get_ingest().ingest(event)
         if result.status == "error":
             logger.warning("[v2_main] persist error: {}", result.reason)
-        elif result.status == "unknown":
-            logger.debug(
-                "[v2_main] no mapper: post_type={} sub_type={}",
+        elif result.status == "processing_failed":
+            logger.warning(
+                "[v2_main] ingest produced failure event: reason={} "
+                "post_type={} sub_type={}",
+                result.reason,
                 getattr(event, "post_type", "?"),
                 getattr(event, "sub_type", "?"),
             )
@@ -118,6 +133,12 @@ async def _ingest_event(event: Event) -> IngestResult | None:
     except Exception as exc:
         logger.warning("[v2_main] ingest swallowed: {}", exc)
         return None
+
+
+def _newly_committed_event(result: IngestResult | None) -> SystemEvent | None:
+    if result is None or result.status not in ("inserted", "processing_failed"):
+        return None
+    return result.event
 
 
 def _remember_bot(bot: Bot) -> None:
@@ -134,7 +155,7 @@ _message_matcher = on_message(priority=10, block=True)
 _notice_matcher = on_notice(priority=10, block=True)
 _request_matcher = on_request(priority=10, block=True)
 # meta_event：heartbeat → 文件旁路（无 DB 写）；lifecycle → 正常 mapper 入库。
-# 分支在 EventIngest.ingest() 内部处理（EventIngest契约.md §7）。
+# 分支在 EventIngest.ingest() 内部处理（EventIngest契约.md §9）。
 _meta_matcher = on_metaevent(priority=10, block=True)
 
 
@@ -147,8 +168,12 @@ async def _on_message(bot: Bot, event: Event) -> None:
 @_notice_matcher.handle()
 async def _on_notice(bot: Bot, event: Event) -> None:
     _remember_bot(bot)
-    await _ingest_event(event)
-    await reflect_bot_role_from_notice(bot, event, AsyncSessionLocal)
+    result = await _ingest_event(event)
+    await reflect_bot_role_from_notice(
+        bot,
+        _newly_committed_event(result),
+        AsyncSessionLocal,
+    )
 
 
 @_request_matcher.handle()
@@ -168,8 +193,12 @@ async def _on_request(bot: Bot, event: Event) -> None:
 @_meta_matcher.handle()
 async def _on_meta(bot: Bot, event: Event) -> None:
     _remember_bot(bot)
-    await _ingest_event(event)
-    reflect_bot_role_from_meta(bot, event, AsyncSessionLocal)
+    result = await _ingest_event(event)
+    reflect_bot_role_from_meta(
+        bot,
+        _newly_committed_event(result),
+        AsyncSessionLocal,
+    )
 
 
 _driver = get_driver()

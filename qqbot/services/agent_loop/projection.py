@@ -927,6 +927,15 @@ class Projector:
                         render=Projector._render_context_recap(ev),
                     )
                 )
+            elif ev.type == "runtime.event_ingest_failed":
+                items.append(
+                    TimelineItem(
+                        event_id=ev.event_id,
+                        occurred_at=ev.occurred_at,
+                        kind="system_hint",
+                        render=Projector._render_ingest_failure(ev),
+                    )
+                )
             elif ev.type.startswith("runtime.") and ev.visibility == "agent_visible":
                 items.append(
                     TimelineItem(
@@ -1210,6 +1219,51 @@ class Projector:
         if not payload:
             return f"<系统>{_esc_text(kind)}"
         return f"<系统>{_esc_text(kind)} {_esc_text(_safe_json(payload))}"
+
+    @staticmethod
+    def _render_ingest_failure(ev: _EventSnapshot) -> str:
+        """Render only the safe summary, never the raw NapCat audit payload."""
+        payload = ev.payload or {}
+        parts = ["<系统>event_ingest_failed"]
+
+        source_type = payload.get("source_event_type")
+        if source_type:
+            parts.append(f" source={_inline_text(str(source_type))}")
+
+        sender = payload.get("sender")
+        if isinstance(sender, dict):
+            name = sender.get("card") or sender.get("nickname")
+            qq = sender.get("user_id") or ev.user_id
+            actor = _head_field(str(name)) if name else ""
+            if qq is not None:
+                actor += f"({_head_field(str(qq))})"
+            if actor:
+                parts.append(f" actor={actor}")
+
+        message_id = payload.get("source_message_id")
+        if message_id:
+            parts.append(f" #{_head_field(str(message_id))}")
+
+        failures = payload.get("failures")
+        if isinstance(failures, list) and failures:
+            labels: list[str] = []
+            for failure in failures:
+                if not isinstance(failure, dict):
+                    continue
+                stage = str(failure.get("stage") or "unknown")
+                code = str(failure.get("error_code") or "unknown")
+                labels.append(f"{_inline_text(stage)}/{_inline_text(code)}")
+            if labels:
+                parts.append(f" failures={','.join(labels)}")
+            first = failures[0] if isinstance(failures[0], dict) else {}
+            reason = first.get("reason")
+            if reason:
+                parts.append(f" reason={_quote_excerpt(str(reason), limit=80)}")
+
+        raw_message = payload.get("raw_message")
+        if raw_message:
+            parts.append(f" text={_quote_excerpt(str(raw_message), limit=120)}")
+        return "".join(parts)
 
     @staticmethod
     def _render_reply_task_completed(ev: _EventSnapshot) -> str:
@@ -1730,7 +1784,7 @@ def _render_segments(
 
     image segment 的富化字段 (file_hash / local_path / mime / downloaded /
     description) 由 event_ingest/media.py 写在 segment 顶层（不在 data 内），见
-    EventIngest契约.md §6.1。downloaded=true 且 local_path 存在的图片才会进
+    EventIngest契约.md §5.1。downloaded=true 且 local_path 存在的图片才会进
     images 列表 —— 2026-07-28 起没有任何 prompt 装配路径消费它（Planner/Replyer
     已不看像素），保留是因为它仍是"这条消息带了哪些已落盘图片"的结构化记录。
     """

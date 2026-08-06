@@ -1,6 +1,6 @@
 """Append a SystemEvent into agent_events using ON CONFLICT DO NOTHING.
 
-Contract: 开发文档/v2.0/EventIngest契约.md §4.2
+Contract: 开发文档/v2.0/20-横切契约/EventIngest契约.md §7
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ async def persist_event(
 
     ``commit=True`` 保持 EventIngest 的单事件事务语义；内部批量 writer 传
     ``commit=False``，在同一 session 写完一组因果事件后统一提交。
-    See EventIngest契约.md §4.2.
+    See EventIngest契约.md §7.
     """
     stmt = (
         pg_insert(AgentEvent)
