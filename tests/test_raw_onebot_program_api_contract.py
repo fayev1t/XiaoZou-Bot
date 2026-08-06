@@ -1,12 +1,12 @@
-"""Raw OneBot 程序函数的隔离与响应语义契约。
+"""OneBotGateway 与 Raw OneBot 程序函数的隔离、响应语义契约。
 
-这批函数是未来程序形态的底层原语，不是现役 Tool 的另一层入口。本文件钉住：
+现役 Tool 和这批具名 Raw 函数共用网关，但 Raw 函数仍不进入模型注册表。本文件钉住：
 
 - 8 个 action 具名存在，参数不注入、不转换，可选 ``None`` 不发送；
 - 优先使用 Bot 同名方法，缺失时回退 ``call_api``；
 - NapCat 明确响应（含 failed）保留为 ``RawOneBotResponse``；
 - 真正无响应才返回 ``RawTransportFailure``，effect 才可能 ``uncertain``；
-- 宿主编程错误继续抛出，且现役 16 个 Tool 注册不发生变化。
+- 宿主编程错误继续抛出，且现役 18 个 Tool 注册不发生变化。
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from qqbot.services.agent_loop.program_api import (
+    OneBotGateway,
     RawOneBotProgramFunctions,
     RawOneBotResponse,
     RawTransportFailure,
@@ -231,6 +232,7 @@ class RawOneBotProgramApiTests(unittest.IsolatedAsyncioTestCase):
                 data={"message_id": 123},
             ),
         )
+        self.assertTrue(result.ok)
 
     async def test_complete_envelope_is_preserved(self) -> None:
         envelope = {
@@ -251,6 +253,7 @@ class RawOneBotProgramApiTests(unittest.IsolatedAsyncioTestCase):
             result,
             RawOneBotResponse(action="get_group_info", **envelope),
         )
+        self.assertFalse(result.ok)
 
     async def test_action_failed_info_returns_raw_response(self) -> None:
         envelope = {
@@ -343,15 +346,18 @@ class RawOneBotProgramApiTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RawOneBotIsolationTests(unittest.TestCase):
-    def test_module_does_not_reuse_existing_tools(self) -> None:
-        from qqbot.services.agent_loop.program_api import raw_onebot
+    def test_gateway_and_raw_module_do_not_reuse_existing_tools(self) -> None:
+        from qqbot.services.agent_loop.program_api import onebot_gateway, raw_onebot
 
-        source = inspect.getsource(raw_onebot)
-        self.assertNotIn("agent_loop.tools", source)
-        self.assertNotIn("ToolOutcome", source)
-        self.assertNotIn("call_action", source)
+        for module in (onebot_gateway, raw_onebot):
+            with self.subTest(module=module.__name__):
+                source = inspect.getsource(module)
+                self.assertNotIn("agent_loop.tools", source)
+                self.assertNotIn("ToolOutcome", source)
+                self.assertNotIn("call_action", source)
 
-    def test_existing_tool_registry_remains_the_same_16_classes(self) -> None:
+    def test_gateway_is_exported_but_not_model_registered(self) -> None:
+        self.assertTrue(inspect.isclass(OneBotGateway))
         root = Path(__file__).resolve().parents[1]
         registry_path = root / "qqbot/services/agent_loop/tools/__init__.py"
         source = registry_path.read_text(encoding="utf-8")
@@ -374,11 +380,13 @@ class RawOneBotIsolationTests(unittest.TestCase):
                 and func.attr == "register"
             ):
                 continue
-            constructor = node.args[0]
-            if isinstance(constructor, ast.Call) and isinstance(
-                constructor.func, ast.Name
+            argument = node.args[0]
+            if isinstance(argument, ast.Name):
+                registered.append(argument.id)
+            elif isinstance(argument, ast.Call) and isinstance(
+                argument.func, ast.Name
             ):
-                registered.append(constructor.func.id)
+                registered.append(argument.func.id)
 
         self.assertEqual(
             registered,
@@ -387,6 +395,8 @@ class RawOneBotIsolationTests(unittest.TestCase):
                 "ReplyTool",
                 "SendMessagesTool",
                 "WaitTool",
+                "ReflectTool",
+                "GetRecentThoughtsTool",
                 "RespondToGroupJoinRequestTool",
                 "MemeCollectionTool",
                 "LookAtImageTool",
@@ -401,7 +411,39 @@ class RawOneBotIsolationTests(unittest.TestCase):
                 "SearchHistoryTool",
             ],
         )
-        self.assertNotIn("program_api", source)
+        self.assertNotIn("OneBotGateway", registered)
+        self.assertNotIn("RawOneBotProgramFunctions", registered)
+
+    def test_program_tool_paths_do_not_bypass_gateway(self) -> None:
+        root = Path(__file__).resolve().parents[1] / "qqbot/services/agent_loop"
+        paths = [
+            root / "outbound_messages.py",
+            root / "tool_registry.py",
+            *(root / "tools").glob("*.py"),
+        ]
+        direct_calls: list[str] = []
+        missing_kind: list[str] = []
+        for path in paths:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                if (
+                    isinstance(func, ast.Attribute)
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "bot"
+                ):
+                    direct_calls.append(f"{path.name}:{node.lineno}:{func.attr}")
+                if (
+                    isinstance(func, ast.Name)
+                    and func.id == "call_action"
+                    and not any(keyword.arg == "effect" for keyword in node.keywords)
+                ):
+                    missing_kind.append(f"{path.name}:{node.lineno}")
+
+        self.assertEqual(direct_calls, [])
+        self.assertEqual(missing_kind, [])
 
 
 if __name__ == "__main__":

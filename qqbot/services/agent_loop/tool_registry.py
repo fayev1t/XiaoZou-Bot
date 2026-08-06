@@ -368,21 +368,30 @@ class BaseTool:
     async def _fetch_live_member_role(self, group_id: int, user_id: str) -> str | None:
         """实时查该 user 在群里的**当前**角色（owner/admin/member）。
 
-        经 bot_registry 取 Bot、调 ``get_group_member_info(no_cache=True)`` 强制取
-        最新值（不吃缓存）。无 bot / napcat 报错（如该用户已退群）/ 无 role 字段 →
-        None（上层据此保守判 GUEST）。延迟 import bot_registry 避免潜在循环。
+        经 bot_registry 取 Bot，再通过 OneBotGateway 调
+        ``get_group_member_info(no_cache=True)`` 强制取最新值（不吃缓存）。无 bot /
+        napcat 报错（如该用户已退群）/ 无 role 字段 → None（上层据此保守判
+        GUEST）。延迟 import 避免潜在循环。
         """
         from qqbot.services.agent_loop import bot_registry
+        from qqbot.services.agent_loop.program_api.onebot_gateway import (
+            OneBotGateway,
+            RawOneBotResponse,
+        )
 
         bot = bot_registry.get_any()
         if bot is None:
             return None
         try:
-            info = await bot.get_group_member_info(
+            response = await OneBotGateway(lambda: bot).query(
+                "get_group_member_info",
                 group_id=int(group_id), user_id=int(user_id), no_cache=True
             )
         except Exception:  # noqa: BLE001 —— 查不到/napcat 错都保守当无角色
             return None
+        if not isinstance(response, RawOneBotResponse) or not response.ok:
+            return None
+        info = response.data
         return info.get("role") if isinstance(info, dict) else None
 
     async def enforce_bot_admin(self, context: dict) -> "ToolOutcome | None":

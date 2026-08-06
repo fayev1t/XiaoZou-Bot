@@ -88,7 +88,11 @@ class LeaveGroupTool(BaseTool):
         if fail:
             return fail
         _, fail = await call_action(
-            bot, "set_group_leave", group_id=group_id, is_dismiss=False
+            bot,
+            "set_group_leave",
+            effect=True,
+            group_id=group_id,
+            is_dismiss=False,
         )
         if fail:
             return fail

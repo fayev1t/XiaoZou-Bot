@@ -83,11 +83,16 @@ class GetGroupInfoTool(BaseTool):
         bot, fail = get_bot()
         if fail:
             return fail
-        info, fail = await call_action(
-            bot, "get_group_info", group_id=group_id, no_cache=True
+        response, fail = await call_action(
+            bot,
+            "get_group_info",
+            effect=False,
+            group_id=group_id,
+            no_cache=True,
         )
         if fail:
             return fail
+        info = response.data if response is not None else None
         info = info or {}
         result = {
             "group_id": info.get("group_id", group_id),

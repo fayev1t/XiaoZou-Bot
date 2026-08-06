@@ -104,15 +104,17 @@ class GetMemberInfoTool(BaseTool):
         bot, fail = get_bot()
         if fail:
             return fail
-        info, fail = await call_action(
+        response, fail = await call_action(
             bot,
             "get_group_member_info",
+            effect=False,
             group_id=group_id,
             user_id=user_id,
             no_cache=True,
         )
         if fail:
             return fail
+        info = response.data if response is not None else None
         info = info or {}
         logger.info("[{}] group={} user={}", self.name, group_id, user_id)
         return ToolOutcome.success({

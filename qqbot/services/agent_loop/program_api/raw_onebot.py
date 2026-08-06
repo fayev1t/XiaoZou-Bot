@@ -1,74 +1,29 @@
-"""现役 NapCat 能力所需的 Raw OneBot 程序函数。
+"""现役 NapCat 能力所需的具名 Raw OneBot 程序函数。
 
-这些函数只负责三件事：把具名参数组成 OneBot JSON、调用同名 action、保留或
-重建响应 envelope。它们刻意不复用现役 Tool，也不做 scope 注入、权限检查、
-参数裁剪、请求 flag 反查、消息段处理或结果 DTO 化。
+这些函数只负责把具名参数组成 OneBot JSON，再交给现役 ``OneBotGateway``。
+它们刻意不复用 Tool，也不做 scope 注入、权限检查、参数裁剪、请求 flag 反查、
+消息段处理或结果 DTO 化。
 
-当前模块只提供函数实现，尚未进入任何 registry、Planner prompt 或 AgentLoop。
-副作用 action 不自动重试；拿不到响应时只返回 ``RawTransportFailure``，由未来的
-程序执行器负责落 effect terminal。
+这些 Raw 函数仍未进入 ToolRegistry 或 Planner prompt；变化只在于它们与现役 Tool
+共用同一个传输网关，不再维护第二套响应和异常分类逻辑。
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from typing import Any, Literal, TypeAlias
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
-from qqbot.services.agent_loop import bot_registry
+from qqbot.services.agent_loop.program_api.onebot_gateway import (
+    BotProvider,
+    OneBotGateway,
+    RawOneBotResponse,
+    RawOneBotResult,
+    RawTransportFailure,
+)
 
-BotProvider: TypeAlias = Callable[[], Any | None]
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
 OneBotId: TypeAlias = int | str
-
-
-@dataclass(frozen=True, slots=True)
-class RawOneBotResponse:
-    """NapCat 已给出响应，或 NoneBot 成功解包后重建的响应 envelope。"""
-
-    action: str
-    status: str | None
-    retcode: int | str | None
-    data: Any
-    message: str | None = None
-    wording: str | None = None
-    stream: str | None = None
-    echo: Any = None
-
-
-@dataclass(frozen=True, slots=True)
-class RawTransportFailure:
-    """调用没有拿到 OneBot 响应；不是 NapCat 明确返回的业务失败。"""
-
-    action: str
-    error_kind: str
-    message: str
-    uncertain: bool
-
-
-RawOneBotResult: TypeAlias = RawOneBotResponse | RawTransportFailure
-
-_TIMEOUT_EXCEPTION_NAMES = frozenset(
-    {
-        "ConnectTimeout",
-        "PoolTimeout",
-        "ReadTimeout",
-        "RequestTimeout",
-        "WriteTimeout",
-    }
-)
-_NETWORK_EXCEPTION_NAMES = frozenset(
-    {
-        "BrokenResourceError",
-        "ConnectError",
-        "ConnectionClosed",
-        "EndOfStream",
-        "NetworkError",
-        "ReadError",
-        "RemoteProtocolError",
-        "WriteError",
-    }
-)
-_TRANSPORT_MODULE_ROOTS = frozenset({"anyio", "httpcore", "httpx", "websockets"})
 
 
 class RawOneBotProgramFunctions:
@@ -79,8 +34,8 @@ class RawOneBotProgramFunctions:
     ``bot.call_api(action, **params)``。
     """
 
-    def __init__(self, bot_provider: BotProvider = bot_registry.get_any) -> None:
-        self._bot_provider = bot_provider
+    def __init__(self, bot_provider: BotProvider | None = None) -> None:
+        self._gateway = OneBotGateway(bot_provider)
 
     async def send_group_msg(  # noqa: PLR0913 - Raw action 保留完整具名参数面
         self,
@@ -253,35 +208,8 @@ class RawOneBotProgramFunctions:
         effect: bool,
         params: dict[str, Any],
     ) -> RawOneBotResult:
-        bot = self._bot_provider()
-        if bot is None:
-            return RawTransportFailure(
-                action=action,
-                error_kind="no_bot_available",
-                message="no bot available",
-                uncertain=False,
-            )
-
-        method = getattr(bot, action, None)
-        try:
-            if callable(method):
-                raw = await method(**params)
-            else:
-                raw = await bot.call_api(action, **params)
-        except Exception as exc:
-            response = _response_from_exception(action, exc)
-            if response is not None:
-                return response
-            error_kind = _transport_error_kind(exc)
-            if error_kind is None:
-                raise
-            return RawTransportFailure(
-                action=action,
-                error_kind=error_kind,
-                message=_exception_message(exc),
-                uncertain=effect,
-            )
-        return _response_from_result(action, raw)
+        call = self._gateway.effect if effect else self._gateway.query
+        return await call(action, **params)
 
 
 def _request_params(
@@ -292,65 +220,6 @@ def _request_params(
         **required,
         **{key: value for key, value in optional.items() if value is not None},
     }
-
-
-def _response_from_result(action: str, raw: Any) -> RawOneBotResponse:
-    if _is_response_envelope(raw):
-        return _response_from_envelope(action, raw)
-    # NoneBot 的 Bot 方法在成功时通常只返回 BaseResponse.data；只重建能够确定
-    # 的字段，不伪造 stream 或 echo。
-    return RawOneBotResponse(
-        action=action,
-        status="ok",
-        retcode=0,
-        data=raw,
-    )
-
-
-def _response_from_exception(action: str, exc: Exception) -> RawOneBotResponse | None:
-    info = getattr(exc, "info", None)
-    if not _is_response_envelope(info):
-        return None
-    return _response_from_envelope(action, info)
-
-
-def _is_response_envelope(value: Any) -> bool:
-    return isinstance(value, Mapping) and "status" in value and "retcode" in value
-
-
-def _response_from_envelope(
-    action: str, envelope: Mapping[str, Any]
-) -> RawOneBotResponse:
-    return RawOneBotResponse(
-        action=action,
-        status=envelope.get("status"),
-        retcode=envelope.get("retcode"),
-        data=envelope.get("data"),
-        message=envelope.get("message"),
-        wording=envelope.get("wording"),
-        stream=envelope.get("stream"),
-        echo=envelope.get("echo"),
-    )
-
-
-def _transport_error_kind(exc: Exception) -> str | None:
-    exc_type = type(exc)
-    if isinstance(exc, TimeoutError) or exc_type.__name__ in _TIMEOUT_EXCEPTION_NAMES:
-        return "timeout"
-    if isinstance(exc, ConnectionError):
-        return "network_error"
-
-    if exc_type.__name__ in _NETWORK_EXCEPTION_NAMES:
-        return "network_error"
-    module_root = exc_type.__module__.partition(".")[0]
-    if module_root in _TRANSPORT_MODULE_ROOTS:
-        return "network_error"
-    return None
-
-
-def _exception_message(exc: Exception) -> str:
-    detail = str(exc)
-    return f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
 
 
 __all__ = [

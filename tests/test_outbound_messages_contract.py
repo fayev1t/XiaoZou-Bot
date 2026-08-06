@@ -192,6 +192,10 @@ class ReceiptHelperTests(unittest.TestCase):
             delivery_status([{"status": "sent"}, {"status": "failed"}]),
             "partial",
         )
+        self.assertEqual(
+            delivery_status([{"status": "sent"}, {"status": "uncertain"}]),
+            "uncertain",
+        )
         self.assertEqual(delivery_status([{"status": "uncertain"}]), "uncertain")
         self.assertEqual(delivery_status([{"status": "failed"}]), "failed")
 

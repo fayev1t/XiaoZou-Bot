@@ -138,6 +138,7 @@ class KickTool(BaseTool):
         _, fail = await call_action(
             bot,
             "set_group_kick",
+            effect=True,
             group_id=group_id,
             user_id=user_id,
             reject_add_request=reject,

@@ -1,4 +1,4 @@
-"""OneBot 动作类工具的公共小工具。
+"""OneBot-backed Tool 的公共校验与网关结果适配。
 
 新增的一批 napcat 动作工具（kick / ban / set_card / get_member_info /
 poke / recall / ...）都遵循同一套出站约定，把重复部分收敛到这里：
@@ -6,15 +6,14 @@ poke / recall / ...）都遵循同一套出站约定，把重复部分收敛到�
 - **group_id 从 scope_key 注入**：群操作的目标群一律取当前 AgentLoop 的
   scope，绝不让 LLM 用 arguments 传任意 group_id —— 隔离契约 §9。
 - **Bot 实例从 bot_registry 取**（`get_bot()`）：与 send_message 同路。
-- **出站统一走 `call_action`**：把 napcat 动作失败（ActionFailed / NetworkError）
-  收敛成结构化 `upstream_action_failed`（带 retcode + action + upstream_status /
-  upstream_message / upstream_wording / stream + retryable/transient/user_fixable
-  弱语义字段，见设计 §9.2）。
+- **协议交互统一走 `OneBotGateway`**：`call_action` 只把网关 DTO 机械适配成
+  ``ToolOutcome``。NapCat 明确拒绝保留 retcode/wording；Effect 没有响应时保守
+  写 ``status=uncertain``，不由 Tool 猜测是否执行。
 
 **全链路无 raise 控制流**：这些 helper 一律**返回** ``ToolOutcome.failure(...)``
 （或 ``(value, ToolOutcome | None)`` 元组）表达可预期失败，工具 execute() 把失败
-直接 return 上来，不 raise。唯一例外：``call_action`` 遇到**非动作失败**的预料外
-异常（网络栈内部错等）原样上抛，由 ``BaseTool.run`` 兜底成 ``internal_tool_error``。
+直接 return 上来，不解释下游 wording。唯一例外是网关无法识别为协议响应或传输
+故障的宿主编程异常，它继续上抛并由 ``BaseTool.run`` 收口。
 """
 
 from __future__ import annotations
@@ -24,6 +23,11 @@ from typing import Any
 from qqbot.core.time import china_now, normalize_china_time
 from qqbot.services.agent_loop import bot_registry
 from qqbot.services.agent_loop.event_writer import parse_scope_key
+from qqbot.services.agent_loop.program_api.onebot_gateway import (
+    OneBotGateway,
+    RawOneBotResponse,
+    RawTransportFailure,
+)
 from qqbot.services.agent_loop.tool_registry import ToolOutcome
 
 
@@ -154,53 +158,62 @@ def epoch_to_iso(value: Any, *, future_only: bool = False) -> str | None:
 
 
 async def call_action(
-    bot: Any, action: str, **params: Any
-) -> tuple[Any, ToolOutcome | None]:
-    """统一出站：调 napcat 的 OneBot V11 动作。
+    bot: Any,
+    action: str,
+    *,
+    effect: bool,
+    **params: Any,
+) -> tuple[RawOneBotResponse | None, ToolOutcome | None]:
+    """通过统一网关调用一个 OneBot action，并机械映射为 Tool 结果。
 
-    成功 → ``(napcat 返回值, None)``（查询类工具用返回值；动作类忽略即可）；
-    动作失败 → ``(None, ToolOutcome.failure("upstream_action_failed", <人类原因>,
-    action=..., retcode=..., upstream_status/upstream_message/upstream_wording/
-    stream=..., retryable/transient/user_fixable=False))``。
-
-    - 优先走 bot 上自动生成的同名方法（``bot.set_group_kick(...)``，与既有单测
-      stub 一致）；下划线前缀的扩展动作（``_send_group_notice``）回退 ``call_api``。
-    - napcat ``status="failed"`` 时 nonebot 抛 ``ActionFailed``，完整响应在
-      ``exc.info``（含 ``retcode`` / ``message`` / ``wording`` / ``status`` /
-      ``stream``）。``error_message`` 取最佳人类可读原因（wording > message >
-      str(exc)）；``message`` / ``wording`` / ``status`` / ``stream`` 原样透传进
-      extra（``upstream_*`` / ``stream``）供 LLM 精确判因，不只靠 wording 猜语义。
-    - **非动作失败**的预料外异常（网络栈内部错等）原样上抛 —— 由 ``BaseTool.run``
-      兜底 ``internal_tool_error``（本函数只把"动作失败"折成返回值）。
+    ``effect`` 必须由调用点显式声明：Query 无响应是查询失败；Effect 无响应则可能
+    已经执行，failure extra 带 ``status=uncertain``。本函数不重试、不补偿，也不
+    根据 retcode 决定下一步业务动作。
     """
-    method = getattr(bot, action, None)
-    try:
-        if callable(method):
-            return await method(**params), None
-        return await bot.call_api(action, **params), None
-    except Exception as exc:  # noqa: BLE001 —— 仅拦"动作失败"，其余上抛给 run 兜底
-        failure = _as_action_failure(exc)
-        if failure is None:
-            raise
-        # error_message 取最佳人类可读原因（wording > message > str(exc)）；原始
-        # message / wording / status / stream 同时透传进 extra（设计 §9.2：上游细节
-        # 在共享 helper 层统一补齐，所有 onebot 工具一致）。retryable / transient 恒
-        # False —— 上游拒绝重发同样调用通常同样失败；是否值得重试由 prompt 按
-        # retcode / upstream_wording 判（不硬编码进 tool result）。
-        human = failure.get("wording") or failure.get("message") or str(exc)
-        return None, ToolOutcome.failure(
-            "upstream_action_failed",
-            str(human),
-            action=action,
-            retcode=failure.get("retcode"),
-            upstream_status=failure.get("status"),
-            upstream_message=failure.get("message"),
-            upstream_wording=failure.get("wording"),
-            stream=failure.get("stream"),
-            retryable=False,
-            transient=False,
-            user_fixable=False,
-        )
+    gateway = OneBotGateway(lambda: bot)
+    call = gateway.effect if effect else gateway.query
+    result = await call(action, **params)
+    if isinstance(result, RawTransportFailure):
+        return None, _transport_failure_outcome(result)
+    if result.ok:
+        return result, None
+    return None, _response_failure_outcome(result)
+
+
+def _response_failure_outcome(response: RawOneBotResponse) -> ToolOutcome:
+    human = (
+        response.wording
+        or response.message
+        or f"{response.action} failed with retcode={response.retcode!r}"
+    )
+    return ToolOutcome.failure(
+        "upstream_action_failed",
+        str(human),
+        action=response.action,
+        retcode=response.retcode,
+        upstream_status=response.status,
+        upstream_message=response.message,
+        upstream_wording=response.wording,
+        stream=response.stream,
+        retryable=False,
+        transient=False,
+        user_fixable=False,
+    )
+
+
+def _transport_failure_outcome(failure: RawTransportFailure) -> ToolOutcome:
+    if failure.error_kind == "no_bot_available":
+        return ToolOutcome.failure("no_bot_available", failure.message)
+    return ToolOutcome.failure(
+        "upstream_action_failed",
+        failure.message,
+        action=failure.action,
+        status=failure.status,
+        transport_error_kind=failure.error_kind,
+        retryable=False,
+        transient=False,
+        user_fixable=False,
+    )
 
 
 # ── 群角色层级：参数相关的细粒度平台权限**前置**判定 ──────────────────────
@@ -235,11 +248,19 @@ async def fetch_member_role(
     ``no_cache=True`` 取最新，与 tool_registry 里发起人 tier 的实时解析同源——目标
     刚被升/降级也能立刻反映，不吃缓存。"""
     try:
-        info = await bot.get_group_member_info(
-            group_id=int(group_id), user_id=int(user_id), no_cache=True
+        response, failure = await call_action(
+            bot,
+            "get_group_member_info",
+            effect=False,
+            group_id=int(group_id),
+            user_id=int(user_id),
+            no_cache=True,
         )
-    except Exception:  # noqa: BLE001 —— 查不到 / napcat 错都当无角色（保守）
+    except Exception:  # noqa: BLE001 —— 宿主异常也保守当无角色
         return None
+    if failure is not None or response is None:
+        return None
+    info = response.data
     if not isinstance(info, dict):
         return None
     role = info.get("role")
@@ -256,9 +277,17 @@ async def fetch_message_author(
     查不到 / 报错 → ``(None, None)``，调用侧**跳过**前置判定（保持"撤消息只凭
     message_id"的宽松默认）。"""
     try:
-        msg = await bot.get_msg(message_id=int(message_id))
-    except Exception:  # noqa: BLE001 —— get_msg 不可用 / 报错都退化为"作者未知"
+        response, failure = await call_action(
+            bot,
+            "get_msg",
+            effect=False,
+            message_id=int(message_id),
+        )
+    except Exception:  # noqa: BLE001 —— get_msg 宿主异常退化为"作者未知"
         return None, None
+    if failure is not None or response is None:
+        return None, None
+    msg = response.data
     if not isinstance(msg, dict):
         return None, None
     sender = msg.get("sender")
@@ -306,33 +335,3 @@ def enforce_actor_outranks_target(
         actual_bot_role=bot_role or None,
         target_role=target_role,
     )
-
-
-def _as_action_failure(exc: Exception) -> dict | None:
-    """识别 OneBot 动作失败并抽出上游细节；识别不出返回 None。
-
-    返回 dict：``{retcode, message, wording, status, stream}``（对应 NapCat
-    BaseResponse 同名字段，缺失键为 None）。用 duck-typing（看 ``.info`` dict / 异常
-    类名），不硬 import nonebot —— 工作区没装 nonebot，运行时（server）才有；测试可用
-    带 ``.info`` 的假异常驱动。
-    """
-    info = getattr(exc, "info", None)
-    if isinstance(info, dict) and (
-        "retcode" in info or "wording" in info or "message" in info
-    ):
-        return {
-            "retcode": info.get("retcode"),
-            "message": info.get("message"),
-            "wording": info.get("wording") or info.get("msg"),
-            "status": info.get("status"),
-            "stream": info.get("stream"),
-        }
-    if type(exc).__name__ in ("ActionFailed", "NetworkError"):
-        return {
-            "retcode": getattr(exc, "retcode", None),
-            "message": None,
-            "wording": str(exc) or type(exc).__name__,
-            "status": "failed",
-            "stream": None,
-        }
-    return None

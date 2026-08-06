@@ -94,6 +94,7 @@ class SetCardTool(BaseTool):
         _, fail = await call_action(
             bot,
             "set_group_card",
+            effect=True,
             group_id=group_id,
             user_id=user_id,
             card=card,

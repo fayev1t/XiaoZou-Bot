@@ -69,7 +69,11 @@ class SetGroupNameTool(BaseTool):
         if fail:
             return fail
         _, fail = await call_action(
-            bot, "set_group_name", group_id=group_id, group_name=name
+            bot,
+            "set_group_name",
+            effect=True,
+            group_id=group_id,
+            group_name=name,
         )
         if fail:
             return fail

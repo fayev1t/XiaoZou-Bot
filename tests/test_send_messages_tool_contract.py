@@ -41,6 +41,10 @@ class _FakeActionFailed(Exception):
         }
 
 
+class NetworkError(Exception):
+    pass
+
+
 class _StubBot:
     def __init__(
         self,
@@ -110,6 +114,9 @@ class SendMessagesToolTests(unittest.IsolatedAsyncioTestCase):
             [item["status"] for item in receipts], ["sent", "sent"]
         )
         self.assertEqual(receipts[0]["self_id"], "10001")
+        self.assertEqual(receipts[0]["receipt"]["action"], "send_group_msg")
+        self.assertEqual(receipts[0]["receipt"]["status"], "ok")
+        self.assertEqual(receipts[0]["receipt"]["retcode"], 0)
 
     async def test_meme_bubble_is_loaded_and_sent_as_image(self) -> None:
         bot = _StubBot()
@@ -234,9 +241,9 @@ class SendMessagesToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("群不存在", outcome.error_message)
 
     async def test_transport_exception_is_uncertain(self) -> None:
-        """OneBot 调用中断（非 ActionFailed 的裸异常）：该气泡可能已发出，
-        整体收敛 uncertain——终态失败，提示词禁止"保险再发一遍"。"""
-        bot = _StubBot(raises=[RuntimeError("socket closed")])
+        """网关识别到 OneBot 传输中断：该气泡可能已发出，整体收敛
+        uncertain——终态失败，提示词禁止"保险再发一遍"。"""
+        bot = _StubBot(raises=[NetworkError("socket closed")])
         bot_registry.register(bot)
         outcome = await self._run(
             {"messages": [{"kind": "chat", "content": [_TEXT]}]}
@@ -245,6 +252,10 @@ class SendMessagesToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.extra["status"], "uncertain")
         self.assertEqual(
             outcome.extra["sent_messages"][0]["status"], "uncertain"
+        )
+        self.assertEqual(
+            outcome.extra["sent_messages"][0]["error"]["kind"],
+            "network_error",
         )
 
     async def test_missing_message_id_is_uncertain_not_success(self) -> None:

@@ -77,7 +77,9 @@ class GroupNoticeTool(BaseTool):
         params: dict[str, Any] = {"group_id": group_id, "content": content}
         if image:
             params["image"] = image
-        _, fail = await call_action(bot, "_send_group_notice", **params)
+        _, fail = await call_action(
+            bot, "_send_group_notice", effect=True, **params
+        )
         if fail:
             return fail
         logger.info("[{}] group={} content={}", self.name, group_id, content)

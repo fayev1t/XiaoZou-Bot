@@ -17,8 +17,9 @@ idle / 查证 / 调本工具把话真正发出去。本工具**始终可调用**
 
 结果语义（status 随 receipts 一起落 terminal payload）：
 
-- ``sent``     全部气泡确认发出 → ``tool_result``；
-- ``partial``  部分 sent、部分 failed → ``tool_failed``（携带完整逐条
+- ``sent``     全部气泡拿到 OneBot 成功响应与 message_id → ``tool_result``；
+  这不是用户端最终可见性的证明；
+- ``partial``  部分 sent、部分明确 failed → ``tool_failed``（携带完整逐条
   receipts，已 sent 的气泡是既成事实，不得重发）；
 - ``failed``   全部明确未发出 → ``tool_failed``；
 - ``uncertain`` 至少一条送达与否无法确认 → ``tool_failed``（可能已发出，
@@ -220,7 +221,7 @@ class SendMessagesTool(BaseTool):
         if fail:
             return fail
 
-        # ── OneBot 逐条发送 → 逐条 receipts → status 折叠（§4.3）。
+        # ── OneBotGateway 逐条发送 → 逐条 receipts → status 折叠（§4.3）。
         receipts = await send_all(bot, scope_key, loaded)
         status = delivery_status(receipts)
         public = redact_runtime_value(receipts)

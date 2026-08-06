@@ -105,6 +105,7 @@ class EmojiLikeTool(BaseTool):
         _, fail = await call_action(
             bot,
             "set_msg_emoji_like",
+            effect=True,
             message_id=message_id,
             emoji_id=emoji_id,
             set=set_flag,

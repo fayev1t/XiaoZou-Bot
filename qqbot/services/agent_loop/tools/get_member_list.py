@@ -183,11 +183,15 @@ class GetMemberListTool(BaseTool):
         bot, fail = get_bot()
         if fail:
             return fail
-        raw, fail = await call_action(
-            bot, "get_group_member_list", group_id=group_id
+        response, fail = await call_action(
+            bot,
+            "get_group_member_list",
+            effect=False,
+            group_id=group_id,
         )
         if fail:
             return fail
+        raw = response.data if response is not None else None
         members = raw if isinstance(raw, list) else []
         # role 过滤在截断之前——"列出所有管理员"不能被 limit 吃掉目标。
         filtered = (

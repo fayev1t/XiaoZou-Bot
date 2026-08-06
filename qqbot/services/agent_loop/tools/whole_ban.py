@@ -71,7 +71,11 @@ class WholeBanTool(BaseTool):
         if fail:
             return fail
         _, fail = await call_action(
-            bot, "set_group_whole_ban", group_id=group_id, enable=enable
+            bot,
+            "set_group_whole_ban",
+            effect=True,
+            group_id=group_id,
+            enable=enable,
         )
         if fail:
             return fail

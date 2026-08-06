@@ -82,6 +82,7 @@ class SetAdminTool(BaseTool):
         _, fail = await call_action(
             bot,
             "set_group_admin",
+            effect=True,
             group_id=group_id,
             user_id=user_id,
             enable=enable,

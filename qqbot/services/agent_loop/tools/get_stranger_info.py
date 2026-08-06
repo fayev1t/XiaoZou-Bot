@@ -64,11 +64,16 @@ class GetStrangerInfoTool(BaseTool):
         bot, fail = get_bot()
         if fail:
             return fail
-        info, fail = await call_action(
-            bot, "get_stranger_info", user_id=user_id, no_cache=False
+        response, fail = await call_action(
+            bot,
+            "get_stranger_info",
+            effect=False,
+            user_id=user_id,
+            no_cache=False,
         )
         if fail:
             return fail
+        info = response.data if response is not None else None
         info = info or {}
         logger.info("[{}] user={}", self.name, user_id)
         return ToolOutcome.success({

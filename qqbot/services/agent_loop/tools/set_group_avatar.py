@@ -74,7 +74,11 @@ class SetGroupAvatarTool(BaseTool):
         if fail:
             return fail
         _, fail = await call_action(
-            bot, "set_group_portrait", group_id=group_id, file=file
+            bot,
+            "set_group_portrait",
+            effect=True,
+            group_id=group_id,
+            file=file,
         )
         if fail:
             return fail

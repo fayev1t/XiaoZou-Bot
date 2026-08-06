@@ -188,6 +188,7 @@ class RespondToGroupJoinRequestTool(BaseTool):
         _, fail = await call_action(
             bot,
             "set_group_add_request",
+            effect=True,
             flag=flag,
             sub_type="add",
             approve=approve,

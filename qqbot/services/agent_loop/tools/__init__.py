@@ -10,10 +10,10 @@ triggered_by_event_id / bot_role 等）一律由程序执行器在 run() 的 con
 注入。registry 保存 factory，每次程序函数调用都创建新的 Tool 实例。
 
 napcat 动作工具集（kick / ban / recall / get_* / ...）把 OneBot V11 能对 QQ
-做的事进一步工具化，公共出站约定收敛在 `_onebot_common.py`：群操作的
-group_id 从 scope_key 注入（隔离契约 §9，不让 LLM 跨群）、经 get_bot() 取
-Bot、napcat 动作失败经 call_action 折成 upstream_action_failed **返回**（全程
-无 raise）。可见性靠 `allowed_scopes`（Program API 按 scope 过滤）；scope / 发起人
+做的事进一步工具化。群操作的 group_id 由 `_onebot_common.py` 从 scope_key 注入
+（隔离契约 §9，不让 LLM 跨群），协议请求统一交给 `program_api.OneBotGateway`；
+`call_action` 只把标准响应/传输失败机械折成 ToolOutcome，不在 Tool 内解释下游
+wording。可见性靠 `allowed_scopes`（Program API 按 scope 过滤）；scope / 发起人
 tier（**实时**查群角色）/ bot 自身角色的判定全在工具内 execute() 首行的
 enforce_access，AgentLoop 不再闸门。详见各文件 docstring 与
 `任务与决策契约.md` §2.2、§7.2。

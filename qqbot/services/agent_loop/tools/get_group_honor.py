@@ -93,11 +93,16 @@ class GetGroupHonorTool(BaseTool):
         bot, fail = get_bot()
         if fail:
             return fail
-        info, fail = await call_action(
-            bot, "get_group_honor_info", group_id=group_id, type=honor_type
+        response, fail = await call_action(
+            bot,
+            "get_group_honor_info",
+            effect=False,
+            group_id=group_id,
+            type=honor_type,
         )
         if fail:
             return fail
+        info = response.data if response is not None else None
         info = info or {}
 
         slim: dict[str, Any] = {"group_id": group_id, "type": honor_type}

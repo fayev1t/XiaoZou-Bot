@@ -23,6 +23,10 @@ class _FakeActionFailed(Exception):
         self.info = {"status": "failed", "retcode": retcode, "wording": wording}
 
 
+class NetworkError(Exception):
+    pass
+
+
 class _StubBot:
     def __init__(
         self,
@@ -136,6 +140,14 @@ class GetGroupInfoToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.extra["retcode"], 1404)
         self.assertEqual(outcome.extra["action"], "get_group_info")
         self.assertIn("群不存在", outcome.error_message)
+
+    async def test_query_transport_failure_is_structured_not_uncertain(self) -> None:
+        bot_registry.register(_StubBot(raise_exc=NetworkError("connection lost")))
+        outcome = await GetGroupInfoTool().run({}, scope_key="group:100")
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.error_kind, "upstream_action_failed")
+        self.assertEqual(outcome.extra["status"], "failed")
+        self.assertEqual(outcome.extra["transport_error_kind"], "network_error")
 
     def test_metadata(self) -> None:
         self.assertEqual(GetGroupInfoTool.name, "get_group_info")

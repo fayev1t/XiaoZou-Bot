@@ -11,7 +11,7 @@
   无损归一，其余形态原样透传交严格校验 fail loudly。
 - ``preflight_memes`` / ``send_all`` / ``delivery_status`` 与回执整形：原
   ``reply_executor.py`` 的 meme 准备（收藏核验 + 媒体读取 + base64）、
-  OneBot 逐条发送与逐条回执（sent / failed / uncertain 三态 +
+  经统一 OneBotGateway 逐条发送与逐条回执（sent / failed / uncertain 三态 +
   base64/二进制脱敏）。删除的只是 Replyer 的 LLM 调用链，不重写已经工作的
   校验与发送逻辑。
 
@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 from typing import Any
 
+from qqbot.services.agent_loop.program_api.onebot_gateway import RawOneBotResponse
 from qqbot.services.agent_loop.tool_registry import ToolOutcome
 
 # 一次发送最多 10 个气泡；meme 气泡不再单独限量（2026-07-31 放开，多少条、
@@ -372,9 +373,10 @@ async def send_all(bot: Any, scope_key: str, prepared: list[dict]) -> list[dict]
             ]
         public_item = {k: v for k, v in item.items() if k != "data"}
         try:
-            result, action_fail = await call_action(
+            response, action_fail = await call_action(
                 bot,
                 "send_group_msg",
+                effect=True,
                 group_id=int(group_id),
                 message=content,
             )
@@ -390,16 +392,20 @@ async def send_all(bot: Any, scope_key: str, prepared: list[dict]) -> list[dict]
             continue
         if action_fail:
             receipts.append(
-                failed_receipt(
+                _receipt_from_action_failure(index, public_item, action_fail)
+            )
+            continue
+        if response is None:
+            receipts.append(
+                uncertain_receipt(
                     index,
                     public_item,
-                    action_fail.error_kind,
-                    action_fail.error_message,
-                    action_fail.extra,
+                    "missing_gateway_response",
+                    "OneBot gateway returned neither response nor failure",
                 )
             )
             continue
-        message_id = extract_message_id(result)
+        message_id = extract_message_id(response.data)
         if message_id is None:
             receipts.append(
                 uncertain_receipt(
@@ -407,7 +413,7 @@ async def send_all(bot: Any, scope_key: str, prepared: list[dict]) -> list[dict]
                     public_item,
                     "missing_message_id",
                     "upstream returned ok but no message_id",
-                    result,
+                    response,
                 )
             )
             continue
@@ -418,10 +424,35 @@ async def send_all(bot: Any, scope_key: str, prepared: list[dict]) -> list[dict]
                 "status": "sent",
                 "message_id": message_id,
                 "self_id": str(getattr(bot, "self_id", "") or "") or None,
-                "receipt": public_receipt(result),
+                "receipt": public_receipt(response),
             }
         )
     return receipts
+
+
+def _receipt_from_action_failure(
+    index: int, item: dict, failure: ToolOutcome
+) -> dict:
+    if failure.extra.get("status") != "uncertain":
+        return failed_receipt(
+            index,
+            item,
+            failure.error_kind,
+            failure.error_message,
+            failure.extra,
+        )
+    error_kind = (
+        failure.extra.get("transport_error_kind")
+        or failure.error_kind
+        or "upstream_delivery_uncertain"
+    )
+    return uncertain_receipt(
+        index,
+        item,
+        str(error_kind),
+        failure.error_message or "OneBot response is unknown",
+        failure.extra,
+    )
 
 
 def first_error_reason(receipts: list[dict]) -> str | None:
@@ -439,12 +470,12 @@ def first_error_reason(receipts: list[dict]) -> str | None:
 def delivery_status(receipts: list[dict]) -> str:
     """逐条回执折成整体 status：sent / partial / uncertain / failed。"""
     statuses = [item.get("status") for item in receipts]
+    if any(status == "uncertain" for status in statuses):
+        return "uncertain"
     if statuses and all(status == "sent" for status in statuses):
         return "sent"
     if any(status == "sent" for status in statuses):
         return "partial"
-    if any(status == "uncertain" for status in statuses):
-        return "uncertain"
     return "failed"
 
 
@@ -488,6 +519,8 @@ def uncertain_receipt(
 
 def public_receipt(value: Any) -> dict:
     """保留可审计回执，但禁止 OneBot 回显的图片正文进入事件流。"""
+    if isinstance(value, RawOneBotResponse):
+        value = value.as_dict()
     if not isinstance(value, dict):
         return {}
     return {str(key): redact_runtime_value(item) for key, item in value.items()}

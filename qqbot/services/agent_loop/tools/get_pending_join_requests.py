@@ -127,9 +127,12 @@ class GetPendingJoinRequestsTool(BaseTool):
         bot, fail = get_bot()
         if fail:
             return fail
-        raw, fail = await call_action(bot, "get_group_system_msg")
+        response, fail = await call_action(
+            bot, "get_group_system_msg", effect=False
+        )
         if fail:
             return fail
+        raw = response.data if response is not None else None
         join_items, fail = _extract_join_list(raw)
         if fail:
             return fail

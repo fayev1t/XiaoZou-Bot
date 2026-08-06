@@ -89,11 +89,11 @@ class SetEssenceTool(BaseTool):
             return fail
         if action == "set":
             _, fail = await call_action(
-                bot, "set_essence_msg", message_id=message_id
+                bot, "set_essence_msg", effect=True, message_id=message_id
             )
         elif action == "delete":
             _, fail = await call_action(
-                bot, "delete_essence_msg", message_id=message_id
+                bot, "delete_essence_msg", effect=True, message_id=message_id
             )
         else:
             return ToolOutcome.failure(

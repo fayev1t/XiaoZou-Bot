@@ -67,7 +67,11 @@ class PokeTool(BaseTool):
         if fail:
             return fail
         _, fail = await call_action(
-            bot, "group_poke", group_id=group_id, user_id=user_id
+            bot,
+            "group_poke",
+            effect=True,
+            group_id=group_id,
+            user_id=user_id,
         )
         if fail:
             return fail

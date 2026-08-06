@@ -110,7 +110,9 @@ class RecallTool(BaseTool):
                 author_id,
             ):
                 return fail
-        _, fail = await call_action(bot, "delete_msg", message_id=message_id)
+        _, fail = await call_action(
+            bot, "delete_msg", effect=True, message_id=message_id
+        )
         if fail:
             return fail
         logger.info("[{}] message_id={}", self.name, message_id)
