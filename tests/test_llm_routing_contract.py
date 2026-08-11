@@ -372,11 +372,135 @@ class ParseConfigTests(unittest.TestCase):
                     "settings": {"cooldown_max_multiplier": 0},
                 }
             ),
+            "groups 非对象": json.dumps(
+                {"providers": [provider], "groups": []}
+            ),
+            "groups models 空": json.dumps(
+                {
+                    "providers": [provider],
+                    "groups": {"g": {"models": [], "strategy": "random"}},
+                }
+            ),
+            "groups 未知策略": json.dumps(
+                {
+                    "providers": [provider],
+                    "groups": {"g": {"models": ["m"], "strategy": "sticky"}},
+                }
+            ),
+            "group 名与模型名冲突": json.dumps(
+                {
+                    "providers": [provider],
+                    "groups": {"m": {"models": ["m"], "strategy": "random"}},
+                }
+            ),
+            "role group 未定义": json.dumps(
+                {
+                    "providers": [provider],
+                    "roles": {"planner": {"group": "ghost"}},
+                }
+            ),
+            "role model 与 group 并存": json.dumps(
+                {
+                    "providers": [provider],
+                    "groups": {"g": {"models": ["m"]}},
+                    "roles": {"planner": {"model": "m", "group": "g"}},
+                }
+            ),
         }
         for label, raw in cases.items():
             with self.subTest(case=label):
                 with self.assertRaises(ValueError):
                     parse_config(raw)
+
+    def test_groups_string_role_resolves_group_or_model(self) -> None:
+        """roles 字符串：命中 groups 则用组，否则当模型名；组独立不绑 role。"""
+        raw = json.dumps(
+            {
+                "providers": [
+                    {
+                        "name": "p",
+                        "base_url": "https://p/v1",
+                        "api_key": "k",
+                        "models": ["a", "b", "c"],
+                    }
+                ],
+                "groups": {
+                    "strong": {
+                        "models": ["a", "b"],
+                        "strategy": "primary_failover",
+                    }
+                },
+                "roles": {
+                    "planner": "strong",
+                    "memory": "c",
+                },
+            }
+        )
+        config = parse_config(raw)
+        self.assertIn("strong", config.groups or {})
+        self.assertEqual(
+            config.roles["planner"].targets,
+            (RoleTarget(model="a"), RoleTarget(model="b")),
+        )
+        self.assertEqual(
+            config.roles["planner"].strategy, STRATEGY_PRIMARY_FAILOVER
+        )
+        self.assertFalse(config.roles["planner"].flat_pool)
+        self.assertEqual(
+            config.roles["memory"].targets, (RoleTarget(model="c"),)
+        )
+
+    def test_groups_duplicate_models_weight_in_flat_pool(self) -> None:
+        """组内同一模型可重复：round_robin 扁平池里出现多次即加权。"""
+        raw = json.dumps(
+            {
+                "providers": [
+                    {
+                        "name": "p",
+                        "base_url": "https://p/v1",
+                        "api_key": "k",
+                        "models": ["a", "b"],
+                    }
+                ],
+                "groups": {
+                    "vlm": {
+                        "models": ["a", "a", "b"],
+                        "strategy": "round_robin",
+                    }
+                },
+                "roles": {
+                    "vision": {
+                        "group": "vlm",
+                        "temperature": 0.2,
+                    }
+                },
+            }
+        )
+        config = parse_config(raw)
+        rule = config.roles["vision"]
+        self.assertTrue(rule.flat_pool)
+        self.assertEqual(rule.strategy, STRATEGY_ROUND_ROBIN)
+        self.assertEqual(
+            rule.targets,
+            (
+                RoleTarget(model="a"),
+                RoleTarget(model="a"),
+                RoleTarget(model="b"),
+            ),
+        )
+        router = EndpointRouter(
+            config.endpoints,
+            config.roles,
+            default_strategy=STRATEGY_PRIMARY_FAILOVER,
+        )
+        first = [e.model for e in router.resolve(role="vision")]
+        second = [e.model for e in router.resolve(role="vision")]
+        third = [e.model for e in router.resolve(role="vision")]
+        # 池长 3：a,a,b 轮转 → 首槽 a → a → b
+        self.assertEqual(first[0], "a")
+        self.assertEqual(second[0], "a")
+        self.assertEqual(third[0], "b")
+        self.assertEqual(len(first), 3)
 
 
 class CollectApiKeysTests(unittest.TestCase):

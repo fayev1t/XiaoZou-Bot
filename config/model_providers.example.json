@@ -14,32 +14,32 @@
       "api_key": "sk-your-relay-key",
       "models": [
         "deepseek-chat",
-        {
-          "name": "gpt-4o",
-          "capabilities": [
-            "vision"
-          ]
-        },
-        {
-          "name": "qwen-vl-max",
-          "capabilities": [
-            "vision"
-          ]
-        }
+        "gpt-4o",
+        "qwen-vl-max"
       ]
     }
   ],
-  "roles": {
-    "planner": "deepseek-chat",
-    "vision": {
-      "targets": [
+  "groups": {
+    "strong_chain": {
+      "models": [
+        "deepseek-chat",
+        "gpt-4o"
+      ],
+      "strategy": "primary_failover"
+    },
+    "vlm_pool": {
+      "models": [
+        "gpt-4o",
         "gpt-4o",
         "qwen-vl-max"
       ],
-      "strategy": "round_robin",
-      "require": [
-        "vision"
-      ],
+      "strategy": "round_robin"
+    }
+  },
+  "roles": {
+    "planner": "strong_chain",
+    "vision": {
+      "group": "vlm_pool",
       "temperature": 0.2
     },
     "caption": {

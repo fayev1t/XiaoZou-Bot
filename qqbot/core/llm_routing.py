@@ -7,9 +7,11 @@
 
 - ``parse_config``：解析 ``config/model_providers.json`` 配置文档（格式见
   `config/model_providers.example.json` 与 `开发文档/v2.0/20-横切契约/LLM路由契约.md`）：
-  ``providers``（服务商注册表）+ ``roles``（用途 → 模型名，可带 per-role
-  ``temperature``）+ ``settings``（全局策略/冷却/采样缺省——2026-07-29 起
-  ``temperature``/``max_tokens`` 全局缺省也在这里配，.env 不再有 LLM 键）。
+  ``providers``（服务商注册表）+ ``groups``（命名模型组：有序回退 /
+  随机或轮询池）+ ``roles``（用途 → 模型名或 ``group`` 引用，可带
+  per-role ``temperature``）+ ``settings``（全局策略/冷却/采样缺省——
+  2026-07-29 起 ``temperature``/``max_tokens`` 全局缺省也在这里配，.env
+  不再有 LLM 键）。
 - ``EndpointRouter``：模型名索引 + role 解析 + 三策略（random /
   primary_failover / round_robin）+ 被动熔断（失败进冷却、连续失败指数
   退避、成功清零；不做主动探活）。
@@ -97,12 +99,29 @@ class RoleRule:
     Router 的全局缺省策略。``temperature=None`` 表示未配置，由调用侧
     回落到 settings 全局缺省——per-role 温度是配置的一部分，不再散落
     在各调用点的常量里（2026-07-29 收拢）。
+
+    ``flat_pool=True``：组内模型展开后并成**一个**排序组再套 strategy
+    （命名 ``groups`` 里 ``random`` / ``round_robin`` 的语义）；``False``
+    保持 targets 回退链（``primary_failover`` 与裸 ``targets`` 默认）。
     """
 
     targets: tuple[RoleTarget, ...]
     strategy: str | None = None
     require: frozenset[str] = frozenset()
     temperature: float | None = None
+    flat_pool: bool = False
+
+
+@dataclass(frozen=True)
+class ModelGroup:
+    """命名模型组（``config/model_providers.json`` 顶层 ``groups``）。
+
+    ``strategy=primary_failover``：``models`` 顺序是回退链（保缓存友好）。
+    ``random`` / ``round_robin``：``models`` 组成扁平池后组内洗牌或轮转。
+    """
+
+    models: tuple[RoleTarget, ...]
+    strategy: str
 
 
 @dataclass(frozen=True)
@@ -111,6 +130,7 @@ class RoutingConfig:
 
     endpoints: tuple[ModelEndpoint, ...]
     roles: dict[str, RoleRule]
+    groups: dict[str, ModelGroup] | None = None
     default_strategy: str = DEFAULT_STRATEGY
     cooldown_seconds: float = DEFAULT_COOLDOWN_BASE_SECONDS
     cooldown_max_multiplier: float = COOLDOWN_MAX_MULTIPLIER
@@ -282,7 +302,62 @@ def _parse_role_target(value: Any, ctx: str) -> RoleTarget:
     raise ValueError(f"{ctx} 必须是模型名字符串或 {{model, provider}} 对象")
 
 
-def _parse_roles_value(value: Any) -> dict[str, RoleRule]:
+def _parse_groups_value(value: Any) -> dict[str, ModelGroup]:
+    """顶层 ``groups``：独立命名模型池，与 role 无绑定。
+
+    role 的目标可以填**组名**或**模型名**（字符串），也可对象里
+    ``"group": "<组名>"``。组内 ``models`` **允许同一模型出现多次**，
+    在 ``random`` / ``round_robin`` 下按出现次数加权。
+
+    每组：``{"models": [...], "strategy": "primary_failover"|"random"|"round_robin"}``。
+    ``strategy`` 缺省 ``primary_failover``（有序回退，缓存友好）。
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("groups 必须是 JSON 对象")
+    groups: dict[str, ModelGroup] = {}
+    for name, entry in value.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("groups 的组名不能为空")
+        ctx = f"groups[{name!r}]"
+        if not isinstance(entry, dict):
+            raise ValueError(f"{ctx} 必须是对象")
+        models_raw = entry.get("models")
+        if not isinstance(models_raw, list) or not models_raw:
+            raise ValueError(f"{ctx}.models 必须是非空数组")
+        # 不去重：重复条目 = 加权槽位
+        models = tuple(
+            _parse_role_target(item, f"{ctx}.models[{i}]")
+            for i, item in enumerate(models_raw)
+        )
+        strategy = (
+            _optional_strategy(entry, "strategy", ctx) or STRATEGY_PRIMARY_FAILOVER
+        )
+        groups[name.strip()] = ModelGroup(models=models, strategy=strategy)
+    return groups
+
+
+def _role_rule_from_group(
+    group: ModelGroup,
+    *,
+    strategy_override: str | None = None,
+    require: frozenset[str] = frozenset(),
+    temperature: float | None = None,
+) -> RoleRule:
+    strategy = strategy_override or group.strategy
+    return RoleRule(
+        targets=group.models,
+        strategy=strategy,
+        require=require,
+        temperature=temperature,
+        flat_pool=strategy in (STRATEGY_RANDOM, STRATEGY_ROUND_ROBIN),
+    )
+
+
+def _parse_roles_value(
+    value: Any, groups: Mapping[str, ModelGroup]
+) -> dict[str, RoleRule]:
     if value is None:
         return {}
     if not isinstance(value, dict):
@@ -294,17 +369,20 @@ def _parse_roles_value(value: Any) -> dict[str, RoleRule]:
             raise ValueError("roles 的 role 名不能为空")
         ctx = f"roles[{role!r}]"
         if isinstance(entry, str):
-            rule = RoleRule(targets=(_parse_role_target(entry, ctx),))
+            # 字符串：先当组名，否则当模型名（组与模型不得同名，见 parse_config）
+            name = entry.strip()
+            if not name:
+                raise ValueError(f"{ctx} 不能是空字符串")
+            if name in groups:
+                rule = _role_rule_from_group(groups[name])
+            else:
+                rule = RoleRule(targets=(RoleTarget(model=name),))
         elif isinstance(entry, dict):
-            rule = RoleRule(
-                targets=_parse_role_object_targets(entry, ctx),
-                strategy=_optional_strategy(entry, "strategy", ctx),
-                require=_parse_capabilities(entry.get("require"), ctx),
-                temperature=_optional_non_negative_number(entry, "temperature", ctx),
-            )
+            rule = _parse_role_object(entry, ctx, groups)
         elif isinstance(entry, list):
             if not entry:
                 raise ValueError(f"{ctx} 不能是空数组")
+            # 数组仍是模型回退链（元素不解析组名，避免隐式展开）
             rule = RoleRule(
                 targets=tuple(
                     _parse_role_target(item, f"{ctx}[{i}]")
@@ -317,8 +395,56 @@ def _parse_roles_value(value: Any) -> dict[str, RoleRule]:
     return roles
 
 
+def _parse_role_object(
+    entry: Mapping[str, Any],
+    ctx: str,
+    groups: Mapping[str, ModelGroup],
+) -> RoleRule:
+    """role 对象：``model`` / ``targets`` / ``group`` 三选一 + 可选覆写。
+
+    ``group`` 只表示「用这个独立组」；组本身不绑定任何 role。
+    """
+    has_model = "model" in entry
+    has_targets = "targets" in entry
+    has_group = "group" in entry
+    kinds = sum(bool(flag) for flag in (has_model, has_targets, has_group))
+    if kinds > 1:
+        raise ValueError(f"{ctx} 的 model / targets / group 互斥，只能配一个")
+    if kinds == 0:
+        raise ValueError(f"{ctx} 必须配置 model、targets 或 group 之一")
+
+    require = _parse_capabilities(entry.get("require"), ctx)
+    temperature = _optional_non_negative_number(entry, "temperature", ctx)
+    strategy_override = _optional_strategy(entry, "strategy", ctx)
+
+    if has_group:
+        if "provider" in entry:
+            raise ValueError(f"{ctx}.provider 只能与 model 搭配（不能与 group 并用）")
+        group_name = entry["group"]
+        if not isinstance(group_name, str) or not group_name.strip():
+            raise ValueError(f"{ctx}.group 必须是非空字符串")
+        group_name = group_name.strip()
+        if group_name not in groups:
+            raise ValueError(f"{ctx}.group 引用了未定义的组：{group_name!r}")
+        return _role_rule_from_group(
+            groups[group_name],
+            strategy_override=strategy_override,
+            require=require,
+            temperature=temperature,
+        )
+
+    targets = _parse_role_object_targets(entry, ctx)
+    return RoleRule(
+        targets=targets,
+        strategy=strategy_override,
+        require=require,
+        temperature=temperature,
+    )
+
+
 def _parse_role_object_targets(
-    entry: Mapping[str, Any], ctx: str
+    entry: Mapping[str, Any],
+    ctx: str,
 ) -> tuple[RoleTarget, ...]:
     """role 对象形态的目标：单目标 ``model``(+``provider``) 或多目标 ``targets``。
 
@@ -326,12 +452,8 @@ def _parse_role_object_targets(
     ——纯数组形态带不了覆写字段，此前这个组合（契约推荐的 vision 配法）
     根本写不出来（2026-07-29 修复，example.json 一直按此形态写但解析不过）。
     """
-    has_model = "model" in entry
-    has_targets = "targets" in entry
-    if has_model and has_targets:
-        raise ValueError(f"{ctx} 的 model 与 targets 互斥，只能配一个")
-    if not has_targets:
-        return (_parse_role_target(entry, ctx),)  # 缺 model 时在这里报错
+    if "targets" not in entry:
+        return (_parse_role_target(entry, ctx),)
     if "provider" in entry:
         raise ValueError(
             f"{ctx}.provider 只能与 model 搭配"
@@ -349,14 +471,16 @@ def _parse_role_object_targets(
 def parse_config(raw: str) -> RoutingConfig:
     """解析 ``config/model_providers.json`` 全文档。
 
-    顶层结构 ``{"providers": [...], "roles": {...}, "settings": {...}}``，
-    仅 ``providers`` 必填。非法配置一律 raise ValueError（含
-    JSONDecodeError），带上下文定位；未知字段忽略（向前兼容）。
+    顶层结构 ``{"providers": [...], "groups"?: {...}, "roles": {...},
+    "settings": {...}}``，仅 ``providers`` 必填。非法配置一律 raise
+    ValueError（含 JSONDecodeError），带上下文定位；未知字段忽略
+    （向前兼容）。
     """
     data = json.loads(raw)
     if not isinstance(data, dict):
         raise ValueError(
-            "LLM 配置必须是 JSON 对象：{providers: [...], roles?, settings?}"
+            "LLM 配置必须是 JSON 对象："
+            "{providers: [...], groups?, roles?, settings?}"
         )
 
     providers = data.get("providers")
@@ -364,10 +488,26 @@ def parse_config(raw: str) -> RoutingConfig:
         raise ValueError("providers 必须是非空数组")
     endpoints = _parse_provider_items(providers, "providers")
 
-    roles = _parse_roles_value(data.get("roles"))
-    # role 钉死的服务商必须在注册表里（模型名的存在性由 Router 兜底校验，
-    # 因为它还要容忍"模型在但都冷却"这类运行期状态）。
+    groups = _parse_groups_value(data.get("groups"))
+    # 组名与模型名冲突时，roles 字符串写法无法区分「用组」还是「用模型」。
+    model_names = {endpoint.model for endpoint in endpoints}
+    collide = sorted(set(groups) & model_names)
+    if collide:
+        raise ValueError(
+            "groups 的组名不能与任何已注册模型名相同（roles 字符串写法会歧义）："
+            + ", ".join(repr(name) for name in collide)
+        )
+    roles = _parse_roles_value(data.get("roles"), groups)
+    # role / group 钉死的服务商必须在注册表里（模型名的存在性由 Router 兜底
+    # 校验，因为它还要容忍"模型在但都冷却"这类运行期状态）。
     known_providers = {endpoint.provider for endpoint in endpoints}
+    for group_name, group in groups.items():
+        for target in group.models:
+            if target.provider is not None and target.provider not in known_providers:
+                raise ValueError(
+                    f"groups[{group_name!r}] 钉死的服务商不存在："
+                    f"{target.provider!r}"
+                )
     for role, rule in roles.items():
         for target in rule.targets:
             if target.provider is not None and target.provider not in known_providers:
@@ -401,6 +541,7 @@ def parse_config(raw: str) -> RoutingConfig:
     return RoutingConfig(
         endpoints=endpoints,
         roles=roles,
+        groups=groups,
         default_strategy=strategy,
         cooldown_seconds=cooldown,
         cooldown_max_multiplier=cooldown_cap,
@@ -516,6 +657,7 @@ class EndpointRouter:
                 strategy=rule.strategy,
                 require=rule.require,
                 temperature=rule.temperature,
+                flat_pool=rule.flat_pool,
             )
 
         self._default_strategy = default_strategy
@@ -647,16 +789,24 @@ class EndpointRouter:
         else:
             rule, explicit = self._rule_for(role)
             need = need | rule.require
-            seen_specs: set[str] = set()
-            groups = []
-            for target in rule.targets:
-                group = [
-                    endpoint
-                    for endpoint in self._expand_target(target)
-                    if endpoint.spec not in seen_specs
-                ]
-                seen_specs.update(endpoint.spec for endpoint in group)
-                groups.append(group)
+            # flat_pool（groups 的 random/rr）：保留重复 target 作为加权槽位，
+            # 不去重；回退链则按 spec 去重，避免空转。
+            if rule.flat_pool:
+                pool: list[ModelEndpoint] = []
+                for target in rule.targets:
+                    pool.extend(self._expand_target(target))
+                groups = [pool] if pool else []
+            else:
+                seen_specs: set[str] = set()
+                groups = []
+                for target in rule.targets:
+                    group = [
+                        endpoint
+                        for endpoint in self._expand_target(target)
+                        if endpoint.spec not in seen_specs
+                    ]
+                    seen_specs.update(endpoint.spec for endpoint in group)
+                    groups.append(group)
             strategy_override = rule.strategy
 
         if need:

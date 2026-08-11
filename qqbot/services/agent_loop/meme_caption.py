@@ -69,9 +69,8 @@ async def caption_image(
 ) -> str:
     """看图生成收藏描述。失败一律 raise CaptionError（见模块 docstring）。
 
-    与 llm_planner 同一个 create_llm 入口，走 role="caption" 路由并硬性
-    要求 vision 能力（单服务商旧配置视为天然多模态，行为不变；多服务商
-    注册表下 caption 候选须带 vision 标签或显式配置 caption role）。
+    与 llm_planner 同一个 create_llm 入口，走 role="caption" 路由；
+    视觉模型由配置里的组 / role 目标选定（不再用 capabilities 硬过滤）。
     每次调用新建包装对象 —— 收藏是低频动作，底层客户端由 llm 层缓存。
     """
     try:
@@ -83,11 +82,11 @@ async def caption_image(
 
     # 温度在 roles.caption.temperature 配（建议低温 0.2：同一张图的描述应当
     # 稳定，不需要发散），见 LLM 路由契约 §2。
-    llm = await create_llm(role="caption", require=("vision",))
+    llm = await create_llm(role="caption")
     if llm is None:
         raise CaptionError(
             "caption LLM not configured "
-            "(config/model_providers.json 缺失，或 caption role 无带 vision 能力的候选)"
+            "(config/model_providers.json 缺失，或 caption role 无候选)"
         )
 
     from langchain_core.messages import HumanMessage

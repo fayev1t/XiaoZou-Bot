@@ -108,6 +108,10 @@ class EnvCentralizationContractTests(unittest.TestCase):
         for section in ("providers", "roles", "settings"):
             with self.subTest(section=section):
                 self.assertIn(section, data)
+        # groups 可选但模板应示范命名组 + role 引用（2026-08-11）
+        self.assertIn("groups", data)
+        self.assertIsInstance(data["groups"], dict)
+        self.assertTrue(data["groups"])
 
         self.assertIn("config/model_providers.json", self.read_text(".gitignore"))
 

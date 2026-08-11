@@ -3,9 +3,10 @@
 背景：2026-07-28 之前 Planner 与 Replyer 都是 VLM，每一拍把 timeline 窗口里
 **所有**图片重新 base64 上传一遍（llm_planner._build_image_blocks，Replyer 复用
 同一函数）。一张图在窗口里待几十条事件，就被重复上传几十次 × 2 个调用点，还把
-系统里最高频的两个调用点硬绑成必须有 vision 能力。现在改成：每张图在 ingest
-落盘后由专用 VLM 看**一次**，写一段客观描述进事件正文。现役 Planner 保持
-纯文本；Replyer 后续已经退役。
+系统里最高频的两个调用点硬绑成必须走 VLM。现在改成：每张图在 ingest
+落盘后由 role=vision 看**一次**，写一段客观描述进事件正文（模型由
+config 的 groups/roles 选定，不再用 capabilities 标签硬过滤）。现役
+Planner 保持纯文本；Replyer 后续已经退役。
 
 为什么描述里不带聊天语境（关键设计取舍）：
   1. ingest 时刻**语境往往还不存在** —— 群里先甩图、隔几条消息再补一句话是常态，
@@ -255,11 +256,11 @@ async def _invoke_vision(
     并发闸，不因为走了不同入口就绕开供应商的并发上限。"""
     # 温度在 roles.vision.temperature 配（建议低温 0.2：同一张图的客观描述
     # 应当稳定，不需要发散；与 caption 同理），见 LLM 路由契约 §2。
-    llm = await create_llm(role="vision", require=("vision",))
+    llm = await create_llm(role="vision")
     if llm is None:
         logger.warning(
             "[image_description] no vision-capable LLM configured "
-            "(config/model_providers.json 里 role=vision 无带 vision 能力的候选)"
+            "(config/model_providers.json 缺失，或 role=vision 无候选)"
         )
         return None, None
 

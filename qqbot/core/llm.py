@@ -267,9 +267,8 @@ async def create_llm(
       （planner / caption / default）。
 
     配置缺失 / 解析失败 / 候选为空时返回 None（与旧版语义一致，调用方
-    已有 None 分支）。``require`` 是能力硬要求（如 caption 传
-    ("vision",)）；显式配置的 role 候选不满足时警告放行，其余入口严格
-    过滤（见 llm_routing 文档）。
+    已有 None 分支）。``require`` 是可选能力过滤（遗留）；现役 vision/
+    caption 靠 roles/groups 选型，不再传 ``require=("vision",)``。
 
     温度解析链（2026-07-29 收拢）：``temperature`` 显式传参（测试注入用，
     生产调用点不传）> role 规则配置的 ``temperature``（走 role 路由时）>
