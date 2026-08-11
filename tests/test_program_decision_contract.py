@@ -1,4 +1,4 @@
-"""AgentLoop contracts for program-shaped decisions and same-tick repair."""
+"""AgentLoop contracts for program-shaped decisions (endpoint failover, no rewrite)."""
 
 # Async mocks accept the production call shape while recording only ordering.
 # ruff: noqa: ARG001
@@ -42,8 +42,11 @@ def _context() -> DecisionContext:
     )
 
 
-class ProgramPreflightRepairContractTests(unittest.IsolatedAsyncioTestCase):
-    async def test_static_error_is_reported_and_repaired_in_same_tick(self) -> None:
+class ProgramPreflightFailoverContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_static_error_reports_and_retries_without_validation_feedback(
+        self,
+    ) -> None:
+        """preflight 失败：冷却端点 + 再 decide，context 不带校验拒绝。"""
         planner = _SequencePlanner("import os", "# repaired")
         loop = AgentLoop(
             scope_key="group:1",
@@ -64,11 +67,8 @@ class ProgramPreflightRepairContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(planner.contexts), 2)
         self.assertEqual(len(planner.reports), 1)
         self.assertIn("program_forbidden_construct", planner.reports[0])
-        feedback = planner.contexts[1].validation_feedback
-        self.assertIsNotNone(feedback)
-        self.assertEqual(feedback.attempt, 1)
-        self.assertEqual(feedback.rejected_program, "import os")
-        self.assertEqual(feedback.error_kind, "program_forbidden_construct")
+        for ctx in planner.contexts:
+            self.assertIsNone(ctx.validation_feedback)
         write_runtime.assert_awaited_once()
         self.assertEqual(
             write_runtime.await_args.kwargs["event_type"],
@@ -147,6 +147,8 @@ class ProgramDecisionEventContractTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(planner.contexts), 3)
         self.assertEqual(len(planner.reports), 3)
+        for ctx in planner.contexts:
+            self.assertIsNone(ctx.validation_feedback)
         write_decision.assert_awaited_once()
         payload = write_decision.await_args.kwargs["payload"]
         self.assertEqual(payload["program"], rejected[-1])

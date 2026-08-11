@@ -429,8 +429,9 @@ class FileAssemblyTests(unittest.TestCase):
         <reply-task-completed> / <my-reply> / <replyer-input>）不得复现。"""
         planner_env = build_library("planner").get("envelope")
         self.assertEqual(planner_env, self._md("envelope.md"))
-        for tag in ("<t>", "<m>", "<程序>", "<等待结束>", "<校验拒绝>"):
+        for tag in ("<t>", "<m>", "<程序>", "<等待结束>", "<现在>"):
             self.assertIn(tag, planner_env)
+        self.assertNotIn("<校验拒绝>", planner_env)
         for stale in (
             "<agent-input>",
             "<reply-task-completed>",

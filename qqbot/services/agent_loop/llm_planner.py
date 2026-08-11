@@ -13,9 +13,10 @@ Planner 内部建立第三人称人物模型，最终措辞仍由同一层直接
 人格、职责或参与规则时直接改 `planner.md`，改信封语法改
 `envelope.md`，改工具说明改 `tools/<name>.md`，都不需要碰 planner。
 
-每次 decide() 只调用模型一次。静态校验与最多三次同拍修复统一由 AgentLoop
-承担；本类保留 report_invalid_output()，把 HTTP 200 但正文不可用的失败同步
-回报给路由层。LLM 不可用或调用失败时返回空程序，等价于本拍 idle。
+每次 decide() 只调用模型一次。静态 preflight 与同拍换端点（最多三次 decide、
+无校验拒绝回灌）由 AgentLoop 承担；本类保留 report_invalid_output()，把
+HTTP 200 但正文不可用的失败同步回报给路由层以冷却端点。LLM 不可用或调用
+失败时返回空程序，等价于本拍 idle。
 
 契约：任务与决策契约.md §2-§4
 """
@@ -159,7 +160,7 @@ class LLMPlanner:
         try:
             mark_failed(str(reason)[:300])
         except Exception:
-            # 路由记账是 best-effort，绝不能反噬下一次同拍修复。
+            # 路由记账是 best-effort，绝不能反噬下一次同拍换端点。
             pass
 
     async def _ensure_llm(self) -> Any:
@@ -251,7 +252,7 @@ def _render_input_text(context: DecisionContext) -> str:
       <任务>…（_render_task_block）
 
       <现在>YYYY-MM-DD HH:MM:SS
-      <校验拒绝>…                        (仅校验重试)
+      （生产路径不再附 <校验拒绝>；字段仅遗留兼容）
 
     缓存契约（2026-07-12）：OpenAI 系 API 的自动前缀缓存要求前缀**逐字节
     一致**。now 每拍必变，曾是信封的头字段，把可缓存前缀掐断在 system
@@ -259,7 +260,7 @@ def _render_input_text(context: DecisionContext) -> str:
     重计费。现按变化频率排序：头两行只留 scope/
     bot_qq/bot_role（稳定/极少变）；未收束任务活跃期逐拍变
     （pending_tool_call_ids 随工具收口增删），排到时间线之后；每拍必变的
-    now 沉为尾部 ``<现在>``；``<校验拒绝>`` 只在同 tick 校验重试出现
+    now 沉为尾部 ``<现在>``；``validation_feedback`` 生产恒为 None
     （契约 §7.1），放最尾——同拍重试可复用直到 ``<现在>`` 的前缀，且作为
     最后一行对模型最显著。表情包收藏是唯一的显著性例外（2026-08-01）：它
     少变、本可留在时间线之前吃前缀缓存，但选图发生在读完局面之后，目录隔

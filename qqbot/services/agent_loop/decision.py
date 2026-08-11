@@ -209,9 +209,9 @@ class DecisionContext:
     # 扩展成"最近 K 版反思"，那会退化回被删掉的那个形态。
     reflection: ReflectionView | None = None
 
-    # ─── 同 tick 校验重试的反馈（任务与决策契约 §7.1）───
-    # 上一次 decide() 输出未通过静态预检时，loop 带着错误与被拒源码重试；
-    # planner 渲染成 <校验拒绝> 行块。正常首次调用恒为 None，不进渲染。
+    # ─── 已退役：同拍「校验拒绝」纠错环（2026-08-11）───
+    # 字段保留以免旧快照/测试构造炸掉；AgentLoop 不再写入，LLMPlanner 若收到
+    # 非 None 仍可渲染，但生产路径恒为 None。
     validation_feedback: ProgramValidationFeedback | None = None
 
     # 当前 tick 上 bot 自己的 QQ user_id（由 bot_registry 提供,AgentLoop
@@ -235,8 +235,8 @@ class Planner(Protocol):
 
     Implementations:
     - LLMPlanner — 现役唯一实现；每次调用模型一次并返回响应源码。
-    - report_invalid_output — 静态预检失败后同步回报路由层，使同拍重试可切换
-      到下一个健康端点。
+    - report_invalid_output — 静态预检失败后同步回报路由层，冷却当前端点，
+      同拍下一次 decide 换组内下一个模型（不喂校验拒绝文本）。
     """
 
     async def decide(self, context: DecisionContext) -> DecisionOutput: ...

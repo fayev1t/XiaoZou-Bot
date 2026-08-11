@@ -1,10 +1,11 @@
 """Long-running per-scope loop for program-shaped Planner decisions.
 
 Each tick projects the scope, asks the Planner for one restricted Python
-program, preflights it (up to three same-tick attempts), persists the decision
-root, and executes every query/effect sequentially before the tick ends.
-There is no worker dispatch or tool batch: a completed tick has no pending
-program call.
+program, preflights it, and on static failure cools the current LLM endpoint
+then tries the next candidate in the role group (no same-tick rewrite with
+validation feedback). Persists the decision root and executes every
+query/effect sequentially before the tick ends. There is no worker dispatch
+or tool batch: a completed tick has no pending program call.
 
 The fixed wake batching window remains a conversation-ingest concern. The
 first wake opens one bounded window; later wakes join it without extending the
@@ -20,7 +21,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import time
-from dataclasses import replace
 from datetime import datetime
 from typing import Any, Callable
 
@@ -34,8 +34,11 @@ from qqbot.services.agent_loop.decision import (
     DecisionContext,
     DecisionOutput,
     Planner,
-    ProgramValidationFeedback,
 )
+
+# 同拍最多决定次数：每次 preflight 失败冷却当前端点后换组内下一个模型再
+# decide；**不**把被拒源码/校验错误喂回模型（2026-08-11 取消「校验拒绝」纠错环）。
+_DECIDE_MAX_ATTEMPTS = 3
 from qqbot.services.agent_loop.event_writer import (
     write_agent_event,
     write_runtime_event,
@@ -329,7 +332,7 @@ class AgentLoop:
         if prepared is None:
             info = preflight_error or ProgramErrorInfo(
                 "invalid_program_giveup",
-                "program preflight failed after three attempts",
+                "program preflight failed after endpoint failover",
             )
             details = dict(info.details)
             if info.line is not None:
@@ -348,7 +351,7 @@ class AgentLoop:
                     effect_call_ids=[],
                     error_kind="invalid_program_giveup",
                     error_message=(
-                        "program remained invalid after three attempts: "
+                        "program remained invalid after endpoint failover: "
                         f"{info.error_kind}: {info.message}"
                     ),
                     failed_call=None,
@@ -428,18 +431,13 @@ class AgentLoop:
         PreflightResult | None,
         ProgramErrorInfo | None,
     ]:
-        feedback: ProgramValidationFeedback | None = None
+        """decide → preflight；失败只冷却端点并换模型再 decide，不喂校验拒绝。"""
         last_decision: DecisionOutput | None = None
         last_error: ProgramErrorInfo | None = None
         scope = self._scope_key.split(":", 1)[0]
-        for attempt in range(1, 4):
-            attempt_context = (
-                context
-                if feedback is None
-                else replace(context, validation_feedback=feedback)
-            )
+        for attempt in range(1, _DECIDE_MAX_ATTEMPTS + 1):
             try:
-                last_decision = await self._planner.decide(attempt_context)
+                last_decision = await self._planner.decide(context)
             except Exception as exc:
                 logger.exception(
                     "[loop {}] planner failed: {}", self._scope_key, exc
@@ -469,16 +467,6 @@ class AgentLoop:
                         "line": exc.info.line,
                         "column": exc.info.column,
                     },
-                )
-                feedback = ProgramValidationFeedback(
-                    attempt=attempt,
-                    error_kind=exc.info.error_kind,
-                    message=exc.info.message,
-                    rejected_program=_bounded_program_source(
-                        last_decision.program
-                    ),
-                    line=exc.info.line,
-                    column=exc.info.column,
                 )
                 continue
             return last_decision, prepared, None
