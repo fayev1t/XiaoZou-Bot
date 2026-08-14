@@ -1,4 +1,10 @@
 {
+  "_comment": "JSON 没有注释，本文件用 _comment 键代替（解析器忽略未知字段）。注意 models 数组里不能塞说明字符串——字符串元素会被当成模型名。",
+
+  "_模型即端点": "providers[].models[] 每个条目 = 一个端点。name 是路由身份（roles / groups 引用它），不必等于上游模型名：填 upstream_model 就把该条目变成别名，于是「同一模型的不同调用档位」就是两个可路由的名字，路由层不需要知道「思考等级」这回事。",
+  "_采样在端点上": "temperature / max_tokens / timeout / streaming 与厂商透传 params 都在端点上声明；roles 里不再有任何采样参数（写了会启动报错）。缺省回落 settings。",
+  "_继承规则": "capabilities 取并集；标量字段模型级覆盖 provider 级；params 合并且模型级同名键覆盖 provider 级。",
+
   "providers": [
     {
       "name": "deepseek",
@@ -12,44 +18,64 @@
       "name": "relay",
       "base_url": "https://relay.example.com/v1",
       "api_key": "sk-your-relay-key",
+      "temperature": 0.7,
+      "timeout": 90,
       "models": [
-        "deepseek-chat",
         "gpt-4o",
-        "qwen-vl-max"
+        {
+          "_comment": "同一上游模型的两个思考档位，各带自己的超时与预算：深档慢且贵，浅档便宜。",
+          "name": "gpt-4o-xhigh",
+          "upstream_model": "gpt-4o",
+          "temperature": 0.6,
+          "timeout": 300,
+          "max_tokens": 2000,
+          "params": { "reasoning_effort": "xhigh" }
+        },
+        {
+          "name": "gpt-4o-low",
+          "upstream_model": "gpt-4o",
+          "params": { "reasoning_effort": "low" }
+        },
+        {
+          "_comment": "各家的档位键名与取值都不一致；params 是自由透传，值可以是字符串 / 数字 / 布尔（不支持嵌套对象）。",
+          "name": "qwen-think",
+          "upstream_model": "qwen-max",
+          "params": { "enable_thinking": true, "thinking_budget": 8192 }
+        },
+        {
+          "_comment": "网关侧已经把档位烘进模型名的（-high 后缀），就是普通条目，不必写 upstream_model——两种形态在路由层完全同构。",
+          "name": "gemini-2.5-flash-high"
+        },
+        {
+          "_comment": "同一模型要两种温度，同样用别名表达：这一条低温，专供图片转录。",
+          "name": "qwen-vl-max",
+          "capabilities": ["vision"],
+          "temperature": 0.2
+        }
       ]
     }
   ],
+
   "groups": {
     "strong_chain": {
-      "models": [
-        "deepseek-chat",
-        "gpt-4o"
-      ],
-      "strategy": "primary_failover"
+      "models": ["gpt-4o-xhigh", "gpt-4o-xhigh", "qwen-think"],
+      "strategy": "round_robin"
     },
     "vlm_pool": {
-      "models": [
-        "gpt-4o",
-        "gpt-4o",
-        "qwen-vl-max"
-      ],
+      "models": ["qwen-vl-max", "qwen-vl-max", "gemini-2.5-flash-high"],
       "strategy": "round_robin"
     }
   },
+
   "roles": {
     "planner": "strong_chain",
-    "vision": {
-      "group": "vlm_pool",
-      "temperature": 0.2
-    },
-    "caption": {
-      "model": "gpt-4o",
-      "temperature": 0.2
-    },
+    "vision": "vlm_pool",
+    "caption": "vlm_pool",
     "memory": "deepseek-chat",
     "web_digest": "deepseek-chat",
     "default": "deepseek-chat"
   },
+
   "settings": {
     "strategy": "random",
     "cooldown_seconds": 60,

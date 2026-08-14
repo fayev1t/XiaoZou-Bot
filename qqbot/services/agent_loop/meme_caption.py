@@ -80,8 +80,9 @@ async def caption_image(
             f"caption image conversion failed: {type(exc).__name__}: {exc}"
         ) from exc
 
-    # 温度在 roles.caption.temperature 配（建议低温 0.2：同一张图的描述应当
-    # 稳定，不需要发散），见 LLM 路由契约 §2。
+    # 温度在 caption 这条 role 指向的**端点**上配（2026-08-14 起采样参数只在
+    # providers[].models[] 上声明）。建议低温 0.2：同一张图的描述应当稳定，
+    # 不需要发散。见 LLM 路由契约 §2。
     llm = await create_llm(role="caption")
     if llm is None:
         raise CaptionError(

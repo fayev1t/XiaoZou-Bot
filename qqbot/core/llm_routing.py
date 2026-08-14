@@ -6,12 +6,14 @@
 切换到下一个；也可以显式钉死某个服务商（provider + model）。
 
 - ``parse_config``：解析 ``config/model_providers.json`` 配置文档（格式见
-  `config/model_providers.example.json` 与 `开发文档/v2.0/20-横切契约/LLM路由契约.md`）：
-  ``providers``（服务商注册表）+ ``groups``（命名模型组：有序回退 /
-  随机或轮询池）+ ``roles``（用途 → 模型名或 ``group`` 引用，可带
-  per-role ``temperature``）+ ``settings``（全局策略/冷却/采样缺省——
-  2026-07-29 起 ``temperature``/``max_tokens`` 全局缺省也在这里配，.env
-  不再有 LLM 键）。
+  `config/model_providers.example.json` 与
+  `开发文档/v2.0/20-横切契约/LLM路由契约.md`）：
+  ``providers``（服务商注册表，每个 ``models`` 条目 = 一个端点，可用
+  ``upstream_model`` 把它变成**别名**并带上自己的采样/透传参数）+
+  ``groups``（命名模型组：有序回退 / 随机或轮询池）+ ``roles``（用途 →
+  模型名或 ``group`` 引用；**不含任何采样参数**）+ ``settings``（全局
+  策略/冷却/采样缺省——2026-07-29 起 ``temperature``/``max_tokens`` 全局
+  缺省也在这里配，.env 不再有 LLM 键）。
 - ``EndpointRouter``：模型名索引 + role 解析 + 三策略（random /
   primary_failover / round_robin）+ 被动熔断（失败进冷却、连续失败指数
   退避、成功清零；不做主动探活）。
@@ -22,6 +24,9 @@
 端点标识 spec 串 ``provider/model``（服务商名不含 ``/``，模型名允许含
 ``/``，如 ``sf/deepseek-ai/DeepSeek-V3``）——仅用于注册表键、熔断状态与
 日志；对外定位一律用 ``model`` + 可选 ``provider`` 两个字段，无歧义。
+这里的 ``model`` 是端点的**路由身份**，可以是本地别名（``grok-4.5-xhigh``），
+不必等于发给上游的模型名——于是同一上游模型的不同调用档位天然是两个端点，
+各有各的冷却计数器与客户端。
 
 本模块**只依赖 stdlib**（不碰 pydantic / langchain / loguru），契约测试
 可在本地裸环境直接跑；文件/env 读取、ChatOpenAI 构造与日志接线都留在
@@ -59,14 +64,54 @@ COOLDOWN_MAX_MULTIPLIER = 16.0
 # 延迟全叠上去（快失败场景 3 个已足够覆盖双备份）。
 DEFAULT_MAX_ATTEMPTS_PER_CALL = 3
 # 全局采样温度缺省（2026-07-29 自 .env 的 LLM_TEMPERATURE 收拢进
-# settings.temperature；解析链见 llm.create_llm：显式传参 > role 配置 >
-# settings.temperature > 本缺省）。
+# settings.temperature）。2026-08-14 起解析链只剩两级：端点声明 >
+# settings.temperature > 本缺省——role 不再参与采样。
 DEFAULT_TEMPERATURE = 0.7
+
+# ``params`` 里禁止出现的键：它们要么由本层自己组装（model/messages/stream），
+# 要么有专用端点字段（temperature/max_tokens/timeout）。允许它们混进透传字典
+# 会造出第二个真相源——同一个参数两个地方能配、优先级只能靠记，正是
+# 2026-07-28/29 两次收拢要消灭的东西。parse 期 raise 并指路到专用字段。
+RESERVED_PARAM_KEYS: frozenset[str] = frozenset(
+    {
+        "model",
+        "model_name",
+        "messages",
+        "stream",
+        "streaming",
+        "temperature",
+        "max_tokens",
+        "timeout",
+    }
+)
+
+# roles 里已退役的键：采样参数 2026-08-14 起只在端点上声明。这几个键**不**走
+# 「未知字段忽略（向前兼容）」——未知字段是没见过的，退役字段是曾经生效过的，
+# 静默吞掉等于配置文件在撒谎（照着 roles 段的形状再写一次不生效，还得翻代码）。
+RETIRED_ROLE_KEYS: tuple[str, ...] = ("temperature",)
 
 
 @dataclass(frozen=True)
 class ModelEndpoint:
-    """一个可请求的「服务商 × 模型」端点（含该服务商的 key 与调用参数）。"""
+    """一个可请求的端点：**模型别名** + 上游模型 + 该次调用的全部参数。
+
+    ``model`` 是**路由身份**——roles / groups 引用的名字、注册表键、熔断状态键
+    与日志里的 spec 都用它，不必等于发给上游的模型名。``upstream_model`` 省略
+    时两者相同；填了就表示 ``model`` 是本地别名（2026-08-14）。
+
+    别名的用途是把「同一个上游模型的不同调用档位」表达成**两个可路由的名字**，
+    典型是思考等级：``grok-4.5-xhigh`` 与 ``grok-4.5`` 指向同一个
+    ``upstream_model``，只是 ``params`` 里的 ``reasoning_effort`` 不同。这样
+    思考等级不需要任何新的路由概念——groups 的加权槽位、role 回退链、按端点
+    独立的冷却计数器全部原样复用。网关侧已经把档位烘进模型名的（如
+    ``gemini-3.6-flash-high``）就是不带 ``upstream_model`` 的普通条目，两种
+    形态在路由层完全同构。
+
+    采样参数（``temperature`` / ``max_tokens`` / ``timeout_seconds`` /
+    ``streaming``）全部在这里定死，``None`` 表示回落 ``settings`` 全局缺省。
+    ``params`` 是厂商特有的透传参数（``reasoning_effort`` / ``enable_thinking``
+    / token 预算……），排序元组形态以保持 dataclass 可哈希。
+    """
 
     provider: str
     model: str
@@ -76,10 +121,18 @@ class ModelEndpoint:
     streaming: bool = True
     timeout_seconds: float | None = None
     max_tokens: int | None = None
+    upstream_model: str | None = None
+    temperature: float | None = None
+    params: tuple[tuple[str, Any], ...] = ()
 
     @property
     def spec(self) -> str:
         return f"{self.provider}/{self.model}"
+
+    @property
+    def wire_model(self) -> str:
+        """实际发给上游的模型名（别名解析后）。"""
+        return self.upstream_model or self.model
 
 
 @dataclass(frozen=True)
@@ -92,13 +145,16 @@ class RoleTarget:
 
 @dataclass(frozen=True)
 class RoleRule:
-    """一个用途（role）的路由规则：目标序列 + 策略覆写 + 能力硬要求 + 采样温度。
+    """一个用途（role）的路由规则：目标序列 + 策略覆写 + 能力硬要求。
 
     ``targets`` 是优先级递减的回退链：先在 targets[0] 的服务商里选，
     全部不可用才轮到 targets[1]，以此类推。``strategy=None`` 表示用
-    Router 的全局缺省策略。``temperature=None`` 表示未配置，由调用侧
-    回落到 settings 全局缺省——per-role 温度是配置的一部分，不再散落
-    在各调用点的常量里（2026-07-29 收拢）。
+    Router 的全局缺省策略。
+
+    **role 不再携带任何采样参数**（2026-08-14）：温度随 max_tokens / timeout /
+    厂商透传参数一起落到端点（模型别名）上。role 只回答「用哪些模型、按什么
+    顺序」，「怎么调这个模型」由别名自己声明——同一模型要两种温度就注册两个
+    别名，与思考等级的表达方式一致。
 
     ``flat_pool=True``：组内模型展开后并成**一个**排序组再套 strategy
     （命名 ``groups`` 里 ``random`` / ``round_robin`` 的语义）；``False``
@@ -108,7 +164,6 @@ class RoleRule:
     targets: tuple[RoleTarget, ...]
     strategy: str | None = None
     require: frozenset[str] = frozenset()
-    temperature: float | None = None
     flat_pool: bool = False
 
 
@@ -135,9 +190,9 @@ class RoutingConfig:
     cooldown_seconds: float = DEFAULT_COOLDOWN_BASE_SECONDS
     cooldown_max_multiplier: float = COOLDOWN_MAX_MULTIPLIER
     max_attempts_per_call: int = DEFAULT_MAX_ATTEMPTS_PER_CALL
-    # 全局采样缺省（原 .env 的 LLM_TEMPERATURE / LLM_MAX_TOKENS）：
-    # temperature 是调用方与 role 都没配温度时的兜底；max_tokens 是端点
-    # 自身没配 max_tokens 时的兜底（None = 不限制）。
+    # 全局采样缺省（原 .env 的 LLM_TEMPERATURE / LLM_MAX_TOKENS）：端点自身
+    # 没声明该参数时的兜底，2026-08-14 起两者语义一致（max_tokens 一直如此，
+    # temperature 这次从「role 兜底」改成「端点兜底」）。None = 不限制。
     temperature: float = DEFAULT_TEMPERATURE
     max_tokens: int | None = None
 
@@ -223,7 +278,54 @@ def _optional_strategy(obj: Mapping[str, Any], key: str, ctx: str) -> str | None
     return value
 
 
+def _parse_params(
+    value: Any,
+    ctx: str,
+    *,
+    base: tuple[tuple[str, Any], ...] = (),
+) -> tuple[tuple[str, Any], ...]:
+    """厂商特有的固定附加请求参数（``reasoning_effort`` / ``enable_thinking`` …）。
+
+    provider 级作缺省，模型级**合并**（同名键覆盖）——与 ``capabilities`` 的并集、
+    以及标量字段的整体覆盖都不同：provider 声明大家共用的键，别名只覆写自己那
+    一档的值。
+
+    值域限死 JSON 标量：``ModelEndpoint`` 是 ``frozen=True``（``capabilities``
+    用 frozenset 就是为了可哈希），嵌套容器会让 ``hash(endpoint)`` 直接炸；
+    而且透传字典没有类型校验，``"temperature": "hot"`` 这类错误只会在上游变成
+    一个 400，parse 期拦住才有意义。返回按键排序的元组以保持可哈希。
+    """
+    merged: dict[str, Any] = dict(base)
+    if value is None:
+        return tuple(sorted(merged.items()))
+    if not isinstance(value, dict):
+        raise ValueError(f"{ctx}.params 必须是 JSON 对象")
+    for raw_key, raw_value in value.items():
+        if not isinstance(raw_key, str) or not raw_key.strip():
+            raise ValueError(f"{ctx}.params 的键必须是非空字符串")
+        key = raw_key.strip()
+        if key in RESERVED_PARAM_KEYS:
+            raise ValueError(
+                f"{ctx}.params.{key} 与端点专用字段冲突：直接写 {ctx}.{key}"
+                "（params 只放厂商特有的透传参数）"
+            )
+        if raw_value is None or not isinstance(raw_value, (bool, int, float, str)):
+            raise ValueError(
+                f"{ctx}.params.{key} 必须是字符串 / 数字 / 布尔值（不支持嵌套）"
+            )
+        merged[key] = raw_value
+    return tuple(sorted(merged.items()))
+
+
 def _parse_provider_items(items: list[Any], ctx: str) -> tuple[ModelEndpoint, ...]:
+    """服务商注册表 → 端点列表。
+
+    每个 ``models`` 元素展开成一个端点。字符串形态沿用 provider 级的全部调用
+    参数；对象形态可逐项覆写，并可用 ``upstream_model`` 把该条目变成**别名**
+    （见 ``ModelEndpoint``）。继承语义三种，互不相同，改这里时留意：
+    ``capabilities`` 并集、标量字段模型覆盖 provider、``params`` 合并且模型
+    级同名键覆盖。
+    """
     endpoints: list[ModelEndpoint] = []
     seen_names: set[str] = set()
     seen_specs: set[str] = set()
@@ -247,6 +349,8 @@ def _parse_provider_items(items: list[Any], ctx: str) -> tuple[ModelEndpoint, ..
         streaming = _optional_bool(item, "streaming", item_ctx, True)
         timeout_seconds = _optional_positive_number(item, "timeout", item_ctx)
         max_tokens = _optional_positive_int(item, "max_tokens", item_ctx)
+        temperature = _optional_non_negative_number(item, "temperature", item_ctx)
+        params = _parse_params(item.get("params"), item_ctx)
 
         models = item.get("models")
         if not isinstance(models, list) or not models:
@@ -257,25 +361,52 @@ def _parse_provider_items(items: list[Any], ctx: str) -> tuple[ModelEndpoint, ..
                 model_name = entry.strip()
                 if not model_name:
                     raise ValueError(f"{model_ctx} 不能是空字符串")
-                model_caps = provider_caps
+                endpoint = ModelEndpoint(
+                    provider=name,
+                    model=model_name,
+                    base_url=base_url,
+                    api_key=api_key,
+                    capabilities=provider_caps,
+                    streaming=streaming,
+                    timeout_seconds=timeout_seconds,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    params=params,
+                )
             elif isinstance(entry, dict):
                 model_name = _required_str(entry, "name", model_ctx)
-                model_caps = provider_caps | _parse_capabilities(
-                    entry.get("capabilities"), model_ctx
+                model_temperature = _optional_non_negative_number(
+                    entry, "temperature", model_ctx
+                )
+                model_timeout = _optional_positive_number(entry, "timeout", model_ctx)
+                model_max_tokens = _optional_positive_int(
+                    entry, "max_tokens", model_ctx
+                )
+                endpoint = ModelEndpoint(
+                    provider=name,
+                    model=model_name,
+                    base_url=base_url,
+                    api_key=api_key,
+                    capabilities=provider_caps
+                    | _parse_capabilities(entry.get("capabilities"), model_ctx),
+                    streaming=_optional_bool(entry, "streaming", model_ctx, streaming),
+                    timeout_seconds=(
+                        timeout_seconds if model_timeout is None else model_timeout
+                    ),
+                    max_tokens=(
+                        max_tokens if model_max_tokens is None else model_max_tokens
+                    ),
+                    upstream_model=_optional_str(entry, "upstream_model", model_ctx),
+                    # 0 是合法温度，不能用 `or` 链回落
+                    # （见 _optional_non_negative_number）
+                    temperature=(
+                        temperature if model_temperature is None else model_temperature
+                    ),
+                    params=_parse_params(entry.get("params"), model_ctx, base=params),
                 )
             else:
                 raise ValueError(f"{model_ctx} 必须是字符串或对象")
 
-            endpoint = ModelEndpoint(
-                provider=name,
-                model=model_name,
-                base_url=base_url,
-                api_key=api_key,
-                capabilities=model_caps,
-                streaming=streaming,
-                timeout_seconds=timeout_seconds,
-                max_tokens=max_tokens,
-            )
             if endpoint.spec in seen_specs:
                 raise ValueError(f"端点重复：{endpoint.spec!r}")
             seen_specs.add(endpoint.spec)
@@ -343,14 +474,12 @@ def _role_rule_from_group(
     *,
     strategy_override: str | None = None,
     require: frozenset[str] = frozenset(),
-    temperature: float | None = None,
 ) -> RoleRule:
     strategy = strategy_override or group.strategy
     return RoleRule(
         targets=group.models,
         strategy=strategy,
         require=require,
-        temperature=temperature,
         flat_pool=strategy in (STRATEGY_RANDOM, STRATEGY_ROUND_ROBIN),
     )
 
@@ -404,6 +533,8 @@ def _parse_role_object(
 
     ``group`` 只表示「用这个独立组」；组本身不绑定任何 role。
     """
+    _reject_retired_role_keys(entry, ctx)
+
     has_model = "model" in entry
     has_targets = "targets" in entry
     has_group = "group" in entry
@@ -414,7 +545,6 @@ def _parse_role_object(
         raise ValueError(f"{ctx} 必须配置 model、targets 或 group 之一")
 
     require = _parse_capabilities(entry.get("require"), ctx)
-    temperature = _optional_non_negative_number(entry, "temperature", ctx)
     strategy_override = _optional_strategy(entry, "strategy", ctx)
 
     if has_group:
@@ -430,7 +560,6 @@ def _parse_role_object(
             groups[group_name],
             strategy_override=strategy_override,
             require=require,
-            temperature=temperature,
         )
 
     targets = _parse_role_object_targets(entry, ctx)
@@ -438,8 +567,24 @@ def _parse_role_object(
         targets=targets,
         strategy=strategy_override,
         require=require,
-        temperature=temperature,
     )
+
+
+def _reject_retired_role_keys(entry: Mapping[str, Any], ctx: str) -> None:
+    """退役的 role 键一律 fail loudly，不走「未知字段忽略」。
+
+    未知字段忽略是为了向前兼容——没见过的键不该阻断启动。但 ``temperature``
+    这类**曾经生效过**的键静默吞掉是另一回事：配置文件看上去接受它，行为上
+    不认，改配置的人（或 agent）只会得到「改了没反应」。这里的报错要直接指出
+    新落点，否则等价于没报。
+    """
+    for key in RETIRED_ROLE_KEYS:
+        if key in entry:
+            raise ValueError(
+                f"{ctx}.{key} 已退役（2026-08-14）：采样参数改在端点（模型别名）"
+                f"上声明，把它写到 providers[].models[] 对应条目的 {key} 字段，"
+                "或用 settings 全局缺省；见 LLM路由契约 §2"
+            )
 
 
 def _parse_role_object_targets(
@@ -656,7 +801,6 @@ class EndpointRouter:
                 targets=tuple(kept),
                 strategy=rule.strategy,
                 require=rule.require,
-                temperature=rule.temperature,
                 flat_pool=rule.flat_pool,
             )
 
@@ -685,14 +829,6 @@ class EndpointRouter:
     ) -> bool:
         groups, _ = self._target_groups(role, model, provider, require)
         return any(groups)
-
-    def role_temperature(self, role: str) -> float | None:
-        """按 role 解析配置温度：跟路由同一条规则查找链（精确命中 →
-        ``"default"`` → 内置兜底），返回**实际用于路由的那条规则**上配的
-        温度；规则没配温度返回 None，由调用侧回落 settings 全局缺省。
-        无副作用。"""
-        rule, _ = self._rule_for(role)
-        return rule.temperature
 
     def primary_model_name(
         self,
@@ -890,7 +1026,12 @@ class RoutedChatModel:
     活着回来的那些（2026-07-29 排查 Replyer 超时时正是卡在这里）。
 
     ``model_name`` 是 best-effort 观测标注（prompt 快照 / 日志用）：
-    有过成功调用后是最近一次实际使用的模型，否则是首选端点的模型。
+    有过成功调用后是最近一次实际使用的模型，否则是首选端点的模型。给出的是
+    **别名**（端点的路由身份，如 ``grok-4.5-xhigh``）而不是上游模型名——快照
+    里要能看出这拍跑的是哪个档位，上游模型名在别名里已经蕴含。
+
+    本类**不持有任何采样参数**（2026-08-14）：温度/max_tokens/透传参数全部
+    是所选端点的属性，由 ``client_factory`` 从 ``ModelEndpoint`` 现场解析。
 
     传输层之外的失败（200 + 内容不可用）由调用方回报：见
     ``mark_last_call_failed``。
@@ -900,12 +1041,11 @@ class RoutedChatModel:
         self,
         router: EndpointRouter,
         *,
-        client_factory: Callable[[ModelEndpoint, float | None], Any],
+        client_factory: Callable[[ModelEndpoint], Any],
         role: str = DEFAULT_ROLE,
         model: str | None = None,
         provider: str | None = None,
         require: Sequence[str] = (),
-        temperature: float | None = None,
         on_event: Callable[..., None] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -915,7 +1055,6 @@ class RoutedChatModel:
         self._model = model
         self._provider = provider
         self._require = tuple(require)
-        self._temperature = temperature
         self._on_event = on_event
         self._clock = clock
         self._last_endpoint: ModelEndpoint | None = None
@@ -986,7 +1125,7 @@ class RoutedChatModel:
         for endpoint in candidates[: self._router.max_attempts_per_call]:
             started = self._clock()
             try:
-                client = self._client_factory(endpoint, self._temperature)
+                client = self._client_factory(endpoint)
                 result = await client.ainvoke(messages, **kwargs)
             except asyncio.CancelledError:
                 self._emit(

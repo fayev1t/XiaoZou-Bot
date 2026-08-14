@@ -8,12 +8,13 @@ ChatOpenAI 客户端（streaming / stream_usage 探测 / max_tokens / timeout）
 配置**只有一个来源**：``config/model_providers.json``（路径可用 env
 ``MODEL_PROVIDERS_PATH`` 覆写；模板见 ``config/model_providers.example.json``，
 真实文件含 api_key、已被 .gitignore 排除）。三段：``providers``（服务商注册表：
-名称 / base_url / api_key / 持有的模型）+ ``roles``（用途 → 模型名，可选钉死
-服务商、可配 per-role 温度）+ ``settings``（全局策略缺省 random、冷却秒数、
-全局采样缺省 temperature/max_tokens）。调用方只给模型名即可，
-路由器在持有该模型的服务商里按策略挑选。文件缺失或解析失败 → LLM 整体不可用
-（fail loudly：``create_llm`` 返回 None，各调用方按自己的降级语义处理），
-**绝不静默回落到别处的配置**。
+名称 / base_url / api_key / 持有的模型——每个模型条目就是一个端点，可带自己的
+温度 / max_tokens / timeout / 厂商透传 ``params``，并可用 ``upstream_model``
+变成别名）+ ``roles``（用途 → 模型名，可选钉死服务商；**不含采样参数**）+
+``settings``（全局策略缺省 random、冷却秒数、全局采样缺省 temperature/max_tokens）。
+调用方只给模型名即可，路由器在持有该模型的服务商里按策略挑选。文件缺失或解析
+失败 → LLM 整体不可用（fail loudly：``create_llm`` 返回 None，各调用方按自己的
+降级语义处理），**绝不静默回落到别处的配置**。
 
 2026-07-28 删除扁平 env 形态（``LLM_PROVIDER / LLM_API_KEY / LLM_MODEL /
 LLM_BASE_URL``）。它当年是单服务商时代的向后兼容层，留着有两处实际危害：
@@ -23,10 +24,22 @@ LLM_BASE_URL``）。它当年是单服务商时代的向后兼容层，留着有
 而 Planner/Replyer 去多模态化之后，"planner 用纯文本模型"恰恰成了常态配置。
 
 2026-07-29 采样参数同样收拢：``LLM_TEMPERATURE / LLM_MAX_TOKENS`` 从 .env
-删除，改在 ``settings`` 段配 ``temperature`` / ``max_tokens``；per-role 温度
-（原散落在 replyer / image_description / meme_caption 的常量）改在 ``roles``
-里配。温度解析链：调用方显式传参（测试注入用）> role 规则的 ``temperature``
-> ``settings.temperature`` > 内置 0.7。.env 里不再有任何 LLM 键。
+删除，改在 ``settings`` 段配 ``temperature`` / ``max_tokens``（原散落在
+replyer / image_description / meme_caption 的常量一并删除）。.env 里不再有
+任何 LLM 键。
+
+2026-08-14 温度**再下沉一层到端点**：``roles[].temperature`` 退役（写了会
+parse 期报错，不静默忽略），温度与 max_tokens / timeout / 厂商透传 ``params``
+一样在 ``providers[].models[]`` 上声明，解析链收敛成一条——**端点声明 >
+settings 全局缺省 > 内置 0.7**，与 max_tokens 一直以来的形状一致，role 完全
+不参与采样。动因是思考等级：各家的档位键名与取值都不一致（``reasoning_effort``
+的 ``high``/``xhigh``、``enable_thinking`` 的布尔、token 预算的整数），而 role
+的目标是一条跨厂回退链，同一个 role 的请求会落到词表不同的模型上——把「怎么
+调这个模型」放在 role 上根本表达不了。改成端点级之后，「模型 × 档位」就是一个
+普通的可路由模型名（别名，见 ``ModelEndpoint``），groups 加权、role 回退链、
+按端点独立的冷却计数器全部原样复用，路由层新增概念为零。连带 ``create_llm``
+的 ``temperature`` 参数、``RoutedChatModel`` 的温度字段、``role_temperature()``
+与 ``(spec, temperature)`` 复合缓存键一并删除。
 
 配置在首次 ``create_llm()`` 时读取并缓存为进程级单例——冷却/熔断状态必须跨
 调用方（planner / vision / caption / memory）共享；改配置需重启生效。
@@ -56,8 +69,10 @@ class _LLMRuntime:
     def __init__(self, routing: RoutingConfig, router: EndpointRouter) -> None:
         self.routing = routing
         self.router = router
-        # (spec, temperature) → ChatOpenAI。端点数 x 少数几档温度，有界。
-        self.clients: dict[tuple[str, float | None], Any] = {}
+        # spec → ChatOpenAI。2026-08-14 起键只剩 spec：一次调用的全部参数都是
+        # 「端点 + settings 全局缺省」的纯函数，两者在配置加载时就固定了，同一个
+        # spec 不可能再需要第二个客户端。要两种温度就注册两个别名（= 两个 spec）。
+        self.clients: dict[str, Any] = {}
 
 
 _runtime: _LLMRuntime | None = None
@@ -117,10 +132,10 @@ def _build_runtime() -> _LLMRuntime | None:
         on_warning=lambda message: logger.warning(f"[llm] {message}"),
     )
     logger.info(
-        "[llm] endpoint registry ready",
+        "[llm] endpoint registry ready（endpoints 里 * = 回落 settings 全局缺省）",
         extra={
             "source": source,
-            "endpoints": [e.spec for e in endpoints],
+            "endpoints": [_describe_endpoint(routing, e) for e in endpoints],
             "roles": {
                 r: [f"{t.provider or '*'}/{t.model}" for t in rule.targets]
                 for r, rule in roles.items()
@@ -128,8 +143,8 @@ def _build_runtime() -> _LLMRuntime | None:
             "default_strategy": default_strategy,
             "cooldown_base_seconds": cooldown,
             "max_attempts_per_call": routing.max_attempts_per_call,
-            "temperature": routing.temperature,
-            "max_tokens": routing.max_tokens,
+            "settings_temperature": routing.temperature,
+            "settings_max_tokens": routing.max_tokens,
         },
     )
     return _LLMRuntime(routing, router)
@@ -150,19 +165,74 @@ def _get_runtime() -> _LLMRuntime | None:
     return _runtime
 
 
-def _chat_client_for(
-    runtime: _LLMRuntime, endpoint: ModelEndpoint, temperature: float | None
-) -> Any:
-    """端点 → ChatOpenAI（按 (spec, temperature) 缓存复用连接池）。"""
-    cache_key = (endpoint.spec, temperature)
-    cached = runtime.clients.get(cache_key)
+def _resolve_endpoint_params(
+    routing: RoutingConfig, endpoint: ModelEndpoint
+) -> tuple[float, int | None]:
+    """端点的采样参数解析链：端点声明 > ``settings`` 全局缺省。
+
+    0 是合法温度，不能用 ``or`` 链回落。无副作用，供客户端构造与启动日志共用
+    ——启动日志打的必须是**真正会用的值**，否则「别名忘了写温度」就看不出来。
+    """
+    temperature = (
+        endpoint.temperature
+        if endpoint.temperature is not None
+        else routing.temperature
+    )
+    max_tokens = (
+        endpoint.max_tokens
+        if endpoint.max_tokens is not None
+        else routing.max_tokens
+    )
+    return temperature, max_tokens
+
+
+def _describe_endpoint(routing: RoutingConfig, endpoint: ModelEndpoint) -> str:
+    """启动日志用的端点摘要：这个 spec 实际会用什么参数。
+
+    别名多起来之后，「``cpa/grok-4.5-xhigh`` 到底是哪个上游模型、哪一档」不该
+    要去翻 JSON 才知道；「新加的别名忘了写温度」也该在启动时一眼看见，而不是
+    等某天发现输出变飘再回头查。``*`` 标记该值回落自 ``settings`` 全局缺省。
+    """
+    temperature, max_tokens = _resolve_endpoint_params(routing, endpoint)
+    parts = [endpoint.spec]
+    if endpoint.upstream_model:
+        parts.append(f"→{endpoint.wire_model}")
+    parts.append(f"t={temperature}{'' if endpoint.temperature is not None else '*'}")
+    if max_tokens is not None:
+        fallback = "" if endpoint.max_tokens is not None else "*"
+        parts.append(f"max_tokens={max_tokens}{fallback}")
+    if endpoint.timeout_seconds is not None:
+        parts.append(f"timeout={endpoint.timeout_seconds}")
+    if not endpoint.streaming:
+        parts.append("streaming=off")
+    if endpoint.params:
+        body = ",".join(f"{key}={value}" for key, value in endpoint.params)
+        parts.append(f"params={{{body}}}")
+    return " ".join(parts)
+
+
+def _chat_client_for(runtime: _LLMRuntime, endpoint: ModelEndpoint) -> Any:
+    """端点 → ChatOpenAI（按 spec 缓存复用连接池）。
+
+    2026-08-14 起这里是采样参数的**唯一**落地点：温度不再由调用方或 role 传入，
+    与 max_tokens / timeout / 厂商透传参数一样从 ``ModelEndpoint`` 上读，缺省
+    回落 ``settings``。别名（``upstream_model`` 非空）在这里解回上游模型名。
+    """
+    cached = runtime.clients.get(endpoint.spec)
     if cached is not None:
         return cached
 
     from langchain_openai import ChatOpenAI
 
+    # 字段表探测：pin 是 langchain-openai>=0.0.5，新字段不能假设存在。
+    fields = (
+        getattr(ChatOpenAI, "model_fields", None)
+        or getattr(ChatOpenAI, "__fields__", {})
+    )
+    temperature, max_tokens = _resolve_endpoint_params(runtime.routing, endpoint)
+
     llm_kwargs: dict[str, Any] = {
-        "model_name": endpoint.model,
+        "model_name": endpoint.wire_model,
         "api_key": endpoint.api_key,
         "temperature": temperature,
     }
@@ -170,39 +240,41 @@ def _chat_client_for(
         llm_kwargs["streaming"] = True
         # 流式响应默认不带 usage；stream_usage=True 让最后一个 chunk 携带
         # token 用量（Prompt 快照 / 观测基线依赖它，待办 #11）。老版本
-        # langchain_openai 没有该字段——按字段表探测，不支持就不传，
-        # 行为退化为快照里 usage=null，不影响调用。
-        fields = (
-            getattr(ChatOpenAI, "model_fields", None)
-            or getattr(ChatOpenAI, "__fields__", {})
-        )
+        # langchain_openai 没有该字段——不支持就不传，行为退化为快照里
+        # usage=null，不影响调用。
         if "stream_usage" in fields:
             llm_kwargs["stream_usage"] = True
 
-    max_tokens = (
-        endpoint.max_tokens
-        if endpoint.max_tokens is not None
-        else runtime.routing.max_tokens
-    )
     if max_tokens is not None:
         llm_kwargs["max_tokens"] = max_tokens
     if endpoint.base_url:
         llm_kwargs["base_url"] = endpoint.base_url
     if endpoint.timeout_seconds is not None:
         llm_kwargs["timeout"] = endpoint.timeout_seconds
+    if endpoint.params:
+        # 别名的固定透传参数（reasoning_effort / enable_thinking / token 预算…）。
+        # 新版 langchain_openai 有专用的 extra_body；老版本只能靠 model_kwargs
+        # 并进顶层 payload。同 stream_usage 一样按字段表探测。
+        passthrough = dict(endpoint.params)
+        if "extra_body" in fields:
+            llm_kwargs["extra_body"] = passthrough
+        else:
+            llm_kwargs["model_kwargs"] = passthrough
 
     logger.info(
         "[llm] create client",
         extra={
             "endpoint": endpoint.spec,
+            "upstream_model": endpoint.wire_model,
             "base_url": endpoint.base_url,
             "max_tokens": max_tokens,
             "temperature": temperature,
             "streaming": llm_kwargs.get("streaming", False),
+            "params": dict(endpoint.params),
         },
     )
     client = ChatOpenAI(**llm_kwargs)
-    runtime.clients[cache_key] = client
+    runtime.clients[endpoint.spec] = client
     return client
 
 
@@ -249,7 +321,6 @@ def _log_route_event(kind: str, **info: Any) -> None:
 
 
 async def create_llm(
-    temperature: float | None = None,
     *,
     role: str = DEFAULT_ROLE,
     model: str | None = None,
@@ -270,9 +341,11 @@ async def create_llm(
     已有 None 分支）。``require`` 是可选能力过滤（遗留）；现役 vision/
     caption 靠 roles/groups 选型，不再传 ``require=("vision",)``。
 
-    温度解析链（2026-07-29 收拢）：``temperature`` 显式传参（测试注入用，
-    生产调用点不传）> role 规则配置的 ``temperature``（走 role 路由时）>
-    ``settings.temperature`` 全局缺省。
+    **不再接受任何采样参数**（2026-08-14）：温度随 max_tokens / timeout /
+    厂商透传参数一起落到端点（模型别名）上，由 ``_chat_client_for`` 在选中
+    端点后解析。同一个上游模型要两种温度就注册两个别名——与思考等级的表达
+    方式一致，路由层不必知道「采样」这回事。原先的 ``temperature`` 位置参数
+    只有测试在用（生产调用点一律只传 role），一并删除。
     """
     runtime = _get_runtime()
     if runtime is None:
@@ -293,18 +366,12 @@ async def create_llm(
         )
         return None
 
-    temp = temperature
-    if temp is None and model is None:
-        temp = runtime.router.role_temperature(role)
-    if temp is None:
-        temp = runtime.routing.temperature
     return RoutedChatModel(
         runtime.router,
-        client_factory=lambda endpoint, t: _chat_client_for(runtime, endpoint, t),
+        client_factory=lambda endpoint: _chat_client_for(runtime, endpoint),
         role=role,
         model=model,
         provider=provider,
         require=require,
-        temperature=temp,
         on_event=_log_route_event,
     )

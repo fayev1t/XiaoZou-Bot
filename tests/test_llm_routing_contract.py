@@ -1,12 +1,17 @@
 """Contract tests for qqbot/core/llm_routing.py（LLM 注册表与按模型名路由）。
 
 冻结的契约（详见 开发文档/v2.0/20-横切契约/LLM路由契约.md）：
-- config/model_providers.json 文档格式（providers / roles / settings 三段）与校验错误；
-  roles 对象形态单目标 model 与多目标 targets 互斥（2026-07-29 起 targets 让
-  「回退链 + strategy/require/temperature 覆写」可同时表达）；per-role
-  temperature 与 settings 全局采样缺省（temperature / max_tokens）、
-  settings 路由旋钮（max_attempts_per_call / cooldown_max_multiplier）
-  均收拢在本文件——LLM 参数在 .env 与调用点代码里没有任何残留；
+- config/model_providers.json 文档格式（providers / groups / roles / settings）与
+  校验错误；roles 对象形态单目标 model 与多目标 targets 互斥（2026-07-29 起
+  targets 让「回退链 + strategy/require 覆写」可同时表达）；settings 全局采样
+  缺省（temperature / max_tokens）与路由旋钮（max_attempts_per_call /
+  cooldown_max_multiplier）均收拢在本文件——LLM 参数在 .env 与调用点代码里
+  没有任何残留；
+- 端点即「模型别名」（2026-08-14）：providers[].models[] 每个条目一个端点，
+  name 是路由身份、upstream_model 是上游模型名；采样参数（temperature /
+  max_tokens / timeout / streaming）与厂商透传 params 全部长在端点上，
+  roles 不再携带任何采样参数（写了 parse 期报错，不走「未知字段忽略」）；
+  继承语义三种互不相同：capabilities 并集、标量模型级覆盖、params 合并覆盖；
 - 按模型名路由：model= 命中所有持有该模型的服务商，缺省策略 random；
   model+provider 显式钉死，无视策略与冷却；
 - role 规则解析顺序：精确命中 → "default" → 内置兜底（每服务商首模型）；
@@ -61,15 +66,27 @@ _CONFIG_JSON = json.dumps(
                 "streaming": False,
                 "timeout": 30,
                 "max_tokens": 800,
+                "temperature": 0.9,
+                "params": {"reasoning_effort": "low"},
                 "models": [
                     "deepseek-chat",
                     {"name": "gpt-4o", "capabilities": []},
+                    # 别名：同一上游模型的另一个思考档位，覆写标量字段、合并 params
+                    {
+                        "name": "gpt-4o-xhigh",
+                        "upstream_model": "gpt-4o",
+                        "temperature": 0.1,
+                        "timeout": 300,
+                        "max_tokens": 2000,
+                        "streaming": True,
+                        "params": {"reasoning_effort": "xhigh", "verbosity": "high"},
+                    },
                 ],
             },
         ],
         "roles": {
             "planner": "deepseek-chat",
-            "replyer": {"model": "deepseek-chat", "temperature": 0.3},
+            "replyer": {"model": "deepseek-chat"},
             "vision": {
                 "targets": [
                     "gpt-4o",
@@ -77,7 +94,6 @@ _CONFIG_JSON = json.dumps(
                 ],
                 "strategy": "round_robin",
                 "require": ["vision"],
-                "temperature": 0.2,
             },
             "caption": {"model": "gpt-4o", "require": ["vision"]},
             "default": ["deepseek-chat", {"model": "gpt-4o", "provider": "relay"}],
@@ -124,6 +140,7 @@ class ParseConfigTests(unittest.TestCase):
                 "deepseek/deepseek-reasoner",
                 "relay/deepseek-chat",
                 "relay/gpt-4o",
+                "relay/gpt-4o-xhigh",
             ],
         )
         self.assertEqual(config.default_strategy, STRATEGY_PRIMARY_FAILOVER)
@@ -136,6 +153,8 @@ class ParseConfigTests(unittest.TestCase):
         ds = config.endpoints[0]
         self.assertTrue(ds.streaming)  # 缺省 True
         self.assertIsNone(ds.timeout_seconds)
+        self.assertIsNone(ds.temperature)  # 未声明 → 调用侧回落 settings
+        self.assertEqual(ds.params, ())
         self.assertEqual(ds.capabilities, frozenset())
         relay = config.endpoints[2]
         self.assertFalse(relay.streaming)
@@ -152,9 +171,7 @@ class ParseConfigTests(unittest.TestCase):
             roles["planner"].targets, (RoleTarget(model="deepseek-chat"),)
         )
         self.assertIsNone(roles["planner"].strategy)
-        self.assertIsNone(roles["planner"].temperature)
         self.assertEqual(roles["caption"].require, frozenset({"vision"}))
-        self.assertIsNone(roles["caption"].temperature)
         self.assertEqual(
             roles["default"].targets,
             (
@@ -163,16 +180,14 @@ class ParseConfigTests(unittest.TestCase):
             ),
         )
 
-    def test_role_object_form_carries_temperature(self) -> None:
+    def test_role_object_form_single_target(self) -> None:
         replyer = parse_config(_CONFIG_JSON).roles["replyer"]
 
         self.assertEqual(replyer.targets, (RoleTarget(model="deepseek-chat"),))
-        self.assertEqual(replyer.temperature, 0.3)
 
     def test_role_object_form_with_targets_fallback_chain(self) -> None:
-        """对象形态多目标：回退链 + strategy/require/temperature 覆写同时表达
-        ——纯数组形态带不了覆写字段，此前这个组合（契约推荐的 vision 配法）
-        写不出来。"""
+        """对象形态多目标：回退链 + strategy/require 覆写同时表达——纯数组
+        形态带不了覆写字段，此前这个组合（契约推荐的 vision 配法）写不出来。"""
         vision = parse_config(_CONFIG_JSON).roles["vision"]
 
         self.assertEqual(
@@ -184,9 +199,13 @@ class ParseConfigTests(unittest.TestCase):
         )
         self.assertEqual(vision.strategy, STRATEGY_ROUND_ROBIN)
         self.assertEqual(vision.require, frozenset({"vision"}))
-        self.assertEqual(vision.temperature, 0.2)
 
-    def test_role_temperature_zero_is_valid(self) -> None:
+    def test_role_sampling_keys_are_retired_and_raise(self) -> None:
+        """``roles[].temperature`` 不走「未知字段忽略」，必须 fail loudly。
+
+        它曾经生效过，静默吞掉等于配置文件在撒谎——改配置的人只会得到
+        「改了没反应」。报错还要指出新落点，否则等于没报（2026-08-14）。
+        """
         raw = json.dumps(
             {
                 "providers": [
@@ -197,12 +216,68 @@ class ParseConfigTests(unittest.TestCase):
                         "models": ["m"],
                     }
                 ],
-                "roles": {"planner": {"model": "m", "temperature": 0}},
+                "roles": {"planner": {"model": "m", "temperature": 0.3}},
+            }
+        )
+        with self.assertRaises(ValueError) as ctx:
+            parse_config(raw)
+        self.assertIn("已退役", str(ctx.exception))
+        self.assertIn("providers[].models[]", str(ctx.exception))
+
+    def test_endpoint_alias_carries_upstream_model_and_params(self) -> None:
+        """别名：``name`` 是路由身份，``upstream_model`` 是实际发给上游的模型。
+
+        「模型 × 思考档位」靠这个变成两个普通的可路由模型名——路由层不新增
+        任何概念，groups 加权 / role 回退链 / 按端点独立的冷却全部原样复用。
+        """
+        endpoints = {e.model: e for e in parse_config(_CONFIG_JSON).endpoints}
+
+        alias = endpoints["gpt-4o-xhigh"]
+        self.assertEqual(alias.spec, "relay/gpt-4o-xhigh")
+        self.assertEqual(alias.wire_model, "gpt-4o")
+        # 标量字段：模型级覆盖 provider 级
+        self.assertEqual(alias.temperature, 0.1)
+        self.assertEqual(alias.timeout_seconds, 300.0)
+        self.assertEqual(alias.max_tokens, 2000)
+        self.assertTrue(alias.streaming)
+        # params：合并，模型级同名键覆盖 provider 级
+        self.assertEqual(
+            dict(alias.params),
+            {"reasoning_effort": "xhigh", "verbosity": "high"},
+        )
+
+        plain = endpoints["gpt-4o"]
+        self.assertIsNone(plain.upstream_model)
+        self.assertEqual(plain.wire_model, "gpt-4o", "未填 upstream_model 时同名")
+        self.assertEqual(plain.temperature, 0.9, "继承 provider 级温度")
+        self.assertFalse(plain.streaming, "继承 provider 级 streaming")
+        self.assertEqual(dict(plain.params), {"reasoning_effort": "low"})
+
+    def test_endpoint_stays_hashable_with_params(self) -> None:
+        """``ModelEndpoint`` 是 frozen dataclass，params 必须是可哈希的排序元组
+        ——塞 dict 进去会让 ``hash(endpoint)`` 直接炸。"""
+        endpoints = parse_config(_CONFIG_JSON).endpoints
+        self.assertEqual(len({hash(e) for e in endpoints}), len(endpoints))
+
+    def test_endpoint_temperature_zero_is_valid(self) -> None:
+        """0 是合法采样温度，不能被 ``or`` 链当成「未配置」吃掉。"""
+        raw = json.dumps(
+            {
+                "providers": [
+                    {
+                        "name": "p",
+                        "base_url": "https://p/v1",
+                        "api_key": "k",
+                        "temperature": 0.5,
+                        "models": [{"name": "m", "temperature": 0}],
+                    }
+                ],
                 "settings": {"temperature": 0},
             }
         )
         config = parse_config(raw)
-        self.assertEqual(config.roles["planner"].temperature, 0.0)
+        (endpoint,) = config.endpoints
+        self.assertEqual(endpoint.temperature, 0.0)
         self.assertEqual(config.temperature, 0.0)
 
     def test_settings_defaults(self) -> None:
@@ -327,11 +402,51 @@ class ParseConfigTests(unittest.TestCase):
                     },
                 }
             ),
-            "role 温度为负": json.dumps(
+            "role 采样参数已退役": json.dumps(
                 {
                     "providers": [provider],
-                    "roles": {"planner": {"model": "m", "temperature": -0.1}},
+                    "roles": {"planner": {"model": "m", "temperature": 0.3}},
                 }
+            ),
+            "端点温度为负": _providers_only(
+                [{**provider, "models": [{"name": "m", "temperature": -0.1}]}]
+            ),
+            "provider 温度为负": _providers_only(
+                [{**provider, "temperature": -0.1}]
+            ),
+            "端点 max_tokens 非正": _providers_only(
+                [{**provider, "models": [{"name": "m", "max_tokens": 0}]}]
+            ),
+            "端点 timeout 非正": _providers_only(
+                [{**provider, "models": [{"name": "m", "timeout": -1}]}]
+            ),
+            "upstream_model 为空串": _providers_only(
+                [{**provider, "models": [{"name": "m", "upstream_model": " "}]}]
+            ),
+            "params 非对象": _providers_only(
+                [{**provider, "models": [{"name": "m", "params": ["a"]}]}]
+            ),
+            "params 撞专用字段": _providers_only(
+                [{**provider, "models": [{"name": "m", "params": {"temperature": 1}}]}]
+            ),
+            "params 撞本层自组装字段": _providers_only(
+                [{**provider, "params": {"model": "x"}}]
+            ),
+            "params 值为嵌套对象": _providers_only(
+                [
+                    {
+                        **provider,
+                        "models": [
+                            {"name": "m", "params": {"reasoning": {"effort": "hi"}}}
+                        ],
+                    }
+                ]
+            ),
+            "params 值为 null": _providers_only(
+                [{**provider, "models": [{"name": "m", "params": {"x": None}}]}]
+            ),
+            "params 键为空串": _providers_only(
+                [{**provider, "models": [{"name": "m", "params": {" ": 1}}]}]
             ),
             "role 空数组": json.dumps(
                 {"providers": [provider], "roles": {"planner": []}}
@@ -468,12 +583,7 @@ class ParseConfigTests(unittest.TestCase):
                         "strategy": "round_robin",
                     }
                 },
-                "roles": {
-                    "vision": {
-                        "group": "vlm",
-                        "temperature": 0.2,
-                    }
-                },
+                "roles": {"vision": {"group": "vlm"}},
             }
         )
         config = parse_config(raw)
@@ -694,41 +804,27 @@ class RouterRoleResolutionTests(unittest.TestCase):
         self.assertEqual([e.spec for e in router.resolve("planner")], ["a/m1"])
         self.assertTrue(any("ghost" in w for w in warnings))
 
-    def test_role_temperature_follows_rule_lookup_chain(self) -> None:
-        """role 温度跟路由同一条规则查找链：精确命中 → default；实际用于
-        路由的那条规则没配温度 → None（settings 兜底在 llm.py 胶水层）。"""
-        endpoints = [_endpoint("a", "m1"), _endpoint("b", "m2")]
-        roles = {
-            "replyer": RoleRule(targets=(RoleTarget(model="m2"),), temperature=0.3),
-            "default": RoleRule(targets=(RoleTarget(model="m1"),), temperature=0.5),
-        }
-        router, _, _ = _router(endpoints, roles)
-
-        self.assertEqual(router.role_temperature("replyer"), 0.3)
-        self.assertEqual(router.role_temperature("planner"), 0.5)  # 回落 default
-
-    def test_role_temperature_none_when_unconfigured(self) -> None:
-        # 内置兜底规则不带温度
-        bare, _, _ = _router([_endpoint("a", "m")])
-        self.assertIsNone(bare.role_temperature("anything"))
-        # 精确命中但规则没配温度：不越过它去别的规则找
-        roles = {
-            "planner": RoleRule(targets=(RoleTarget(model="m"),)),
-            "default": RoleRule(targets=(RoleTarget(model="m"),), temperature=0.5),
-        }
-        router, _, _ = _router([_endpoint("a", "m")], roles)
-        self.assertIsNone(router.role_temperature("planner"))
-
-    def test_role_temperature_survives_unknown_target_pruning(self) -> None:
+    def test_rule_fields_survive_unknown_target_pruning(self) -> None:
+        """剔除未知目标时 ``__init__`` 会重建 RoleRule——targets 之外的字段
+        必须逐个带过去。漏一个不会报错，只会让那条配置静默失效，所以这里
+        把非 targets 字段全钉住。"""
         roles = {
             "planner": RoleRule(
                 targets=(RoleTarget(model="ghost"), RoleTarget(model="m")),
-                temperature=0.1,
+                strategy=STRATEGY_ROUND_ROBIN,
+                require=frozenset({"vision"}),
+                flat_pool=True,
             )
         }
-        router, _, _ = _router([_endpoint("a", "m")], roles)
+        router, _, _ = _router([_endpoint("a", "m", caps=("vision",))], roles)
 
-        self.assertEqual(router.role_temperature("planner"), 0.1)
+        rule, explicit = router._rule_for("planner")
+        self.assertTrue(explicit)
+        self.assertEqual(rule.targets, (RoleTarget(model="m"),))
+        self.assertEqual(rule.strategy, STRATEGY_ROUND_ROBIN)
+        self.assertEqual(rule.require, frozenset({"vision"}))
+        self.assertTrue(rule.flat_pool)
+        self.assertEqual([e.spec for e in router.resolve("planner")], ["a/m"])
 
     def test_duplicate_endpoint_across_targets_deduped(self) -> None:
         endpoints = [_endpoint("a", "m"), _endpoint("b", "m")]
@@ -939,8 +1035,9 @@ class RoutedChatModelTests(unittest.IsolatedAsyncioTestCase):
         factory_calls: list = []
         events: list[tuple[str, dict]] = []
 
-        def factory(endpoint: ModelEndpoint, temperature: float | None) -> Any:
-            factory_calls.append((endpoint.spec, temperature))
+        def factory(endpoint: ModelEndpoint) -> Any:
+            # 采样参数不再经由 RoutedChatModel：工厂只拿到端点，自己去读
+            factory_calls.append(endpoint.spec)
             return clients[endpoint.spec]
 
         model = RoutedChatModel(
@@ -956,13 +1053,12 @@ class RoutedChatModelTests(unittest.IsolatedAsyncioTestCase):
         model, router, events, factory_calls = self._make(
             {"a/m": ok, "b/m": _StubClient(result="unused")},
             model="m",
-            temperature=0.3,
         )
 
         result = await model.ainvoke(["msg"])
 
         self.assertEqual(result, "answer")
-        self.assertEqual(factory_calls, [("a/m", 0.3)])
+        self.assertEqual(factory_calls, ["a/m"])
         self.assertEqual(model.model_name, "m")
         self.assertEqual(model.last_endpoint_spec, "a/m")
         self.assertEqual([kind for kind, _ in events], ["call_ok"])
@@ -1053,7 +1149,7 @@ class RoutedChatModelTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(RuntimeError):
             await model.ainvoke(["msg"])
-        self.assertEqual([spec for spec, _ in factory_calls], ["b/m"])
+        self.assertEqual(factory_calls, ["b/m"])
         self.assertEqual(other.calls, [])
 
     async def test_role_path_resolves_via_rules(self) -> None:
@@ -1068,7 +1164,7 @@ class RoutedChatModelTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(await model.ainvoke(["msg"]), "planned")
-        self.assertEqual([spec for spec, _ in factory_calls], ["b/m2"])
+        self.assertEqual(factory_calls, ["b/m2"])
 
     async def test_model_name_before_any_call_is_primary(self) -> None:
         model, _, _, _ = self._make(
@@ -1085,7 +1181,7 @@ class RoutedChatModelTests(unittest.IsolatedAsyncioTestCase):
 
         model = RoutedChatModel(
             router,
-            client_factory=lambda e, t: _StubClient(result="fine"),
+            client_factory=lambda e: _StubClient(result="fine"),
             model="m",
             on_event=bad_event,
         )
@@ -1136,7 +1232,7 @@ class RoutedChatModelTests(unittest.IsolatedAsyncioTestCase):
         client = _KwargsClient()
         router, _, _ = _router([_endpoint("a", "m")])
         model = RoutedChatModel(
-            router, client_factory=lambda e, t: client, model="m"
+            router, client_factory=lambda e: client, model="m"
         )
 
         await model.ainvoke(["msg"], config={"tags": ["x"]})

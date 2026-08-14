@@ -254,8 +254,9 @@ async def _invoke_vision(
     """一次看图调用（描述与带问重看共用）。返回 (文本, 端点 spec)；任何失败
     → (None, None)。调用方负责持 `_semaphore`——所有 vision 调用共享同一道
     并发闸，不因为走了不同入口就绕开供应商的并发上限。"""
-    # 温度在 roles.vision.temperature 配（建议低温 0.2：同一张图的客观描述
-    # 应当稳定，不需要发散；与 caption 同理），见 LLM 路由契约 §2。
+    # 温度在 vision 这条 role 指向的**端点**上配（2026-08-14 起采样参数只在
+    # providers[].models[] 上声明）。建议低温 0.2：同一张图的客观描述应当稳定，
+    # 不需要发散；与 caption 同理。见 LLM 路由契约 §2。
     llm = await create_llm(role="vision")
     if llm is None:
         logger.warning(
