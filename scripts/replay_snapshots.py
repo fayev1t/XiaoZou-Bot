@@ -9,6 +9,11 @@ LLM_* env 已于 2026-07-28/29 删除，本脚本经 create_llm(role="planner") 
     python scripts/replay_snapshots.py --limit 5       # 只回放前 5 个
     python scripts/replay_snapshots.py path/to/a.json  # 回放指定快照文件
     python scripts/replay_snapshots.py --system recorded   # 用录制时的 system prompt
+    python scripts/replay_snapshots.py --model grok-4.6-high
+    python scripts/replay_snapshots.py --system recorded --repeats 2 \\
+        --model gpt-5.6-luna-xhigh \\
+        --model gemini-3.7-flash-high \\
+        --model deepseek-v4-flash-max
     python scripts/replay_snapshots.py --with-images   # 兼容旧命令；Planner 已不收图片
 
 工作流：
@@ -19,6 +24,8 @@ LLM_* env 已于 2026-07-28/29 删除，本脚本经 create_llm(role="planner") 
   3. 每次改 prompt 后跑本脚本：默认 --system current 用当前代码重新渲染
      system prompt、配录制的行文法 user text 重新请求 LLM，输出与录制行为的
      对比报告（preflight / Query-Effect 调用序列 / 源码 / token / 延迟）。
+  4. 比模型：``--model`` 钉死端点别名（可重复），建议配 ``--system recorded``
+     排除 prompt 改动；``--repeats`` 压非确定性。不执行 Program。
 
 已知边界（读报告时须心里有数）：
   - Program API 参考位于 system prompt；--system current 会反映当前 registry、
@@ -154,6 +161,8 @@ async def _replay_one(
 
     return {
         "case": case_path.name,
+        "replay_model": getattr(args, "replay_model", None),
+        "repeat": getattr(args, "repeat_index", 1),
         "scope_key": case.get("scope_key"),
         "tick_seq": case.get("tick_seq"),
         "system_mode": args.system,
@@ -180,19 +189,36 @@ async def _replay_one(
     }
 
 
+def _label(result: dict[str, Any]) -> str:
+    model = result.get("replay_model") or "planner"
+    repeat = result.get("repeat") or 1
+    if repeat != 1:
+        return f"{model}#{repeat}"
+    return str(model)
+
+
+def _clip(text: str | None, limit: int = 400) -> str:
+    if not text:
+        return "-"
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 1] + "…"
+
+
 def _write_report(out_dir: Path, results: list[dict[str, Any]]) -> Path:
     lines = [
         "# Prompt 回放报告",
         "",
-        "| 用例 | scope | 调用一致 | 录制调用 | 回放调用 | preflight | 回放耗时 | 回放 tokens |",
-        "|---|---|---|---|---|---|---|",
+        "| 用例 | 模型 | scope | 调用一致 | 录制调用 | 回放调用 | preflight | 耗时 | tokens |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for r in results:
         match = {True: "✅", False: "❌", None: "—"}[r["calls_match"]]
         usage = r.get("usage") or {}
-        preflight_status = r.get("replay_preflight_error") or "ok"
+        preflight_status = r.get("replay_preflight_error") or r.get("error") or "ok"
         lines.append(
-            f"| {r['case']} | {r.get('scope_key') or '-'} | {match} "
+            f"| {r['case']} | {_label(r)} | {r.get('scope_key') or '-'} | {match} "
             f"| {','.join(r['recorded_calls'] or []) or '-'} "
             f"| {','.join(r['replay_calls'] or []) or '-'} "
             f"| {preflight_status} "
@@ -202,10 +228,30 @@ def _write_report(out_dir: Path, results: list[dict[str, Any]]) -> Path:
     mismatches = [r for r in results if r["calls_match"] is False]
     lines += [
         "",
-        f"共 {len(results)} 例，调用序列不一致 {len(mismatches)} 例。",
-        "调用一致只是第一道闸——分支、return、发言内容、口吻与事实保持请打开各用例",
-        "result JSON 对比 recorded_response 与 replay_response。",
+        f"共 {len(results)} 次调用，与录制调用序列不一致 {len(mismatches)} 次。",
+        "调用一致只是第一道闸——分支、return、发言内容、口吻请对下面原文。",
+        "",
+        "## 原文对照",
     ]
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for r in results:
+        grouped.setdefault(r["case"], []).append(r)
+    for case_name, rows in grouped.items():
+        rec = rows[0].get("recorded_response")
+        lines += [
+            "",
+            f"### {case_name}",
+            "",
+            f"- recorded calls: {','.join(rows[0].get('recorded_calls') or []) or '-'}",
+            f"- recorded: {_clip(rec)}",
+        ]
+        for r in rows:
+            err = r.get("error") or r.get("replay_preflight_error")
+            suffix = f" ({err})" if err else ""
+            lines.append(
+                f"- {_label(r)} [{','.join(r.get('replay_calls') or []) or '-'}]"
+                f"{suffix}: {_clip(r.get('replay_response'))}"
+            )
     report = out_dir / "report.md"
     report.write_text("\n".join(lines), encoding="utf-8")
     return report
@@ -219,39 +265,62 @@ async def _amain(args: argparse.Namespace) -> int:
     from qqbot.core.llm import create_llm
     from qqbot.core.time import china_now
 
-    # 回放的是 planner 用例，走与 planner 相同的路由，保证模型行为可比。
-    llm = await create_llm(role="planner")
-    if llm is None:
-        print(  # noqa: T201
-            "LLM 未配置（config/model_providers.json 缺失或解析失败）",
-            file=sys.stderr,
-        )
-        return 1
+    models: list[str | None] = list(args.models) if args.models else [None]
+    repeats = max(1, int(args.repeats))
+    llms: dict[str | None, Any] = {}
+    for model in models:
+        if model is None:
+            llm = await create_llm(role="planner")
+        else:
+            llm = await create_llm(model=model, provider=args.provider)
+        if llm is None:
+            target = model or "role=planner"
+            print(  # noqa: T201
+                f"LLM 未配置或别名不存在：{target}",
+                file=sys.stderr,
+            )
+            return 1
+        llms[model] = llm
 
     out_dir = Path(args.out_dir) / china_now().strftime("%Y%m%dT%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     results: list[dict[str, Any]] = []
     for case_path in cases:
-        print(f"replaying {case_path.name} ...")  # noqa: T201
-        try:
-            result = await _replay_one(llm, case_path, args)
-        except Exception as exc:
-            result = {
-                "case": case_path.name,
-                "error": f"replay crashed: {type(exc).__name__}: {exc}",
-                "calls_match": None,
-                "recorded_calls": None,
-                "replay_calls": None,
-                "recorded_preflight_error": None,
-                "replay_preflight_error": None,
-                "latency_ms": -1,
-            }
-        results.append(result)
-        (out_dir / f"{case_path.stem}.result.json").write_text(
-            json.dumps(result, ensure_ascii=False, indent=1),
-            encoding="utf-8",
-        )
+        for model in models:
+            for repeat in range(1, repeats + 1):
+                tag = model or "planner"
+                extra = f" #{repeat}" if repeats > 1 else ""
+                print(f"replaying {case_path.name} @ {tag}{extra} ...")  # noqa: T201
+                args.replay_model = model
+                args.repeat_index = repeat
+                try:
+                    result = await _replay_one(llms[model], case_path, args)
+                except Exception as exc:
+                    result = {
+                        "case": case_path.name,
+                        "replay_model": model,
+                        "repeat": repeat,
+                        "error": (
+                            f"replay crashed: {type(exc).__name__}: {exc}"
+                        ),
+                        "calls_match": None,
+                        "recorded_calls": None,
+                        "replay_calls": None,
+                        "recorded_preflight_error": None,
+                        "replay_preflight_error": None,
+                        "latency_ms": -1,
+                    }
+                results.append(result)
+                stem = case_path.stem
+                if model:
+                    stem = f"{stem}__{model}"
+                if repeats > 1:
+                    stem = f"{stem}__r{repeat}"
+                (out_dir / f"{stem}.result.json").write_text(
+                    json.dumps(result, ensure_ascii=False, indent=1),
+                    encoding="utf-8",
+                )
 
     report = _write_report(out_dir, results)
     print(f"报告：{report}")  # noqa: T201
@@ -275,6 +344,24 @@ def main() -> int:
         help="兼容旧命令；Planner 已是纯文本模型，本参数忽略",
     )
     parser.add_argument("--limit", type=int, default=0, help="至多回放 N 例")
+    parser.add_argument(
+        "--model",
+        action="append",
+        dest="models",
+        default=None,
+        help="钉死端点别名（可重复）。省略则走 role=planner",
+    )
+    parser.add_argument(
+        "--provider",
+        default=None,
+        help="配合 --model 钉死服务商，一般不用",
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=1,
+        help="每个用例×每个模型重复次数，默认 1",
+    )
     return asyncio.run(_amain(parser.parse_args()))
 
 
