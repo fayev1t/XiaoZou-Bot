@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 MAX_SOURCE_CHARS = 8_000
 MAX_AST_NODES = 400
 MAX_SYNTAX_DEPTH = 8
-MAX_EFFECT_CALL_SITES = 4
+MAX_EFFECT_CALL_SITES = 8
 MAX_CONTAINER_ELEMENTS = 1_000
 MAX_STRING_LENGTH = 4_000
 
@@ -736,7 +736,7 @@ class _Validator:
                 self._forbidden(node, "program_function_positional_args")
             if any(keyword.arg is None for keyword in node.keywords):
                 self._forbidden(node, "starred_arguments")
-            if spec.program_kind == "effect" and (in_loop or in_comp):
+            if in_loop or in_comp:
                 self._forbidden(node, "effect_in_loop_or_comprehension")
             seen: set[str] = set()
             value_schemas: dict[str, dict | None] = {}
@@ -765,16 +765,15 @@ class _Validator:
                     occurrence=occurrence,
                 )
             )
-            if spec.program_kind == "effect":
-                count = self._effect_counts.get(name, 0) + 1
-                self._effect_counts[name] = count
-                if count > spec.max_call_sites:
-                    _raise_quota(
-                        node,
-                        f"effect_call_sites:{name}",
-                        count,
-                        spec.max_call_sites,
-                    )
+            count = self._effect_counts.get(name, 0) + 1
+            self._effect_counts[name] = count
+            if count > spec.max_call_sites:
+                _raise_quota(
+                    node,
+                    f"effect_call_sites:{name}",
+                    count,
+                    spec.max_call_sites,
+                )
             return _schema_with_origin(spec.result_schema, spec.name)
         if self._registry.spec(name) is not None:
             self._unknown_name(node, name)
@@ -811,13 +810,7 @@ class _Validator:
         properties = _schema_properties(schema)
         declared = set(properties)
         reserved = _RESERVED_EFFECT_ARGUMENTS - declared
-        if spec.program_kind == "query":
-            illegal = sorted(set(keywords) & reserved)
-            if illegal:
-                self._forbidden(node, "query_reserved_argument")
-            allowed = declared
-        else:
-            allowed = declared | reserved
+        allowed = declared | reserved
         unknown = sorted(set(keywords) - allowed)
         if unknown:
             self._error(
@@ -827,21 +820,20 @@ class _Validator:
                 construct="unknown_keyword",
                 function=spec.name,
             )
-        if spec.program_kind == "effect":
-            for field_name in sorted(set(keywords) & reserved):
-                value_schema = value_schemas.get(field_name)
-                if value_schema is not None and not (
-                    _schema_allows_type(value_schema, "string")
-                    or _schema_allows_type(value_schema, "null")
-                ):
-                    self._error(
-                        keywords[field_name],
-                        "program_forbidden_construct",
-                        f"{field_name} must be a string or null",
-                        construct="reserved_argument_type",
-                        function=spec.name,
-                        field=field_name,
-                    )
+        for field_name in sorted(set(keywords) & reserved):
+            value_schema = value_schemas.get(field_name)
+            if value_schema is not None and not (
+                _schema_allows_type(value_schema, "string")
+                or _schema_allows_type(value_schema, "null")
+            ):
+                self._error(
+                    keywords[field_name],
+                    "program_forbidden_construct",
+                    f"{field_name} must be a string or null",
+                    construct="reserved_argument_type",
+                    function=spec.name,
+                    field=field_name,
+                )
         missing = sorted(set(schema.get("required") or []) - set(keywords))
         if missing:
             self._error(

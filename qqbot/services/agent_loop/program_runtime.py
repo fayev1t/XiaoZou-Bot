@@ -27,6 +27,8 @@ from qqbot.services.agent_loop.program_events import (
     uncertain_outcome,
 )
 from qqbot.services.agent_loop.tool_registry import (
+    OUTCOME_ERROR_SCHEMA,
+    OUTCOME_FIELDS,
     ProgramFunctionSpec,
     ToolOutcome,
     ToolRegistry,
@@ -38,9 +40,16 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-MAX_QUERY_CALLS = 6
+MAX_PROGRAM_CALLS = 8
 MAX_ITERATIONS = 1_000
 MAX_STATEMENTS = 5_000
+
+# 2026-08-15「失败即返回值」的例外：这两种不是"这次调用没成"，而是**程序正在
+# 被拆掉**——墙钟到点或进程关停。后续语句既没有时间预算，副作用状态也存疑，
+# 继续跑等于让一个已超时的程序接着发消息。它们保持中止语义，由启动收口写
+# interrupted/uncertain。注意与 send_messages 的 status="uncertain" 区分：那是
+# 一次投递结果不确定（工具级事实，是返回值），不是程序被拆。
+FATAL_ERROR_KINDS = frozenset({"program_timeout", "interrupted"})
 CALL_TIMEOUT_SECONDS = 20.0
 PROGRAM_TIMEOUT_SECONDS = 40.0
 MAX_RETURN_BYTES = 6_144
@@ -153,6 +162,43 @@ class ProgramRecord:
         return "<program-record>"
 
 
+class FailedProgramRecord(ProgramRecord):
+    """失败调用的返回值（2026-08-15，失败即返回值）。
+
+    ``ok`` / ``error`` 正常可读；**业务字段一读即中止程序**。
+
+    这条守卫是 A 方案的必要配套。失败变成返回值以后，"不检查 ok"不再像从前
+    那样安全地把整段程序停住，而是让 None 一路流进 f-string 和参数里——
+    群里会看见「找到 None 条结果」。守卫把这种情况变回一次干净的中止，
+    ``program_unchecked_failure`` 明确指出漏检了哪个函数的哪个字段。
+
+    结果是三种写法各得其所：检查了 ``ok`` 再分支 → 照常跑；没检查但也没用
+    返回值（只是继续调下一个）→ 照常跑；没检查却直接用数据 → 中止，与迁移前
+    行为一致。
+    """
+
+    __slots__ = ()
+
+    def __getattr__(self, field_name: str) -> Any:
+        if field_name.startswith("_"):
+            raise AttributeError(field_name)
+        if field_name in OUTCOME_FIELDS:
+            return ProgramRecord.__getattr__(self, field_name)
+        values = object.__getattribute__(self, "_values")
+        if field_name in values:
+            function = object.__getattribute__(self, "_function")
+            raise ProgramExecutionError(
+                ProgramErrorInfo(
+                    "program_unchecked_failure",
+                    f"{function} failed; check .ok before reading "
+                    f".{field_name}",
+                    details={"function": function, "field": field_name},
+                )
+            )
+        # 未声明的字段仍然是 program_unknown_field，与成功路径同一种错。
+        return ProgramRecord.__getattr__(self, field_name)
+
+
 class ProgramList(Sequence[Any]):
     """Read-only bounded sequence used for tool arrays and program lists."""
 
@@ -179,7 +225,7 @@ class ProgramList(Sequence[Any]):
 
 
 class ProgramExecutor:
-    """Execute one :class:`PreflightResult` in the current AgentLoop tick."""
+    """Execute one prepared program. Hosted by ProgramRunner, not the decision tick."""
 
     def __init__(  # noqa: PLR0913
         self,
@@ -525,15 +571,10 @@ class _RuntimeState:
         # schema 已声明的同名字段是业务参数,只进 arguments,不当挂靠锚——否则
         # task(action="note"/"complete"/"fail") 的业务 task_id 会伴生一条伪造的
         # task_state_changed(pending→running),把已收束任务复活成 running。
-        task_id = (
-            raw_kwargs.get("task_id")
-            if spec.program_kind == "effect" and "task_id" not in declared
-            else None
-        )
+        task_id = raw_kwargs.get("task_id") if "task_id" not in declared else None
         triggered = (
             raw_kwargs.get("triggered_by_event_id")
-            if spec.program_kind == "effect"
-            and "triggered_by_event_id" not in declared
+            if "triggered_by_event_id" not in declared
             else None
         )
         arguments = dict(raw_kwargs)
@@ -561,19 +602,16 @@ class _RuntimeState:
             if triggered is None:
                 triggered = self.executor.task_anchor(task_id)
 
-        if spec.program_kind == "query":
-            self.query_call_count += 1
-            self.trace.query_calls.append(spec.name)
-            if self.query_call_count > MAX_QUERY_CALLS:
-                self.fail(
-                    "program_quota_exceeded",
-                    "dynamic query call quota exceeded",
-                    failed_call=site,
-                    quota="query_calls",
-                    actual=self.query_call_count,
-                    max=MAX_QUERY_CALLS,
-                )
-            return await self._run_query(spec, site, arguments)
+        self.query_call_count += 1
+        if self.query_call_count > MAX_PROGRAM_CALLS:
+            self.fail(
+                "program_quota_exceeded",
+                "dynamic program call quota exceeded",
+                failed_call=site,
+                quota="program_calls",
+                actual=self.query_call_count,
+                max=MAX_PROGRAM_CALLS,
+            )
         return await self._run_effect(
             spec,
             site,
@@ -597,82 +635,6 @@ class _RuntimeState:
             triggered_by_event_id=None,
             forced_outcome=ToolOutcome.failure("invalid_arguments", message),
         )
-
-    async def _run_query(
-        self,
-        spec: ProgramFunctionSpec,
-        site: ProgramCallSite,
-        arguments: dict[str, Any],
-    ) -> Any:
-        started = time.monotonic()
-        try:
-            outcome = await self._call_tool(
-                spec,
-                arguments,
-                task_id=None,
-                triggered_by_event_id=None,
-                tool_call_event_id=None,
-            )
-        except asyncio.TimeoutError:
-            scope = "program" if time.monotonic() >= self.deadline else "call"
-            self._record_call(
-                spec,
-                site,
-                arguments,
-                "failed",
-                started,
-                error_kind="program_timeout",
-            )
-            self.fail(
-                "program_timeout",
-                f"query {spec.name} exceeded the call timeout",
-                failed_call=site,
-                scope=scope,
-            )
-        if not outcome.ok:
-            self._record_call(
-                spec,
-                site,
-                arguments,
-                "failed",
-                started,
-                error_kind=outcome.error_kind,
-            )
-            self.fail(
-                outcome.error_kind or "internal_tool_error",
-                outcome.error_message or f"query {spec.name} failed",
-                failed_call=site,
-                **(outcome.extra or {}),
-            )
-        result_bytes = _result_size(outcome.result)
-        try:
-            wrapped = wrap_program_value(
-                outcome.result,
-                spec.result_schema,
-                function=spec.name,
-            )
-        except ProgramExecutionError as exc:
-            if exc.failed_call is None:
-                exc.failed_call = site
-            self._record_call(
-                spec,
-                site,
-                arguments,
-                "failed",
-                started,
-                result_bytes=result_bytes,
-                error_kind=exc.info.error_kind,
-            )
-            raise
-        self._record_call(
-            spec,
-            site,
-            arguments,
-            "ok",
-            started,
-            result_bytes=result_bytes,
-        )
-        return wrapped
 
     async def _run_effect(  # noqa: C901, PLR0913
         self,
@@ -733,13 +695,23 @@ class _RuntimeState:
                 scope="program" if timed_out else None,
             )
 
-        terminal_cancelled = await _shield_finish_effect(
-            self.executor._session_factory,
-            scope_key=self.executor._scope_key,
-            correlation_id=self.executor._correlation_id,
-            handle=handle,
-            outcome=outcome,
-        )
+        try:
+            terminal_cancelled = await _shield_finish_effect(
+                self.executor._session_factory,
+                scope_key=self.executor._scope_key,
+                correlation_id=self.executor._correlation_id,
+                handle=handle,
+                outcome=outcome,
+            )
+        except Exception:  # noqa: BLE001
+            terminal_cancelled = True
+            if outcome.ok:
+                outcome = uncertain_outcome(
+                    error_kind="interrupted",
+                    error_message=(
+                        "effect terminal write failed after the call finished"
+                    ),
+                )
         cancelled = cancelled or terminal_cancelled
         if cancelled:
             error_kind = outcome.error_kind or "interrupted"
@@ -751,15 +723,27 @@ class _RuntimeState:
                 started,
                 error_kind=error_kind,
             )
+            # extra 里可能已经带了 status（uncertain_outcome 恒设 status=
+            # "uncertain"），与这里显式传的重名会直接 TypeError，再被外层通用
+            # 兜底吞成 program_forbidden_construct——真实原因（超时/取消）就此
+            # 丢失。先摘掉再合。
+            cancelled_extra = {
+                key: value
+                for key, value in (outcome.extra or {}).items()
+                if key != "status"
+            }
             self.fail(
                 error_kind,
                 outcome.error_message
                 or "program execution stopped; effect state is uncertain",
                 failed_call=site,
                 status="uncertain",
-                **(outcome.extra or {}),
+                **cancelled_extra,
             )
-        if not outcome.ok:
+        if not outcome.ok and outcome.error_kind in FATAL_ERROR_KINDS:
+            # 程序自身正在被拆掉（墙钟到点、进程关停），不是"这次调用没成"。
+            # 没有"继续往下跑"可言：后面的语句已经没有时间预算，副作用状态也
+            # 存疑。这类必须保持中止，否则超时程序会继续发消息。
             self._record_call(
                 spec,
                 site,
@@ -774,6 +758,19 @@ class _RuntimeState:
                 failed_call=site,
                 **(outcome.extra or {}),
             )
+        if not outcome.ok:
+            # 2026-08-15：其余失败不再中止程序，而是作为返回值交回去。工具终态
+            # （agent.tool_failed）已经在上面写完，时间线上失败仍是既成事实；
+            # 变的只是"这段程序还能不能继续"。
+            self._record_call(
+                spec,
+                site,
+                arguments,
+                str((outcome.extra or {}).get("status") or "failed"),
+                started,
+                error_kind=outcome.error_kind,
+            )
+            return self._failure_value(spec, outcome)
 
         for event in outcome.emitted_events:
             if event.event_type == "agent.task_created":
@@ -785,7 +782,7 @@ class _RuntimeState:
         result_bytes = _result_size(outcome.result)
         try:
             wrapped = wrap_program_value(
-                outcome.result,
+                _with_success_envelope(outcome.result),
                 spec.result_schema,
                 function=spec.name,
             )
@@ -865,6 +862,35 @@ class _RuntimeState:
                 "internal_tool_error", f"{type(exc).__name__}: {exc}"
             )
         return coerce_tool_outcome(raw)
+
+    def _failure_value(
+        self, spec: ProgramFunctionSpec, outcome: ToolOutcome
+    ) -> FailedProgramRecord:
+        """失败 outcome → 程序可读的返回值：``ok=False`` + ``error``，业务字段全 None。
+
+        业务字段仍然逐个建出来（值为 None），这样 ``.results`` 这类访问命中的
+        是 ``program_unchecked_failure``（漏检 ok），而不是
+        ``program_unknown_field``（写错字段名）——两种错因对模型是不同的事。
+        """
+        extra = outcome.extra or {}
+        status = extra.get("status")
+        error = ProgramRecord(
+            {
+                "kind": outcome.error_kind or "internal_tool_error",
+                "message": (
+                    outcome.error_message or f"{spec.name} failed"
+                )[:MAX_RESULT_STRING_CHARS],
+                "status": str(status) if isinstance(status, str) else None,
+            },
+            OUTCOME_ERROR_SCHEMA,
+            spec.name,
+        )
+        values: dict[str, Any] = dict.fromkeys(
+            _schema_properties(spec.result_schema)
+        )
+        values["ok"] = False
+        values["error"] = error
+        return FailedProgramRecord(values, spec.result_schema, spec.name)
 
     def _record_call(  # noqa: PLR0913
         self,
@@ -1086,6 +1112,18 @@ async def _shield_finish_effect(
             cancelled = True
     task.result()
     return cancelled
+
+
+def _with_success_envelope(result: Any) -> dict:
+    """成功 outcome 的 result → 带 ``ok=True`` / ``error=None`` 的载荷。
+
+    19 个工具的 result_schema 顶层都是 object，result 也都是 dict；非 Mapping
+    只可能来自 stub，按空载荷处理，信封字段照样在。
+    """
+    payload = dict(result) if isinstance(result, Mapping) else {}
+    payload["ok"] = True
+    payload["error"] = None
+    return payload
 
 
 def wrap_program_value(  # noqa: C901, PLR0911, PLR0912
@@ -1339,7 +1377,7 @@ def _elapsed_ms(started: float) -> int:
 def _log_trace(trace: ProgramTrace) -> None:
     logger.info(
         "[program_trace] decision={} sha={} scope={} duration_ms={} "
-        "statements={} iterations={} query_calls={} effect_calls={} "
+        "statements={} iterations={} calls={} effect_calls={} "
         "return_bytes={} error_kind={} calls={}",
         trace.decision_id,
         trace.program_sha256[:12],
@@ -1347,7 +1385,7 @@ def _log_trace(trace: ProgramTrace) -> None:
         trace.duration_ms,
         trace.statement_count,
         trace.iteration_count,
-        trace.query_calls,
+        len(trace.calls),
         len(trace.effect_call_ids),
         trace.return_bytes,
         trace.error_kind,
@@ -1370,7 +1408,7 @@ def _log_trace(trace: ProgramTrace) -> None:
 __all__ = [
     "CALL_TIMEOUT_SECONDS",
     "MAX_ITERATIONS",
-    "MAX_QUERY_CALLS",
+    "MAX_PROGRAM_CALLS",
     "MAX_RESULT_CONTAINER_ELEMENTS",
     "MAX_RESULT_STRING_CHARS",
     "MAX_RETURN_BYTES",

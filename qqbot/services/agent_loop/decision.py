@@ -142,10 +142,10 @@ class ToolResultView:
     """A folded view of an agent.tool_called and its eventual result/failure
     (任务与决策契约 §5.1).
 
-    程序形态下工具行投影时必为终态。成功/失败只靠内容区分：
-    ``error_kind is None`` 为成功（``result`` 有效），非 None 为失败
-    （error_* 有效）。若历史数据只有 ``tool_called``，投影层防御性地把它
-    折成 ``interrupted`` / ``uncertain``，不再暴露 processing 状态。
+    成功/失败只靠内容区分：``error_kind is None`` 为成功（``result`` 有效），
+    非 None 为失败（error_* 有效）。所属 decision 尚无 program terminal 且
+    调用本身无 terminal 时，``error_kind`` 为 ``pending``，渲染成中性
+    「已调用」。只有收口后的半截才是 ``interrupted`` / ``uncertain``。
     """
 
     tool_call_id: str
@@ -189,9 +189,9 @@ class DecisionContext:
     # 与 pending 区双重渲染，两处语义必然漂移。ToolResultView 仍保留——它是
     # timeline 渲染 tool-call 行时的折叠视图（fold_tool_results）。
 
-    # ─── 程序源码不进入跨拍上下文（2026-08-03）───
-    # DecisionOutput.program 随 agent.decision_emitted 落库，供日志、快照与审计；
-    # Projector 对源码强消隐，只渲染 program terminal 的查询函数名、return 或错误。
+    # ─── 程序源码进入时间线（2026-08-14）───
+    # DecisionOutput.program 随 agent.decision_emitted 落库并渲染为 <程序>决策。
+    # 它表示当拍产出了什么，不表示已经落地；落地看 <工具> 与 <程序>完成|失败。
 
     # ─── 自我认识（2026-08-03，reflect 工具）───
     # agent.reflection_written 折叠出的最新一版正文，latest-wins；渲染成信封

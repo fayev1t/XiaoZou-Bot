@@ -83,7 +83,8 @@ _USAGE_PROMPT = load_sibling_md(__file__, "websearch.md")
 
 class WebsearchTool(BaseTool):
     name = "websearch"
-    program_kind = "query"
+    program_kind = "effect"
+    max_call_sites = 4
     description = (
         "按关键词检索网页，返回标题、URL 和摘要；可通过 fetch_top_n 为前若干"
         "条结果附加正文，通过 max_results 限制结果数量。"

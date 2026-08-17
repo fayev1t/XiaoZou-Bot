@@ -80,7 +80,8 @@ def _member_role(member: Any) -> str | None:
 
 class GetMemberListTool(BaseTool):
     name = "get_member_list"
-    program_kind = "query"
+    program_kind = "effect"
+    max_call_sites = 4
     allowed_scopes = ("group",)
     # required_permission 用 BaseTool 默认 GUEST（查询无副作用）
     usage_prompt = _USAGE_PROMPT

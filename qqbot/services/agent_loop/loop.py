@@ -3,17 +3,14 @@
 Each tick projects the scope, asks the Planner for one restricted Python
 program, preflights it, and on static failure cools the current LLM endpoint
 then tries the next candidate in the role group (no same-tick rewrite with
-validation feedback). Persists the decision root and executes every
-query/effect sequentially before the tick ends. There is no worker dispatch
-or tool batch: a completed tick has no pending program call.
+validation feedback). The decision root is persisted and a non-empty program
+is dispatched; the tick then ends. A per-scope ProgramRunner runs dispatched
+programs concurrently (one coroutine each, calls inside one program stay
+sequential) and wakes the loop when a program terminal is written.
 
 The fixed wake batching window remains a conversation-ingest concern. The
 first wake opens one bounded window; later wakes join it without extending the
 deadline, so split QQ messages can land before the next decision starts.
-
-A tick whose program actually called something wakes the scope again on its
-own (see ``_CONTINUATION_MAX_ENV``), so a burst of work runs tick by tick until
-one program calls nothing at all.
 """
 
 from __future__ import annotations
@@ -54,6 +51,7 @@ from qqbot.services.agent_loop.program_events import (
     write_program_completed,
     write_program_failed,
 )
+from qqbot.services.agent_loop.program_runner import ProgramRunner, QueuedProgram
 from qqbot.services.agent_loop.program_runtime import (
     ProgramExecutionError,
     ProgramExecutor,
@@ -154,10 +152,15 @@ class AgentLoop:
         self._wake_timer: asyncio.Task[None] | None = None
         # 每个 loop 实例的第一拍、投影之前收口一次历史半截程序；成功后不重跑。
         self._recovery_done = False
-        # 自续拍状态：depth 是本段活动里已经连续自续了几拍，被任何外部唤醒清零；
-        # max 在构造时读一次 env（进程内不会变）。
+        # Runner 完成 wake 计入自续拍深度；外部 wake 清零。上界仍是
+        # AGENT_CONTINUATION_MAX_TICKS，防止「跑完→决策→再入队」自转。
         self._continuation_depth = 0
         self._continuation_max = continuation_max_ticks()
+        self._runner = ProgramRunner(
+            scope_key=scope_key,
+            execute=self._run_queued_program,
+            on_finished=self._wake_continuation,
+        )
 
     @property
     def scope_key(self) -> str:
@@ -166,6 +169,7 @@ class AgentLoop:
     def start(self) -> None:
         if self._task is not None:
             return
+        self._runner.start()
         self._task = asyncio.create_task(
             self._run(), name=f"agent_loop:{self._scope_key}"
         )
@@ -181,6 +185,7 @@ class AgentLoop:
                 self._task.cancel()
             finally:
                 self._task = None
+        await self._runner.stop()
 
     def wake(self) -> None:
         """请求开拍。外部入口一律走固定攒批窗口（见模块 docstring）。
@@ -195,10 +200,10 @@ class AgentLoop:
         self._arm_wake(immediate=False)
 
     def _wake_continuation(self) -> bool:
-        """本拍程序调用过函数 → 立刻再开一拍。返回是否真的排上。
+        """Runner 写出 program terminal 后立刻再开一拍。返回是否真的排上。
 
-        自续拍是 loop 内部排程，不走公开 wake：不是在等谁把话说完，攒批窗口
-        在这里只是每跳白加三秒。
+        不走公开 wake：刚落下的 ``<工具>`` / ``<程序>`` 已经是新事实，不必
+        再等三秒攒批。上界防止非空程序死循环。
         """
         if self._stopped:
             return False
@@ -366,22 +371,68 @@ class AgentLoop:
             )
             return
 
-        status, made_call = await self._execute_program(
-            prepared,
-            context=context,
-            correlation_id=correlation_id,
-            decision_id=decision_id,
+        if prepared.call_sites or prepared.has_return:
+            try:
+                self._runner.enqueue(
+                    QueuedProgram(
+                        decision_id=decision_id,
+                        scope_key=self._scope_key,
+                        correlation_id=correlation_id,
+                        prepared=prepared,
+                        context=context,
+                        enqueued_at=now,
+                    )
+                )
+            except Exception as exc:
+                logger.exception(
+                    "[loop {}] enqueue failed: {}", self._scope_key, exc
+                )
+                await _shield_write(
+                    write_program_failed(
+                        self._session_factory,
+                        scope_key=self._scope_key,
+                        correlation_id=correlation_id,
+                        decision_id=decision_id,
+                        program_sha256=program_sha256,
+                        duration_ms=0,
+                        query_calls=[],
+                        effect_call_ids=[],
+                        error_kind="dispatch_failed",
+                        error_message=f"program enqueue failed: {type(exc).__name__}",
+                    )
+                )
+                await self._write_tick_ended(
+                    correlation_id,
+                    tick_started_id,
+                    program_status="failed",
+                )
+                return
+            await self._write_tick_ended(
+                correlation_id,
+                tick_started_id,
+                program_status="dispatched",
+            )
+            return
+
+        await _shield_write(
+            write_program_completed(
+                self._session_factory,
+                scope_key=self._scope_key,
+                correlation_id=correlation_id,
+                decision_id=decision_id,
+                program_sha256=program_sha256,
+                duration_ms=0,
+                query_calls=[],
+                effect_call_ids=[],
+                result=None,
+                has_result=prepared.has_return,
+            )
         )
         await self._write_tick_ended(
             correlation_id,
             tick_started_id,
-            program_status=status,
+            program_status="completed",
         )
-        # 自续拍：排在 tick_ended 之后，本拍的事实全部落库才请求下一拍——与
-        # 「wake 不能领先于事实」同序。上面两条提前 return 的路径（planner_error /
-        # invalid）一个函数都没调用过，天然不续，无需另写分支。
-        if made_call:
-            self._wake_continuation()
 
     async def _build_context(
         self,
@@ -485,36 +536,24 @@ class AgentLoop:
                 exc,
             )
 
-    async def _execute_program(
-        self,
-        prepared: PreflightResult,
-        *,
-        context: DecisionContext,
-        correlation_id: str,
-        decision_id: str,
-    ) -> tuple[str, bool]:
-        """执行程序。返回 (program_status, 本拍是否调用过函数)。
-
-        第二项是自续拍的唯一判据：``trace.calls`` 对 query / effect、成功 / 失败
-        一视同仁地记录（program_runtime._record_call），所以「调用过」按字面成立
-        ——查询也算，失败也算。失败尤其要算：那一拍的价值正是让她看见错误再判断，
-        而中止余下程序意味着她当拍不可能自己接住。
-        """
+    async def _run_queued_program(self, item: QueuedProgram) -> None:
+        """Runner 回调：顺序执行一段已 preflight 的程序并写 program terminal。"""
         executor = ProgramExecutor(
             registry=self._tool_registry,
             session_factory=self._session_factory,
             scope_key=self._scope_key,
-            correlation_id=correlation_id,
-            decision_id=decision_id,
-            context=context,
+            correlation_id=item.correlation_id,
+            decision_id=item.decision_id,
+            context=item.context,
             supervisor=self._supervisor,
             caption_image=self._caption_image,
         )
+        prepared = item.prepared
         try:
             result = await executor.execute(prepared)
         except ProgramExecutionError as exc:
             trace = exc.trace or ProgramTrace(
-                decision_id=decision_id,
+                decision_id=item.decision_id,
                 program_sha256=prepared.program_sha256,
                 scope_key=self._scope_key,
             )
@@ -527,8 +566,8 @@ class AgentLoop:
                 write_program_failed(
                     self._session_factory,
                     scope_key=self._scope_key,
-                    correlation_id=correlation_id,
-                    decision_id=decision_id,
+                    correlation_id=item.correlation_id,
+                    decision_id=item.decision_id,
                     program_sha256=prepared.program_sha256,
                     duration_ms=trace.duration_ms,
                     query_calls=list(trace.query_calls),
@@ -539,11 +578,8 @@ class AgentLoop:
                     **details,
                 )
             )
-            return "failed", bool(trace.calls)
+            return
         except Exception as exc:  # noqa: BLE001
-            # 兜底:执行器契约之外的宿主异常也必须留下 program terminal,
-            # 否则 decision_emitted 悬空、tick_ended 不写,而收口器只在
-            # 进程首拍跑一次,同进程内永远无人补写这一拍。
             logger.exception(
                 "[loop {}] program host failure escaped executor", self._scope_key
             )
@@ -551,8 +587,8 @@ class AgentLoop:
                 write_program_failed(
                     self._session_factory,
                     scope_key=self._scope_key,
-                    correlation_id=correlation_id,
-                    decision_id=decision_id,
+                    correlation_id=item.correlation_id,
+                    decision_id=item.decision_id,
                     program_sha256=prepared.program_sha256,
                     duration_ms=0,
                     query_calls=[],
@@ -561,16 +597,14 @@ class AgentLoop:
                     error_message=f"program host failure: {type(exc).__name__}",
                 )
             )
-            # 执行器契约之外的宿主异常：没有 trace，无从证实调用发生过。这里
-            # 保守地不续拍——真有持续性宿主 bug 时，续拍只会把它变成自转。
-            return "failed", False
+            return
 
         await _shield_write(
             write_program_completed(
                 self._session_factory,
                 scope_key=self._scope_key,
-                correlation_id=correlation_id,
-                decision_id=decision_id,
+                correlation_id=item.correlation_id,
+                decision_id=item.decision_id,
                 program_sha256=prepared.program_sha256,
                 duration_ms=result.trace.duration_ms,
                 query_calls=list(result.trace.query_calls),
@@ -579,7 +613,6 @@ class AgentLoop:
                 has_result=result.has_result,
             )
         )
-        return "completed", bool(result.trace.calls)
 
     async def _write_tick_ended(
         self,

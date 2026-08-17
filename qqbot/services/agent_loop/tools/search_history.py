@@ -57,7 +57,8 @@ class SearchHistoryTool(BaseTool):
     """
 
     name = "search_history"
-    program_kind = "query"
+    program_kind = "effect"
+    max_call_sites = 4
     description = (
         "检索当前 scope 中未包含在近期时间线窗口内的历史事件。过滤条件可组合："
         "anchor_event_id 或 task_id 提供锚点，start_time/end_time 提供时间范围，"

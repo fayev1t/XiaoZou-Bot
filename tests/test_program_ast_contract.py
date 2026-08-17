@@ -27,7 +27,8 @@ from qqbot.services.agent_loop.tool_registry import (
 
 class _MembersQuery(BaseTool):
     name = "members"
-    program_kind = "query"
+    program_kind = "effect"
+    max_call_sites = 4
     allowed_scopes = ("group",)
     arguments_schema = {
         "type": "object",
@@ -231,9 +232,13 @@ class ProgramWhitelistContractTests(unittest.TestCase):
         info = self._error('notify("hello")')
         self.assertEqual(info.details["construct"], "program_function_positional_args")
 
-    def test_query_rejects_system_reserved_arguments(self) -> None:
-        info = self._error('members(task_id="T1")')
-        self.assertEqual(info.details["construct"], "query_reserved_argument")
+    def test_former_query_accepts_system_reserved_arguments(self) -> None:
+        prepared = preflight(
+            'members(task_id="T1")',
+            self.registry,
+            "group",
+        )
+        self.assertEqual(prepared.call_sites[0].name, "members")
 
     def test_effect_reserved_arguments_must_be_string_or_null(self) -> None:
         for source in (

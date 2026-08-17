@@ -60,7 +60,8 @@ _USAGE_PROMPT = load_sibling_md(__file__, "webfetch.md")
 
 class WebfetchTool(BaseTool):
     name = "webfetch"
-    program_kind = "query"
+    program_kind = "effect"
+    max_call_sites = 4
     description = (
         "读取一个公开 HTTP(S) URL，提取网页标题与正文并在内部提炼为不超过"
         " 1500 字的短转述，返回重定向后的最终 URL、状态码、内容类型及抓取"

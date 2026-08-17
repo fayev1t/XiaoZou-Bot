@@ -13,8 +13,9 @@ Behaviour:
   agent_events; the loop will see them once it tickets).
 - stop() cancels every running loop with a 5s grace timeout.
 
-Program API functions all execute inside the current AgentLoop tick. There is
-no ToolWorker, pending-tool notification, or tool-batch completion wake.
+Non-empty programs are enqueued after decision_emitted; a per-scope
+ProgramRunner executes them FIFO. There is no ToolWorker, pending-tool
+notification, or tool-batch completion wake.
 """
 
 from __future__ import annotations

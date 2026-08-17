@@ -70,7 +70,8 @@ _FALSE_STRINGS = frozenset({"false", "0", "no", ""})
 
 class GetPendingJoinRequestsTool(BaseTool):
     name = "get_pending_join_requests"
-    program_kind = "query"
+    program_kind = "effect"
+    max_call_sites = 4
     allowed_scopes = ("group",)
     # required_permission 用 BaseTool 默认 GUEST（查询无副作用，信息本就进 timeline）
     required_bot_role = "admin"  # 非管理员 bot 收不到入群申请，前置拦成明确失败

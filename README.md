@@ -38,10 +38,10 @@
 本系统围绕**事件驱动**、**Tick-Based 状态机**与**程序化工具调用**构建，形成完整的闭环运行机制：
 
 - **🌊 统一事件轴与状态折叠 (Unified Event Stream & Projection)**  
-  所有外部 OneBot 事件（群消息、撤回、入群申请、退群等）与系统内部事件（包括 `runtime.reply_task_completed` 拟人发言定时唤醒、后台任务回调等）统一持久化至 PostgreSQL。通过 Envelope 投影机制将其格式化为平铺的自然中文时间线，大幅降低模型上下文损耗与 Token 消耗。
+  所有外部 OneBot 事件（群消息、撤回、入群申请、退群等）与系统内部事件（包括 `runtime.reply_task_completed` 拟人发言定时唤醒、后台任务回调等）统一持久化至 PostgreSQL。通过 Envelope 投影机制将其格式化为平铺的自然中文时间线，富含语义并且大幅降低模型上下文损耗与 Token 消耗。
 
 - **🔄 Tick-Based AgentLoop 驱动架构**  
-  在事件到达或内部定时器到点时唤醒 Tick 运转。按 `事件摄入 -> 状态折叠 -> LLM 代码生成 -> 沙盒顺序执行 -> 领域事件/Terminal 收口` 流程闭环。支持同拍 Preflight 静态语法与类型纠偏（最多 3 次试错），崩溃或异常事件在启动恢复期收口为 `interrupted` / `uncertain`，确保状态机强幂等。
+  在事件到达或内部定时器到点时唤醒 Tick 运转。按 `事件摄入 -> 状态折叠 -> LLM 代码生成 -> 沙盒顺序执行 -> 领域事件/Terminal 收口` 流程闭环。支持同拍 Preflight 静态语法与类型纠偏，崩溃或异常事件在启动恢复期收口为 `interrupted` / `uncertain`，确保状态机强幂等。
 
 - **🐍 程序化工具调用沙盒 (Program-Shaped Tool Calling / Python DSL)**  
   摒弃传统的 JSON Function Call，Planner 在每拍直接生成受限 Python 代码（支持条件分支、循环控制与多工具协同）。代码运行在受限 Python AST 隔离沙盒中，安全管控 built-in 访问与配额。

@@ -66,7 +66,8 @@ class _MembersQuery(BaseTool):
 
 class _EchoQuery(BaseTool):
     name = "echo"
-    program_kind = "query"
+    program_kind = "effect"
+    max_call_sites = 8
     arguments_schema = {
         "type": "object",
         "properties": {"value": {}},
@@ -240,12 +241,25 @@ def _registry(*tools: type[BaseTool]) -> ToolRegistry:
     return registry
 
 
+def _effect_handle(name: str = "tool") -> EffectCallHandle:
+    return EffectCallHandle(
+        tool_call_id=f"TC_{name}",
+        called_event_id=f"CALLED_{name}",
+        decision_id="DECISION",
+        tool_name=name,
+        task_id=None,
+        call_site=f"1:0:{name}:1",
+        occurrence=1,
+    )
+
+
 async def _execute(
     source: str,
     registry: ToolRegistry,
     *,
     call_timeout: float = 0.2,
     program_timeout: float = 0.5,
+    persist: bool = True,
 ):
     prepared = preflight(source, registry, "group")
     executor = ProgramExecutor(
@@ -257,7 +271,25 @@ async def _execute(
         call_timeout_seconds=call_timeout,
         program_timeout_seconds=program_timeout,
     )
-    return await executor.execute(prepared)
+    if not persist:
+        return await executor.execute(prepared)
+
+    async def _begin(*args: Any, **kwargs: Any) -> EffectCallHandle:
+        return _effect_handle(str(kwargs.get("tool_name") or "tool"))
+
+    begin = AsyncMock(side_effect=_begin)
+    finish = AsyncMock(return_value="TERMINAL")
+    with (
+        patch(
+            "qqbot.services.agent_loop.program_runtime.begin_effect_call",
+            new=begin,
+        ),
+        patch(
+            "qqbot.services.agent_loop.program_runtime.finish_effect_call",
+            new=finish,
+        ),
+    ):
+        return await executor.execute(prepared)
 
 
 class ProgramReadOnlyAbiContractTests(unittest.IsolatedAsyncioTestCase):
@@ -283,7 +315,7 @@ class ProgramReadOnlyAbiContractTests(unittest.IsolatedAsyncioTestCase):
             result.result,
             {"names": ["Alice", "B"], "spoken": "members: Alice、B"},
         )
-        self.assertEqual(result.trace.query_calls, ["members"])
+        self.assertEqual(result.trace.query_calls, [])
         self.assertEqual(len(result.trace.calls), 1)
         self.assertEqual(result.trace.calls[0].status, "ok")
 
@@ -388,6 +420,7 @@ class ProgramEffectContractTests(unittest.IsolatedAsyncioTestCase):
             result = await _execute(
                 'outcome = notify(message="hello")\nreturn outcome.accepted',
                 _registry(_NotifyEffect),
+                persist=False,
             )
 
         self.assertTrue(result.result)
@@ -398,22 +431,100 @@ class ProgramEffectContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(finish.await_args.kwargs["outcome"].ok)
         self.assertEqual(finish.await_args.kwargs["handle"].called_event_id, "CALLED1")
 
-    async def test_query_failure_aborts_before_later_effect(self) -> None:
-        with patch(
-            "qqbot.services.agent_loop.program_runtime.begin_effect_call",
-            new=AsyncMock(),
-        ) as begin:
+    async def test_failed_call_returns_a_value_and_the_program_continues(
+        self,
+    ) -> None:
+        """2026-08-15：失败即返回值。此前任一失败会中止整段程序，程序里因此
+        写不出任何失败分支——一段不能处理失败的程序等价于一次 JSON action。
+        现在失败调用返回 `ok=False` + `error`，后续语句照常执行。
+
+        工具终态不受影响：`agent.tool_failed` 仍然照写，时间线上失败是既成
+        事实；变的只是"这段程序还能不能继续"。"""
+        handles = [
+            _effect_handle("fail_query"),
+            _effect_handle("notify"),
+        ]
+        with (
+            patch(
+                "qqbot.services.agent_loop.program_runtime.begin_effect_call",
+                new=AsyncMock(side_effect=handles),
+            ) as begin,
+            patch(
+                "qqbot.services.agent_loop.program_runtime.finish_effect_call",
+                new=AsyncMock(return_value="TERM"),
+            ) as finish,
+        ):
+            result = await _execute(
+                'r = fail_query(value="x")\n'
+                'if not r.ok:\n'
+                '    notify(message="查失败了")\n'
+                "return r.error.kind",
+                _registry(_FailQuery, _NotifyEffect),
+                persist=False,
+            )
+        self.assertEqual(result.result, "upstream_action_failed")
+        # 两个调用都真的发生了：失败没有吃掉后面那一条。
+        self.assertEqual(begin.await_count, 2)
+        self.assertEqual(
+            [call.kwargs["tool_name"] for call in begin.await_args_list],
+            ["fail_query", "notify"],
+        )
+        self.assertEqual(len(_NotifyEffect.calls), 1)
+        # 失败调用的终态仍是 tool_failed。
+        self.assertFalse(finish.await_args_list[0].kwargs["outcome"].ok)
+        self.assertTrue(finish.await_args_list[1].kwargs["outcome"].ok)
+
+    async def test_unchecked_failure_field_read_aborts(self) -> None:
+        """失败变成返回值之后，"不检查 ok"不再安全地把程序停住，而是让 None
+        一路流进 f-string 与参数——群里会看见「找到 None 条」。守卫把这种情况
+        变回一次干净的中止，并指出漏检了哪个函数的哪个字段。
+
+        `ok` / `error` 本身照常可读，否则就没法检查了。"""
+        with (
+            patch(
+                "qqbot.services.agent_loop.program_runtime.begin_effect_call",
+                new=AsyncMock(side_effect=[_effect_handle("fail_query")]),
+            ),
+            patch(
+                "qqbot.services.agent_loop.program_runtime.finish_effect_call",
+                new=AsyncMock(return_value="TERM"),
+            ),
+        ):
             with self.assertRaises(ProgramExecutionError) as caught:
                 await _execute(
-                    'value = fail_query(value="x")\nnotify(message="never")',
-                    _registry(_FailQuery, _NotifyEffect),
+                    'r = fail_query(value="x")\nreturn r.value',
+                    _registry(_FailQuery),
+                    persist=False,
                 )
-        self.assertEqual(caught.exception.info.error_kind, "upstream_action_failed")
-        self.assertEqual(caught.exception.failed_call.name, "fail_query")
-        begin.assert_not_awaited()
-        self.assertEqual(_NotifyEffect.calls, [])
+        self.assertEqual(
+            caught.exception.info.error_kind, "program_unchecked_failure"
+        )
+        self.assertEqual(caught.exception.info.details["function"], "fail_query")
+        self.assertEqual(caught.exception.info.details["field"], "value")
 
-    async def test_effect_failure_writes_terminal_and_aborts_later_query(self) -> None:
+    async def test_successful_call_carries_the_outcome_envelope(self) -> None:
+        """成功路径同样带 ok / error——信封是无条件的，否则模型得先知道成功
+        与否才能读 ok，等于没有。"""
+        with (
+            patch(
+                "qqbot.services.agent_loop.program_runtime.begin_effect_call",
+                new=AsyncMock(side_effect=[_effect_handle("echo")]),
+            ),
+            patch(
+                "qqbot.services.agent_loop.program_runtime.finish_effect_call",
+                new=AsyncMock(return_value="TERM"),
+            ),
+        ):
+            result = await _execute(
+                'r = echo(value="x")\nreturn [r.ok, r.error, r.value]',
+                _registry(_EchoQuery),
+                persist=False,
+            )
+        self.assertEqual(list(result.result), [True, None, "x"])
+
+    async def test_effect_failure_writes_terminal_and_the_program_continues(
+        self,
+    ) -> None:
         handle = EffectCallHandle(
             tool_call_id="TC_FAIL",
             called_event_id="CALLED_FAIL",
@@ -433,15 +544,17 @@ class ProgramEffectContractTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value="TERMINAL_FAIL"),
             ) as finish,
         ):
-            with self.assertRaises(ProgramExecutionError) as caught:
-                await _execute(
-                    'fail_effect(message="x")\nlater = echo(value="never")',
-                    _registry(_FailEffect, _EchoQuery),
-                )
-        self.assertEqual(caught.exception.failed_call.name, "fail_effect")
-        self.assertEqual(_EchoQuery.calls, [])
-        finish.assert_awaited_once()
-        self.assertFalse(finish.await_args.kwargs["outcome"].ok)
+            result = await _execute(
+                'e = fail_effect(message="x")\n'
+                'later = echo(value="仍然执行")\n'
+                "return [e.ok, e.error.status, later.value]",
+                _registry(_FailEffect, _EchoQuery),
+                persist=False,
+            )
+        self.assertEqual(list(result.result), [False, "failed", "仍然执行"])
+        self.assertEqual(_EchoQuery.calls, ["仍然执行"])
+        # 第一次 finish 写的仍是失败终态。
+        self.assertFalse(finish.await_args_list[0].kwargs["outcome"].ok)
 
     async def test_declared_business_task_id_is_not_a_reserved_anchor(self) -> None:
         """schema 已声明的业务 task_id 只进 arguments，不进保留挂靠通道——
@@ -470,6 +583,7 @@ class ProgramEffectContractTests(unittest.IsolatedAsyncioTestCase):
             result = await _execute(
                 'done = task_like(task_id="T1", note="进展")\nreturn done.task_id',
                 _registry(_TaskLikeEffect),
+                persist=False,
             )
 
         self.assertEqual(result.result, "T1")
@@ -520,6 +634,7 @@ class ProgramEffectContractTests(unittest.IsolatedAsyncioTestCase):
                     ]
                 ),
                 _registry(_CreateTaskEffect, _NotifyEffect),
+                persist=False,
             )
 
         self.assertEqual(result.result, "T_NEW")
@@ -537,19 +652,16 @@ class ProgramDynamicQuotaContractTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         _EchoQuery.calls.clear()
 
-    async def test_dynamic_query_call_limit(self) -> None:
-        source = "\n".join(
-            [
-                "items = [0, 1, 2, 3, 4, 5, 6]",
-                "values = [echo(value=item).value for item in items]",
-                "return values",
-            ]
-        )
-        with self.assertRaises(ProgramExecutionError) as caught:
-            await _execute(source, _registry(_EchoQuery))
+    async def test_dynamic_program_call_limit(self) -> None:
+        source = 'echo(value=1)\necho(value=2)\nreturn 1'
+        with patch(
+            "qqbot.services.agent_loop.program_runtime.MAX_PROGRAM_CALLS", 1
+        ):
+            with self.assertRaises(ProgramExecutionError) as caught:
+                await _execute(source, _registry(_EchoQuery))
         self.assertEqual(caught.exception.info.error_kind, "program_quota_exceeded")
-        self.assertEqual(caught.exception.info.details["quota"], "query_calls")
-        self.assertEqual(len(_EchoQuery.calls), 6)
+        self.assertEqual(caught.exception.info.details["quota"], "program_calls")
+        self.assertEqual(len(_EchoQuery.calls), 1)
 
     async def test_iteration_limit(self) -> None:
         source = (

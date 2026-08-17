@@ -6,16 +6,16 @@ Strategy:
 - Fetch the newest agent_visible events for this scope (count-limited window).
 - Fold `agent.task_*` into TaskView snapshots (active_tasks).
 - Pair `agent.tool_called` with `agent.tool_result | agent.tool_failed`
-  into terminal-only ToolResultView；历史半截调用防御性折成 interrupted。
+  into ToolResultView。所属 decision 尚无 program terminal 时，半截调用
+  折成 pending / 「已调用」；收口后的半截才是 interrupted。
   视图**只**用于渲染 timeline 的 <工具> 行——2026-07-02 起不再有独立的
   pending_tool_results 区，
   工具结果在 timeline 单点呈现（旧的双重渲染是复读诱饵）。
 - Build the timeline from messages / notices / tool-call pairs / replies /
   agent-visible runtime hints. Task and tool-result events are folded
   upstream and do NOT produce timeline rows of their own.
-- Keep `agent.decision_emitted` source out of the timeline. Only its separate
-  `agent.program_completed | failed` terminal can produce a source-free
-  <程序> row.
+- Render `agent.decision_emitted.payload.program` as ``<程序>决策`` plus
+  the full source. The later ``<程序>完成|失败`` row is a separate event.
 
 Folding and rendering are split into pure staticmethods so unit tests
 can drive them without a DB.
@@ -698,26 +698,42 @@ class Projector:
     ) -> list[ToolResultView]:
         """Pair every tool call with its terminal result/failure.
 
-        程序形态不再暴露 processing。若历史窗口里只有 ``tool_called``，这里
-        防御性折成 ``interrupted`` / ``uncertain``；正常启动时收口器会在投影
-        前补出同义 terminal。
+        所属 decision 尚无 program terminal 时，无终态的 ``tool_called`` 折成
+        ``pending``（渲染「已调用」）。窗口内已有 program terminal、调用本身
+        仍无 terminal，才防御性折成 ``interrupted`` / ``uncertain``。
         """
+        closed_decisions = {
+            str(ev.causation_id)
+            for ev in events
+            if ev.type in ("agent.program_completed", "agent.program_failed")
+            and ev.causation_id
+        }
         calls: dict[str, dict] = {}
         for ev in events:
             if ev.type == "agent.tool_called":
                 tc_id = ev.payload.get("tool_call_id")
                 if not tc_id:
                     continue
+                decision_id = str(ev.causation_id or "")
+                in_flight = decision_id and decision_id not in closed_decisions
+                if in_flight:
+                    error_kind = "pending"
+                    error_message = None
+                    error_extra = None
+                else:
+                    error_kind = "interrupted"
+                    error_message = (
+                        "tool call has no terminal; delivery state is uncertain"
+                    )
+                    error_extra = {"status": "uncertain"}
                 calls[tc_id] = {
                     "tool_call_id": tc_id,
                     "tool_name": ev.payload.get("tool_name", ""),
                     "arguments": dict(ev.payload.get("arguments") or {}),
                     "result": None,
-                    "error_kind": "interrupted",
-                    "error_message": (
-                        "tool call has no terminal; delivery state is uncertain"
-                    ),
-                    "error_extra": {"status": "uncertain"},
+                    "error_kind": error_kind,
+                    "error_message": error_message,
+                    "error_extra": error_extra,
                 }
             elif ev.type == "agent.tool_result":
                 tc_id = ev.payload.get("tool_call_id")
@@ -822,9 +838,16 @@ class Projector:
                 # 形态。写下这件事本身由它的 <工具>reflect 行呈现。
                 continue
             if ev.type == "agent.decision_emitted":
-                # reasoning 是运行日志与审计信息，不是下一拍的输入。自由笔记
-                # 一旦逐字回显，就会把旧的回复意图、口吻乃至草稿变成高显著度
-                # 自我提示；跨拍事实与义务分别由 timeline / active_tasks 承载。
+                rendered = Projector._render_decision(ev)
+                if rendered is not None:
+                    items.append(
+                        TimelineItem(
+                            event_id=ev.event_id,
+                            occurred_at=ev.occurred_at,
+                            kind="program",
+                            render=rendered,
+                        )
+                    )
                 continue
             if ev.type in (
                 "agent.reply_emitted",
@@ -1125,6 +1148,9 @@ class Projector:
             if special is not None:
                 return special
 
+        if tv.error_kind == "pending":
+            return f"<工具>{_esc_text(name)} 已调用\n{args_line}"
+
         if tv.error_kind is None:
             result_json = _safe_json(tv.result)
             truncated = ""
@@ -1142,31 +1168,35 @@ class Projector:
         return "\n".join(lines)
 
     @staticmethod
+    def _render_decision(ev: _EventSnapshot) -> str | None:
+        """``agent.decision_emitted`` → ``<程序>决策`` plus full source."""
+        payload = ev.payload or {}
+        if "program" not in payload:
+            return None
+        raw = payload.get("program")
+        source = raw if isinstance(raw, str) else str(raw)
+        if not source.strip():
+            return "<程序>决策\n  （空程序）"
+        return f"<程序>决策\n  {_ml_text(source)}"
+
+    @staticmethod
     def _render_program(ev: _EventSnapshot) -> str | None:
         """Program terminal → one source-free ``<程序>`` line block."""
         payload = ev.payload or {}
-        raw_calls = payload.get("query_calls") or []
-        query_calls = [str(name) for name in raw_calls if str(name)]
-        calls_suffix = (
-            f" 查询 {_esc_text(','.join(query_calls))}" if query_calls else ""
-        )
         if ev.type == "agent.program_completed":
             has_result = bool(payload.get("has_result"))
-            if not query_calls and not has_result:
-                return None
-            head = f"<程序>完成{calls_suffix}"
             if not has_result:
-                return head
+                return "<程序>完成"
             result_json = _safe_json(payload.get("result"))
             truncated = ""
             if len(result_json) > Projector.MAX_TOOL_RESULT_CHARS:
                 result_json = result_json[: Projector.MAX_TOOL_RESULT_CHARS]
                 truncated = "（截断）"
-            return f"{head}\n  结果 {_esc_text(result_json)}{truncated}"
+            return f"<程序>完成\n  结果 {_esc_text(result_json)}{truncated}"
 
         error_kind = str(payload.get("error_kind") or "unknown")
         extra = _extract_program_error_extra(payload)
-        head = f"<程序>失败{calls_suffix}{_error_head_suffix(error_kind, extra)}"
+        head = f"<程序>失败{_error_head_suffix(error_kind, extra)}"
         message = payload.get("error_message")
         if isinstance(message, str) and message:
             return f"{head}\n  原因 {_ml_text(message)}"
@@ -1476,8 +1506,10 @@ def _safe_json(value) -> str:
 
 
 def _spoken_bubble_text(content: object) -> str | None:
-    """chat 气泡段数组 → 单条人话文本。形状不识 → None（调用方整体退回
-    JSON 通用行）。text 段转义后换行缩进；at/回复/表情用行文法记号。"""
+    """**迁移前**的 chat 气泡段数组 → 单条人话文本（2026-08-14 前的事件）。
+
+    形状不识 → None（调用方整体退回 JSON 通用行）。text 段转义后换行缩进；
+    at/回复/表情用行文法记号。新形状走 ``_domain_bubble_text``。"""
     if not isinstance(content, list) or not content:
         return None
     parts: list[str] = []
@@ -1500,18 +1532,52 @@ def _spoken_bubble_text(content: object) -> str | None:
     return "".join(parts)
 
 
+def _domain_bubble_text(bubble: dict) -> str | None:
+    """领域形状 chat 气泡（2026-08-14 起）→ 单条人话文本。
+
+    渲染顺序与 ``outbound_messages.build_chat_content`` 的段顺序一致
+    （reply → at → text → face），记号沿用行文法：``回复#ID`` / ``@QQ`` /
+    ``<表情ID>``。四个键全缺 → None，调用方退回 JSON 通用行。"""
+    parts: list[str] = []
+    # 参数气泡（`agent.tool_called`）渲染的是模型原样写的值，未经 validate_messages
+    # 归一：schema 允许 reply/at/face 写成整数，这里不能只认字符串。
+    reply = bubble.get("reply")
+    if isinstance(reply, (str, int)) and not isinstance(reply, bool):
+        reply = str(reply).strip()
+        if reply:
+            parts.append(f"回复#{_esc_text(reply)}")
+    at = bubble.get("at")
+    for qq in at if isinstance(at, list) else ([at] if at is not None else []):
+        parts.append(f"@{_esc_text(str(qq))}")
+    text = bubble.get("text")
+    if isinstance(text, str) and text:
+        parts.append(_ml_text(text))
+    face = bubble.get("face")
+    for fid in face if isinstance(face, list) else ([face] if face is not None else []):
+        parts.append(f"<表情{_esc_text(str(fid))}>")
+    return "".join(parts) if parts else None
+
+
 def _render_bubble_line(bubble: object, receipt: object = None) -> str | None:
     """单气泡 → ``「内容」[→回执]`` 一行。气泡形状不识 → None。
+
+    两种 chat 形状都要认：2026-08-14 之后是领域键（text/reply/at/face），
+    之前是 OneBot 段数组（``content``）。旧形状**不能**只保留一段时间——
+    ``agent_events`` 只增不改，早于迁移的发言行会被永久重复投影，两条路径
+    都是现役代码。
 
     回执（可选）三态：sent+message_id → ``→#ID``；failed → ``→失败``；
     uncertain → ``→存疑``；其余取值原样透出（历史形状兜底）。"""
     if not isinstance(bubble, dict):
         return None
-    if bubble.get("kind") == "meme":
-        image_hash = _nonempty_str(bubble.get("image_hash"))
+    if bubble.get("kind") == "meme" or "meme" in bubble:
+        image_hash = _nonempty_str(bubble.get("image_hash") or bubble.get("meme"))
         body = f"<meme {_hash12(image_hash)}>" if image_hash else "<meme>"
     else:
-        spoken = _spoken_bubble_text(bubble.get("content"))
+        if "content" in bubble:
+            spoken = _spoken_bubble_text(bubble.get("content"))
+        else:
+            spoken = _domain_bubble_text(bubble)
         if spoken is None:
             return None
         body = f"「{spoken}」"
@@ -1538,6 +1604,17 @@ def _render_send_messages_call(args: object, tv: "ToolResultView | None") -> str
     arg_bubbles: list | None = None
     if isinstance(args, dict) and isinstance(args.get("messages"), list):
         arg_bubbles = args["messages"] or None
+
+    if tv is not None and tv.error_kind == "pending":
+        if not arg_bubbles:
+            return None
+        lines = ["<工具>send_messages 已调用"]
+        for bubble in arg_bubbles:
+            line = _render_bubble_line(bubble)
+            if line is None:
+                return None
+            lines.append(f"  {line}")
+        return "\n".join(lines)
 
     if tv is None:
         if not arg_bubbles:

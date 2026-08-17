@@ -10,6 +10,8 @@ from typing import Any
 
 from qqbot.core.permissions import PermissionTier
 from qqbot.services.agent_loop.tool_registry import (
+    OUTCOME_ERROR_SCHEMA,
+    OUTCOME_FIELDS,
     BaseTool,
     ToolOutcome,
     ToolRegistry,
@@ -53,7 +55,7 @@ class ToolRegistryContractTest(unittest.TestCase):
         self.assertIn("triggered_by_event_id=None", spec.signature)
         self.assertIsNot(registry.get("stub"), registry.get("stub"))
 
-    def test_query_signature_has_no_reserved_effect_parameters(self) -> None:
+    def test_legacy_query_kind_is_normalized_to_effect(self) -> None:
         class _Query(_StubTool):
             name = "query_stub"
             program_kind = "query"
@@ -62,8 +64,9 @@ class ToolRegistryContractTest(unittest.TestCase):
         registry.register(_Query)
         spec = registry.spec("query_stub")
         assert spec is not None
-        self.assertNotIn("task_id", spec.signature)
-        self.assertNotIn("triggered_by_event_id", spec.signature)
+        self.assertEqual(spec.program_kind, "effect")
+        self.assertIn("task_id=None", spec.signature)
+        self.assertIn("triggered_by_event_id=None", spec.signature)
 
     def test_scope_filtering_uses_same_specs_as_runtime(self) -> None:
         class _GroupOnly(_StubTool):
@@ -143,7 +146,7 @@ class ToolRegistryContractTest(unittest.TestCase):
         registry = build_default_registry()
         for spec in registry.specs():
             with self.subTest(tool=spec.name):
-                self.assertIn(spec.program_kind, {"query", "effect"})
+                self.assertEqual(spec.program_kind, "effect")
                 self.assertIsInstance(spec.result_schema, dict)
                 self.assertTrue(spec.result_schema)
                 self.assertGreaterEqual(spec.max_call_sites, 1)
@@ -263,14 +266,19 @@ class ToolRegistryContractTest(unittest.TestCase):
                 "render",
             },
             ("send_messages", "sent_messages"): {
-                "content",
+                # 2026-08-14 去协议化：回执逐气泡回显领域键，不再回显 OneBot
+                # 段数组（原 "content"）。
+                "at",
+                "face",
                 "image_hash",
                 "index",
                 "kind",
                 "message_id",
                 "receipt",
+                "reply",
                 "self_id",
                 "status",
+                "text",
             },
             ("websearch", "results"): {
                 "fetch_error",
@@ -288,7 +296,11 @@ class ToolRegistryContractTest(unittest.TestCase):
                 spec = registry.spec(name)
                 assert spec is not None
                 properties = spec.result_schema.get("properties") or {}
-                self.assertEqual(set(properties), expected_keys)
+                # ok/error 由结果信封统一注入（2026-08-15），不属于任何工具
+                # 自己声明的业务字段——这里只锁业务字段。
+                self.assertEqual(
+                    set(properties) - set(OUTCOME_FIELDS), expected_keys
+                )
         for (name, field), expected_keys in expected_array_items.items():
             with self.subTest(tool=name, field=field):
                 spec = registry.spec(name)
@@ -297,29 +309,57 @@ class ToolRegistryContractTest(unittest.TestCase):
                 item_properties = field_schema["items"].get("properties") or {}
                 self.assertEqual(set(item_properties), expected_keys)
 
-    def test_query_effect_partition_matches_contract(self) -> None:
+    def test_every_result_schema_carries_the_outcome_envelope(self) -> None:
+        """2026-08-15 失败即返回值：每个函数的返回都带 ok / error。
+
+        注入点必须只有 `with_outcome_envelope` 一处——静态字段校验
+        （program_ast）、给模型的返回 schema（usage_docs）、运行时的
+        `wrap_program_value` 读的是同一份 spec.result_schema，任何一处自带
+        一套就会出现"模型看得到但校验不认"的字段。
+
+        同时钉住：工具自己不得声明 ok/error（ToolOutcome 已经承载成功/失败，
+        重复声明必然漂移），以及原 required 被移到 x-payload-required——失败
+        返回里那些字段是 null，schema 不能继续声称它们必然存在。
+        """
         registry = build_default_registry()
-        queries = {
-            spec.name for spec in registry.specs() if spec.program_kind == "query"
-        }
-        self.assertEqual(
-            queries,
-            {
-                "get_group_info",
-                "get_member_info",
-                "get_member_list",
-                "get_pending_join_requests",
-                "get_recent_thoughts",
-                "look_at_image",
-                "search_history",
-                "webfetch",
-                "websearch",
-            },
-        )
+        for spec in registry.specs():
+            with self.subTest(tool=spec.name):
+                properties = spec.result_schema["properties"]
+                self.assertEqual(properties["ok"]["type"], "boolean")
+                self.assertEqual(properties["error"], OUTCOME_ERROR_SCHEMA)
+                self.assertEqual(
+                    list(spec.result_schema["required"]), list(OUTCOME_FIELDS)
+                )
+                payload_required = spec.result_schema.get("x-payload-required")
+                self.assertIsInstance(payload_required, list)
+                for field in payload_required:
+                    self.assertIn(field, properties)
+                    self.assertNotIn(field, OUTCOME_FIELDS)
+
+    def test_tool_declaring_envelope_fields_is_rejected(self) -> None:
+        class _Clashing:
+            name = "clashing"
+            description = "x"
+            arguments_schema: dict = {"type": "object", "properties": {}}
+            result_schema: dict = {
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+            }
+
+            async def run(self, arguments: dict, **context: object) -> object:
+                return {}
+
+        with self.assertRaises(ValueError) as caught:
+            ToolRegistry().register(_Clashing())
+        self.assertIn("outcome envelope", str(caught.exception))
+
+    def test_all_active_tools_are_effects(self) -> None:
+        registry = build_default_registry()
+        kinds = {spec.program_kind for spec in registry.specs()}
+        self.assertEqual(kinds, {"effect"})
+        self.assertEqual(get_tool_program_kind(registry.get("websearch")), "effect")
         self.assertEqual(get_tool_program_kind(registry.get("send_messages")), "effect")
         self.assertEqual(get_tool_program_kind(registry.get("poke")), "effect")
-        # reflect 写事件、留终态记录 → effect（2026-08-03）。它读起来像"记笔记"，
-        # 但产出一条 agent.reflection_written，不能划到无痕的 query 一侧。
         self.assertEqual(get_tool_program_kind(registry.get("reflect")), "effect")
 
 

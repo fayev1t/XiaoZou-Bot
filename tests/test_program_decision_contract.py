@@ -172,7 +172,14 @@ class ProgramDecisionEventContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(invalid_calls), 3)
 
     async def test_runtime_failure_does_not_trigger_static_retry(self) -> None:
-        planner = _SequencePlanner("# valid")
+        """静态重试只由 preflight 失败触发。
+
+        2026-08-14 派发拍之后这条更强了：通过 preflight 的程序当拍只被派发，
+        执行整个发生在 Runner 里、`_tick` 之外，运行时失败**结构上**不可能回到
+        decide。这里用一段"无调用但有 return"的程序走派发路径（空程序会走当拍
+        收束分支，那条由下一个用例覆盖）。
+        """
+        planner = _SequencePlanner("return 1")
         loop = AgentLoop(
             scope_key="group:1",
             planner=planner,
@@ -190,15 +197,14 @@ class ProgramDecisionEventContractTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value="DECISION"),
             ),
             patch.object(
-                loop,
-                "_execute_program",
-                new=AsyncMock(return_value="failed"),
-            ) as execute,
+                loop._runner,
+                "enqueue",
+            ) as enqueue,
         ):
             await loop._tick()
         self.assertEqual(len(planner.contexts), 1)
         self.assertEqual(planner.reports, [])
-        execute.assert_awaited_once()
+        enqueue.assert_called_once()
 
     async def test_empty_program_has_decision_and_program_terminal_but_no_idle_event(
         self,

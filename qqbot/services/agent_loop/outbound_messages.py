@@ -15,11 +15,31 @@
   base64/二进制脱敏）。删除的只是 Replyer 的 LLM 调用链，不重写已经工作的
   校验与发送逻辑。
 
+2026-08-14 出站气泡去协议化（send_message工具黑盒设计 §5/§6 同步改写）。此前
+一个 chat 气泡是 ``{"kind":"chat","content":[{"type":"text","data":{"text":…}}]}``：
+``data`` 包装、``type`` 判别、段顺序规则（reply 必须 content[0]）全部是 OneBot 11
+的协议知识，与"说一句话"无关，却要模型每次发言都正确复述一遍。现在气泡是领域
+形状，一项就是一条消息：
+
+- chat：``{"text": "…"}``，可选 ``reply`` / ``at`` / ``face``
+- meme：``{"meme": "<12 位 hash 前缀>"}``
+
+OneBot 段数组由 ``build_chat_content`` 在发送时构造，顺序固定
+reply → at → text → face。**出站侧的协议知识收敛到这一个函数**。
+
+代价照实记：一个气泡内不能再把 ``@`` 或表情插在文字中间——``at`` 一律在文字前、
+``face`` 一律在文字后。要精细排版就拆成两个气泡。
+
+``normalize_segment`` / ``validate_content`` 不删，改为只服务
+``_legacy_bubble_to_domain``：模型带着旧习惯写出 ``kind``/``content`` 时无损转成
+新形状，不让一次形状迁移变成线上发不出话。该兼容路径不写进 usage 文档。
+
 消费者：``tools/send_messages.py``（Planner 直接发言的唯一出口）。
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from typing import Any
 
@@ -221,16 +241,187 @@ def _is_hash_prefix(value: Any) -> bool:
     )
 
 
+_CHAT_BUBBLE_KEYS = frozenset({"text", "reply", "at", "face"})
+
+
+def _meme_bubble(index: int, image_hash: Any) -> tuple[dict, ToolOutcome | None]:
+    if not _is_hash_prefix(image_hash):
+        return {}, invalid_args(
+            "bad_image_hash",
+            f"messages[{index}].meme must be a 12-64 char sha256 hex prefix "
+            "copied from a <meme> entry in 表情包收藏",
+        )
+    return {"kind": "meme", "image_hash": str(image_hash).lower()}, None
+
+
+def _id_list(
+    index: int, field: str, value: Any, reason_code: str, *, allow_all: bool
+) -> tuple[list[str], ToolOutcome | None]:
+    """``at`` / ``face`` 的单值或数组 → 归一后的字符串列表。
+
+    单值写法（``"at": 10001``）是常态，数组是需要 @ 多个人时的写法；两种都收，
+    内部统一成列表，调用方不必分情况。
+    """
+    raw = value if isinstance(value, list) else [value]
+    if not raw:
+        return [], None
+    out: list[str] = []
+    for entry in raw:
+        if isinstance(entry, bool) or not isinstance(entry, (str, int)):
+            return [], invalid_args(
+                reason_code,
+                f"messages[{index}].{field} must be a QQ id or a list of them",
+            )
+        text = str(entry).strip()
+        if allow_all and text == "all":
+            out.append("all")
+            continue
+        if not text.isdigit() or int(text) <= 0:
+            hint = "'all' or a positive id" if allow_all else "a positive id"
+            return [], invalid_args(
+                reason_code,
+                f"messages[{index}].{field} entries must be {hint}, "
+                f"got {entry!r}",
+            )
+        out.append(text)
+    return out, None
+
+
+def _chat_bubble(index: int, item: dict) -> tuple[dict, ToolOutcome | None]:
+    """领域形状的 chat 气泡 → 归一后的内部条目。
+
+    ``text`` 是常规负载，但不强制：只 ``@`` 某人或只发一个 QQ 表情都是完整
+    气泡。四个键全空才是 ``bubble_all_blank``。
+    """
+    extras = sorted(set(item) - _CHAT_BUBBLE_KEYS)
+    if extras:
+        return {}, invalid_args(
+            "unexpected_argument",
+            f"messages[{index}] has unknown key(s): {', '.join(extras)}; "
+            f"allowed: {', '.join(sorted(_CHAT_BUBBLE_KEYS))}, meme",
+        )
+
+    text = item.get("text", "")
+    if not isinstance(text, str):
+        return {}, invalid_args(
+            "bad_field_type", f"messages[{index}].text must be a string"
+        )
+
+    bubble: dict[str, Any] = {"kind": "chat", "text": text}
+
+    if "reply" in item:
+        reply = item["reply"]
+        if isinstance(reply, bool) or not isinstance(reply, (str, int)):
+            return {}, invalid_args(
+                "bad_reply_target",
+                f"messages[{index}].reply must be a message id copied from a "
+                "#消息ID mark in the timeline",
+            )
+        reply_id = str(reply).strip()
+        if not reply_id:
+            return {}, invalid_args(
+                "bad_reply_target",
+                f"messages[{index}].reply must not be empty",
+            )
+        bubble["reply"] = reply_id
+
+    at: list[str] = []
+    if "at" in item:
+        at, fail = _id_list(index, "at", item["at"], "bad_at_target", allow_all=True)
+        if fail is not None:
+            return {}, fail
+        if at:
+            bubble["at"] = at
+
+    face: list[str] = []
+    if "face" in item:
+        face, fail = _id_list(
+            index, "face", item["face"], "bad_face_id", allow_all=False
+        )
+        if fail is not None:
+            return {}, fail
+        if face:
+            bubble["face"] = face
+
+    if not text.strip() and not at and not face:
+        return {}, invalid_args(
+            "bubble_all_blank",
+            f"messages[{index}] has no visible payload; give it text, at or face",
+        )
+    return bubble, None
+
+
+def _legacy_bubble_to_domain(
+    index: int, item: dict
+) -> tuple[dict, ToolOutcome | None]:
+    """旧 OneBot 形状（``kind``/``content``/段数组）→ 新领域气泡，无损。
+
+    2026-08-14 形状迁移的兼容路径，与 ``normalize_segment`` 同性质：只接住模型
+    的旧习惯，不写进 usage 文档，也不是可依赖的第二套输入契约。段顺序在转换中
+    被折叠成 reply → at → text → face，与 ``build_chat_content`` 的输出顺序一致。
+    """
+    kind = item.get("kind")
+    if kind == "meme":
+        extras = sorted(set(item) - {"kind", "image_hash"})
+        if extras:
+            return {}, invalid_args(
+                "unexpected_argument",
+                f"messages[{index}] has unknown key(s): {', '.join(extras)}",
+            )
+        return _meme_bubble(index, item.get("image_hash"))
+    if kind != "chat":
+        return {}, invalid_args(
+            "bad_message_kind",
+            f"messages[{index}] is not a recognized bubble; use "
+            '{"text": …} or {"meme": …}',
+        )
+    extras = sorted(set(item) - {"kind", "content"})
+    if extras:
+        return {}, invalid_args(
+            "unexpected_argument",
+            f"messages[{index}] has unknown key(s): {', '.join(extras)}",
+        )
+    content = item.get("content")
+    if not isinstance(content, list):
+        return {}, invalid_args(
+            "bad_field_type", f"messages[{index}].content must be an array"
+        )
+    content = [normalize_segment(seg) for seg in content]
+    if fail := validate_content(content):
+        return {}, fail
+    bubble: dict[str, Any] = {"kind": "chat", "text": ""}
+    at: list[str] = []
+    face: list[str] = []
+    for seg in content:
+        data = seg.get("data") or {}
+        seg_type = seg.get("type")
+        if seg_type == "text":
+            bubble["text"] += str(data.get("text", ""))
+        elif seg_type == "at":
+            at.append(str(data.get("qq", "")).strip())
+        elif seg_type == "reply":
+            bubble["reply"] = str(data.get("id", "")).strip()
+        elif seg_type == "face":
+            face.append(str(data.get("id", "")).strip())
+    if at:
+        bubble["at"] = at
+    if face:
+        bubble["face"] = face
+    return bubble, None
+
+
 def validate_messages(
     messages: Any,
 ) -> tuple[list[dict], ToolOutcome | None]:
     """出站 ``messages`` 数组的静态校验 + 归一。
 
     返回 ``(归一后的 messages, None)`` 或 ``([], 失败 outcome)``。结构规则：
-    1–``MAX_OUTBOUND_MESSAGES`` 个气泡；每个是 ``{"kind":"chat","content":[…]}``
-    或 ``{"kind":"meme","image_hash":"<sha256>"}``；chat 段先经
-    ``normalize_segment`` 归一再走严格校验；meme 气泡数量不限（hash 是否仍在
-    收藏、媒体是否可读属于投递前的动态 preflight，不在这里查库）。
+    1–``MAX_OUTBOUND_MESSAGES`` 个气泡；每项是 ``{"meme": "<hash>"}`` 或一个
+    chat 气泡 ``{"text": …}``（可选 ``reply`` / ``at`` / ``face``）。meme 气泡
+    数量不限——hash 是否仍在收藏、媒体是否可读属于投递前的动态 preflight，不在
+    这里查库。
+
+    带 ``kind`` 键的旧 OneBot 形状走 ``_legacy_bubble_to_domain`` 无损转换。
     """
     if not isinstance(messages, list) or not messages:
         return [], invalid_args(
@@ -249,48 +440,43 @@ def validate_messages(
             return [], invalid_args(
                 "bad_field_type", f"messages[{index}] must be an object"
             )
-        kind = item.get("kind")
-        if kind == "chat":
-            extras = sorted(set(item) - {"kind", "content"})
+        if "kind" in item:
+            bubble, fail = _legacy_bubble_to_domain(index, item)
+        elif "meme" in item:
+            extras = sorted(set(item) - {"meme"})
             if extras:
                 return [], invalid_args(
                     "unexpected_argument",
-                    f"messages[{index}] has unknown key(s): {', '.join(extras)}",
+                    f"messages[{index}] is a meme bubble and cannot carry "
+                    f"{', '.join(extras)}; send text as its own bubble",
                 )
-            content = item.get("content")
-            if not isinstance(content, list):
-                return [], invalid_args(
-                    "bad_field_type",
-                    f"messages[{index}].content must be an array",
-                )
-            content = [normalize_segment(seg) for seg in content]
-            if fail := validate_content(content):
-                return [], fail
-            normalized.append({"kind": "chat", "content": content})
-        elif kind == "meme":
-            extras = sorted(set(item) - {"kind", "image_hash"})
-            if extras:
-                return [], invalid_args(
-                    "unexpected_argument",
-                    f"messages[{index}] has unknown key(s): {', '.join(extras)}",
-                )
-            image_hash = item.get("image_hash")
-            if not _is_hash_prefix(image_hash):
-                return [], invalid_args(
-                    "bad_image_hash",
-                    f"messages[{index}].image_hash must be a 12-64 char "
-                    "sha256 hex prefix copied from a <meme> entry in "
-                    "表情包收藏",
-                )
-            normalized.append(
-                {"kind": "meme", "image_hash": str(image_hash).lower()}
-            )
+            bubble, fail = _meme_bubble(index, item["meme"])
         else:
-            return [], invalid_args(
-                "bad_message_kind",
-                f'messages[{index}].kind must be "chat" or "meme"',
-            )
+            bubble, fail = _chat_bubble(index, item)
+        if fail is not None:
+            return [], fail
+        normalized.append(bubble)
     return normalized, None
+
+
+def build_chat_content(bubble: dict) -> list[dict]:
+    """归一后的 chat 气泡 → OneBot V11 段数组。**出站协议知识只在这里。**
+
+    顺序固定 reply → at → text → face：reply 段必须是 content[0] 是 OneBot 的
+    规则，模型不再需要知道它。
+    """
+    content: list[dict] = []
+    reply = bubble.get("reply")
+    if reply:
+        content.append({"type": "reply", "data": {"id": str(reply)}})
+    for qq in bubble.get("at") or []:
+        content.append({"type": "at", "data": {"qq": str(qq)}})
+    text = bubble.get("text") or ""
+    if text:
+        content.append({"type": "text", "data": {"text": text}})
+    for face_id in bubble.get("face") or []:
+        content.append({"type": "face", "data": {"id": str(face_id)}})
+    return content
 
 
 def extract_message_id(result: Any) -> Any:
@@ -347,12 +533,42 @@ async def preflight_memes(
     return loaded, None
 
 
+_send_locks: dict[str, asyncio.Lock] = {}
+
+
+def send_lock(scope_key: str) -> asyncio.Lock:
+    """同 scope 出站的进程内互斥（2026-08-14，程序拍间并行）。
+
+    拍间并行后同一 scope 可能有两段程序同时跑到 ``send_all``；没有这把锁，
+    A 的气泡 [1,2,3] 与 B 的 [x,y] 会在群里交错成 1,x,2,y,3。
+
+    它**只**保证一次调用的气泡连续，不是发送 fence：不判重、不认领、不消费、
+    不设 TTL。「这句话要不要再说一次」仍然只由下一拍模型对着时间线判断
+    （上下游边界契约 §4 不变）。
+    """
+    lock = _send_locks.get(scope_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _send_locks[scope_key] = lock
+    return lock
+
+
 async def send_all(bot: Any, scope_key: str, prepared: list[dict]) -> list[dict]:
     """OneBot 逐条发送并生成回执；单条失败/存疑不阻断后续气泡。
 
     回执三态：``sent``（拿到 message_id）/ ``failed``（napcat 明确拒绝）/
     ``uncertain``（传输中断或 ok 无 message_id——可能已发出）。
+
+    整段持 ``send_lock(scope_key)``：同 scope 的并行程序按到达顺序逐次发送，
+    气泡不交错。
     """
+    async with send_lock(scope_key):
+        return await _send_all_locked(bot, scope_key, prepared)
+
+
+async def _send_all_locked(
+    bot: Any, scope_key: str, prepared: list[dict]
+) -> list[dict]:
     from qqbot.services.agent_loop.event_writer import parse_scope_key
     from qqbot.services.agent_loop.tools._onebot_common import call_action
 
@@ -360,7 +576,7 @@ async def send_all(bot: Any, scope_key: str, prepared: list[dict]) -> list[dict]
     receipts: list[dict] = []
     for index, item in enumerate(prepared):
         if item["kind"] == "chat":
-            content = item["content"]
+            content = build_chat_content(item)
         else:
             content = [
                 {

@@ -40,7 +40,8 @@ _USAGE_PROMPT = load_sibling_md(__file__, "get_group_info.md")
 
 class GetGroupInfoTool(BaseTool):
     name = "get_group_info"
-    program_kind = "query"
+    program_kind = "effect"
+    max_call_sites = 4
     allowed_scopes = ("group",)
     # required_permission 用 BaseTool 默认 GUEST（查询无副作用）
     usage_prompt = _USAGE_PROMPT

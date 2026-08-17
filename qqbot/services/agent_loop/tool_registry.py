@@ -3,7 +3,7 @@
 一个 Tool 描述了 agent 可调用的一项能力：
   - name                 工具名（agent.tool_called.payload.tool_name 匹配它）
   - description          面向 LLM 的客观中文能力简介
-  - program_kind         query | effect；漏标默认 effect
+  - program_kind         现役一律 effect；漏标默认 effect
   - arguments_schema     JSON Schema (dict)，字段说明使用客观中文，纯文档用途
   - result_schema        程序可读取的只读结果 ABI
   - required_permission  (可选) 触发用户最低 tier；默认 GUEST
@@ -492,11 +492,82 @@ def _group_id_from_scope_key(scope_key: Any) -> int | None:
 
 
 def get_tool_program_kind(tool: Any) -> ProgramKind:
-    """读取程序函数分类；漏标默认 effect，非法值在注册期失败。"""
+    """读取程序函数分类；现役一律 effect，漏标也按 effect。"""
     raw = getattr(tool, "program_kind", "effect")
     if raw in ("query", "effect"):
-        return raw
+        return "effect"
     raise ValueError(f"tool.program_kind must be 'query' or 'effect'; got {raw!r}")
+
+
+# ── 结果信封（2026-08-15，失败即返回值）─────────────────────────────────
+#
+# 此前任一调用失败会中止整段程序，程序里没有失败分支可写；模型于是只敢一拍
+# 做一件事——一段不能处理失败的程序等价于一次 JSON action，程序形态白给了。
+# 现在每个函数的返回值都多两个**必然存在**的字段：
+#
+#   ok     bool          调用是否成功
+#   error  object|null   失败时为 {kind, message, status}，成功时为 null
+#
+# 失败时 result_schema 原有字段全部为 None，程序继续往下跑。注入点只有这里，
+# 保证三处看到的是同一份 schema：program_ast 的静态字段校验、usage_docs 给
+# 模型的返回 schema、program_runtime 的 wrap_program_value。工具自己**不**声明
+# 这两个字段——ToolOutcome 已经承载了成功/失败，重复声明只会两处漂移。
+OUTCOME_ERROR_SCHEMA: dict = {
+    "type": ["object", "null"],
+    "properties": {
+        "kind": {
+            "type": "string",
+            "description": (
+                "稳定错误语义：invalid_arguments / permission_denied_user_tier / "
+                "permission_denied_bot_role / tool_unavailable_in_scope / "
+                "no_bot_available / upstream_action_failed / internal_tool_error。"
+            ),
+        },
+        "message": {"type": "string", "description": "失败原因的可读说明。"},
+        "status": {
+            "type": ["string", "null"],
+            "description": (
+                "部分工具的补充状态，如 send_messages 的 "
+                "partial / failed / uncertain；其余为 null。"
+            ),
+        },
+    },
+    "required": ["kind", "message", "status"],
+    "additionalProperties": False,
+}
+
+OUTCOME_FIELDS: tuple[str, ...] = ("ok", "error")
+
+
+def with_outcome_envelope(schema: dict) -> dict:
+    """给一份 result_schema 加上 ``ok`` / ``error``（就地复制，不改原对象）。
+
+    顶层是 ``oneOf`` 时逐支注入——现役 19 个工具都是普通 object，这条只是不
+    留下一个会静默漏掉字段的形状分支。
+    """
+    if not isinstance(schema, dict):
+        return schema
+    if schema.get("oneOf") and not schema.get("properties"):
+        return {
+            **schema,
+            "oneOf": [with_outcome_envelope(branch) for branch in schema["oneOf"]],
+        }
+    properties = dict(schema.get("properties") or {})
+    properties["ok"] = {
+        "type": "boolean",
+        "description": "调用是否成功。为 false 时下列业务字段全部为 null。",
+    }
+    properties["error"] = OUTCOME_ERROR_SCHEMA
+    required = list(schema.get("required") or [])
+    required = [name for name in required if name not in OUTCOME_FIELDS]
+    return {
+        **schema,
+        "properties": properties,
+        # ok/error 必然存在；原有 required 字段在失败时是 null，故降为非必填，
+        # 否则 schema 会声称一个失败返回里仍有它们。
+        "required": [*OUTCOME_FIELDS],
+        "x-payload-required": required,
+    }
 
 
 def get_tool_result_schema(tool: Any) -> dict:
@@ -505,7 +576,14 @@ def get_tool_result_schema(tool: Any) -> dict:
         raise ValueError(
             f"tool {getattr(tool, 'name', '?')!r} must declare result_schema"
         )
-    return copy.deepcopy(schema)
+    for field_name in OUTCOME_FIELDS:
+        if field_name in (schema.get("properties") or {}):
+            raise ValueError(
+                f"tool {getattr(tool, 'name', '?')!r} must not declare "
+                f"result field {field_name!r}; it is supplied by the outcome "
+                "envelope (see with_outcome_envelope)"
+            )
+    return with_outcome_envelope(copy.deepcopy(schema))
 
 
 def get_tool_max_call_sites(tool: Any) -> int:
@@ -638,28 +716,27 @@ class ToolRegistry:
 
     def usage_docs(self, scope: str | None = None) -> str:
         sections = [
-            "程序函数只能用具名参数调用。query 只在本程序内返回值，不写时间线；"
-            "effect 会写一条终态工具记录。程序结束后，除 effect 调用记录外，只有 "
-            "return 的 JSON 会留到下一拍；需要跨拍保留的查询结论必须 return。"
+            "程序函数只能用具名参数调用。每次调用都会留下一条终态工具记录；"
+            "程序结束后，除这些调用记录外，只有 return 的 JSON 会作为 "
+            "<程序>完成 的结果行留到下一拍。\n\n"
+            "下面每个函数的返回 schema 里，`ok` 与 `error` 是所有函数共有的："
+            "`ok` 为 true 时业务字段有效、`error` 为 null；`ok` 为 false 时"
+            "业务字段全是 null，`error` 给出 `kind` / `message` / `status`。"
+            "调用失败不会中止程序——**但要用业务字段之前必须先判 `ok`**，"
+            "没判就读会当场中止整段程序。"
         ]
         for spec in self.specs(scope):
-            meta = [spec.program_kind]
+            meta = ["effect"]
             if spec.required_permission > PermissionTier.GUEST:
                 meta.append(f"用户权限>={spec.required_permission.name}")
             if spec.required_bot_role:
                 meta.append(f"本账号群角色>={spec.required_bot_role}")
             if spec.allowed_scopes:
                 meta.append("scope=" + ",".join(spec.allowed_scopes))
-            if spec.program_kind == "effect":
-                meta.append(f"静态调用点<={spec.max_call_sites}")
-                reserved = (
-                    "额外保留具名参数：task_id=None、triggered_by_event_id=None。"
-                )
-            else:
-                reserved = (
-                    "query 不接受系统保留参数 task_id / "
-                    "triggered_by_event_id（schema 自身同名业务字段除外）。"
-                )
+            meta.append(f"静态调用点<={spec.max_call_sites}")
+            reserved = (
+                "额外保留具名参数：task_id=None、triggered_by_event_id=None。"
+            )
             block = [
                 f"## 程序函数：{spec.name}",
                 "",
@@ -738,11 +815,10 @@ def _program_signature(
             parameters.append(
                 f"{field_name}={_python_literal(field_schema.get('default'))}"
             )
-    if program_kind == "effect":
-        if "task_id" not in properties:
-            parameters.append("task_id=None")
-        if "triggered_by_event_id" not in properties:
-            parameters.append("triggered_by_event_id=None")
+    if "task_id" not in properties:
+        parameters.append("task_id=None")
+    if "triggered_by_event_id" not in properties:
+        parameters.append("triggered_by_event_id=None")
     if not parameters:
         return f"{name}()"
     return f"{name}(*, {', '.join(parameters)})"
@@ -792,6 +868,8 @@ __all__ = [
     "ProgramKind",
     "Tool",
     "ToolGeneratedEvent",
+    "OUTCOME_ERROR_SCHEMA",
+    "OUTCOME_FIELDS",
     "ToolOutcome",
     "ToolRegistry",
     "coerce_tool_outcome",
@@ -801,4 +879,5 @@ __all__ = [
     "get_tool_required_bot_role",
     "get_tool_required_permission",
     "get_tool_result_schema",
+    "with_outcome_envelope",
 ]

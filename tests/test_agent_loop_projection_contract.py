@@ -41,6 +41,7 @@ def _snap(
     visibility: str = "agent_visible",
     origin: str | None = None,
     correlation_id: str | None = None,
+    causation_id: str | None = None,
     seconds_offset: float = 0.0,
 ) -> _EventSnapshot:
     if origin is None:
@@ -55,7 +56,7 @@ def _snap(
         user_id=user_id,
         visibility=visibility,
         correlation_id=correlation_id,
-        causation_id=None,
+        causation_id=causation_id,
         payload=payload or {},
     )
 
@@ -381,10 +382,11 @@ class FoldTasksTests(unittest.TestCase):
 class FoldToolResultsTests(unittest.TestCase):
     # 程序形态只暴露终态；成败靠 error_kind 区分（None=成功）。
 
-    def test_historical_half_call_folds_to_interrupted_uncertain(self) -> None:
+    def test_in_flight_half_call_folds_to_pending(self) -> None:
         evs = [
             _snap(
                 type="agent.tool_called",
+                causation_id="D1",
                 payload={
                     "tool_call_id": "TC1",
                     "tool_name": "web_search",
@@ -395,6 +397,28 @@ class FoldToolResultsTests(unittest.TestCase):
         views = Projector.fold_tool_results(evs)
         self.assertEqual(len(views), 1)
         self.assertEqual(views[0].arguments, {"q": "x"})
+        self.assertEqual(views[0].error_kind, "pending")
+        self.assertIsNone(views[0].error_extra)
+
+    def test_closed_program_half_call_folds_to_interrupted_uncertain(self) -> None:
+        evs = [
+            _snap(
+                type="agent.tool_called",
+                causation_id="D1",
+                payload={
+                    "tool_call_id": "TC1",
+                    "tool_name": "web_search",
+                    "arguments": {"q": "x"},
+                },
+            ),
+            _snap(
+                type="agent.program_completed",
+                causation_id="D1",
+                payload={"has_result": False},
+                seconds_offset=1,
+            ),
+        ]
+        views = Projector.fold_tool_results(evs)
         self.assertEqual(views[0].error_kind, "interrupted")
         self.assertEqual(views[0].error_extra, {"status": "uncertain"})
 
@@ -1606,16 +1630,17 @@ class BuildTimelineTests(unittest.TestCase):
         # render_timeline_stream 生成的 <t> 时刻头承载。
         self.assertNotIn("<t>", items[0].render)
 
-    def test_tool_called_without_result_renders_interrupted_uncertain(self) -> None:
+    def test_tool_called_without_result_renders_called_when_program_open(self) -> None:
         called = _snap(
             type="agent.tool_called",
+            causation_id="D1",
             payload={"tool_call_id": "TC1", "tool_name": "x"},
         )
         tool_views = Projector.fold_tool_results([called])
         items = Projector.build_timeline([called], tool_views=tool_views)
-        self.assertIn("<工具>x 失败 interrupted", items[0].render)
-        self.assertIn("status=uncertain", items[0].render)
+        self.assertIn("<工具>x 已调用", items[0].render)
         self.assertIn("  参数 {}", items[0].render)
+        self.assertNotIn("interrupted", items[0].render)
 
     def test_failed_tool_call_renders_error_extra_as_attributes(self) -> None:
         # 回归防护：结构化失败字段（required_tier/actual_tier）必须作为 <error>
@@ -1649,12 +1674,12 @@ class BuildTimelineTests(unittest.TestCase):
         self.assertIn("actual_tier=GUEST", rendered)
         self.assertIn("needs ADMIN", rendered)
 
-    def test_program_completed_with_query_calls_and_result(self) -> None:
+    def test_program_completed_with_result_and_visible_source(self) -> None:
         decision = _snap(
             type="agent.decision_emitted",
             event_id="D_PROGRAM",
             payload={
-                "program": "SECRET_SOURCE_MUST_NOT_RENDER",
+                "program": "return {\"admins\": [\"A\", \"B\"]}",
                 "program_sha256": "sha",
             },
         )
@@ -1672,13 +1697,15 @@ class BuildTimelineTests(unittest.TestCase):
             seconds_offset=1,
         )
         items = Projector.build_timeline([decision, terminal], tool_views=[])
-        self.assertEqual(len(items), 1)
-        self.assertEqual(items[0].kind, "program")
-        self.assertIn("<程序>完成 查询 search_history,websearch", items[0].render)
-        self.assertIn('  结果 {"admins": ["A", "B"]}', items[0].render)
-        self.assertNotIn("SECRET_SOURCE_MUST_NOT_RENDER", items[0].render)
+        self.assertEqual(len(items), 2)
+        self.assertIn("<程序>决策", items[0].render)
+        self.assertIn("return", items[0].render)
+        self.assertEqual(items[1].kind, "program")
+        self.assertIn("<程序>完成", items[1].render)
+        self.assertNotIn("查询 search_history", items[1].render)
+        self.assertIn('  结果 {"admins": ["A", "B"]}', items[1].render)
 
-    def test_program_completed_with_calls_but_without_return(self) -> None:
+    def test_program_completed_without_return_still_renders(self) -> None:
         terminal = _snap(
             type="agent.program_completed",
             payload={
@@ -1690,7 +1717,7 @@ class BuildTimelineTests(unittest.TestCase):
         )
         items = Projector.build_timeline([terminal], tool_views=[])
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0].render, "<程序>完成 查询 get_member_list")
+        self.assertEqual(items[0].render, "<程序>完成")
 
     def test_program_failed_renders_error_and_structured_details(self) -> None:
         terminal = _snap(
@@ -1700,21 +1727,26 @@ class BuildTimelineTests(unittest.TestCase):
                 "effect_call_ids": [],
                 "error_kind": "program_quota_exceeded",
                 "error_message": "too many queries",
-                "quota": "query_calls",
-                "actual": 7,
-                "max": 6,
+                "quota": "program_calls",
+                "actual": 9,
+                "max": 8,
             },
         )
         items = Projector.build_timeline([terminal], tool_views=[])
         self.assertEqual(len(items), 1)
         rendered = items[0].render
-        self.assertIn("<程序>失败 查询 websearch program_quota_exceeded", rendered)
-        self.assertIn("quota=query_calls", rendered)
-        self.assertIn("actual=7", rendered)
-        self.assertIn("max=6", rendered)
+        self.assertIn("<程序>失败 program_quota_exceeded", rendered)
+        self.assertNotIn("查询 websearch", rendered)
+        self.assertIn("quota=program_calls", rendered)
+        self.assertIn("actual=9", rendered)
+        self.assertIn("max=8", rendered)
         self.assertIn("too many queries", rendered)
 
-    def test_completely_empty_program_has_no_timeline_row(self) -> None:
+    def test_empty_program_renders_decision_and_completed(self) -> None:
+        decision = _snap(
+            type="agent.decision_emitted",
+            payload={"program": "# idle"},
+        )
         terminal = _snap(
             type="agent.program_completed",
             payload={
@@ -1723,10 +1755,15 @@ class BuildTimelineTests(unittest.TestCase):
                 "has_result": False,
                 "result": None,
             },
+            seconds_offset=1,
         )
-        self.assertEqual(Projector.build_timeline([terminal], tool_views=[]), [])
+        items = Projector.build_timeline([decision, terminal], tool_views=[])
+        self.assertEqual(len(items), 2)
+        self.assertIn("<程序>决策", items[0].render)
+        self.assertIn("# idle", items[0].render)
+        self.assertEqual(items[1].render, "<程序>完成")
 
-    def test_program_source_never_duplicates_send_messages_wording(self) -> None:
+    def test_program_source_and_send_messages_are_both_visible(self) -> None:
         spoken = "只应出现一次的措辞"
         decision = _snap(
             type="agent.decision_emitted",
@@ -1790,8 +1827,10 @@ class BuildTimelineTests(unittest.TestCase):
         rendered = "\n".join(
             item.render for item in Projector.build_timeline(events, tool_views=views)
         )
-        self.assertEqual(rendered.count(spoken), 1)
-        self.assertNotIn("send_messages(messages=", rendered)
+        self.assertGreaterEqual(rendered.count(spoken), 2)
+        self.assertIn("<程序>决策", rendered)
+        self.assertIn("send_messages(messages=", rendered)
+        self.assertIn("<工具>send_messages 完成", rendered)
 
     def test_legacy_tool_batch_event_uses_generic_runtime_fallback(self) -> None:
         """批次机制已退场；窗口内旧事件只走通用 runtime 渲染。"""
@@ -2858,8 +2897,45 @@ class ReplyFlushedProjectionTests(unittest.TestCase):
         self.assertEqual(len(message_rows), 1)
         self.assertIn("回复#301((10001*))", message_rows[0].render)
 
+    def test_domain_shape_bubbles_render_as_speech(self) -> None:
+        """2026-08-14 去协议化后的气泡形状（text/reply/at/face/meme）。
+
+        渲染结果与迁移前的段数组逐字节相同——换的是模型怎么写，不是时间线
+        长什么样。记号顺序同样是 reply → at → text → face，与
+        `outbound_messages.build_chat_content` 的段序一致。"""
+        called = _snap(
+            type="agent.tool_called",
+            event_id="TC_SPEAK_DOMAIN",
+            payload={
+                "tool_call_id": "TC_SPEAK_D",
+                "tool_name": "send_messages",
+                "arguments": {
+                    "messages": [
+                        # reply/at 写成整数：schema 允许，且这是未经归一的原始参数。
+                        {"text": "你认真的?", "reply": 77, "at": 222},
+                        {"text": "算了"},
+                        {"meme": "ab12cd34" + "f" * 56},
+                        {"at": "all", "face": [178]},
+                    ]
+                },
+            },
+        )
+        rendered = Projector.build_timeline([called], tool_views=[])[0].render
+        self.assertIn("  「回复#77@222你认真的?」", rendered)
+        self.assertIn("  「算了」", rendered)
+        self.assertIn("  <meme ab12cd34ffff>", rendered)
+        self.assertIn("  「@all<表情178>」", rendered)
+        # JSON 骨架不得残留。`meme` 不在此列——`<meme …>` 是行文法记号本身；
+        # `at` 也不在——它是 "state"/"status" 的子串，拿来当锚点会误报。
+        for skeleton in ("text", "reply", "face"):
+            with self.subTest(skeleton=skeleton):
+                self.assertNotIn(skeleton, rendered)
+
     def test_send_messages_args_render_as_speech_not_json(self) -> None:
         """2026-08-01：`send_messages` 的 <args> 渲染成人话，一个气泡一行。
+
+        用的是**迁移前**的段数组形状。`agent_events` 只增不改，早于 2026-08-14
+        的发言行会被永久重复投影，所以这条不是历史测试，是现役路径。
 
         2026-07-31 裁定「一次发送只渲染一行」之后，自己说过的话在 timeline 上
         的唯一形态就是这一行的 <args>。它过去是 JSON 参数文本，而别人的话是

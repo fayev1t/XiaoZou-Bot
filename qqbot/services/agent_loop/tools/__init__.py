@@ -94,10 +94,8 @@ def build_default_registry() -> ToolRegistry:
     # 渲染成信封 `## 反思` 一节。与 2026-08-01 删除的 <my-thought> 逐拍回显
     # 的区别（低频 / 全量替换 / 有上限）见 reflect.py docstring。
     registry.register(ReflectTool)
-    # get_recent_thoughts：取回自己最近几拍的程序注释（2026-08-03）。注释本来
-    # 就随 decision_emitted.payload.program 落库，只是从不回显；做成 Query 而
-    # 不是渲进信封，是为了让"不回显"保持字面为真——回显病理在构造上不存在，
-    # 只有她主动回想时才付这笔钱。
+    # get_recent_thoughts：跨多拍抽取程序注释。2026-08-14 起当拍源码已在
+    # <程序>决策 里，本工具不再承担找回上一拍程序的兜底。
     registry.register(GetRecentThoughtsTool)
     # 入群申请审批（2026-07-03 拆分自已删除的 respond_to_request）：group.add
     # 事件进目标群 timeline，管理员明确授权后由群内 LLM 调它回执；好友申请 /

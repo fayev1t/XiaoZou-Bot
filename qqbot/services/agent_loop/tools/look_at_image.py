@@ -64,7 +64,8 @@ MAX_QUESTION_CHARS = 500
 
 class LookAtImageTool(BaseTool):
     name = "look_at_image"
-    program_kind = "query"
+    program_kind = "effect"
+    max_call_sites = 4
     description = (
         "针对一张已下载图片执行一次视觉问答。image_hash 指定图片，question "
         "指定需要从图像中识别的信息。该调用会新建一次视觉模型请求；不修改时间线"

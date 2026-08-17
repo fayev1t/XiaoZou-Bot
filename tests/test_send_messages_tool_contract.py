@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 from types import SimpleNamespace
 from typing import Any
@@ -21,12 +22,14 @@ from qqbot.services.agent_loop import bot_registry
 from qqbot.services.agent_loop.outbound_messages import (
     _ALLOWED_SEGMENT_TYPES,
     MAX_OUTBOUND_MESSAGES,
+    build_chat_content,
     validate_messages,
 )
 from qqbot.services.agent_loop.tools.send_messages import SendMessagesTool
 
 HASH_A = "ab" * 32
-_TEXT = {"type": "text", "data": {"text": "hi"}}
+_TEXT = {"type": "text", "data": {"text": "hi"}}  # 迁移前的段形状
+_CHAT = {"text": "hi"}
 
 
 class _FakeActionFailed(Exception):
@@ -98,8 +101,8 @@ class SendMessagesToolTests(unittest.IsolatedAsyncioTestCase):
         outcome = await self._run(
             {
                 "messages": [
-                    {"kind": "chat", "content": [_TEXT]},
-                    {"kind": "chat", "content": [_TEXT]},
+                    _CHAT,
+                    _CHAT,
                 ]
             }
         )
@@ -134,7 +137,7 @@ class SendMessagesToolTests(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             outcome = await self._run(
-                {"messages": [{"kind": "meme", "image_hash": HASH_A}]}
+                {"messages": [{"meme": HASH_A}]}
             )
         self.assertTrue(outcome.ok)
         sent = bot.calls[0]["message"]
@@ -153,7 +156,7 @@ class SendMessagesToolTests(unittest.IsolatedAsyncioTestCase):
         bot_registry.register(bot)
         for event_id in ("E_CALL_A", "E_CALL_B"):
             outcome = await self._run(
-                {"messages": [{"kind": "chat", "content": [_TEXT]}]},
+                {"messages": [_CHAT]},
                 context=_context(tool_call_event_id=event_id),
             )
             self.assertTrue(outcome.ok)
@@ -167,8 +170,8 @@ class SendMessagesToolTests(unittest.IsolatedAsyncioTestCase):
         cases = [
             {"messages": []},
             {"messages": [{"kind": "verbatim"}]},
-            {"messages": [{"kind": "chat", "content": [_TEXT]}], "tone": "x"},
-            {"messages": [{"kind": "meme", "image_hash": "short"}]},
+            {"messages": [_CHAT], "tone": "x"},
+            {"messages": [{"meme": "short"}]},
         ]
         for arguments in cases:
             with self.subTest(arguments=arguments):
@@ -187,8 +190,8 @@ class SendMessagesToolTests(unittest.IsolatedAsyncioTestCase):
             outcome = await self._run(
                 {
                     "messages": [
-                        {"kind": "chat", "content": [_TEXT]},
-                        {"kind": "meme", "image_hash": HASH_A},
+                        _CHAT,
+                        {"meme": HASH_A},
                     ]
                 }
             )
@@ -199,7 +202,7 @@ class SendMessagesToolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_bot_available(self) -> None:
         outcome = await self._run(
-            {"messages": [{"kind": "chat", "content": [_TEXT]}]}
+            {"messages": [_CHAT]}
         )
         self.assertFalse(outcome.ok)
         self.assertEqual(outcome.error_kind, "no_bot_available")
@@ -215,8 +218,8 @@ class SendMessagesToolTests(unittest.IsolatedAsyncioTestCase):
         outcome = await self._run(
             {
                 "messages": [
-                    {"kind": "chat", "content": [_TEXT]},
-                    {"kind": "chat", "content": [_TEXT]},
+                    _CHAT,
+                    _CHAT,
                 ]
             }
         )
@@ -233,7 +236,7 @@ class SendMessagesToolTests(unittest.IsolatedAsyncioTestCase):
         bot = _StubBot(raises=[_FakeActionFailed(1404, "群不存在")])
         bot_registry.register(bot)
         outcome = await self._run(
-            {"messages": [{"kind": "chat", "content": [_TEXT]}]}
+            {"messages": [_CHAT]}
         )
         self.assertFalse(outcome.ok)
         self.assertEqual(outcome.error_kind, "upstream_action_failed")
@@ -246,7 +249,7 @@ class SendMessagesToolTests(unittest.IsolatedAsyncioTestCase):
         bot = _StubBot(raises=[NetworkError("socket closed")])
         bot_registry.register(bot)
         outcome = await self._run(
-            {"messages": [{"kind": "chat", "content": [_TEXT]}]}
+            {"messages": [_CHAT]}
         )
         self.assertFalse(outcome.ok)
         self.assertEqual(outcome.extra["status"], "uncertain")
@@ -262,7 +265,7 @@ class SendMessagesToolTests(unittest.IsolatedAsyncioTestCase):
         bot = _StubBot(message_ids=[None])
         bot_registry.register(bot)
         outcome = await self._run(
-            {"messages": [{"kind": "chat", "content": [_TEXT]}]}
+            {"messages": [_CHAT]}
         )
         self.assertFalse(outcome.ok)
         self.assertEqual(outcome.extra["status"], "uncertain")
@@ -277,7 +280,7 @@ class SendMessagesToolTests(unittest.IsolatedAsyncioTestCase):
         for scope_key in ("system", "private:555"):
             with self.subTest(scope_key=scope_key):
                 outcome = await self._run(
-                    {"messages": [{"kind": "chat", "content": [_TEXT]}]},
+                    {"messages": [_CHAT]},
                     context=_context(scope_key=scope_key),
                 )
                 self.assertFalse(outcome.ok)
@@ -358,53 +361,63 @@ class SendMessagesMetadataTests(unittest.TestCase):
         self.assertNotIn("1-4", SendMessagesTool.description)
         self.assertNotIn("at most one", SendMessagesTool.description)
 
-    def test_bubble_schema_presents_chat_and_meme_as_peer_branches(self) -> None:
-        """2026-08-01：`messages.items` 曾是 `{"type": "object"}`——两种气泡
-        唯一同框的地方是 description 那段散文，chat 占前 2/3、meme 挂在分号
-        后面当尾巴。模型逐 token 写 JSON 时最强的结构先验是 schema，那等于
-        表情包在结构上不存在，而提示词层（planner.md 的"优先让图说话"）却把
-        它当惯用表达。这里钉住两支平级：同一个 oneOf 下的兄弟、由 kind 判别、
-        各自带完整的 required 与 additionalProperties，没有主次没有嵌套。
+    def test_bubble_schema_presents_text_and_meme_as_peer_branches(self) -> None:
+        """2026-08-01 起两种气泡是 oneOf 下的平级兄弟（此前 `messages.items`
+        是 `{"type": "object"}`，表情包在结构上等于不存在，而提示词层却把它当
+        惯用表达）。2026-08-14 去协议化后判别键从 `kind` 换成"有没有 meme"，
+        平级这条不变：各自带完整 additionalProperties，没有主次没有嵌套。
         """
         items = SendMessagesTool.arguments_schema["properties"]["messages"][
             "items"
         ]
         branches = items["oneOf"]
+        self.assertEqual(len(branches), 2)
+        chat, meme = branches
         self.assertEqual(
-            [b["properties"]["kind"]["const"] for b in branches],
-            ["chat", "meme"],
+            sorted(chat["properties"]), ["at", "face", "reply", "text"]
         )
+        self.assertEqual(sorted(meme["properties"]), ["meme"])
+        self.assertEqual(meme["required"], ["meme"])
         for branch in branches:
-            with self.subTest(kind=branch["properties"]["kind"]["const"]):
-                self.assertEqual(branch["required"][0], "kind")
-                self.assertFalse(branch["additionalProperties"])
-        # 段类型白名单只有一处真相（outbound_messages），schema 不得自成一套。
-        segment_type = branches[0]["properties"]["content"]["items"][
-            "properties"
-        ]["type"]
-        self.assertEqual(set(segment_type["enum"]), set(_ALLOWED_SEGMENT_TYPES))
+            self.assertFalse(branch["additionalProperties"])
+        # chat 支没有 required：只 @ 人或只发系统表情时 text 可以省略。
+        self.assertNotIn("required", chat)
+
+    def test_model_facing_surface_has_no_onebot_segment_vocabulary(self) -> None:
+        """2026-08-14 去协议化的实质断言。
+
+        `send_messages` 是全部 19 个程序函数里唯一把上游协议摊给模型的那个：
+        气泡曾是 `{"kind":"chat","content":[{"type":"text","data":{...}}]}`，
+        `data` 包装、`type` 判别、reply 必须 content[0] 三样都是 OneBot 11 的
+        规则，与"说一句话"无关，却要模型每次发言复述一遍。段数组现在只在
+        `outbound_messages.build_chat_content` 里构造。
+
+        这条钉的是**暴露面**，不是实现：schema / description / 用法文档三处
+        合起来不得再出现段形状词汇。运行时仍无损接住旧形状（见
+        `LegacySegmentShapeTests`），但那是迁移兼容，不重新教给模型。
+        """
+        surface = "\n".join(
+            [
+                json.dumps(SendMessagesTool.arguments_schema, ensure_ascii=False),
+                SendMessagesTool.description,
+                SendMessagesTool.usage_prompt,
+            ]
+        )
+        for token in ('"data"', '"content"', "消息段", "段数组", "OneBot V11"):
+            with self.subTest(token=token):
+                self.assertNotIn(token, surface)
 
     def test_bubble_schema_shape_matches_validate_messages(self) -> None:
         """schema 是纯文档（tool_registry 模块头），真正的校验是
         validate_messages——两边形状必须逐字对齐，否则模型照 schema 写出的
         气泡会被校验拒绝，而它看不到 schema 之外的真相。
 
-        按每支的 required 造最小气泡送进真校验（必须通过），再多塞一个键
-        （必须被拒）——证明 additionalProperties:False 确有 extras 检查兜底，
-        不是一句装饰性的文档。
+        每支造一个最小气泡送进真校验（必须通过），再多塞一个键（必须被拒）
+        ——证明 additionalProperties:False 确有 extras 检查兜底，不是一句
+        装饰性的文档。
         """
-        branches = SendMessagesTool.arguments_schema["properties"]["messages"][
-            "items"
-        ]["oneOf"]
-        minimal = {
-            "chat": {"kind": "chat", "content": [_TEXT]},
-            "meme": {"kind": "meme", "image_hash": HASH_A},
-        }
-        for branch in branches:
-            kind = branch["properties"]["kind"]["const"]
-            with self.subTest(kind=kind):
-                bubble = minimal[kind]
-                self.assertEqual(sorted(branch["required"]), sorted(bubble))
+        for bubble, kind in ((_CHAT, "chat"), ({"meme": HASH_A}, "meme")):
+            with self.subTest(bubble=bubble):
                 normalized, fail = validate_messages([bubble])
                 self.assertIsNone(fail)
                 self.assertEqual(normalized[0]["kind"], kind)
@@ -412,6 +425,80 @@ class SendMessagesMetadataTests(unittest.TestCase):
                 self.assertEqual(
                     getattr(rejected, "error_kind", None), "invalid_arguments"
                 )
+
+    def test_schema_optional_keys_all_reach_the_wire(self) -> None:
+        """chat 支声明的四个键必须条条落到 OneBot 段上，且顺序固定
+        reply → at → text → face（模型不再能控制段序，所以这个顺序是契约）。"""
+        content = build_chat_content(
+            validate_messages(
+                [{"text": "hi", "reply": 88, "at": [10001, "all"], "face": 178}]
+            )[0][0]
+        )
+        self.assertEqual(
+            [(seg["type"], seg["data"]) for seg in content],
+            [
+                ("reply", {"id": "88"}),
+                ("at", {"qq": "10001"}),
+                ("at", {"qq": "all"}),
+                ("text", {"text": "hi"}),
+                ("face", {"id": "178"}),
+            ],
+        )
+        self.assertEqual(
+            {seg["type"] for seg in content} | {"text"}, set(_ALLOWED_SEGMENT_TYPES)
+        )
+
+
+class LegacySegmentShapeTests(unittest.TestCase):
+    """旧 OneBot 形状的迁移兼容（2026-08-14）。
+
+    模型带着旧习惯写出 `kind`/`content` 时无损转成新形状——一次形状迁移不该
+    表现为线上发不出话。与 `normalize_segment` 同性质：接住漂移，不写进 usage
+    文档，也不是可依赖的第二套输入契约。
+    """
+
+    def test_legacy_bubbles_are_converted_losslessly(self) -> None:
+        normalized, fail = validate_messages(
+            [
+                {
+                    "kind": "chat",
+                    "content": [
+                        {"type": "reply", "data": {"id": "M1"}},
+                        {"type": "at", "data": {"qq": "10001"}},
+                        {"type": "text", "data": {"text": "hi"}},
+                        {"type": "face", "data": {"id": "178"}},
+                    ],
+                },
+                {"kind": "meme", "image_hash": HASH_A},
+            ]
+        )
+        self.assertIsNone(fail)
+        self.assertEqual(
+            normalized[0],
+            {
+                "kind": "chat",
+                "text": "hi",
+                "reply": "M1",
+                "at": ["10001"],
+                "face": ["178"],
+            },
+        )
+        self.assertEqual(
+            normalized[1], {"kind": "meme", "image_hash": HASH_A}
+        )
+
+    def test_legacy_segment_rules_still_reject_bad_shapes(self) -> None:
+        for messages, reason in (
+            (
+                [{"kind": "chat", "content": [{"type": "image", "data": {}}]}],
+                "unsupported_segment_type",
+            ),
+            ([{"kind": "verbatim", "content": []}], "bad_message_kind"),
+        ):
+            with self.subTest(reason=reason):
+                _, fail = validate_messages(messages)
+                assert fail is not None
+                self.assertEqual(fail.extra["reason_code"], reason)
 
 
 if __name__ == "__main__":

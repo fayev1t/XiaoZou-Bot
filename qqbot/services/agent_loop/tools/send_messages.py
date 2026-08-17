@@ -52,66 +52,61 @@ logger = get_logger(__name__)
 
 _USAGE_PROMPT = load_sibling_md(__file__, "send_messages.md")
 
-# ── 气泡 schema（2026-08-01）：`items` 原本只是 {"type": "object"}，两种气泡
-# 唯一同框的地方是 messages.description 那段散文，chat 占前 2/3、meme 挂在分号
-# 后面——模型写 JSON 时最强的结构先验是 schema，而 schema 里表情包等于不存在。
-# 现按 task.py 的既有写法展开成 kind 判别的两分支，把"平级"在模型真正读的那份
-# 结构里说出来。schema 纯文档用途（tool_registry 模块头），真正的校验始终是
-# outbound_messages.validate_messages——两边形状逐字对齐，不得出现 schema 放行
-# 而校验拒绝的错位。
+# ── 气泡 schema（2026-08-14 去协议化）：一项就是一条消息，键名即语义。此前
+# chat 气泡是 {"kind":"chat","content":[{"type":"text","data":{"text":…}}]}——
+# data 包装、type 判别、reply 必须 content[0]，三样都是 OneBot 11 的协议规则，
+# 却要模型每次发言复述一遍。段数组现在由 outbound_messages.build_chat_content
+# 在发送时构造，模型面只剩 text / reply / at / face / meme 五个键。
 #
-# 段级不写 additionalProperties：validate_content 只看 type/data，不拒绝多余
-# 键，schema 不能比校验更严。reply 段至多一个且必须在 content[0]，JSON Schema
-# 表达不了，留在 send_messages.md。
-_SEGMENT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "type": {
-            "enum": ["text", "at", "reply", "face"],
-            "description": "段类型。",
-        },
-        "data": {
-            "type": "object",
-            "description": "该段类型的字段，全部位于 data 内。",
-        },
-    },
-    "required": ["type", "data"],
-}
-
-# 两分支各自的 required / additionalProperties 就是 validate_messages 里
-# extras = set(item) - {...} 那两处检查的形状。
+# schema 纯文档用途（tool_registry 模块头），真正的校验始终是
+# outbound_messages.validate_messages——两边形状逐字对齐，不得出现 schema 放行
+# 而校验拒绝的错位。带 kind 的旧形状仍被 validate_messages 无损接住，但那是迁移
+# 兼容路径，故意不写进 schema：schema 是教模型怎么写，不是穷举运行时收什么。
 _CHAT_BUBBLE_SCHEMA = {
     "properties": {
-        "kind": {
-            "const": "chat",
-            "description": "固定为 chat，表示一条聊天气泡。",
+        "text": {
+            "type": "string",
+            "description": "这条消息的文字。只 @ 人或只发表情时可以省略。",
         },
-        "content": {
-            "type": "array",
-            "minItems": 1,
-            "description": "OneBot V11 段数组。",
-            "items": _SEGMENT_SCHEMA,
+        "reply": {
+            "type": ["string", "integer"],
+            "description": (
+                "可选：被引用消息的 ID，取时间线 #消息ID 记号里的号原样照抄。"
+                "引用只作用于本条气泡。"
+            ),
+        },
+        "at": {
+            "type": ["string", "integer", "array"],
+            "items": {"type": ["string", "integer"]},
+            "description": (
+                "可选：要 @ 的 QQ 号，单个或数组；\"all\" 表示 @全体成员。"
+                "@ 出现在本条文字之前。"
+            ),
+        },
+        "face": {
+            "type": ["string", "integer", "array"],
+            "items": {"type": ["string", "integer"]},
+            "description": (
+                "可选：QQ 系统表情 ID，单个或数组，出现在本条文字之后。"
+                "发表情包用 meme 气泡，不是这个。"
+            ),
         },
     },
-    "required": ["kind", "content"],
     "additionalProperties": False,
 }
 
 _MEME_BUBBLE_SCHEMA = {
     "properties": {
-        "kind": {
-            "const": "meme",
-            "description": "固定为 meme，表示一个表情包气泡。",
-        },
-        "image_hash": {
+        "meme": {
             "type": "string",
             "pattern": "^[0-9a-fA-F]{12,64}$",
             "description": (
                 "表情包收藏 <meme> 行中的哈希，12 位前缀原样照抄（也接受完整 64 位）。"
+                "该气泡只发这张图，不能同时带文字。"
             ),
         },
     },
-    "required": ["kind", "image_hash"],
+    "required": ["meme"],
     "additionalProperties": False,
 }
 
@@ -124,8 +119,9 @@ class SendMessagesTool(BaseTool):
     # 目标——不照抄旧 send_message.py 的 ("group", "private")。
     allowed_scopes = ("group",)
     description = (
-        "向当前群发送一条或多条有序气泡。messages 中每项可为 OneBot V11 聊天气泡或"
-        "收藏表情包气泡。标准发言链路先由 reply 表示正在输入并启动等待，再在 "
+        "向当前群发送一条或多条有序气泡。messages 中每项就是一条消息："
+        '文字气泡 {"text": …}（可选 reply / at / face）或表情包气泡 '
+        '{"meme": …}。标准发言链路先由 reply 表示正在输入并启动等待，再在 '
         "<reply-task-completed> 出现后调用本工具；运行时不强制该顺序。返回值中的"
         "逐气泡回执是送达状态记录；status=uncertain 表示至少一条气泡可能已经"
         "送达。"
@@ -139,8 +135,8 @@ class SendMessagesTool(BaseTool):
                 "minItems": 1,
                 "maxItems": MAX_OUTBOUND_MESSAGES,
                 "description": (
-                    "按发送顺序排列的气泡数组，一条或多条均可。每项是一个 "
-                    "chat 气泡或一个 meme 气泡，两者平级、可任意穿插。"
+                    "按发送顺序排列的气泡数组，一条或多条均可。每项是一条文字"
+                    "消息或一个表情包，两者平级、可任意穿插。"
                 ),
                 "items": {"oneOf": [_CHAT_BUBBLE_SCHEMA, _MEME_BUBBLE_SCHEMA]},
             },
@@ -163,7 +159,10 @@ class SendMessagesTool(BaseTool):
                     "properties": {
                         "index": {"type": "integer"},
                         "kind": {"type": "string"},
-                        "content": {"type": "array", "items": {}},
+                        "text": {"type": ["string", "null"]},
+                        "reply": {"type": ["string", "integer", "null"]},
+                        "at": {},
+                        "face": {},
                         "image_hash": {"type": ["string", "null"]},
                         "status": {"type": "string"},
                         "message_id": {"type": ["integer", "string", "null"]},

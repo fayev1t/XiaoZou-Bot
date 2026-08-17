@@ -279,8 +279,9 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
     async def test_effect_intent_timestamp_is_tick_start_not_write_time(self) -> None:
         """程序 effect 的意图事件仍锚定本拍投影时刻。
 
-        ``tool_called`` 是模型拍板的 effect 调用行，必须和 decision 同锚；
-        terminal 与 program terminal 则记录真实完成时刻。
+        ``tool_called`` 是模型拍板的调用行，必须和 decision 同锚；
+        terminal 与 program terminal 则记录真实完成时刻。决策拍在入队后
+        即 ``tick_ended``，工具事件由 Runner 随后写出。
         """
         captured: list[Any] = []
         registry = ToolRegistry()
@@ -298,11 +299,12 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
             loop.wake()
             for _ in range(200):
                 await asyncio.sleep(0.01)
-                if any(
-                    _values_of(stmt).get("type") == "runtime.tick_ended"
+                types = {
+                    _values_of(stmt).get("type")
                     for stmt in captured
                     if getattr(stmt, "table", None) is not None
-                ):
+                }
+                if "agent.tool_called" in types and "runtime.tick_ended" in types:
                     break
             await loop.stop()
 
@@ -890,10 +892,8 @@ class ContinuationMaxTicksResolverTests(unittest.TestCase):
 
 
 class ContinuationTickTests(unittest.IsolatedAsyncioTestCase):
-    """自续拍（2026-08-04，任务与决策契约 §1.2）。
-
-    程序调用过函数 → 本拍收尾后自行再开一拍；某一拍一个函数都不调用 → 链条结束。
-    判据是 ``ProgramTrace.calls``：Query 与 Effect 同等、成功与失败同等。
+    """自续拍（2026-08-14 改口）：Runner 写出 program terminal 后立刻再开一拍；
+    空程序不入队，是不动点。
     """
 
     @staticmethod
@@ -953,11 +953,11 @@ class ContinuationTickTests(unittest.IsolatedAsyncioTestCase):
             registry=registry,
             expect_ticks=2,
         )
-        # 第一拍调用 → 自续第二拍 → 第二拍空程序 → 停。
+        # 第一拍入队 → Runner 跑完 wake → 第二拍空程序 → 停。
         self.assertEqual(self._tick_count(captured), 2)
 
     async def test_query_only_program_continues(self) -> None:
-        """Query 同样续拍 —— 「查完接着办」正是这条机制存在的理由。"""
+        """只读函数同样续拍 —— Runner 跑完才叫醒，查完才能接着办。"""
         registry = ToolRegistry()
         registry.register(_TimestampQuery)
         captured = await self._run(
