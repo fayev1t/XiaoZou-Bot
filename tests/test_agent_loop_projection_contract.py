@@ -1763,6 +1763,56 @@ class BuildTimelineTests(unittest.TestCase):
         self.assertIn("# idle", items[0].render)
         self.assertEqual(items[1].render, "<程序>完成")
 
+    def test_decision_row_carries_its_own_event_id(self) -> None:
+        """2026-08-17 提案-裁决流水线：决策行必须带 ev:。
+
+        写下的程序当拍不执行，要由后来某一拍 ``execute_decision(event_id=…)``
+        指名才跑——模型抄不到这个 ID 就永远执行不了自己写的任何东西。
+        """
+        decision = _snap(
+            type="agent.decision_emitted",
+            event_id="01K2X9F3MQ8B4NVYRTC7HDZ6EW",
+            payload={"program": 'notify(message="hi")'},
+        )
+        items = Projector.build_timeline([decision], tool_views=[])
+        self.assertTrue(
+            items[0].render.startswith("<程序>决策 ev:01K2X9F3MQ8B4NVYRTC7HDZ6EW")
+        )
+
+    def test_program_terminal_points_back_at_its_decision(self) -> None:
+        """终态行回指它收束的那条决策——并发派发下靠位置对不上号。"""
+        completed = _snap(
+            type="agent.program_completed",
+            event_id="P1",
+            payload={
+                "decision_id": "01K2X9F3MQ8B4NVYRTC7HDZ6EW",
+                "query_calls": [],
+                "effect_call_ids": [],
+                "has_result": False,
+                "result": None,
+            },
+        )
+        failed = _snap(
+            type="agent.program_failed",
+            event_id="P2",
+            causation_id="01K2X9F3MQ8B4NVYRTC7HDZ6EX",
+            payload={
+                "query_calls": [],
+                "effect_call_ids": [],
+                "error_kind": "already_executed",
+                "error_message": "already running",
+            },
+            seconds_offset=1,
+        )
+        items = Projector.build_timeline([completed, failed], tool_views=[])
+        self.assertEqual(items[0].render, "<程序>完成 ev:01K2X9F3MQ8B4NVYRTC7HDZ6EW")
+        # payload.decision_id 缺失时退回 causation_id，事实不消失。
+        self.assertTrue(
+            items[1].render.startswith(
+                "<程序>失败 ev:01K2X9F3MQ8B4NVYRTC7HDZ6EX already_executed"
+            )
+        )
+
     def test_program_source_and_send_messages_are_both_visible(self) -> None:
         spoken = "只应出现一次的措辞"
         decision = _snap(

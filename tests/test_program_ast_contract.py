@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import ast
+import hashlib
 import unittest
 from typing import Any
 from unittest.mock import patch
@@ -15,6 +17,7 @@ from qqbot.services.agent_loop.program_ast import (
     MAX_SOURCE_CHARS,
     MAX_STRING_LENGTH,
     ProgramPreflightError,
+    build_executable_tree,
     preflight,
     strip_outer_fence,
 )
@@ -327,6 +330,164 @@ class ProgramStaticQuotaContractTests(unittest.TestCase):
         source += f"{indent}value = 1\nreturn value"
         details = self._quota(source)
         self.assertEqual(details["quota"], "syntax_depth")
+
+
+class ExecuteDecisionContractTests(unittest.TestCase):
+    """裁决层调度元指令的静态形状（2026-08-17 提案-裁决流水线 §1.0/§1.1）。
+
+    它不是 Program API 工具，不占调用点；与动作层新代码**可以写在同一次输出里**
+    （④ 流水线混合）。形状必须在静态期就确定：模块顶层的独立语句、唯一具名参数、
+    写死的事件 ID。
+    """
+
+    EVENT_ID = "01K2X9F3MQ8B4NVYRTC7HDZ6EW"
+
+    def setUp(self) -> None:
+        self.registry = _registry()
+
+    def _error(self, source: str, scope: str = "group"):
+        with self.assertRaises(ProgramPreflightError) as caught:
+            preflight(source, self.registry, scope)
+        return caught.exception.info
+
+    def test_bare_commit_statement_yields_commit_event_id(self) -> None:
+        prepared = preflight(
+            f'execute_decision(event_id="{self.EVENT_ID}")', self.registry, "group"
+        )
+        self.assertEqual(prepared.commit_event_id, self.EVENT_ID)
+        # 它自己不是调用点：裁决拍没有任何工具被调用。
+        self.assertEqual(prepared.call_sites, ())
+        self.assertFalse(prepared.has_return)
+
+    def test_ordinary_program_has_no_commit_event_id(self) -> None:
+        prepared = preflight(
+            'notify(message="hi")', self.registry, "group"
+        )
+        self.assertIsNone(prepared.commit_event_id)
+        self.assertEqual(len(prepared.call_sites), 1)
+
+    def test_a_commit_and_new_code_coexist_in_one_response(self) -> None:
+        """④ 流水线混合：两层可以同时出现——它们作用在不同的东西上。
+
+        2026-08-17 维护者裁定：此前的 `program_mixed_commit_and_action` 是错的，
+        它把调度指令当成了程序的一部分才推出"同一 AST 两种生效时机"。稳态下模型
+        每拍都该两层都写：确认上一段、同时写下一段，多出来的那次推理才被摊掉。
+        """
+        prepared = preflight(
+            f'execute_decision(event_id="{self.EVENT_ID}")\n'
+            'notify(message="hi")',
+            self.registry,
+            "group",
+        )
+        self.assertEqual(prepared.commit_event_id, self.EVENT_ID)
+        self.assertEqual([site.name for site in prepared.call_sites], ["notify"])
+
+        with_return = preflight(
+            f'execute_decision(event_id="{self.EVENT_ID}")\nreturn 1',
+            self.registry,
+            "group",
+        )
+        self.assertEqual(with_return.commit_event_id, self.EVENT_ID)
+        self.assertTrue(with_return.has_return)
+
+    def test_the_directive_is_stripped_before_storage(self) -> None:
+        """落库解耦（§1.1 防套娃）：`source` / sha / 可执行树都不含调度指令。
+
+        存进 `payload.program` 的必须是纯业务代码——否则那条决策日后被指名时会
+        连带再调度一次，形成套娃。
+        """
+        prepared = preflight(
+            f'execute_decision(event_id="{self.EVENT_ID}")\n'
+            'notify(message="hi")',
+            self.registry,
+            "group",
+        )
+        self.assertEqual(prepared.source, 'notify(message="hi")')
+        self.assertEqual(
+            prepared.program_sha256,
+            hashlib.sha256(prepared.source.encode("utf-8")).hexdigest(),
+        )
+        self.assertNotIn(
+            "execute_decision", ast.unparse(build_executable_tree(prepared))
+        )
+        # 落库的源码再走一遍 preflight（裁决时就是这么做的）必须干净。
+        again = preflight(prepared.source, self.registry, "group")
+        self.assertIsNone(again.commit_event_id)
+        self.assertEqual(
+            [site.name for site in again.call_sites],
+            [site.name for site in prepared.call_sites],
+        )
+
+    def test_a_pure_directive_leaves_an_empty_body(self) -> None:
+        """③ 纯裁决：剥完只剩空串，动作层为空，日后不可被指名。"""
+        prepared = preflight(
+            f'execute_decision(event_id="{self.EVENT_ID}")', self.registry, "group"
+        )
+        self.assertEqual(prepared.source, "")
+        self.assertEqual(prepared.call_sites, ())
+        self.assertFalse(prepared.has_return)
+
+    def test_a_multiline_directive_is_stripped_whole(self) -> None:
+        prepared = preflight(
+            f'execute_decision(\n    event_id="{self.EVENT_ID}",\n)\n'
+            'notify(message="hi")',
+            self.registry,
+            "group",
+        )
+        self.assertEqual(prepared.commit_event_id, self.EVENT_ID)
+        self.assertEqual(prepared.source, 'notify(message="hi")')
+
+    def test_event_id_must_be_a_literal_26_char_id(self) -> None:
+        cases = {
+            'execute_decision(event_id="not-an-id")': "commit_event_id_malformed",
+            # 小写 / 含 base32 排除字符（I L O U）都不是合法事件 ID。
+            'execute_decision(event_id="01k2x9f3mq8b4nvyrtc7hdz6ew")': (
+                "commit_event_id_malformed"
+            ),
+            'execute_decision(event_id="01K2X9F3MQ8B4NVYRTC7HDZ6EI")': (
+                "commit_event_id_malformed"
+            ),
+            f'e = "{self.EVENT_ID}"\nexecute_decision(event_id=e)': (
+                "commit_event_id_not_literal"
+            ),
+        }
+        for source, construct in cases.items():
+            with self.subTest(source=source):
+                info = self._error(source)
+                self.assertEqual(info.error_kind, "program_forbidden_construct")
+                self.assertEqual(info.details["construct"], construct)
+
+    def test_commit_must_be_a_top_level_statement(self) -> None:
+        nested = self._error(
+            f'if 1 == 1:\n    execute_decision(event_id="{self.EVENT_ID}")'
+        )
+        self.assertEqual(nested.details["construct"], "commit_not_top_level")
+        assigned = self._error(
+            f'x = execute_decision(event_id="{self.EVENT_ID}")'
+        )
+        self.assertEqual(assigned.details["construct"], "commit_not_a_statement")
+
+    def test_signature_is_exactly_one_named_event_id(self) -> None:
+        positional = self._error(f'execute_decision("{self.EVENT_ID}")')
+        self.assertEqual(
+            positional.details["construct"], "program_function_positional_args"
+        )
+        extra = self._error(
+            f'execute_decision(event_id="{self.EVENT_ID}", extra=1)'
+        )
+        self.assertEqual(extra.details["construct"], "commit_signature")
+
+    def test_one_commit_per_program(self) -> None:
+        info = self._error(
+            f'execute_decision(event_id="{self.EVENT_ID}")\n'
+            f'execute_decision(event_id="{self.EVENT_ID}")'
+        )
+        self.assertEqual(info.error_kind, "program_quota_exceeded")
+        self.assertEqual(info.details["max"], 1)
+
+    def test_the_name_cannot_be_shadowed(self) -> None:
+        info = self._error("execute_decision = 1")
+        self.assertEqual(info.details["construct"], "reserved_assignment_name")
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -25,15 +25,14 @@ if TYPE_CHECKING:
 SessionFactory = Callable[[], AsyncSession]
 
 _TOOL_TERMINALS = frozenset({"agent.tool_result", "agent.tool_failed"})
+# 收口只认工具调用（2026-08-17 提案-裁决流水线）：``agent.decision_emitted``
+# 不再参与——决策事件和时间线上任何一条事件同级，写进去就是一段文本，没有
+# 状态、没有生命周期、不需要收口。"这条执行过没有"永远是对 append-only 事件流
+# 的一次查询（有没有以它为因的 program terminal），不是被维护的标志位。
+_RECOVERY_TYPES = tuple({"agent.tool_called", *_TOOL_TERMINALS})
 _PROGRAM_TERMINALS = frozenset({"agent.program_completed", "agent.program_failed"})
-_RECOVERY_TYPES = tuple(
-    {
-        "agent.decision_emitted",
-        "agent.tool_called",
-        *_TOOL_TERMINALS,
-        *_PROGRAM_TERMINALS,
-    }
-)
+# 「这条决策已经开始执行」的判据（见 load_referenced_decision）。
+_EXECUTION_MARKS = tuple({"agent.tool_called", *_PROGRAM_TERMINALS})
 
 
 @dataclass(frozen=True)
@@ -50,7 +49,16 @@ class EffectCallHandle:
 @dataclass(frozen=True)
 class RecoveryReport:
     tool_calls_closed: int = 0
-    programs_closed: int = 0
+
+
+@dataclass(frozen=True)
+class ReferencedDecision:
+    """``execute_decision(event_id=…)`` 指名的那条历史决策。"""
+
+    event_id: str
+    correlation_id: str
+    program: str
+    program_sha256: str
 
 
 async def begin_effect_call(  # noqa: PLR0913
@@ -264,21 +272,19 @@ async def recover_interrupted_programs(
     *,
     scope_key: str,
 ) -> RecoveryReport:
-    """Close every pre-existing half call/program in one scope; never replay."""
+    """Close every pre-existing half tool call in one scope; never replay.
+
+    只收口 ``agent.tool_called``——那是真正发生过外部副作用、投递状态存疑的
+    地方。决策事件不收口（见 ``_RECOVERY_TYPES`` 上的说明）；进程异常关闭后
+    已开跑程序的整体收束由后续统一方案处理，不在这里。
+    """
     rows = await _load_recovery_rows(session_factory, scope_key=scope_key)
     terminal_causes = {
         str(row.causation_id)
         for row in rows
-        if row.type in _TOOL_TERMINALS | _PROGRAM_TERMINALS and row.causation_id
+        if row.type in _TOOL_TERMINALS and row.causation_id
     }
     calls = [row for row in rows if row.type == "agent.tool_called"]
-    decisions = [
-        row
-        for row in rows
-        if row.type == "agent.decision_emitted"
-        and isinstance(row.payload, dict)
-        and "program" in row.payload
-    ]
 
     tool_calls_closed = 0
     for row in calls:
@@ -305,40 +311,65 @@ async def recover_interrupted_programs(
         )
         tool_calls_closed += 1
 
-    programs_closed = 0
-    calls_by_decision: dict[str, list[str]] = {}
-    for row in calls:
-        if row.causation_id:
-            calls_by_decision.setdefault(str(row.causation_id), []).append(
-                str((row.payload or {}).get("tool_call_id") or "")
-            )
-    for row in decisions:
-        if str(row.event_id) in terminal_causes:
-            continue
-        payload = row.payload or {}
-        await write_program_failed(
-            session_factory,
-            scope_key=scope_key,
-            correlation_id=str(row.correlation_id or new_event_id()),
-            decision_id=str(row.event_id),
-            program_sha256=str(payload.get("program_sha256") or ""),
-            duration_ms=0,
-            query_calls=[],
-            effect_call_ids=[
-                call_id
-                for call_id in calls_by_decision.get(str(row.event_id), [])
-                if call_id
-            ],
-            error_kind="interrupted",
-            error_message=(
-                "process stopped before the program produced a terminal; "
-                "the source was not replayed"
-            ),
-            status="uncertain",
-        )
-        programs_closed += 1
+    return RecoveryReport(tool_calls_closed)
 
-    return RecoveryReport(tool_calls_closed, programs_closed)
+
+async def load_referenced_decision(
+    session_factory: SessionFactory,
+    *,
+    scope_key: str,
+    event_id: str,
+) -> tuple[ReferencedDecision | None, str | None]:
+    """按事件 ID 取本 scope 的一条历史决策源码，附带"执行过没有"的查询结果。
+
+    返回 ``(decision, error_kind)``——``error_kind`` 为 None 时 ``decision``
+    必然非 None。两种拒绝：
+
+    - ``decision_not_found``：本 scope 内没有这条事件，或它不是一条带源码的
+      ``agent.decision_emitted``；
+    - ``already_executed``：库里已经存在以它为因的 ``agent.tool_called`` 或
+      program terminal。这是对 append-only 事件流的一次**查询**，不是被维护
+      的状态位：决策事件本身没有任何字段记录自己执行过没有。
+
+    为什么连 ``tool_called`` 也算数：program terminal 要等整段程序跑完才写，
+    而并发派发下「已经在跑」的那几十秒里照样会开新拍——只看终态的话，模型
+    能把同一段程序再裁决一次，副作用就出去两遍。``tool_called`` 按铁律**先于**
+    副作用落库，所以「存在 tool_called」等价于「这段程序已经开始改变世界」，
+    进程重启也不会让这个事实消失（半截调用由收口器写成 uncertain，从不重放）。
+    """
+    scope, group_id, user_id = parse_scope_key(scope_key)
+    stmt = select(AgentEvent).where(AgentEvent.event_id == event_id)
+    stmt = stmt.where(AgentEvent.scope == scope)
+    if scope == "group":
+        stmt = stmt.where(AgentEvent.group_id == group_id)
+    elif scope == "private":
+        stmt = stmt.where(AgentEvent.user_id == user_id)
+    started_stmt = (
+        select(AgentEvent.event_id)
+        .where(AgentEvent.causation_id == event_id)
+        .where(AgentEvent.type.in_(_EXECUTION_MARKS))
+        .limit(1)
+    )
+    async with session_factory() as session:
+        row = (await session.execute(stmt)).scalars().first()
+        if row is None or row.type != "agent.decision_emitted":
+            return None, "decision_not_found"
+        payload = row.payload if isinstance(row.payload, dict) else {}
+        program = payload.get("program")
+        if not isinstance(program, str):
+            return None, "decision_not_found"
+        started = (await session.execute(started_stmt)).scalars().first()
+    if started is not None:
+        return None, "already_executed"
+    return (
+        ReferencedDecision(
+            event_id=str(row.event_id),
+            correlation_id=str(row.correlation_id or ""),
+            program=program,
+            program_sha256=str(payload.get("program_sha256") or ""),
+        ),
+        None,
+    )
 
 
 async def _load_recovery_rows(
@@ -362,8 +393,10 @@ async def _load_recovery_rows(
 __all__ = [
     "EffectCallHandle",
     "RecoveryReport",
+    "ReferencedDecision",
     "begin_effect_call",
     "finish_effect_call",
+    "load_referenced_decision",
     "recover_interrupted_programs",
     "uncertain_outcome",
     "write_program_completed",

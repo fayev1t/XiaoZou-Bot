@@ -17,7 +17,12 @@ Also verifies:
 - scope_key parser handles all three AgentLoop scopes.
 - 唤醒攒批窗口（2026-07-28 引入，2026-08-01 改固定窗口；2026-08-06 外部一律
   进窗）：wake() 由第一次开窗、到点才开拍，窗口内并入且不顺延；持续唤醒下每
-  个窗口到点照常开拍。自续拍仍是 loop 内部 immediate。
+  个窗口到点照常开拍。2026-08-17 起**自续拍也走同一条窗口**——落库的事件没有
+  谁可以插队，那三秒正是人补完后半句的时间；自续与外部的差别只在是否清零
+  `AGENT_CONTINUATION_MAX_TICKS` 的计数。
+
+空程序拍的事件链在 2026-08-17 提案-裁决流水线下不变（它是唯一的停止符）；
+提案拍 / 裁决拍的事件链由 test_program_decision_contract.py 覆盖。
 """
 
 from __future__ import annotations
@@ -73,7 +78,7 @@ class _EmptyResult:
 class _RecordingSession:
     """async session double that captures every executed insert statement.
 
-    Reads used by ReplyExecutor, task backfill, and program crash recovery are
+    Reads used by task backfill and program crash recovery are
     ignored and return an empty result. Only mutating statements are appended
     to ``store``.
     """
@@ -115,6 +120,156 @@ def _values_of(stmt: Any) -> dict:
     return {k: v for k, v in stmt.compile().params.items()}
 
 
+def _bind(params: dict, prefix: str) -> Any:
+    for key, value in params.items():
+        if key == prefix or key.startswith(prefix + "_"):
+            return value
+    return None
+
+
+def _mentioned_event_types(compiled: Any) -> set[str]:
+    found: set[str] = set()
+    text = str(compiled)
+    for name in (
+        "agent.tool_called",
+        "agent.program_completed",
+        "agent.program_failed",
+        "agent.tool_result",
+        "agent.tool_failed",
+        "agent.decision_emitted",
+    ):
+        if name in text:
+            found.add(name)
+    for value in compiled.params.values():
+        if isinstance(value, str) and value.startswith("agent."):
+            found.add(value)
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            for item in value:
+                if isinstance(item, str) and item.startswith("agent."):
+                    found.add(item)
+    return found
+
+
+class _SelectResult:
+    def __init__(self, rows: list[Any]) -> None:
+        self._rows = rows
+
+    def mappings(self) -> "_SelectResult":
+        return self
+
+    def scalars(self) -> "_SelectResult":
+        return self
+
+    def all(self) -> list[Any]:
+        return list(self._rows)
+
+    def first(self) -> Any:
+        return self._rows[0] if self._rows else None
+
+
+class _DecisionLookupSession(_RecordingSession):
+    """Recording session that can answer ``load_referenced_decision`` SELECTs.
+
+    Other SELECTs (recovery, projection, task backfill) stay empty so idle-tick
+    tests keep seeing a blank world.
+    """
+
+    async def execute(self, stmt: Any, params: dict | None = None) -> Any:
+        from sqlalchemy.sql.elements import TextClause
+
+        _ = params
+        if isinstance(stmt, TextClause) or bool(getattr(stmt, "is_select", False)):
+            return self._select(stmt)
+        self._store.append(stmt)
+        return SimpleNamespace(rowcount=1)
+
+    def _select(self, stmt: Any) -> _SelectResult:
+        compiled = stmt.compile()
+        params = compiled.params
+        causation_id = _bind(params, "causation_id")
+        event_id = _bind(params, "event_id")
+        rows = []
+        for item in self._store:
+            vals = _values_of(item)
+            rows.append(
+                SimpleNamespace(
+                    event_id=vals.get("event_id"),
+                    type=vals.get("type"),
+                    scope=vals.get("scope"),
+                    group_id=vals.get("group_id"),
+                    user_id=vals.get("user_id"),
+                    correlation_id=vals.get("correlation_id"),
+                    causation_id=vals.get("causation_id"),
+                    payload=vals.get("payload") or {},
+                )
+            )
+        if causation_id is not None:
+            mentioned = _mentioned_event_types(compiled)
+            hits = [
+                row.event_id
+                for row in rows
+                if row.causation_id == causation_id and row.type in mentioned
+            ]
+            return _SelectResult(hits)
+        if isinstance(event_id, str):
+            scope = _bind(params, "scope")
+            group_id = _bind(params, "group_id")
+            user_id = _bind(params, "user_id")
+            hits = []
+            for row in rows:
+                if row.event_id != event_id:
+                    continue
+                if scope is not None and row.scope != scope:
+                    continue
+                if group_id is not None and row.group_id != group_id:
+                    continue
+                if user_id is not None and row.user_id != user_id:
+                    continue
+                hits.append(row)
+            return _SelectResult(hits)
+        return _SelectResult([])
+
+
+def _pipeline_factory_for(store: list[Any]):
+    def factory() -> _DecisionLookupSession:
+        return _DecisionLookupSession(store)
+
+    return factory
+
+
+class _ProposeThenCommitPlanner:
+    """第一拍写业务代码，第二拍指名那条决策；之后空程序。"""
+
+    def __init__(
+        self,
+        store: list[Any],
+        program: str,
+        *,
+        delay_commit: float = 0.0,
+    ) -> None:
+        self._store = store
+        self._program = program
+        self._delay_commit = delay_commit
+
+    async def decide(self, context: Any) -> DecisionOutput:
+        _ = context
+        decisions = [
+            _values_of(stmt)
+            for stmt in self._store
+            if _values_of(stmt).get("type") == "agent.decision_emitted"
+        ]
+        if not decisions:
+            return DecisionOutput(program=self._program)
+        if len(decisions) == 1:
+            if self._delay_commit:
+                await asyncio.sleep(self._delay_commit)
+            event_id = decisions[0].get("event_id")
+            return DecisionOutput(
+                program=f'execute_decision(event_id="{event_id}")'
+            )
+        return DecisionOutput(program="# nothing left to do")
+
+
 class ScopeKeyParserTests(unittest.TestCase):
     def test_system(self) -> None:
         self.assertEqual(parse_scope_key("system"), ("system", None, None))
@@ -152,25 +307,15 @@ class _TimestampEffect(BaseTool):
         "properties": {},
         "additionalProperties": False,
     }
+    # 字段不能叫 ok：2026-08-15 起 ok/error 由结果信封统一注入。
     result_schema = {
         "type": "object",
-        "properties": {"ok": {"type": "boolean"}},
+        "properties": {"passed": {"type": "boolean"}},
         "additionalProperties": False,
     }
 
     async def execute(self, arguments: dict, **context: Any) -> ToolOutcome:
-        return ToolOutcome.success({"ok": True})
-
-
-class _SlowCallToolPlanner:
-    """模拟 LLM 往返后在本拍内执行一个 effect。"""
-
-    DELAY = 0.15
-
-    async def decide(self, context: Any) -> Any:
-        _ = context
-        await asyncio.sleep(self.DELAY)
-        return DecisionOutput(program="timestamp_effect()")
+        return ToolOutcome.success({"passed": True})
 
 
 class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
@@ -277,19 +422,21 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(terminal, decision)
 
     async def test_effect_intent_timestamp_is_tick_start_not_write_time(self) -> None:
-        """程序 effect 的意图事件仍锚定本拍投影时刻。
+        """``tool_called.occurred_at`` 锚定**裁决拍**的投影时刻，不是写入时刻。
 
-        ``tool_called`` 是模型拍板的调用行，必须和 decision 同锚；
-        terminal 与 program terminal 则记录真实完成时刻。决策拍在入队后
-        即 ``tick_ended``，工具事件由 Runner 随后写出。
+        提案拍只落库，不写 ``tool_called``。指名执行的那一拍才入队，Runner
+        用那一拍的 ``context.now`` 当意图时间；correlation 仍归被引用的提案。
         """
         captured: list[Any] = []
         registry = ToolRegistry()
         registry.register(_TimestampEffect)
+        delay = 0.15
         loop = AgentLoop(
             scope_key="group:12345",
-            planner=_SlowCallToolPlanner(),
-            session_factory=_factory_for(captured),
+            planner=_ProposeThenCommitPlanner(
+                captured, "timestamp_effect()", delay_commit=delay
+            ),
+            session_factory=_pipeline_factory_for(captured),
             tool_registry=registry,
         )
         with patch(
@@ -304,25 +451,52 @@ class AgentLoopSkeletonTickTests(unittest.IsolatedAsyncioTestCase):
                     for stmt in captured
                     if getattr(stmt, "table", None) is not None
                 }
-                if "agent.tool_called" in types and "runtime.tick_ended" in types:
+                if (
+                    "agent.tool_called" in types
+                    and "agent.program_completed" in types
+                ):
                     break
             await loop.stop()
 
-        by_type = {
-            _values_of(stmt).get("type"): _values_of(stmt) for stmt in captured
-        }
-        started = by_type["runtime.tick_started"]["occurred_at"]
-        decision = by_type["agent.decision_emitted"]["occurred_at"]
-        ended = by_type["runtime.tick_ended"]["occurred_at"]
-        called_at = by_type["agent.tool_called"]["occurred_at"]
-        self.assertEqual(called_at, decision)
-        self.assertLessEqual(called_at, started)
-        self.assertGreaterEqual(
-            by_type["agent.tool_result"]["occurred_at"], called_at
+        events = [
+            _values_of(stmt)
+            for stmt in captured
+            if getattr(stmt, "table", None) is not None
+        ]
+        decisions = [
+            item
+            for item in events
+            if item.get("type") == "agent.decision_emitted"
+        ]
+        self.assertGreaterEqual(len(decisions), 2)
+        proposal, commit = decisions[0], decisions[1]
+        called = next(
+            item for item in events if item.get("type") == "agent.tool_called"
         )
-        # 反证 planner 确实慢过一拍（同 decision 测试的护栏语义）。
+        result = next(
+            item for item in events if item.get("type") == "agent.tool_result"
+        )
+        commit_corr = commit["correlation_id"]
+        commit_started = next(
+            item
+            for item in events
+            if item.get("type") == "runtime.tick_started"
+            and item.get("correlation_id") == commit_corr
+        )
+        commit_ended = next(
+            item
+            for item in events
+            if item.get("type") == "runtime.tick_ended"
+            and item.get("correlation_id") == commit_corr
+        )
+        self.assertEqual(called["occurred_at"], commit["occurred_at"])
+        self.assertEqual(called["causation_id"], proposal["event_id"])
+        self.assertEqual(called["correlation_id"], proposal["correlation_id"])
+        self.assertLessEqual(called["occurred_at"], commit_started["occurred_at"])
+        self.assertGreaterEqual(result["occurred_at"], called["occurred_at"])
         self.assertGreaterEqual(
-            (ended - decision).total_seconds(), _SlowCallToolPlanner.DELAY
+            (commit_ended["occurred_at"] - commit["occurred_at"]).total_seconds(),
+            delay,
         )
 
     async def test_loop_idle_when_not_waked(self) -> None:
@@ -464,7 +638,7 @@ class WakeBatchWindowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self._tick_count(captured), 1)
 
     async def test_external_wake_never_bypasses_window(self) -> None:
-        """外部 wake 一律进攒批窗口（含 reply 完成 / wait 到点 / 静默）。"""
+        """外部 wake 一律进攒批窗口（含 wait 到点 / 静默）。"""
         captured: list[Any] = []
         loop = AgentLoop(
             scope_key="group:12345",
@@ -481,6 +655,29 @@ class WakeBatchWindowTests(unittest.IsolatedAsyncioTestCase):
             await self._settle(captured, 4, budget=1.0)
             await loop.stop()
         self.assertEqual(await self._tick_count(captured), 1)
+
+    async def test_self_wake_uses_the_same_window(self) -> None:
+        """自续拍没有 immediate 旁路（2026-08-17 维护者裁定）。
+
+        提案拍写完源码后自己开下一拍，那一拍要等窗口到点才起——否则裁决拍的
+        投影紧贴着提案拍拍出，这三秒里到达的消息（正是人补完的后半句）就照旧
+        看不见，多出来的那一拍白花一次推理。
+        """
+        loop = AgentLoop(
+            scope_key="group:12345",
+            planner=_FakeIdlePlanner(),
+            session_factory=_factory_for([]),
+        )
+        with patch(
+            "qqbot.services.agent_loop.loop._WAKE_BATCH_WINDOW_SECONDS", 0.3
+        ):
+            self.assertTrue(loop._wake_continuation())
+            # 开的是窗口，不是立刻置位。
+            self.assertFalse(loop._wake.is_set())
+            self.assertIsNotNone(loop._wake_deadline)
+            await asyncio.sleep(0.5)
+            self.assertTrue(loop._wake.is_set())
+        loop._cancel_wake_timer()
 
     async def test_continuous_wakes_tick_once_per_window(self) -> None:
         """持续刷屏不能把 tick 饿死：窗口不被顺延，到点就开拍，之后的唤醒开一
@@ -835,12 +1032,12 @@ class _TimestampQuery(BaseTool):
     }
     result_schema = {
         "type": "object",
-        "properties": {"ok": {"type": "boolean"}},
+        "properties": {"passed": {"type": "boolean"}},
         "additionalProperties": False,
     }
 
     async def execute(self, arguments: dict, **context: Any) -> ToolOutcome:
-        return ToolOutcome.success({"ok": True})
+        return ToolOutcome.success({"passed": True})
 
 
 class _FailingEffect(BaseTool):
@@ -853,7 +1050,7 @@ class _FailingEffect(BaseTool):
     }
     result_schema = {
         "type": "object",
-        "properties": {"ok": {"type": "boolean"}},
+        "properties": {"passed": {"type": "boolean"}},
         "additionalProperties": False,
     }
 
@@ -892,8 +1089,10 @@ class ContinuationMaxTicksResolverTests(unittest.TestCase):
 
 
 class ContinuationTickTests(unittest.IsolatedAsyncioTestCase):
-    """自续拍（2026-08-14 改口）：Runner 写出 program terminal 后立刻再开一拍；
-    空程序不入队，是不动点。
+    """自续拍：提案拍 / 裁决报错拍 / Runner terminal 都再开一拍；空程序是不动点。
+
+    提案拍自己就会自唤醒，不代表程序跑过。要证明副作用发生，必须再看一拍
+    ``execute_decision`` 之后有没有 ``tool_called``。
     """
 
     @staticmethod
@@ -911,13 +1110,18 @@ class ContinuationTickTests(unittest.IsolatedAsyncioTestCase):
         registry: ToolRegistry | None = None,
         expect_ticks: int,
         max_ticks: int | None = None,
+        lookup: bool = False,
+        store: list[Any] | None = None,
     ) -> list[Any]:
         """开一次外部 wake，跑到链条停稳，返回捕获到的语句。
 
         settle 预算给到期望拍数之后仍多等一截，好让"多续了一拍"这类回归表现为
         断言失败而不是恰好没观测到。
         """
-        captured: list[Any] = []
+        captured = store if store is not None else []
+        factory = (
+            _pipeline_factory_for(captured) if lookup else _factory_for(captured)
+        )
         with patch(
             "qqbot.services.agent_loop.loop.continuation_max_ticks",
             return_value=max_ticks,
@@ -927,7 +1131,7 @@ class ContinuationTickTests(unittest.IsolatedAsyncioTestCase):
             loop = AgentLoop(
                 scope_key="group:12345",
                 planner=planner,
-                session_factory=_factory_for(captured),
+                session_factory=factory,
                 tool_registry=registry,
             )
             loop.start()
@@ -945,7 +1149,8 @@ class ContinuationTickTests(unittest.IsolatedAsyncioTestCase):
         captured = await self._run(_FakeIdlePlanner(), expect_ticks=1)
         self.assertEqual(self._tick_count(captured), 1)
 
-    async def test_effect_call_continues_until_empty_program(self) -> None:
+    async def test_proposal_self_wakes_without_running(self) -> None:
+        """提案拍只落库：自唤醒去审阅，当拍不写 tool_called。"""
         registry = ToolRegistry()
         registry.register(_TimestampEffect)
         captured = await self._run(
@@ -953,35 +1158,92 @@ class ContinuationTickTests(unittest.IsolatedAsyncioTestCase):
             registry=registry,
             expect_ticks=2,
         )
-        # 第一拍入队 → Runner 跑完 wake → 第二拍空程序 → 停。
+        types = [_values_of(stmt).get("type") for stmt in captured]
         self.assertEqual(self._tick_count(captured), 2)
+        self.assertNotIn("agent.tool_called", types)
+        ended = [
+            _values_of(stmt)
+            for stmt in captured
+            if _values_of(stmt).get("type") == "runtime.tick_ended"
+        ]
+        self.assertEqual(ended[0]["payload"]["program_status"], "proposed")
+        self.assertTrue(ended[0]["payload"]["left_proposal"])
 
-    async def test_query_only_program_continues(self) -> None:
-        """只读函数同样续拍 —— Runner 跑完才叫醒，查完才能接着办。"""
+    async def test_commit_runs_named_program_then_terminal_wakes(self) -> None:
+        """后一拍 execute_decision 才入队；terminal 再叫醒空程序收尾。"""
+        registry = ToolRegistry()
+        registry.register(_TimestampEffect)
+        captured: list[Any] = []
+        captured = await self._run(
+            _ProposeThenCommitPlanner(captured, "timestamp_effect()"),
+            registry=registry,
+            expect_ticks=3,
+            lookup=True,
+            store=captured,
+        )
+        types = [_values_of(stmt).get("type") for stmt in captured]
+        self.assertEqual(self._tick_count(captured), 3)
+        self.assertIn("agent.tool_called", types)
+        self.assertIn("agent.program_completed", types)
+        decisions = [
+            _values_of(stmt)
+            for stmt in captured
+            if _values_of(stmt).get("type") == "agent.decision_emitted"
+        ]
+        called = next(
+            _values_of(stmt)
+            for stmt in captured
+            if _values_of(stmt).get("type") == "agent.tool_called"
+        )
+        self.assertEqual(called["causation_id"], decisions[0]["event_id"])
+        self.assertEqual(decisions[1]["payload"]["program"], "")
+
+    async def test_query_only_commit_wakes_via_terminal(self) -> None:
+        """现役一律 Effect：标成 query 的函数同样要先被指名才跑，同样写
+        ``tool_called``，terminal 再叫醒。
+        """
         registry = ToolRegistry()
         registry.register(_TimestampQuery)
+        captured: list[Any] = []
         captured = await self._run(
-            _ScriptedPlanner(["timestamp_query()"]),
+            _ProposeThenCommitPlanner(captured, "timestamp_query()"),
             registry=registry,
-            expect_ticks=2,
+            expect_ticks=3,
+            lookup=True,
+            store=captured,
         )
-        self.assertEqual(self._tick_count(captured), 2)
+        types = [_values_of(stmt).get("type") for stmt in captured]
+        self.assertEqual(self._tick_count(captured), 3)
+        self.assertIn("agent.tool_called", types)
+        self.assertIn("agent.program_completed", types)
+        called = next(
+            _values_of(stmt)
+            for stmt in captured
+            if _values_of(stmt).get("type") == "agent.tool_called"
+        )
+        self.assertEqual(called["payload"]["tool_name"], "timestamp_query")
 
-    async def test_failed_call_continues(self) -> None:
-        """失败调用照样续拍：中止余下程序意味着她当拍接不住，得换一拍再判断。"""
+    async def test_failed_call_completes_and_wakes(self) -> None:
+        """失败调用是返回值（2026-08-15），程序跑完仍写 terminal 并唤醒。"""
         registry = ToolRegistry()
         registry.register(_FailingEffect)
+        captured: list[Any] = []
         captured = await self._run(
-            _ScriptedPlanner(["failing_effect()"]),
+            _ProposeThenCommitPlanner(captured, "failing_effect()"),
             registry=registry,
-            expect_ticks=2,
+            expect_ticks=3,
+            lookup=True,
+            store=captured,
         )
-        self.assertEqual(self._tick_count(captured), 2)
         types = [_values_of(stmt).get("type") for stmt in captured]
-        self.assertIn("agent.program_failed", types)
+        self.assertEqual(self._tick_count(captured), 3)
+        self.assertIn("agent.tool_called", types)
+        self.assertIn("agent.tool_failed", types)
+        self.assertIn("agent.program_completed", types)
+        self.assertNotIn("agent.program_failed", types)
 
     async def test_max_ticks_caps_the_chain(self) -> None:
-        """上界只约束一段自转的长度：1 → 外部一拍 + 自续一拍后必须停。"""
+        """上界约束自续（提案拍自唤醒也算）：1 → 外部一拍 + 自续一拍后必须停。"""
         registry = ToolRegistry()
         registry.register(_TimestampEffect)
         captured = await self._run(

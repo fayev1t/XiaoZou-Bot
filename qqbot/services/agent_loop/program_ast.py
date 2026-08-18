@@ -16,7 +16,7 @@ import io
 import re
 import textwrap
 import tokenize
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, NoReturn
 
 if TYPE_CHECKING:
@@ -56,6 +56,26 @@ _MIN_FENCED_LINE_COUNT = 2
 _FENCE_OPEN = re.compile(r"^```(?:python)?[ \t]*$", re.IGNORECASE)
 _RESERVED_EFFECT_ARGUMENTS = frozenset({"task_id", "triggered_by_event_id"})
 _SCHEMA_ORIGIN_KEY = "x-program-function"
+
+# 裁决层的调度元指令（2026-08-17 提案-裁决流水线 §1.0）。模型每拍的输出解耦为
+# 两层：**裁决层**一行 ``execute_decision``，告诉调度器"把历史事件 X 提交给
+# Runner 执行"；**动作层**才是这一拍新写的业务代码。两层完全正交，一次输出里
+# 可以两者都有——那正是流水线形态：确认上一段的同时写下一段。
+#
+# 它不是 Program API 工具：registry 里没有它，不占调用点，ProgramExecutor 永远
+# 见不到它。**落库解耦（防套娃）**：preflight 在这里就把指令行从源码里剥掉，
+# ``PreflightResult.source`` 与 ``program_sha256`` 都只覆盖剩下的纯业务代码，
+# 因此 ``decision_emitted.payload.program`` 里绝不会再嵌一条裁决指令；指令本身
+# 化为 ``commit_event_id``，由 AgentLoop 在派发处消费。
+#
+# 形状必须在静态期锁死：模块顶层的独立语句、唯一具名参数、字面量事件 ID。写在
+# 表达式里（赋值右侧、当参数、放进 if 条件）一律拒绝——那会让"这一拍要不要执行
+# 某条历史决策"变成运行期才知道的事。
+_COMMIT_FUNCTION_NAME = "execute_decision"
+_COMMIT_MAX_CALL_SITES = 1
+# 事件 ID = 26 位 Crockford base32 ULID（core/ids.new_event_id）。信封里带
+# ``ev:`` 前缀展示，实参取裸值。
+_EVENT_ID_PATTERN = re.compile(r"[0-9A-HJKMNP-TV-Z]{26}")
 
 
 @dataclass(frozen=True)
@@ -102,6 +122,12 @@ class PreflightResult:
     tree: ast.Module = field(repr=False, compare=False)
     call_sites: tuple[ProgramCallSite, ...] = ()
     has_return: bool = False
+    # 裁决层：非 None 表示本拍还带了一条调度元指令，值是被引用的历史决策事件
+    # ID。它与动作层（source / call_sites / has_return）互不相干，可以同时存在；
+    # ``source`` 里**已经剥掉**了这条指令。
+    commit_event_id: str | None = None
+    # 指令在**原始**响应里占的物理行范围，只在 preflight 内部用于剥离。
+    commit_lines: tuple[int, int] | None = field(default=None, compare=False)
 
 
 def strip_outer_fence(raw: str) -> str:
@@ -158,8 +184,43 @@ def preflight(
     registry: ToolRegistry,
     scope: str,
 ) -> PreflightResult:
-    """Validate source without executing it and return its stable metadata."""
+    """Validate source without executing it and return its stable metadata.
+
+    带裁决指令时走两遍（提案-裁决流水线 §1.1「落库解耦（防套娃）」）：第一遍认出
+    指令并拿到它的物理行范围，把那几行从源码里剥掉；第二遍在**纯业务代码**上重新
+    走完整校验，于是返回的 ``source`` / ``program_sha256`` / ``call_sites`` 行号
+    全部对齐真正落库的那段文本。落库的 ``payload.program`` 因此绝不会再嵌一条
+    裁决指令。
+    """
     cleaned = strip_outer_fence(source)
+    result = _preflight_source(cleaned, registry, scope)
+    if result.commit_event_id is None or result.commit_lines is None:
+        return result
+    body = _strip_lines(cleaned, result.commit_lines)
+    stripped = _preflight_source(body, registry, scope)
+    return replace(
+        stripped,
+        commit_event_id=result.commit_event_id,
+        commit_lines=result.commit_lines,
+    )
+
+
+def _strip_lines(source: str, span: tuple[int, int]) -> str:
+    """删掉 1-based 闭区间 ``span`` 覆盖的物理行。"""
+    start, end = span
+    kept = [
+        line
+        for index, line in enumerate(source.splitlines(), start=1)
+        if not start <= index <= end
+    ]
+    return "\n".join(kept).strip()
+
+
+def _preflight_source(
+    cleaned: str,
+    registry: ToolRegistry,
+    scope: str,
+) -> PreflightResult:
     if len(cleaned) > MAX_SOURCE_CHARS:
         _raise_quota(
             None,
@@ -187,11 +248,17 @@ def preflight(
         tree=tree,
         call_sites=tuple(validator.call_sites),
         has_return=validator.return_count == 1,
+        commit_event_id=validator.commit_event_id,
+        commit_lines=validator.commit_lines,
     )
 
 
 def build_executable_tree(result: PreflightResult) -> ast.Module:
-    """Return a copied AST with awaits and quota hooks inserted."""
+    """Return a copied AST with awaits and quota hooks inserted.
+
+    树里不会有裁决指令——``preflight`` 已在落库前把那一层剥掉，这里拿到的始终
+    是纯动作层代码。
+    """
     tree = copy.deepcopy(result.tree)
     tree = _Instrumenter(result.call_sites).visit(tree)
     ast.fix_missing_locations(tree)
@@ -306,8 +373,11 @@ class _Validator:
         self._visible = {spec.name: spec for spec in registry.specs(scope)}
         self.call_sites: list[ProgramCallSite] = []
         self.return_count = 0
+        self.commit_event_id: str | None = None
+        self.commit_lines: tuple[int, int] | None = None
         self._call_occurrences: dict[str, int] = {}
         self._effect_counts: dict[str, int] = {}
+        self._commit_count = 0
 
     def validate(self, function: ast.AsyncFunctionDef) -> None:
         if function.decorator_list or function.args.args or function.args.kwonlyargs:
@@ -315,7 +385,7 @@ class _Validator:
         # Empty source is represented by our own pass node.
         if len(function.body) == 1 and isinstance(function.body[0], ast.Pass):
             return
-        self._block(function.body, {})
+        self._block(function.body, {}, top_level=True)
         effect_total = sum(self._effect_counts.values())
         if effect_total > MAX_EFFECT_CALL_SITES:
             _raise_quota(
@@ -338,6 +408,7 @@ class _Validator:
         env: dict[str, dict | None],
         *,
         in_loop: bool = False,
+        top_level: bool = False,
     ) -> dict[str, dict | None]:
         for index, statement in enumerate(statements):
             if isinstance(statement, ast.Assign):
@@ -357,6 +428,9 @@ class _Validator:
             if isinstance(statement, ast.Expr):
                 if not isinstance(statement.value, ast.Call):
                     self._forbidden(statement, "bare_expression")
+                if _is_commit_call(statement.value):
+                    self._commit(statement.value, top_level=top_level)
+                    continue
                 self._expr(
                     statement.value,
                     env,
@@ -730,6 +804,15 @@ class _Validator:
         if not isinstance(node.func, ast.Name):
             self._forbidden(node, "method_or_indirect_call")
         name = node.func.id
+        if name == _COMMIT_FUNCTION_NAME:
+            # 顶层独立语句的形态已被 _block 截走；能落到表达式求值这里，说明它
+            # 出现在赋值右侧 / 实参 / 分支条件里。它没有返回值，也不该被当成值。
+            self._error(
+                node,
+                "program_forbidden_construct",
+                f"{_COMMIT_FUNCTION_NAME}() is a statement, not a value",
+                construct="commit_not_a_statement",
+            )
         if name in self._visible:
             spec = self._visible[name]
             if node.args:
@@ -859,9 +942,67 @@ class _Validator:
                     field=field_name,
                 )
 
+    def _commit(self, node: ast.Call, *, top_level: bool) -> None:
+        """``execute_decision(event_id="…")`` 的静态形状。
+
+        只在模块顶层、作为独立语句成立。参数唯一且必须是字面量事件 ID——运行期
+        不去解析变量，"这一拍要执行哪条历史决策"必须在派发之前就是确定的。
+        """
+        if not top_level:
+            self._forbidden(node, "commit_not_top_level")
+        if node.args:
+            self._forbidden(node, "program_function_positional_args")
+        keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+        if len(node.keywords) != 1 or set(keywords) != {"event_id"}:
+            self._error(
+                node,
+                "program_forbidden_construct",
+                f"{_COMMIT_FUNCTION_NAME} takes exactly one keyword argument: "
+                'event_id="<事件ID>"',
+                construct="commit_signature",
+                function=_COMMIT_FUNCTION_NAME,
+            )
+        value = keywords["event_id"]
+        if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+            self._error(
+                value,
+                "program_forbidden_construct",
+                f"{_COMMIT_FUNCTION_NAME} event_id must be a string literal",
+                construct="commit_event_id_not_literal",
+                function=_COMMIT_FUNCTION_NAME,
+            )
+        text = value.value
+        if _EVENT_ID_PATTERN.fullmatch(text) is None:
+            self._error(
+                value,
+                "program_forbidden_construct",
+                f"{_COMMIT_FUNCTION_NAME} event_id must be a 26-character event id "
+                "copied from the timeline without its ev: prefix",
+                construct="commit_event_id_malformed",
+                function=_COMMIT_FUNCTION_NAME,
+                event_id=text[:64],
+            )
+        self._commit_count += 1
+        if self._commit_count > _COMMIT_MAX_CALL_SITES:
+            _raise_quota(
+                node,
+                f"effect_call_sites:{_COMMIT_FUNCTION_NAME}",
+                self._commit_count,
+                _COMMIT_MAX_CALL_SITES,
+            )
+        self.commit_event_id = text
+        # 物理行范围（含首尾），供 preflight 从源码里剥掉这一层。函数壳占一行，
+        # 因此 AST 行号比模型源码大 1。
+        self.commit_lines = (
+            node.lineno - 1,
+            (node.end_lineno or node.lineno) - 1,
+        )
+
     def _validate_assignment_name(self, node: ast.AST, name: str) -> None:
         self._validate_public_name(node, name)
         if name in SAFE_BUILTINS or name.startswith("__program_"):
+            self._forbidden(node, "reserved_assignment_name")
+        if name == _COMMIT_FUNCTION_NAME:
             self._forbidden(node, "reserved_assignment_name")
         if self._registry.spec(name) is not None:
             self._forbidden(node, "reserved_assignment_name")
@@ -1075,6 +1216,14 @@ class _Instrumenter(ast.NodeTransformer):
             else:
                 output.append(transformed)
         return output
+
+
+def _is_commit_call(node: ast.expr) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == _COMMIT_FUNCTION_NAME
+    )
 
 
 def _source_position(node: ast.AST | None) -> tuple[int, int]:

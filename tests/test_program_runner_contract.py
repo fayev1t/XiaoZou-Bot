@@ -15,7 +15,7 @@ from typing import Any
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from qqbot.services.agent_loop.decision import DecisionContext, DecisionOutput
+from qqbot.services.agent_loop.decision import DecisionContext
 from qqbot.services.agent_loop.loop import AgentLoop
 from qqbot.services.agent_loop.outbound_messages import send_all
 from qqbot.services.agent_loop.program_ast import preflight
@@ -289,26 +289,26 @@ class _GateEffect(BaseTool):
         return ToolOutcome.success({"passed": True})
 
 
-class _GatePlanner:
-    async def decide(self, context: Any) -> DecisionOutput:
-        _ = context
-        return DecisionOutput(program="gate()")
-
-
 class DispatchOverlapTests(unittest.IsolatedAsyncioTestCase):
     async def test_decision_tick_ends_before_tool_finishes(self) -> None:
+        """裁决拍入队后即 tick_ended；工具由 Runner 随后跑，不得堵住这一拍。"""
         captured: list[Any] = []
         _GateEffect.started = asyncio.Event()
         _GateEffect.release = asyncio.Event()
         registry = ToolRegistry()
         registry.register(_GateEffect)
 
-        from tests.test_agent_loop_skeleton_contract import _factory_for, _values_of
+        from tests.test_agent_loop_skeleton_contract import (
+            _pipeline_factory_for,
+            _ProposeThenCommitPlanner,
+            _values_of,
+        )
 
+        planner = _ProposeThenCommitPlanner(captured, "gate()")
         loop = AgentLoop(
             scope_key="group:1",
-            planner=_GatePlanner(),
-            session_factory=_factory_for(captured),
+            planner=planner,
+            session_factory=_pipeline_factory_for(captured),
             tool_registry=registry,
         )
         with patch(
@@ -316,15 +316,19 @@ class DispatchOverlapTests(unittest.IsolatedAsyncioTestCase):
         ):
             loop.start()
             loop.wake()
-            await _GateEffect.started.wait()
+            await asyncio.wait_for(_GateEffect.started.wait(), timeout=2)
             types = [_values_of(stmt).get("type") for stmt in captured]
-            self.assertIn("runtime.tick_ended", types)
-            ended = next(
+            ended = [
                 _values_of(stmt)
                 for stmt in captured
                 if _values_of(stmt).get("type") == "runtime.tick_ended"
+            ]
+            self.assertTrue(
+                any(
+                    item["payload"]["program_status"] == "dispatched"
+                    for item in ended
+                )
             )
-            self.assertEqual(ended["payload"]["program_status"], "dispatched")
             self.assertNotIn("agent.program_completed", types)
             _GateEffect.release.set()
             for _ in range(50):

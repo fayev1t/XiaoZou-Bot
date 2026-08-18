@@ -29,8 +29,10 @@ ID 记号：记号标识值域，各值域互不通用，也不可互相推导�
                   后缀，不会出现"非本账号"标记）。
   #N              OneBot 消息 ID。与出站 reply 段的 data.id、以消息为目标的
                   工具参数 message_id 同域。
-  ev:X            内部事件存储 ID。仅出现在加群申请行与任务起因槽；
+  ev:X            内部事件存储 ID。出现在程序行、加群申请行与任务起因槽。
+                  execute_decision 的 event_id、
                   respond_to_group_join_request 的 request_event_id 取此值。
+                  实参写裸值，不带 ev: 前缀。
   12 位十六进制    图片内容 sha256 的展示前缀。<图> 段与 <meme> 行同域；
                   工具参数 image_hash 按前缀原样照抄即可（也接受完整 64 位）。
   任务/等待 ID     原样字面。任务 ID 与程序 effect 调用的 task_id= 参数同域。
@@ -158,20 +160,26 @@ ID 记号：记号标识值域，各值域互不通用，也不可互相推导�
 
 ── 程序行 ──
 
-<程序>决策
+<程序>决策 ev:X
   源码全文或（空程序）
 
-<程序>完成
+<程序>完成 ev:X
   结果 <JSON>[（截断）]
 
-<程序>失败 kind [k=v …]
+<程序>失败 ev:X kind [k=v …]
   原因 <文字>
 
-  `<程序>决策` 是这一拍最终写出的完整程序原文，含注释；它表示发出了什么，
-  不表示已经执行到哪一步。空文本显示为「（空程序）」；纯注释按原文显示。
-  `<程序>完成|失败` 是执行终态。完成时只有程序显式 `return` 了数据才有结果行；
-  空程序也会追加一行 `<程序>完成`。调用明细在各自的 `<工具>` 行上，不在这里
-  用查询名摘要代替。失败 kind 除工具自身错误外，程序层常见取值：
+  `<程序>决策` 是某一拍写出的业务代码原文，含注释；那一拍若还带了一行
+  `execute_decision(...)`，它属于调度层、已在当时生效，不会出现在这里。
+  **写出来不等于跑过**：行头的 ev:X 是这段代码自己的事件 ID，它只有在后来某一拍
+  被 `execute_decision(event_id="X")` 指名之后才会真的执行。空文本显示为
+  「（空程序）」；纯注释按原文显示。
+  `<程序>完成|失败` 是执行终态，行头的 ev:X 回指它收束的那条 `<程序>决策`——
+  多段程序可以同时在跑，靠这个 ID 而不是靠位置对上号。没有终态的决策行有三种
+  情形：还没被指名执行、正在执行中、以及再也不会被执行。完成时只有程序显式
+  `return` 了数据才有结果行；空程序在它自己那一拍就直接得到 `<程序>完成`。
+  调用明细在各自的 `<工具>` 行上，不在这里用查询名摘要代替。失败 kind 除工具
+  自身错误外，程序层常见取值：
     program_syntax_error        源码语法或最外层围栏不合法
     program_forbidden_construct 使用了受限子集之外的结构，附 construct=
     program_unknown_name        名字不存在或当前 scope 不可见，附 name=
@@ -179,6 +187,11 @@ ID 记号：记号标识值域，各值域互不通用，也不可互相推导�
     program_unknown_field       读取返回 schema 未声明字段，附 function= field=
     program_timeout             单调用或整程序超时，附 scope=call|program
     program_output_too_large    return JSON 超限，附 actual_bytes= max_bytes=
+    decision_not_found          execute_decision 指的事件不在本 scope，附
+                                target_event_id=
+    already_executed            那条决策已经在跑或已经跑完，附 target_event_id=
+    decision_not_a_proposal     那条决策里没有代码可跑（它当时只下过一条调度
+                                指令，或本来就是空程序），附 target_event_id=
     invalid_program_giveup      同拍三次静态校验都未通过
     interrupted                 进程退出留下半截程序，附 status=uncertain；不重放
 
@@ -218,10 +231,8 @@ ID 记号：记号标识值域，各值域互不通用，也不可互相推导�
   目标群恒为当前群，不再标注。
 
 <等待结束>等待ID [rN]
-  一段等待结束的记录，出现在其 flush_at 到达的时刻。该等待自此为 terminal；
-  此行只陈述等待结束这一事实。等待 ID 与 <工具>reply 结果中的
-  reply_task_id 同值；rN 为结束时生效的修订序号，即最后一次 reply 调用落下
-  的那份。
+  仅旧记录：已删除的 reply 等待链路中一段等待到点的事实。现行链路不产生本行，
+  也不再有 reply 这个函数。
 
 <任务收束>任务ID 完成|失败[: 正文]
   一个任务的收束记录，出现在 task 工具 complete / fail 分支生效的时刻。

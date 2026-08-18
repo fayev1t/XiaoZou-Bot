@@ -265,13 +265,9 @@ class Projector:
         # 渲染成表情包收藏节（meme 工具凭 hash 前缀操作收藏的选图目录）。同样
         # best-effort 降级——查不到收藏夹只影响本 tick 发不了表情包。
         ctx = await self._augment_with_saved_memes(ctx, scope_key)
-        # _augment_with_pending_reply 已于 2026-07-24 删除（待办#19）：它每拍
-        # 多查一次 reply_task 事件、只为渲染 <pending-reply>，而那一段的每个
-        # Planner 所需字段都被 timeline 上的 <工具>reply 行覆盖
-        # （reply_task_id / revision / flush_at / hard_deadline 在 <result> 里，
-        # hold_seconds 在 <args> 里）。reply 成功行不再折叠之后主从关系反转，
-        # Planner 信封没有独立状态区。ReplyExecutor 也不走这条投影：它从
-        # reply_task 领域事件折叠调度事实，避免 terminal 竞态与 timeline 裁剪。
+        # _augment_with_pending_reply 已于 2026-07-24 删除（待办#19），它服务的
+        # 整套 reply / ReplyTask 又于 2026-08-17 随提案-裁决流水线删除。Planner
+        # 信封没有独立状态区：一切都在 timeline 上。
         return ctx
 
     async def _augment_with_persisted_tasks(
@@ -863,13 +859,8 @@ class Projector:
             if ev.type == "agent.tool_called":
                 tc_id = ev.payload.get("tool_call_id")
                 tv = tool_view_by_id.get(tc_id)
-                # 2026-07-24（待办#19）起 reply 的成功行**不再折叠**：它是
-                # Planner 回看自己每次等了多久的时间线记录——<args> 是该次
-                # hold_seconds，<result> 是它落成的调度事实（reply_task_id/
-                # revision/flush_at/hard_deadline）。折叠是为了避免与
-                # <pending-reply> 双重渲染，而那一段已随当时的改动删除。
-                # 2026-08-01 删掉 analysis 之后这些行更是短到不值得折叠，而且
-                # 连成一串正好让模型看见自己续了几次等待。
+                # 工具调用行一律不折叠：每一次调用及其终态都是 Planner 回看
+                # 自己做过什么的时间线记录。
                 items.append(
                     TimelineItem(
                         event_id=ev.event_id,
@@ -1169,34 +1160,48 @@ class Projector:
 
     @staticmethod
     def _render_decision(ev: _EventSnapshot) -> str | None:
-        """``agent.decision_emitted`` → ``<程序>决策`` plus full source."""
+        """``agent.decision_emitted`` → ``<程序>决策 ev:X`` plus full source.
+
+        ``ev:X`` 是这段源码自己的事件 ID（2026-08-17 提案-裁决流水线）：写下的
+        程序不会当拍执行，要执行得由后一拍写 ``execute_decision(event_id=…)``
+        指名，因此这个 ID 必须对模型可见。它与 ``<程序>完成|失败`` 行上回指的
+        ID 同域，据此把终态与它所收束的那段源码对上。
+        """
         payload = ev.payload or {}
         if "program" not in payload:
             return None
+        head = f"<程序>决策 ev:{_head_field(str(ev.event_id))}"
         raw = payload.get("program")
         source = raw if isinstance(raw, str) else str(raw)
         if not source.strip():
-            return "<程序>决策\n  （空程序）"
-        return f"<程序>决策\n  {_ml_text(source)}"
+            return f"{head}\n  （空程序）"
+        return f"{head}\n  {_ml_text(source)}"
 
     @staticmethod
     def _render_program(ev: _EventSnapshot) -> str | None:
-        """Program terminal → one source-free ``<程序>`` line block."""
+        """Program terminal → one source-free ``<程序>`` line block.
+
+        行头回指它收束的那条 ``<程序>决策`` 的 ``ev:``（payload.decision_id，
+        缺失时退回 causation_id）——并发派发下同一屏可以有多段程序在跑，靠位置
+        对不上号。
+        """
         payload = ev.payload or {}
+        anchor = _decision_anchor(ev)
         if ev.type == "agent.program_completed":
+            head = f"<程序>完成{anchor}"
             has_result = bool(payload.get("has_result"))
             if not has_result:
-                return "<程序>完成"
+                return head
             result_json = _safe_json(payload.get("result"))
             truncated = ""
             if len(result_json) > Projector.MAX_TOOL_RESULT_CHARS:
                 result_json = result_json[: Projector.MAX_TOOL_RESULT_CHARS]
                 truncated = "（截断）"
-            return f"<程序>完成\n  结果 {_esc_text(result_json)}{truncated}"
+            return f"{head}\n  结果 {_esc_text(result_json)}{truncated}"
 
         error_kind = str(payload.get("error_kind") or "unknown")
         extra = _extract_program_error_extra(payload)
-        head = f"<程序>失败{_error_head_suffix(error_kind, extra)}"
+        head = f"<程序>失败{anchor}{_error_head_suffix(error_kind, extra)}"
         message = payload.get("error_message")
         if isinstance(message, str) and message:
             return f"{head}\n  原因 {_ml_text(message)}"
@@ -1419,6 +1424,14 @@ def _head_field(s: str) -> str:
     （半角 ( ) / : # @ → 全角）。行头的解析终点是第一个 ``: ``，净化后
     头内不残留用户可控的定界字符。"""
     return _esc_text(_flatten(s)).translate(_HEAD_FIELD_TABLE)
+
+
+def _decision_anchor(ev: _EventSnapshot) -> str:
+    """program terminal → `` ev:<决策事件ID>``；查不到来源时返回空串。"""
+    decision_id = (ev.payload or {}).get("decision_id") or ev.causation_id
+    if not decision_id:
+        return ""
+    return f" ev:{_head_field(str(decision_id))}"
 
 
 def _quote_excerpt(s: str, *, limit: int = 40) -> str:
