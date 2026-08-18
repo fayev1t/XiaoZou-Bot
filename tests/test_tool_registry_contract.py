@@ -130,7 +130,6 @@ class ToolRegistryContractTest(unittest.TestCase):
                 "meme_collection",
                 "poke",
                 "reflect",
-                "reply",
                 "respond_to_group_join_request",
                 "search_history",
                 "send_messages",
@@ -140,7 +139,7 @@ class ToolRegistryContractTest(unittest.TestCase):
                 "websearch",
             },
         )
-        self.assertEqual(len(registry), 19)
+        self.assertEqual(len(registry), 18)
 
     def test_all_active_tools_declare_machine_readable_result_abi(self) -> None:
         registry = build_default_registry()
@@ -198,13 +197,6 @@ class ToolRegistryContractTest(unittest.TestCase):
                 "results",
                 "saved",
                 "saved_count",
-            },
-            "reply": {
-                "flush_at",
-                "hard_deadline",
-                "reply_task_id",
-                "revision",
-                "state",
             },
             "respond_to_group_join_request": {
                 "applied",

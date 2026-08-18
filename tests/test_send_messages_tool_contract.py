@@ -1,7 +1,7 @@
 """SendMessagesTool 合同（2026-07-31 删除 Replyer：Planner 亲自发言的出口）。
 
 钉住四组边界（重构提案-删除Replyer.md §4、§8）：
-- 普通 Program Effect：不读 ReplyTask、不查完成事件——没有任何完成事件时
+- 普通 Program Effect：不查任何前置状态——没有任何前置事件时
   调用照常执行；不写任何领域/runtime 事件（发送事实只活在 terminal 里）；
 - 静态校验与 meme preflight 失败无副作用（不碰 OneBot）；
 - 结果语义：sent → success；partial / failed / uncertain → failure，
@@ -91,11 +91,11 @@ class SendMessagesToolTests(unittest.IsolatedAsyncioTestCase):
             arguments, **(context or _context())
         )
 
-    # ── 主路径：普通工具，不读 ReplyTask ──
+    # ── 主路径：普通工具，不读任何前置状态 ──
 
     async def test_send_without_any_completed_event_still_executes(self) -> None:
         """§0.5 软约束：运行时不因缺少完成事件拒绝调用；工具也不查询
-        ReplyTask——这里没有打任何 reply_task 相关补丁，调用照常成功。"""
+        前置状态——这里没有打任何前置补丁，调用照常成功。"""
         bot = _StubBot()
         bot_registry.register(bot)
         outcome = await self._run(
@@ -330,10 +330,16 @@ class SendMessagesMetadataTests(unittest.TestCase):
         self.assertIn("轻微无厘头", doc)
         self.assertIn("无须增加文字解释", doc)
 
-    def test_description_names_the_two_step_flow(self) -> None:
+    def test_description_no_longer_names_a_two_step_flow(self) -> None:
+        """2026-08-17 删除 reply/ReplyTask：description 不再描述发言前置流程。
+
+        "想好的话不会当拍就出去"现在由提案-裁决流水线在结构上保证（写下调用
+        的那一拍只落库，要等下一拍 execute_decision 指名），不是这个工具的
+        参数面，也不该由它的介绍来交代。
+        """
         desc = SendMessagesTool.description
-        self.assertIn("reply 表示正在输入并启动等待", desc)
-        self.assertIn("<reply-task-completed>", desc)
+        self.assertNotIn("reply", desc)
+        self.assertNotIn("reply-task-completed", desc)
         self.assertIn("逐气泡回执", desc)
         self.assertIn("可能已经送达", desc)
         self.assertNotIn("保存分析", desc)
@@ -386,7 +392,7 @@ class SendMessagesMetadataTests(unittest.TestCase):
     def test_model_facing_surface_has_no_onebot_segment_vocabulary(self) -> None:
         """2026-08-14 去协议化的实质断言。
 
-        `send_messages` 是全部 19 个程序函数里唯一把上游协议摊给模型的那个：
+        `send_messages` 是全部 18 个程序函数里唯一把上游协议摊给模型的那个：
         气泡曾是 `{"kind":"chat","content":[{"type":"text","data":{...}}]}`，
         `data` 包装、`type` 判别、reply 必须 content[0] 三样都是 OneBot 11 的
         规则，与"说一句话"无关，却要模型每次发言复述一遍。段数组现在只在

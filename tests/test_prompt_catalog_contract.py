@@ -407,7 +407,7 @@ class FileAssemblyTests(unittest.TestCase):
         rendered = build_library("planner").render(scope="group")
         anchors = [
             "# 身份与核心任务",
-            "# 系统运行方式",  # 原 system.md（机器事实+行动纪律+两步发言）
+            "# 系统运行方式",  # 原 system.md（机器事实+行动纪律+提案-裁决流水线）
             "# 人物模型",  # 原 persona.md
             "# 输入数据",
             "输入信封格式规范",  # envelope.md 槽（仍是独立文件）

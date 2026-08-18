@@ -68,12 +68,10 @@ class MemeView:
     context_note: str | None = None
 
 
-# PendingReplyView 已于 2026-07-24 删除（待办#19）：它是 <pending-reply> 段的
-# 载体，而 Planner 所需的每个字段都被 timeline 上的
-# <tool-call name="reply"> 行覆盖（调度字段在 <result>、内容在 <args>）。
-# 到点交接不复用这个有界投影视图：ReplyExecutor 从 reply_task 折叠态复核后
-# 写 runtime.reply_task_completed（2026-07-31 起）。该完成事件 2026-08-01 起
-# 不带任何内容，只是一次到点叫醒。
+# PendingReplyView 已于 2026-07-24 删除（待办#19），承载它的 reply / ReplyTask
+# 体系整套已于 2026-08-17 删除（提案-裁决流水线取而代之）。TimelineItem 仍保留
+# "reply_task_completed" 这个 kind：库里存量的 runtime.reply_task_completed 还要
+# 兼容渲染一个版本周期，只是不会再有新的写入方。
 
 
 @dataclass(frozen=True)
@@ -171,11 +169,6 @@ class DecisionContext:
 
     timeline: list[TimelineItem] = field(default_factory=list)
     active_tasks: list[TaskView] = field(default_factory=list)
-    # 2026-07-24 起 Planner context 没有 pending_reply 字段（待办#19）：等待的
-    # 调度状态与历史调用都在 timeline 的 <tool-call name="reply"> 行上；到点
-    # 只落一条空的 <reply-task-completed> 行（2026-08-01 删除 analysis 后它
-    # 不再携带内容）。
-
     # ─── 表情包收藏夹（meme_collection 管收藏；send_messages 发送）───
     # 全局共享的 agent_memes（2026-07-06 起全 bot 一份，created_at 倒序、
     # 封顶 meme_store.MAX_SAVED_MEMES 条），由 Projector.

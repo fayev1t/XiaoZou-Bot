@@ -10,7 +10,7 @@
   3. request handler 在入库后调 request_auto_approval：好友申请 / 邀请入群
      自动同意（不走 LLM）；入群申请（group.add）进目标群 timeline 由
      GroupAgentLoop 处理，此处不动作
-  4. 启动期：拉起 LoopSupervisor（含 SystemAgentLoop + ReplyExecutor）；
+  4. 启动期：拉起 LoopSupervisor（含 SystemAgentLoop）；
      关停期：优雅停止
   5. 任何 handler 异常一律 swallow —— 单条事件失败不能让 napcat 重推爆炸
 

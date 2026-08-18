@@ -6,7 +6,7 @@
 - 优先使用 Bot 同名方法，缺失时回退 ``call_api``；
 - NapCat 明确响应（含 failed）保留为 ``RawOneBotResponse``；
 - 真正无响应才返回 ``RawTransportFailure``，effect 才可能 ``uncertain``；
-- 宿主编程错误继续抛出，且现役 19 个 Tool 注册不发生变化。
+- 宿主编程错误继续抛出，且现役 18 个 Tool 注册不发生变化。
 """
 
 from __future__ import annotations
@@ -392,7 +392,6 @@ class RawOneBotIsolationTests(unittest.TestCase):
             registered,
             [
                 "TaskTool",
-                "ReplyTool",
                 "SendMessagesTool",
                 "WaitTool",
                 "ReflectTool",

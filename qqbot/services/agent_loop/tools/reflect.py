@@ -23,7 +23,7 @@ create/note/complete/fail 的生命周期，写进程序注释则当拍即焚。
 存储：``agent.reflection_written`` 领域事件，经 ``ToolGeneratedEvent`` 随工具
 terminal 同事务落库（程序执行黑盒设计 §Effect 两段事务）。投影只认最新一条，
 折叠进 ``DecisionContext.reflection`` 并渲染成信封 `## 反思` 一节；该事件本身在
-timeline 里消隐，避免同一段文字两处渲染（与 reply_task_upserted 同型处理）。
+timeline 里消隐，避免同一段文字两处渲染。
 
 依赖注入：无。本工具不读库、不调 napcat——它只把文本交给执行层落库，
 scope/correlation/causation 全由 ProgramExecutor 统一接。

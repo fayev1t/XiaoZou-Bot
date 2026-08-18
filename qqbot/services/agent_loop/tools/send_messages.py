@@ -1,19 +1,17 @@
 """SendMessagesTool —— Planner 亲自发言的唯一出口（2026-07-31 删除 Replyer）。
 
-链路（重构提案-删除Replyer.md §2/§4）：`reply` 起一段等待；到点后
-``runtime.reply_task_completed`` 唤醒 Planner；Planner 结合最新时间流决定
-idle / 查证 / 调本工具把话真正发出去。本工具**始终可调用**——运行时不检查
-是否存在完成事件，也不查 ReplyTask；"正常在完成事件之后发言"是提示词纪律，
-不是工具权限（§0.5，有意的软约束，不得补授权门闩）。**但这条实现事实只写在
-代码里**：2026-08-01 起 `send_messages.md` 不再向模型主动交底"没人拦你"——
-工具用法文档没有义务告诉模型某条纪律缺少强制力。
+2026-08-17 删除 `reply` / ReplyTask 后，"想好的话不会当拍就出去"不再靠提示词
+纪律，而由提案-裁决流水线在结构上保证：写下 `send_messages(...)` 的那一拍只把
+源码落成一条决策事件，谁都没被调用；要等下一拍重新读完时间线、写
+``execute_decision(event_id=…)`` 指名它，气泡才真的发得出去。人打字要花的那段
+时间，就是这两拍之间模型重新看世界的那一眼。
 
-它是一个普通 Program Effect：执行器先写 ``agent.tool_called`` 意图，再调用
-本工具，最后把结构化 receipts 写进 ``agent.tool_result | tool_failed``。它不
-查询或修改 ReplyTask，也不新增 fence / finalizer。若 OneBot 已出手但 terminal
-尚未写成时进程退出，启动收口器会把半截调用标成 ``interrupted`` / ``uncertain``，
-**永不自动重放**。其 `<工具>send_messages` 行块（气泡 + 回执）就是时间线上的
-唯一发言记录；不再派生第二条发言行，`<旧发言>` 只兼容历史链路。
+本工具自己**始终可调用**，不检查任何前置状态——它是一个普通 Program Effect：
+执行器先写 ``agent.tool_called`` 意图，再调用本工具，最后把结构化 receipts 写进
+``agent.tool_result | tool_failed``。它不新增 fence / finalizer。若 OneBot 已出手
+但 terminal 尚未写成时进程退出，启动收口器会把半截调用标成 ``interrupted`` /
+``uncertain``，**永不自动重放**。其 `<工具>send_messages` 行块（气泡 + 回执）就是
+时间线上的唯一发言记录；不再派生第二条发言行，`<旧发言>` 只兼容历史链路。
 
 结果语义（status 随 receipts 一起落 terminal payload）：
 
@@ -121,10 +119,8 @@ class SendMessagesTool(BaseTool):
     description = (
         "向当前群发送一条或多条有序气泡。messages 中每项就是一条消息："
         '文字气泡 {"text": …}（可选 reply / at / face）或表情包气泡 '
-        '{"meme": …}。标准发言链路先由 reply 表示正在输入并启动等待，再在 '
-        "<reply-task-completed> 出现后调用本工具；运行时不强制该顺序。返回值中的"
-        "逐气泡回执是送达状态记录；status=uncertain 表示至少一条气泡可能已经"
-        "送达。"
+        '{"meme": …}。返回值中的逐气泡回执是送达状态记录；status=uncertain '
+        "表示至少一条气泡可能已经送达。"
     )
     usage_prompt = _USAGE_PROMPT
     arguments_schema = {

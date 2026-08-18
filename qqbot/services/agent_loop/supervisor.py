@@ -13,9 +13,10 @@ Behaviour:
   agent_events; the loop will see them once it tickets).
 - stop() cancels every running loop with a 5s grace timeout.
 
-Non-empty programs are enqueued after decision_emitted; a per-scope
-ProgramRunner executes them FIFO. There is no ToolWorker, pending-tool
-notification, or tool-batch completion wake.
+Programs are enqueued only when a later tick commits them by event id
+(``execute_decision``); a per-scope ProgramRunner executes them concurrently.
+There is no ToolWorker, no ReplyExecutor, no pending-tool notification, and no
+tool-batch completion wake.
 """
 
 from __future__ import annotations
@@ -28,10 +29,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from qqbot.core.logging import get_logger
 from qqbot.services.agent_loop import bot_registry
 from qqbot.services.agent_loop.decision import Planner
-from qqbot.services.agent_loop.event_writer import RuntimeEventPublisher
 from qqbot.services.agent_loop.loop import AgentLoop
 from qqbot.services.agent_loop.projection import Projector
-from qqbot.services.agent_loop.reply_executor import ReplyExecutor
 from qqbot.services.agent_loop.silence_watcher import SilenceWatcher
 from qqbot.services.agent_loop.tool_registry import ToolRegistry
 
@@ -60,7 +59,6 @@ class LoopSupervisor:
         self._lock = asyncio.Lock()
         self._started = False
         self._stopped = False
-        self._reply_executor: ReplyExecutor | None = None
         # 滚动记忆压缩器（记忆系统契约 §4）：MEMORY_COMPACTION_ENABLED
         # 打开时 start() 拉起；类型留 Any——模块惰性导入，避免默认关闭时
         # 平白拉进 LLM 依赖链。
@@ -95,33 +93,12 @@ class LoopSupervisor:
             logger.warning(
                 "[supervisor] task backfill failed (continuing): {}", exc
             )
-        # 静默叫醒先于 ReplyExecutor：rescan 补 completed 时 note_activity 已可用。
         # 计时器由可见事实落库武装；silence_elapsed 本身不算动静。
         self._silence_watcher = SilenceWatcher(
             self._session_factory, self.wake
         )
         if self._silence_watcher.enabled:
             logger.info("[supervisor] silence watcher online")
-        # ReplyExecutor 独立负责 reply_task 的到点生命周期完成（2026-07-31 起
-        # 不再组稿发送）：completed 经 RuntimeEventPublisher 落库后走统一 3s
-        # 攒批窗口唤醒；写成功的 agent_visible 事实顺带 note_activity。
-        self._reply_executor = ReplyExecutor(
-            session_factory=self._session_factory,
-            event_publisher=RuntimeEventPublisher(
-                self._session_factory,
-                notify_event_available=self.wake,
-                note_activity=self.note_activity,
-            ),
-        )
-        # rescan 与上面的任务回填同属恢复性动作，best-effort：失败只损失
-        # "重挂定时器 / 补 uncertain / 补 wake"，不挡启动。
-        try:
-            await self._reply_executor.start()
-        except Exception as exc:
-            logger.warning(
-                "[supervisor] reply executor rescan failed (continuing): {}",
-                exc,
-            )
         # MemoryCompactor（记忆系统契约 §4）：滚动折叠式场景记忆。开关
         # 默认关；启用时只挂起 worker 并给投影装推式探针。worker 启动不
         # 扫描、不 merge；只有 tick 投影报告真正触顶才会唤醒。best-effort：
@@ -158,9 +135,6 @@ class LoopSupervisor:
         await asyncio.gather(
             *(loop.stop() for loop in loops), return_exceptions=True
         )
-        if self._reply_executor is not None:
-            await self._reply_executor.stop()
-            self._reply_executor = None
         if self._silence_watcher is not None:
             try:
                 await self._silence_watcher.stop()
@@ -214,19 +188,6 @@ class LoopSupervisor:
         """
         if self._memory_compactor is not None:
             self._memory_compactor.notify(scope_key, uncovered_events)
-
-    async def notify_reply_task(
-        self,
-        scope_key: str,
-        reply_task_id: str,
-        revision: int,
-        flush_at: Any,
-        event_id: str,
-    ) -> None:
-        if self._reply_executor is not None:
-            await self._reply_executor.notify(
-                scope_key, reply_task_id, revision, flush_at, event_id
-            )
 
     async def _ensure(self, scope_key: str) -> AgentLoop:
         async with self._lock:

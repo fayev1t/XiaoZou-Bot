@@ -6,10 +6,11 @@ workers; no external dedup is needed because they have unique event_ids
 generated locally.
 
 ``announce()`` is the single "写一条事实，然后叫醒这个 scope" boundary
-(2026-08-04)。此前 wait 工具、SilenceWatcher、ReplyExecutor 各写一遍
+(2026-08-04)。此前 wait 工具、SilenceWatcher、ReplyExecutor（已于 2026-08-17
+删除）各写一遍
 persist-then-notify，连"写失败还叫不叫醒"这种真语义都埋在各自的 try 里；
 现在只有这一个函数，差异全部收敛成参数。``RuntimeEventPublisher``
-退化成一个绑好配置的薄封装，供 ReplyExecutor 这种要长期持有 publisher 的
+退化成一个绑好配置的薄封装，供要长期持有 publisher 的
 生产者使用。
 
 公开唤醒一律进 AgentLoop 的固定攒批窗口；静默计时器武装不再挂在 wake 上，
@@ -335,7 +336,7 @@ async def announce(  # noqa: PLR0913
 class RuntimeEventPublisher:
     """``announce()`` 的绑定配置封装，供需要长期持有发布口的生产者使用。
 
-    ReplyExecutor 在构造时拿到它、之后只管 ``publish(...)``，不必每次重复
+    长期存活的组件在构造时拿到它、之后只管 ``publish(...)``，不必每次重复
     传 wake / note_activity 与失败策略。语义完全等同于直接调 ``announce()``。
     """
 

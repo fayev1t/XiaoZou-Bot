@@ -542,7 +542,7 @@ OUTCOME_FIELDS: tuple[str, ...] = ("ok", "error")
 def with_outcome_envelope(schema: dict) -> dict:
     """给一份 result_schema 加上 ``ok`` / ``error``（就地复制，不改原对象）。
 
-    顶层是 ``oneOf`` 时逐支注入——现役 19 个工具都是普通 object，这条只是不
+    顶层是 ``oneOf`` 时逐支注入——现役 18 个工具都是普通 object，这条只是不
     留下一个会静默漏掉字段的形状分支。
     """
     if not isinstance(schema, dict):

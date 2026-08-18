@@ -7,7 +7,7 @@ Contracts:
 
 包级导入策略(③ 模块解耦,见开发日志 2026-06-23):
   纯数据类(decision)与轻量 bot_registry 保持 eager —— 它们只依赖 stdlib;
-  但 **重模块惰性化**:LLMPlanner / Projector / AgentLoop / ReplyExecutor /
+  但 **重模块惰性化**:LLMPlanner / Projector / AgentLoop /
   LoopSupervisor / ToolRegistry 等会拉 sqlalchemy(DB)或 langchain(LLM),
   改用 PEP 562 module `__getattr__` 按需导入。于是 `import qqbot.services.
   agent_loop`(或导入其任一**纯**子模块,如 decision / task_store 的纯函数部分)

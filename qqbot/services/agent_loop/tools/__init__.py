@@ -45,7 +45,6 @@ from qqbot.services.agent_loop.tools.meme_collection import MemeCollectionTool
 from qqbot.services.agent_loop.tools.poke import PokeTool
 from qqbot.services.agent_loop.tools.recall import RecallTool
 from qqbot.services.agent_loop.tools.reflect import ReflectTool
-from qqbot.services.agent_loop.tools.reply import ReplyTool
 from qqbot.services.agent_loop.tools.respond_to_group_join_request import (
     RespondToGroupJoinRequestTool,
 )
@@ -65,8 +64,7 @@ from qqbot.services.agent_loop.tools.whole_ban import WholeBanTool
 
 
 def build_default_registry() -> ToolRegistry:
-    # 2026-07-19：reply 已取代 send_message，落 reply_task 后由独立执行器发送。
-    # 原因：现有 napcat 动作 / websearch / search_history 的实现「太粗」，先全部
+    # 2026-07-19：现有 napcat 动作 / websearch / search_history 的实现「太粗」，先全部
     # 停用，待逐个重做后再逐一恢复注册。工具类、sibling .md、各自的契约测试都仍
     # 留在仓库里——恢复某个工具时，把它对应的 registry.register(...) 行取消注释
     # 即可，无需改别处。（respond_to_request 已于 2026-07-03 拆分删除，见下。）
@@ -75,16 +73,12 @@ def build_default_registry() -> ToolRegistry:
     # task：跨 tick 任务生命周期。它是普通 Program Effect；create 返回的
     # task_id 可直接存在程序变量里，供同拍后续 effect 的 task_id= 参数使用。
     registry.register(TaskTool)
-    # reply：发言的第一步——纯粹起一段等待（"我在输入，字还没发出去"）。
-    # 2026-08-01 删除内容参数后普通分支只剩 hold_seconds；撤稿留在 action 分支
-    # 里（曾评估拆成独立工具，因每个函数都要占一段 Program API + usage
-    # 文档而否决）。
-    registry.register(ReplyTool)
-    # send_messages：发言的第二步（2026-07-31 删除 Replyer）——等待到点、
-    # runtime.reply_task_completed 唤醒后，Planner 用它把最终措辞真正发出去。
-    # 普通 Program Effect：始终可调（"完成事件之后才发言"是提示词纪律，不是
-    # 权限），发送事实与时间线记录 = 它自己的 tool terminal receipts（调用行
-    # 即发言记录，不派生 <my-reply>），见 send_messages.py docstring。
+    # send_messages：出站发言。2026-08-17 删除 reply/ReplyTask 后它不再是
+    # "两步发言的第二步"——"想好的话不会当拍就出去"已由提案-裁决流水线在结构
+    # 上保证：写下 send_messages 的那一拍只把源码落库，要等下一拍重新读完
+    # 时间线、写 execute_decision 指名它，气泡才真的发得出去。发送事实与时间线
+    # 记录 = 它自己的 tool terminal receipts（调用行即发言记录，不派生
+    # <my-reply>），见 send_messages.py docstring。
     registry.register(SendMessagesTool)
     # wait：模型的时间自主权（自我延迟唤醒），2026-07-02 新增。2026-08-03 起
     # note 必填、上界 6000 秒，同时承担"给自己的回想改期"。
@@ -102,7 +96,7 @@ def build_default_registry() -> ToolRegistry:
     # 邀请入群不经工具，由 plugin 层 request_auto_approval 自动同意。
     registry.register(RespondToGroupJoinRequestTool)
     # 表情包收藏管理：save（描述由 caption LLM 生成）/ delete / recaption。
-    # 发送入口已并入 reply_task；Replyer 从 <saved-memes> 决定 0..1 张。
+    # 发送入口在 send_messages 的 meme 气泡上，不在这里。
     # 2026-07-25 由 `meme` 改名 `meme_collection`：裸名词 `meme` 读起来像
     # "表情包能力"，而发送 2026-07-19 就不在它参数面上了，新名点明操作对象是
     # 收藏夹本身（历史事件的旧 tool_name 原样保留，投影 author index 仍认）。
@@ -111,7 +105,7 @@ def build_default_registry() -> ToolRegistry:
     # Replyer 降级为纯文本模型、图片改由 ingest 期 VLM 转录成 desc= 进 timeline，
     # 本工具是那条无语境描述覆盖不到时的兜底 —— 没有它这次改动就是纯降级。
     # 明知每个注册函数都要占一段 Program API + usage 文档仍然收下它，
-    # 理由就是这个能力天花板（对比 reply 拒绝拆分的取舍，见 reply.py）。
+    # 理由就是这个能力天花板。
     registry.register(LookAtImageTool)
     # ── 群信息查询（2026-07-07 重做后恢复 / 新增）──
     # 查询三件套按下架备注的路线重做后恢复：get_group_info（no_cache + 可选
@@ -195,7 +189,6 @@ __all__ = [
     "ReflectTool",
     "RespondToGroupJoinRequestTool",
     "SearchHistoryTool",
-    "ReplyTool",
     "SendMessagesTool",
     "SetAdminTool",
     "SetCardTool",

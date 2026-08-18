@@ -844,11 +844,6 @@ class _RuntimeState:
                         self.executor._supervisor, "note_activity", None
                     ),
                     caption_image=self.executor._caption_image,
-                    notify_reply_task=getattr(
-                        self.executor._supervisor,
-                        "notify_reply_task",
-                        None,
-                    ),
                 ),
                 timeout=timeout,
             )
@@ -1117,7 +1112,7 @@ async def _shield_finish_effect(
 def _with_success_envelope(result: Any) -> dict:
     """成功 outcome 的 result → 带 ``ok=True`` / ``error=None`` 的载荷。
 
-    19 个工具的 result_schema 顶层都是 object，result 也都是 dict；非 Mapping
+    18 个工具的 result_schema 顶层都是 object，result 也都是 dict；非 Mapping
     只可能来自 stub，按空载荷处理，信封字段照样在。
     """
     payload = dict(result) if isinstance(result, Mapping) else {}
