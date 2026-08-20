@@ -11,7 +11,9 @@ from typing import Any
 from qqbot.core.time import CHINA_TIMEZONE
 from qqbot.services.agent_loop.decision import (
     DecisionContext,
+    MemeView,
     ProgramValidationFeedback,
+    TimelineItem,
 )
 from qqbot.services.agent_loop.llm_planner import (
     LLMPlanner,
@@ -153,6 +155,55 @@ class PlannerEnvelopeTests(unittest.TestCase):
         self.assertIn("## 程序函数：lookup", prompt)
         self.assertIn("返回 schema", prompt)
         self.assertIn("响应正文就是一段受限 Python 源码", prompt)
+
+
+class EnvelopeCacheLayoutTests(unittest.TestCase):
+    """前缀缓存契约：收藏少变，必须排在时间线之前。"""
+
+    def _meme(self) -> MemeView:
+        return MemeView(
+            file_hash="ab" * 32,
+            description="黑猫瞪眼",
+            saved_at=datetime(2026, 8, 1, 12, 0, tzinfo=CHINA_TIMEZONE),
+        )
+
+    def _row(self, event_id: str, second: int, text: str) -> TimelineItem:
+        return TimelineItem(
+            event_id=event_id,
+            occurred_at=datetime(
+                2026, 8, 3, 12, 0, second, tzinfo=CHINA_TIMEZONE
+            ),
+            kind="message",
+            render=text,
+        )
+
+    def test_empty_collection_omits_section(self) -> None:
+        rendered = _render_input_text(_ctx())
+        self.assertNotIn("## 表情包收藏", rendered)
+
+    def test_memes_sit_before_timeline(self) -> None:
+        rendered = _render_input_text(_ctx(saved_memes=[self._meme()]))
+        self.assertLess(
+            rendered.index("## 表情包收藏"),
+            rendered.index("## 时间线"),
+        )
+        self.assertLess(
+            rendered.index("## 时间线"),
+            rendered.index("## 未收束任务"),
+        )
+        self.assertIn("<meme>abababababab (08-01): 黑猫瞪眼", rendered)
+
+    def test_stable_memes_keep_prefix_when_timeline_grows(self) -> None:
+        """时间线追加不得改写收藏段及其之前的前缀。"""
+        memes = [self._meme()]
+        row1 = self._row("ev1", 0, "<m>甲(1): 你好")
+        row2 = self._row("ev2", 1, "<m>乙(2): 在吗")
+        first = _render_input_text(_ctx(saved_memes=memes, timeline=[row1]))
+        second = _render_input_text(
+            _ctx(saved_memes=memes, timeline=[row1, row2])
+        )
+        cut = "## 时间线"
+        self.assertEqual(first[: first.index(cut)], second[: second.index(cut)])
 
 
 if __name__ == "__main__":

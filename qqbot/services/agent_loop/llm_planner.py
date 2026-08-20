@@ -182,11 +182,11 @@ def _build_messages(
     System prompt 完全由提示词库输出 —— 默认装配是根页 `planner.md` 的正文，
     并在页内指定位置展开 `envelope.md` 与 Program API 参考。
 
-    HumanMessage 的 text block 是**行文法信封**（重构提案-信封行文法，
-    2026-08-03 起替换 XML）：timeline 里每条 item 的 render 字段本身就是
-    `<m>` / `<工具>` / `<通知>` 等独立的行（或行块），外层只需 markdown 节头
-    与少量骨架行；上下引用关系（回复标记、@、工具 ↔ 结果）留在行内文法里，
-    不会被 JSON 字符串转义压平成扁平的字段表。
+    HumanMessage 的 text block 是**行文法信封**（2026-08-03 起替换 XML；不变量
+    与安全模型见主线 Part 3 §2）：timeline 里每条
+    item 的 render 字段本身就是 `<m>` / `<工具>` / `<通知>` 等独立的行（或行块），
+    外层只需 markdown 节头与少量骨架行；上下引用关系（回复标记、@、工具 ↔ 结果）
+    留在行内文法里，不会被 JSON 字符串转义压平成扁平的字段表。
 
     图片（2026-07-28 起）：Planner 是**纯文本模型**，HumanMessage 只有
     文本，不再附带任何图像 block。群里的图在 EventIngest 落盘时就由专用 VLM
@@ -229,20 +229,21 @@ def _build_messages(
 
 
 def _render_input_text(context: DecisionContext) -> str:
-    """拼装喂给 LLM 的行文法信封（重构提案-信封行文法，2026-08-03 替换 XML）。
+    """拼装喂给 LLM 的行文法信封（2026-08-03 替换 XML）。
 
-    结构（顺序按**变化频率升序**排列——前缀缓存契约，2026-07-12；
-    表情包收藏为唯一显著性例外，见段末说明）：
+    节序与安全模型见主线 Part 3 §2、§4。
+
+    结构（顺序按**变化频率升序**排列——前缀缓存契约，2026-07-12）：
 
       # 决策输入 <scope>
       本账号(QQ) 群角色 <role>          (两字段各自可缺)
 
+      ## 表情包收藏                       (有收藏才出)
+      <meme><hash12> (<日期>): 描述
+
       ## 时间线
       <t>…
       {item.render …}                    (同秒的行共享一个时刻头)
-
-      ## 表情包收藏                       (有收藏才出)
-      <meme><hash12> (<日期>): 描述
 
       ## 反思                             (写过才出)
       <反思>MM-DD HH:MM
@@ -258,16 +259,16 @@ def _render_input_text(context: DecisionContext) -> str:
     一致**。now 每拍必变，曾是信封的头字段，把可缓存前缀掐断在 system
     prompt 末尾——时间线（追加为主，窗口起点锚定见 projection）每拍全价
     重计费。现按变化频率排序：头两行只留 scope/
-    bot_qq/bot_role（稳定/极少变）；未收束任务活跃期逐拍变
-    （pending_tool_call_ids 随工具收口增删），排到时间线之后；每拍必变的
-    now 沉为尾部 ``<现在>``；``validation_feedback`` 生产恒为 None
+    bot_qq/bot_role（稳定/极少变）；表情包收藏只在 save/delete/recaption
+    时变，排在时间线之前，收藏稳定时整段进入可缓存前缀；未收束任务活跃期
+    逐拍变（pending_tool_call_ids 随工具收口增删），排到时间线之后；每拍
+    必变的 now 沉为尾部 ``<现在>``；``validation_feedback`` 生产恒为 None
     （契约 §7.1），放最尾——同拍重试可复用直到 ``<现在>`` 的前缀，且作为
-    最后一行对模型最显著。表情包收藏是唯一的显著性例外（2026-08-01）：它
-    少变、本可留在时间线之前吃前缀缓存，但选图发生在读完局面之后，目录隔
-    着整条时间线就几乎不被想起——移到时间线之后、任务之前，接受它随时间
-    线追加逐拍重编码。``## 反思``（2026-08-03）排在收藏与任务之间：它只在
-    ``reflect`` 调用那一拍变，比逐拍可变的未收束任务稳定，放前面多吃一段
-    前缀；同一段追加区里它已经在重编码，再往前挪也换不到额外收益。
+    最后一行对模型最显著。2026-08-01 曾把收藏挪到时间线之后换显著性
+    （选图发生在读完局面之后）；2026-08-20 撤回——发图已稳定，收藏段重新
+    进入可缓存前缀。``## 反思``（2026-08-03）排在时间线之后、未收束任务
+    之前：它只在 ``reflect`` 调用那一拍变，比逐拍可变的未收束任务稳定，
+    放前面多吃一段前缀。
 
     工具结果只在时间线的 ``<工具>`` 行呈现一次（2026-07-02 删除了
     pending-tool-results 区——同一调用双重渲染、且无消费切割地每拍重复
@@ -275,7 +276,7 @@ def _render_input_text(context: DecisionContext) -> str:
     只保留在运行日志与快照，不再投影进 timeline；跨拍事实与义务分别由客观
     事件行和未收束任务表达。
 
-    安全模型（行文法 §3）：一切动态值经 `_esc_text` / `_head_field` /
+    安全模型（Part 3 §2.1）：一切动态值经 `_esc_text` / `_head_field` /
     `_ml_text` 净化后才进信封——节头、行头、``<现在>`` 等列 0 结构只可能
     由本函数与投影渲染器落笔。
     """
@@ -297,17 +298,8 @@ def _render_input_text(context: DecisionContext) -> str:
     if account_bits:
         parts.append(" ".join(account_bits))
 
-    parts.append("")
-    parts.append("## 时间线")
-    # 时间流渲染：行按同秒分组共享 <t> 时刻头，行内无时间字段
-    # （render_timeline_stream，时间流契约 2026-07-26；纯追加见其 docstring）。
-    parts.extend(render_timeline_stream(context.timeline))
-
-    # ─── 表情包收藏（有才渲染）：meme 工具凭 hash 前缀精确操作收藏的选图
-    # 目录。空收藏整节省略——不给模型一个空节头去好奇。2026-08-01 从
-    # timeline 之前移到之后：选图发生在读完局面之后，目录隔着整条 timeline
-    # 时几乎不被想起；代价是本节进入 timeline 追加即失效的重编码区——显著性
-    # 换缓存，与下方未收束任务同型取舍（变化频率升序布局的唯一例外）。───
+    # ─── 表情包收藏（有才渲染）。少变，排在时间线之前吃前缀缓存。空收藏
+    # 整节省略。2026-08-01 曾挪到时间线后换显著性，2026-08-20 撤回。───
     saved_memes = getattr(context, "saved_memes", None) or []
     if saved_memes:
         parts.append("")
@@ -325,10 +317,16 @@ def _render_input_text(context: DecisionContext) -> str:
                 f"{_ml_text(meme.description)}"
             )
 
+    parts.append("")
+    parts.append("## 时间线")
+    # 时间流渲染：行按同秒分组共享 <t> 时刻头，行内无时间字段
+    # （render_timeline_stream，时间流契约 2026-07-26；纯追加见其 docstring）。
+    parts.extend(render_timeline_stream(context.timeline))
+
     # ─── 反思：她自己写下、由后来的版本整段改写的那一段自我认识 ───
-    # 位置在表情包收藏之后、未收束任务之前，仍守变化频率升序：它只在
-    # reflect 调用那一拍变（静默叫醒或她自己改期），比逐拍可变的未收束任务
-    # 稳定得多，放在前面能多吃一段前缀缓存。
+    # 位置在时间线之后、未收束任务之前：它只在 reflect 调用那一拍变
+    # （静默叫醒或她自己改期），比逐拍可变的未收束任务稳定得多，放在
+    # 前面能多吃一段前缀缓存。
     #
     # 与 2026-08-01 删除的 `<my-thought>` 的边界（勿在此扩容）：那次删的是
     # 每拍自由笔记逐字回显；这里只渲染**最新一版**被主动整合过的结论，且有
@@ -407,7 +405,7 @@ def _render_input_text(context: DecisionContext) -> str:
 
 
 def _render_task_block(task: Any) -> str:
-    """单条 task → ``<任务>`` 行块（行文法 §6.3）。
+    """单条 task → ``<任务>`` 行块（Part 3 §4）。
 
     头行 ``<任务>task_id state: 目标``；四个子槽（相关工具/起因/在途调用/
     逐条笔记）有则出、无则省，缩进两空格从属于头行。笔记行的
