@@ -54,14 +54,20 @@ def finalize(
     partial: PartialSystemEvent,
     *,
     occurred_at: datetime,
+    event_id: str | None = None,
 ) -> SystemEvent:
     """Stamp a PartialSystemEvent with event_id and self-correlation.
+
+    ``event_id`` is used as-is when the caller minted it at arrival; omitted
+    means mint here. EventIngest stamps before any await so success and
+    failure terminals share that id — media/VLM duration must not reorder
+    same-second facts in the projection.
 
     Ingest terminal events are self-correlated: their correlation_id equals
     their own event_id, so any tick the loop runs in response can reuse it.
     See 事件系统设计.md §6.
     """
-    eid = new_event_id()
+    eid = event_id or new_event_id()
     return SystemEvent(
         event_id=eid,
         occurred_at=occurred_at,

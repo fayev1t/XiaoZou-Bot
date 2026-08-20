@@ -144,6 +144,14 @@ class EventIdGeneratorContractTests(unittest.TestCase):
         b = new_event_id()
         self.assertLess(a, b)
 
+    def test_new_event_id_is_monotonic_in_a_tight_batch(self) -> None:
+        """Same-millisecond ids in one process strictly increase."""
+        from qqbot.core.ids import new_event_id
+
+        ids = [new_event_id() for _ in range(200)]
+        self.assertEqual(ids, sorted(ids))
+        self.assertEqual(len(set(ids)), 200)
+
 
 class ContractDocsCrossReferenceTests(unittest.TestCase):
     """Sanity: the design docs that describe this schema still mention it."""
