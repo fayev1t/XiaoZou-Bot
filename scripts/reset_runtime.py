@@ -9,6 +9,8 @@
   agent_events           信息流本体。**记忆也在这里** —— 压缩摘要是
                          runtime.context_compacted 事件（memory_compactor.py），
                          系统没有独立的记忆表，清了事件流记忆随之消失。
+  raw_events             原文绕库短表。满 100 行会自己清。
+  group_memories         一群一行记忆正文。
   agent_tasks            任务读模型。必须与事件流同清：Projector 查它时不受
                          取数窗口限制（models/agent_task.py），留着会让没有
                          事件支撑的未完成任务继续出现在 <active-tasks> 里。
@@ -57,6 +59,8 @@ from sqlalchemy import text  # noqa: E402
 # 默认清空的表，顺序即打印顺序（无外键，TRUNCATE 不存在依赖顺序问题）
 _TABLES: tuple[tuple[str, str], ...] = (
     ("agent_events", "信息流 + 记忆摘要"),
+    ("raw_events", "原文绕库（可丢）"),
+    ("group_memories", "群记忆正文"),
     ("agent_tasks", "任务读模型"),
     ("agent_delivery_claims", "投递租约"),
     ("agent_memes", "表情包收藏"),

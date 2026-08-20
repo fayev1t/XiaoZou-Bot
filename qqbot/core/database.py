@@ -117,8 +117,10 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
 async def init_db() -> None:
     """初始化数据库表
 
-    三张表：
+    表：
     - agent_events（append-only event stream，唯一真相源）
+    - raw_events（原文绕库，满 100 清表；见 models/raw_event.py）
+    - group_memories（一群一行记忆正文，UPDATE；见 models/group_memory.py）
     - agent_tasks（任务读模型 / CQRS read model，从 agent.task_* 事件派生；
       允许 UPDATE，可从事件流 replay 重建。见 models/agent_task.py）
     - agent_delivery_claims（历史 worker 的投递租约表；Program Effect 不再使用，
@@ -136,11 +138,13 @@ async def init_db() -> None:
     """
     try:
         # 触发模型模块加载以注册到 Base.metadata
-        # （agent_events + agent_tasks + agent_delivery_claims）
+        # （agent_events + raw_events + agent_tasks + agent_delivery_claims）
         from qqbot.models import Base  # noqa: F401
+        from qqbot.models import agent_delivery_claim  # noqa: F401
         from qqbot.models import agent_event  # noqa: F401
         from qqbot.models import agent_task  # noqa: F401
-        from qqbot.models import agent_delivery_claim  # noqa: F401
+        from qqbot.models import group_memory  # noqa: F401
+        from qqbot.models import raw_event  # noqa: F401
 
         async with engine.begin() as conn:
             # 必须在 create_all 之前，否则 GIN trgm 索引创建会失败
