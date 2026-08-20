@@ -9,10 +9,12 @@ Contract sources:
 
 from __future__ import annotations
 
+import asyncio
 import unittest
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from qqbot.services.event_ingest import (
@@ -135,7 +137,7 @@ class GroupMessageMapperContractTests(unittest.TestCase):
         self.assertEqual(partial.payload["segments"], expected)
 
     def test_reply_segment_enriched_from_adapter_resolved_reply(self) -> None:
-        # EventIngest契约.md §6.4：适配器已解析的 event.reply（分发前 get_msg
+        # EventIngest契约.md §4：适配器已解析的 event.reply（分发前 get_msg
         # 的产物）固化进首个 reply 段顶层 quoted 键——被引消息滚出投影窗口后
         # from_*/excerpt 不再丢失。子键"有才落键"。
         original = [
@@ -325,6 +327,27 @@ class FinalizeContractTests(unittest.TestCase):
         self.assertEqual(ev.idempotency_key, "k")
         self.assertEqual(ev.scope, "group")
 
+    def test_supplied_event_id_is_kept(self) -> None:
+        partial = PartialSystemEvent(
+            origin="external",
+            type="external.message.group.normal",
+            scope="group",
+            group_id=1,
+            user_id=2,
+            visibility="agent_visible",
+            payload={},
+            raw=None,
+            idempotency_key="k",
+        )
+        stamped = "0" * 25 + "A"
+        ev = finalize(
+            partial,
+            occurred_at=datetime(2026, 5, 26, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+            event_id=stamped,
+        )
+        self.assertEqual(ev.event_id, stamped)
+        self.assertEqual(ev.correlation_id, stamped)
+
 
 class IdempotencyHelpersTests(unittest.TestCase):
     def test_for_message(self) -> None:
@@ -399,7 +422,9 @@ class IngestPipelineTests(unittest.IsolatedAsyncioTestCase):
         result = await ingest.ingest(_make_message_event())
 
         self.assertEqual(result.status, "inserted")
-        self.assertEqual(order, ["execute", "commit", "notify"])
+        # raw 插入之后才登记；通知仍在终态 commit 之后。
+        self.assertEqual(order[-1], "notify")
+        self.assertLess(order.index("commit"), order.index("notify"))
 
     async def test_commit_failure_never_notifies(self) -> None:
         class FailingSession:
@@ -457,8 +482,8 @@ class IngestPipelineTests(unittest.IsolatedAsyncioTestCase):
             ev.idempotency_key,
             "10000:notice:notify:profile_like:1716700000:222:_",
         )
-        self.assertEqual(recorder.executes, 1)
-        self.assertEqual(recorder.commits, 1)
+        self.assertGreaterEqual(recorder.executes, 2)
+        self.assertGreaterEqual(recorder.commits, 2)
         self.assertEqual(notifier.events, [ev])
 
     async def test_unknown_event_duplicate_on_repush(self) -> None:
@@ -517,8 +542,8 @@ class IngestPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.event.type, "external.message.group.normal")
         self.assertEqual(result.event.scope, "group")
         self.assertEqual(result.event.idempotency_key, "10000:msg:12345")
-        self.assertEqual(recorder.commits, 1)
-        self.assertEqual(recorder.executes, 1)
+        self.assertGreaterEqual(recorder.commits, 2)
+        self.assertGreaterEqual(recorder.executes, 2)
 
     async def test_ingest_group_message_duplicate(self) -> None:
         recorder = _FakeSessionRecorder(rowcount=0)
@@ -537,6 +562,103 @@ class IngestPipelineTests(unittest.IsolatedAsyncioTestCase):
         result = await ingest.ingest(_make_recall_event())
         self.assertEqual(result.status, "inserted")
         self.assertEqual(result.event.type, "external.notice.group_recall")
+
+    async def test_failure_terminal_uses_arrival_event_id(self) -> None:
+        stamped = "0" * 25 + "F"
+        recorder = _FakeSessionRecorder(rowcount=1)
+        ingest = EventIngest(
+            build_default_registry(), session_factory=recorder.factory
+        )
+        with patch(
+            "qqbot.services.event_gateway.registry.new_event_id",
+            return_value=stamped,
+        ):
+            result = await ingest.ingest(_UnknownEvent())
+        self.assertEqual(result.status, "processing_failed")
+        self.assertEqual(result.event.event_id, stamped)
+        self.assertEqual(result.event.correlation_id, stamped)
+
+    async def test_same_window_sorts_by_gateway_time_not_vlm_finish(
+        self,
+    ) -> None:
+        """同一聚水窗里先到的图即使 VLM 更慢，登记序仍按 occurred_at/seq。"""
+        from qqbot.services.event_ingest.media import MediaProcessingResult
+
+        image_id = "0" * 25 + "1"
+        text_id = "0" * 25 + "2"
+        ids = iter((image_id, text_id))
+
+        async def fake_attach(
+            payload: dict,
+            describer: Any = None,
+            batch_describer: Any = None,
+        ) -> MediaProcessingResult:
+            _ = describer, batch_describer
+            segs = payload.get("segments") or []
+            has_image = any(
+                isinstance(seg, dict) and seg.get("type") == "image" for seg in segs
+            )
+            if has_image:
+                await asyncio.sleep(0.05)
+            return MediaProcessingResult()
+
+        class RecordingSession:
+            async def execute(self, stmt: Any) -> Any:
+                _ = stmt
+                return SimpleNamespace(rowcount=1)
+
+            async def commit(self) -> None:
+                return None
+
+            async def __aenter__(self) -> "RecordingSession":
+                return self
+
+            async def __aexit__(self, *args: Any) -> None:
+                return None
+
+        import qqbot.services.event_ingest.ingest as ingest_mod
+
+        original_attach = ingest_mod.attach_media_to_payload
+        ingest_mod.attach_media_to_payload = fake_attach
+        ingest = EventIngest(
+            build_default_registry(),
+            session_factory=RecordingSession,
+            registration_window_seconds=0.1,
+        )
+        image_event = _make_message_event(
+            message_id=1,
+            raw_message="[image]",
+            message=[
+                SimpleNamespace(type="image", data={"url": "http://x/y.png"})
+            ],
+        )
+        text_event = _make_message_event(
+            message_id=2,
+            raw_message="hello",
+        )
+        try:
+            with patch(
+                "qqbot.services.event_gateway.registry.new_event_id",
+                side_effect=lambda: next(ids),
+            ):
+                image_task = asyncio.create_task(ingest.ingest(image_event))
+                await asyncio.sleep(0)
+                text_task = asyncio.create_task(ingest.ingest(text_event))
+                image_result, text_result = await asyncio.gather(
+                    image_task, text_task
+                )
+        finally:
+            ingest_mod.attach_media_to_payload = original_attach
+
+        image_ev = image_result.event
+        text_ev = text_result.event
+        self.assertEqual(image_ev.event_id, image_id)
+        self.assertEqual(text_ev.event_id, text_id)
+        self.assertLessEqual(image_ev.occurred_at, text_ev.occurred_at)
+        self.assertLess(
+            (image_ev.occurred_at, image_ev.event_id),
+            (text_ev.occurred_at, text_ev.event_id),
+        )
 
 
 class _FakeSession:

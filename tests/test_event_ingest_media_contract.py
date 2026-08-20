@@ -327,7 +327,9 @@ class IngestPipelineAttachesMediaTests(unittest.IsolatedAsyncioTestCase):
         async def fake_attach(
             payload: dict,
             describer: Any = None,
+            batch_describer: Any = None,
         ) -> MediaProcessingResult:
+            _ = batch_describer
             seen.append(payload)
             describers.append(describer)
             # mimic side effect: mark image segs downloaded=true
@@ -395,8 +397,9 @@ class IngestPipelineAttachesMediaTests(unittest.IsolatedAsyncioTestCase):
         async def fake_attach(
             payload: dict,
             describer: Any = None,
+            batch_describer: Any = None,
         ) -> MediaProcessingResult:
-            _ = payload, describer
+            _ = payload, describer, batch_describer
             return MediaProcessingResult(
                 failures=(
                     IngestFailureDetail(
@@ -477,7 +480,9 @@ class IngestPipelineAttachesMediaTests(unittest.IsolatedAsyncioTestCase):
         async def fake_attach(
             payload: dict,
             describer: Any = None,
+            batch_describer: Any = None,
         ) -> MediaProcessingResult:
+            _ = payload, describer, batch_describer
             called()
             return MediaProcessingResult()
 

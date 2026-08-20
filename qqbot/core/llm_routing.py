@@ -1047,6 +1047,7 @@ class RoutedChatModel:
         provider: str | None = None,
         require: Sequence[str] = (),
         on_event: Callable[..., None] | None = None,
+        on_outcome: Callable[[dict[str, Any]], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._router = router
@@ -1056,6 +1057,7 @@ class RoutedChatModel:
         self._provider = provider
         self._require = tuple(require)
         self._on_event = on_event
+        self._on_outcome = on_outcome
         self._clock = clock
         self._last_endpoint: ModelEndpoint | None = None
 
@@ -1134,6 +1136,15 @@ class RoutedChatModel:
                     role=self._role,
                     latency_ms=self._elapsed_ms(started),
                 )
+                self._publish_outcome(
+                    {
+                        "ok": False,
+                        "role": self._role,
+                        "endpoint": endpoint.spec,
+                        "error_kind": "timeout",
+                        "latency_ms": self._elapsed_ms(started),
+                    }
+                )
                 raise
             except Exception as exc:
                 cooldown = self._router.mark_failure(endpoint.spec)
@@ -1155,10 +1166,26 @@ class RoutedChatModel:
                 role=self._role,
                 latency_ms=self._elapsed_ms(started),
             )
+            self._publish_outcome(
+                {
+                    "ok": True,
+                    "role": self._role,
+                    "endpoint": endpoint.spec,
+                    "latency_ms": self._elapsed_ms(started),
+                }
+            )
             return result
 
         if last_exc is None:  # max_attempts_per_call 被配成 0 之类的病态情形
             raise RuntimeError("未尝试任何 LLM 端点（max_attempts_per_call<1?）")
+        self._publish_outcome(
+            {
+                "ok": False,
+                "role": self._role,
+                "error_kind": "call_failed",
+                "error_message": f"{type(last_exc).__name__}: {last_exc}"[:300],
+            }
+        )
         raise last_exc
 
     def _elapsed_ms(self, started: float) -> int:
@@ -1170,5 +1197,13 @@ class RoutedChatModel:
             return
         try:
             self._on_event(kind, **info)
+        except Exception:
+            pass
+
+    def _publish_outcome(self, payload: dict[str, Any]) -> None:
+        if self._on_outcome is None:
+            return
+        try:
+            self._on_outcome(payload)
         except Exception:
             pass

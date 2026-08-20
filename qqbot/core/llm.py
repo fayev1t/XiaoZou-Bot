@@ -44,7 +44,7 @@ settings 全局缺省 > 内置 0.7**，与 max_tokens 一直以来的形状一�
 配置在首次 ``create_llm()`` 时读取并缓存为进程级单例——冷却/熔断状态必须跨
 调用方（planner / vision / caption / memory）共享；改配置需重启生效。
 （``roles.replyer`` 随 2026-07-31 删除 Replyer 一并退役，见
-重构提案-删除Replyer.md §5.5。）
+v2.0/30-工具设计/发言链路设计.md §7。）
 """
 
 from typing import Any
@@ -77,6 +77,13 @@ class _LLMRuntime:
 
 _runtime: _LLMRuntime | None = None
 _runtime_failed: bool = False
+_outcome_sink: Any = None
+
+
+def set_model_outcome_sink(sink: Any) -> None:
+    """生产由 v2_main 接到入口网关。测试可不设。"""
+    global _outcome_sink
+    _outcome_sink = sink
 
 
 def reset_llm_runtime() -> None:
@@ -374,4 +381,5 @@ async def create_llm(
         provider=provider,
         require=require,
         on_event=_log_route_event,
+        on_outcome=_outcome_sink,
     )

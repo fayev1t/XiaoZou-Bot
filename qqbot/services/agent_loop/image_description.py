@@ -89,6 +89,139 @@ _semaphore = asyncio.Semaphore(_MAX_CONCURRENT_CALLS)
 _inflight: dict[str, "asyncio.Future[str | None]"] = {}
 
 
+async def describe_images(
+    items: list[tuple[bytes, str, str]],
+    *,
+    session_factory: SessionFactory,
+) -> list[str | None]:
+    """最多 5 张图一次模型请求。空位与失败返回 None。"""
+    if not items:
+        return []
+    if len(items) == 1:
+        image_bytes, mime, file_hash = items[0]
+        return [
+            await describe_image(
+                image_bytes, mime, file_hash, session_factory=session_factory
+            )
+        ]
+    results: list[str | None] = []
+    pending: list[tuple[int, bytes, str, str]] = []
+    for index, (image_bytes, mime, file_hash) in enumerate(items):
+        cached = await _load_cached(session_factory, file_hash)
+        if cached is not None:
+            results.append(cached)
+            continue
+        results.append(None)
+        pending.append((index, image_bytes, mime, file_hash))
+    if not pending:
+        return results
+    prepared: list[tuple[int, bytes, str, str]] = []
+    for index, image_bytes, mime, file_hash in pending:
+        try:
+            payload, payload_mime = normalize_image_for_llm(
+                image_bytes, mime or "image/png"
+            )
+        except Exception as exc:
+            logger.warning(
+                "[image_description] image conversion failed: {} hash={}",
+                exc,
+                file_hash,
+            )
+            continue
+        prepared.append((index, payload, payload_mime, file_hash))
+    if not prepared:
+        return results
+    try:
+        prompt = _load_prompt("image_description")
+    except Exception as exc:
+        logger.warning("[image_description] prompt asset missing: {}", exc)
+        return results
+    async with _semaphore:
+        texts = await _invoke_vision_batch(prompt, prepared)
+    for (index, payload, payload_mime, file_hash), text in zip(
+        prepared, texts, strict=True
+    ):
+        if not text:
+            continue
+        results[index] = text
+        await _store(
+            session_factory,
+            file_hash=file_hash,
+            description=text,
+            mime=payload_mime,
+            byte_size=len(payload),
+            model=None,
+        )
+    return results
+
+
+async def _invoke_vision_batch(
+    prompt: str,
+    prepared: list[tuple[int, bytes, str, str]],
+) -> list[str | None]:
+    llm = await create_llm(role="vision")
+    if llm is None:
+        logger.warning(
+            "[image_description] no vision-capable LLM configured "
+            "(config/model_providers.json 缺失，或 role=vision 无候选)"
+        )
+        return [None] * len(prepared)
+    from langchain_core.messages import HumanMessage
+
+    n = len(prepared)
+    user_text = (
+        prompt
+        + f"\n\n下面共 {n} 张图，按顺序各写一段客观描述。"
+        + "只输出 JSON 字符串数组，长度必须等于图数，不要其它文字。"
+    )
+    content: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
+    for _, payload, payload_mime, _hash in prepared:
+        b64 = base64.b64encode(payload).decode("ascii")
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:{payload_mime};base64,{b64}"},
+            }
+        )
+    try:
+        raw = await llm.ainvoke([HumanMessage(content=content)])
+    except Exception as exc:
+        logger.warning(
+            "[image_description] batch VLM call failed: {}: {}",
+            type(exc).__name__,
+            exc,
+        )
+        return [None] * n
+    parsed = _parse_description_list(_extract_text(raw).strip(), n)
+    return [item[:MAX_DESCRIPTION_CHARS] if item else None for item in parsed]
+
+
+def _parse_description_list(text: str, expected: int) -> list[str | None]:
+    import json
+
+    blob = text.strip()
+    start = blob.find("[")
+    end = blob.rfind("]")
+    if start >= 0 and end > start:
+        blob = blob[start : end + 1]
+    try:
+        data = json.loads(blob)
+    except Exception:
+        parts = [p.strip() for p in text.split("\n---\n") if p.strip()]
+        data = parts
+    if not isinstance(data, list):
+        return [None] * expected
+    out: list[str | None] = []
+    for item in data[:expected]:
+        if isinstance(item, str) and item.strip():
+            out.append(item.strip())
+        else:
+            out.append(None)
+    while len(out) < expected:
+        out.append(None)
+    return out
+
+
 async def describe_image(
     image_bytes: bytes,
     mime: str,

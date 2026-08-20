@@ -739,7 +739,7 @@ class MemoryCompactor:
             "folded_revision": revision,
             "compactor_version": COMPACTOR_VERSION,
         }
-        return await write_runtime_event(
+        event_id = await write_runtime_event(
             self._session_factory,
             event_type=RECAP_EVENT_TYPE,
             scope_key=scope_key,
@@ -752,3 +752,17 @@ class MemoryCompactor:
             # （边界语义以 covers_until_event_id 全序位置为准，契约 §2.2）。
             occurred_at=covers_until_at + timedelta(milliseconds=1),
         )
+        if scope_key.startswith("group:"):
+            from qqbot.services.group_memory_store import upsert_group_memory
+
+            try:
+                group_id = int(scope_key.split(":", 1)[1])
+            except (TypeError, ValueError):
+                group_id = None
+            if group_id is not None:
+                await upsert_group_memory(
+                    self._session_factory,
+                    group_id=group_id,
+                    content=summary,
+                )
+        return event_id

@@ -1,17 +1,10 @@
-"""EventIngest orchestrator: NapCat input → one terminal SystemEvent.
+"""EventIngest: NapCat 适配 + 接到统一入口网关 / 注册器。
 
-Contract: 开发文档/v2.0/20-横切契约/EventIngest契约.md §3
+契约：开发文档/v2.0/20-横切契约/提案-重新设计agent_loop前后的模块以及流水线.md
+以及 EventIngest契约.md。
 
-Pipeline:
-  (0) heartbeat short-circuit → write_heartbeat() (§9)
-  (1) mapper lookup + mapping (§4)
-  (2) required content preprocessing, including image persistence + VLM (§5)
-  (3) choose exactly one terminal event:
-      success → mapper's external.* event
-      failure → runtime.event_ingest_failed
-  (4) finalize + persist (ON CONFLICT DO NOTHING)
-  (5) notify the committed internal event; only this ingest notification may
-      wake AgentLoop for the current NapCat input
+heartbeat 仍旁路。其余上游（含模型/工具响应）走：
+  入口网关盖 occurred_at → raw 插入 → 注册器 1s 聚水 → 适配 → 排序发 id。
 """
 
 from __future__ import annotations
@@ -23,19 +16,24 @@ from typing import Any, Literal
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from qqbot.core.logging import get_logger
-from qqbot.core.time import china_now, normalize_china_time
+from qqbot.services.event_gateway.inbound import InboundGateway, UpstreamEnvelope
+from qqbot.services.event_gateway.registry import AdaptedEvent, EventRegistrar
 from qqbot.services.event_ingest.failure import (
     IngestFailureDetail,
     build_ingest_failure_event,
 )
 from qqbot.services.event_ingest.heartbeat import write_heartbeat
 from qqbot.services.event_ingest.mapper import MapperRegistry
-from qqbot.services.event_ingest.media import ImageDescriber, attach_media_to_payload
+from qqbot.services.event_ingest.media import (
+    BatchImageDescriber,
+    ImageDescriber,
+    attach_media_to_payload,
+)
+from qqbot.services.event_ingest.napcat_helpers import dump_event
 from qqbot.services.event_ingest.persistence import persist_event
 from qqbot.services.event_ingest.system_event import (
     PartialSystemEvent,
     SystemEvent,
-    finalize,
 )
 
 logger = get_logger(__name__)
@@ -59,11 +57,7 @@ class IngestResult:
 
 
 class EventIngest:
-    """Single entry point for external events.
-
-    Stateless aside from its registry and session factory. Safe to call
-    concurrently as long as the session factory yields independent sessions.
-    """
+    """NapCat 适配器挂在统一网关上。决策拍不在这里。"""
 
     def __init__(
         self,
@@ -71,21 +65,29 @@ class EventIngest:
         session_factory: SessionFactory,
         committed_notifier: CommittedNotifier | None = None,
         image_describer: ImageDescriber | None = None,
+        batch_image_describer: BatchImageDescriber | None = None,
+        registration_window_seconds: float | None = None,
     ) -> None:
         self._registry = registry
         self._session_factory = session_factory
-        # EventIngest 只发布“内部事件已提交”这一事实，不认识 LoopSupervisor、
-        # scope_key 或 wake 模式。生产装配在 plugin 层把该通知翻译为 AgentLoop wake。
         self._committed_notifier = committed_notifier
-        # 看图写客观描述的回调（2026-07-28）。以鸭子类型注入，保持 ingest
-        # 不静态依赖 agent_loop；含图片却未注入时会形成处理失败内部事件。
-        # 生产实现在 agent_loop.image_description，由 v2_main 绑好 session_factory
-        # 传进来。
         self._image_describer = image_describer
+        self._batch_image_describer = batch_image_describer
+        self._registrar = EventRegistrar(
+            adapter=self._adapt,
+            persist=self._persist_terminal,
+            window_seconds=registration_window_seconds,
+        )
+        self._gateway = InboundGateway(
+            session_factory=session_factory,
+            registrar=self._registrar,
+        )
+
+    @property
+    def gateway(self) -> InboundGateway:
+        return self._gateway
 
     async def ingest(self, event: Any) -> IngestResult:
-        # heartbeat 旁路：不入库，仅原子写 runtime_data/napcat_heartbeat.json
-        # 见 EventIngest契约.md §9。
         if (
             getattr(event, "post_type", None) == "meta_event"
             and getattr(event, "meta_event_type", None) == "heartbeat"
@@ -93,11 +95,40 @@ class EventIngest:
             await write_heartbeat(event)
             return IngestResult(status="heartbeat")
 
+        payload = dump_event(event)
+        if not payload:
+            payload = {"_repr": repr(event)}
+        return await self._gateway.submit(
+            "external",
+            payload,
+            source=event,
+        )
+
+    async def ingest_channel(
+        self,
+        channel: str,
+        payload: dict[str, Any],
+        *,
+        source: Any = None,
+    ) -> IngestResult:
+        return await self._gateway.submit(channel, payload, source=source)
+
+    async def _adapt(self, envelope: UpstreamEnvelope) -> AdaptedEvent:
+        channel = envelope.channel
+        if channel == "external":
+            return await self._adapt_napcat(envelope.source)
+        if channel == "model":
+            return self._adapt_model(envelope.payload)
+        if channel == "tool":
+            return self._adapt_tool(envelope.payload)
+        return self._adapt_other(envelope)
+
+    async def _adapt_napcat(self, event: Any) -> AdaptedEvent:
         try:
             mapper = self._registry.find(event)
         except Exception as exc:
             logger.warning("[event_ingest] mapper lookup failed: {}", exc)
-            return await self._commit_failure(
+            return self._failure(
                 event,
                 (
                     IngestFailureDetail(
@@ -113,7 +144,7 @@ class EventIngest:
                 getattr(event, "post_type", "?"),
                 getattr(event, "sub_type", "?"),
             )
-            return await self._commit_failure(
+            return self._failure(
                 event,
                 (
                     IngestFailureDetail(
@@ -132,7 +163,7 @@ class EventIngest:
                 type(mapper).__name__,
                 exc,
             )
-            return await self._commit_failure(
+            return self._failure(
                 event,
                 (
                     IngestFailureDetail(
@@ -143,19 +174,15 @@ class EventIngest:
                 ),
             )
 
-        # 媒体副作用：图片同步下载、sha256、本地落盘并就地补充
-        # payload.segments 中的 file_hash/local_path/downloaded 等字段。
-        # 2026-07-28 起同一步里还会调 VLM 写 description（Planner 不直接接收
-        # 图片像素，描述是正常消息进入时间线的必需内容）。frozen dataclass 不阻止
-        # dict 字段被 in-place 修改。
         try:
             media_result = await attach_media_to_payload(
                 partial.payload,
                 self._image_describer,
+                batch_describer=self._batch_image_describer,
             )
         except Exception as exc:
             logger.warning("[event_ingest] media preprocessing failed: {}", exc)
-            return await self._commit_failure(
+            return self._failure(
                 event,
                 (
                     IngestFailureDetail(
@@ -167,66 +194,123 @@ class EventIngest:
                 partial=partial,
             )
         if media_result.failures:
-            return await self._commit_failure(
-                event,
-                media_result.failures,
-                partial=partial,
-            )
+            return self._failure(event, media_result.failures, partial=partial)
 
-        try:
-            sys_event = self._finalize(event, partial)
-        except Exception as exc:
-            logger.warning("[event_ingest] event finalization failed: {}", exc)
-            return await self._commit_failure(
-                event,
-                (
-                    IngestFailureDetail(
-                        stage="event_finalization",
-                        error_code="event_finalization_failed",
-                        reason="内部事件定稿失败",
-                    ),
+        return AdaptedEvent(partial=partial, status="inserted")
+
+    def _adapt_model(self, payload: dict[str, Any]) -> AdaptedEvent:
+        if not isinstance(payload, dict) or "ok" not in payload:
+            return AdaptedEvent(
+                partial=PartialSystemEvent(
+                    origin="runtime",
+                    type="runtime.model_responded",
+                    scope="system",
+                    group_id=None,
+                    user_id=None,
+                    visibility="runtime_only",
+                    payload={"ok": False, "error_kind": "invalid_shape"},
+                    raw=payload if isinstance(payload, dict) else {},
+                    idempotency_key=None,
                 ),
-                partial=partial,
+                status="processing_failed",
+                reason="invalid_shape",
             )
-        return await self._persist_terminal(sys_event, inserted_status="inserted")
+        return AdaptedEvent(
+            partial=PartialSystemEvent(
+                origin="runtime",
+                type="runtime.model_responded",
+                scope=str(payload.get("scope") or "system"),
+                group_id=_optional_int(payload.get("group_id")),
+                user_id=_optional_int(payload.get("user_id")),
+                visibility="runtime_only",
+                payload=dict(payload),
+                raw=dict(payload),
+                idempotency_key=None,
+            ),
+            status="inserted" if payload.get("ok") else "processing_failed",
+            reason=(
+                None
+                if payload.get("ok")
+                else str(payload.get("error_kind") or "model_failed")
+            ),
+        )
 
-    async def _commit_failure(
+    def _adapt_tool(self, payload: dict[str, Any]) -> AdaptedEvent:
+        if not isinstance(payload, dict):
+            payload = {}
+        return AdaptedEvent(
+            partial=PartialSystemEvent(
+                origin="runtime",
+                type="runtime.tool_responded",
+                scope=str(payload.get("scope") or "system"),
+                group_id=_optional_int(payload.get("group_id")),
+                user_id=_optional_int(payload.get("user_id")),
+                visibility="runtime_only",
+                payload=dict(payload),
+                raw=dict(payload),
+                idempotency_key=None,
+            ),
+            status="inserted",
+        )
+
+    def _adapt_other(self, envelope: UpstreamEnvelope) -> AdaptedEvent:
+        payload = envelope.payload if isinstance(envelope.payload, dict) else {}
+        event_type = str(payload.get("event_type") or "")
+        if event_type == "runtime.silence_elapsed":
+            scope = payload.get("scope") or "group"
+            if scope not in ("system", "group", "private"):
+                scope = "group"
+            visibility = payload.get("visibility") or "agent_visible"
+            if visibility not in ("agent_visible", "runtime_only"):
+                visibility = "agent_visible"
+            seconds = payload.get("seconds")
+            return AdaptedEvent(
+                partial=PartialSystemEvent(
+                    origin="runtime",
+                    type="runtime.silence_elapsed",
+                    scope=scope,
+                    group_id=_optional_int(payload.get("group_id")),
+                    user_id=_optional_int(payload.get("user_id")),
+                    visibility=visibility,
+                    payload={"seconds": seconds},
+                    raw=dict(payload),
+                    idempotency_key=None,
+                ),
+                status="inserted",
+            )
+        return AdaptedEvent(
+            partial=PartialSystemEvent(
+                origin="runtime",
+                type="runtime.other_event",
+                scope="system",
+                group_id=None,
+                user_id=None,
+                visibility="runtime_only",
+                payload=dict(payload),
+                raw=dict(payload),
+                idempotency_key=None,
+            ),
+            status="inserted",
+        )
+
+    def _failure(
         self,
         event: Any,
         failures: tuple[IngestFailureDetail, ...],
         *,
         partial: PartialSystemEvent | None = None,
-    ) -> IngestResult:
-        failure_partial = build_ingest_failure_event(
-            event,
-            failures,
-            partial=partial,
-        )
-        try:
-            sys_event = self._finalize(event, failure_partial)
-        except Exception as exc:
-            logger.warning(
-                "[event_ingest] failure timestamp invalid; using receive time: {}",
-                exc,
-            )
-            sys_event = finalize(failure_partial, occurred_at=china_now())
-        return await self._persist_terminal(
-            sys_event,
-            inserted_status="processing_failed",
+    ) -> AdaptedEvent:
+        return AdaptedEvent(
+            partial=build_ingest_failure_event(event, failures, partial=partial),
+            status="processing_failed",
             reason=failures[0].error_code,
         )
-
-    @staticmethod
-    def _finalize(event: Any, partial: PartialSystemEvent) -> SystemEvent:
-        occurred_at = normalize_china_time(getattr(event, "time", None))
-        return finalize(partial, occurred_at=occurred_at)
 
     async def _persist_terminal(
         self,
         sys_event: SystemEvent,
-        *,
-        inserted_status: Literal["inserted", "processing_failed"],
-        reason: str | None = None,
+        inserted_status: str,
+        reason: str | None,
     ) -> IngestResult:
         try:
             async with self._session_factory() as session:
@@ -248,11 +332,12 @@ class EventIngest:
             return IngestResult(status="duplicate", event=sys_event)
 
         await self._notify_committed(sys_event)
-        return IngestResult(
-            status=inserted_status,
-            event=sys_event,
-            reason=reason,
+        status: IngestStatus = (
+            "processing_failed"
+            if inserted_status == "processing_failed"
+            else "inserted"
         )
+        return IngestResult(status=status, event=sys_event, reason=reason)
 
     async def _notify_committed(self, event: SystemEvent) -> None:
         if self._committed_notifier is None:
@@ -261,3 +346,12 @@ class EventIngest:
             await self._committed_notifier(event)
         except Exception as exc:
             logger.warning("[event_ingest] committed notifier failed: {}", exc)
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None

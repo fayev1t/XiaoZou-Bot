@@ -13,7 +13,7 @@ enriched in place with file_hash / local_path / byte_size / mime / downloaded.
   from being committed; EventIngest converts the result into one
   ``runtime.event_ingest_failed`` internal event instead.
 - Cross-scope dedup: files are addressed by sha256, not by scope. Same hash
-  across multiple groups uses one local copy (隔离契约 §9.2 第 6 条).
+  across multiple groups uses one local copy (事件系统设计 §11.3).
 - Layout: runtime_data/media/img/<hash[:2]>/<hash>, two-char bucket prefix
   to keep any single directory's entry count bounded.
 
@@ -49,6 +49,11 @@ _DOWNLOAD_TIMEOUT_SECONDS = 5.0
 # 这里刻意不 import agent_loop —— ingest 不反向依赖 agent_loop；生产装配
 # 只把回调注入 EventIngest，契约测试可塞假 describer 离线运行。
 ImageDescriber = Callable[[bytes, str, str], Awaitable[str | None]]
+# (bytes, mime, file_hash) 一组，返回等长描述列表。
+BatchImageDescriber = Callable[
+    [list[tuple[bytes, str, str]]], Awaitable[list[str | None]]
+]
+_VLM_BATCH_SIZE = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,14 +66,11 @@ class MediaProcessingResult:
 
 
 async def attach_media_to_payload(
-    payload: dict[str, Any], describer: ImageDescriber | None = None
+    payload: dict[str, Any],
+    describer: ImageDescriber | None = None,
+    batch_describer: BatchImageDescriber | None = None,
 ) -> MediaProcessingResult:
-    """Download every image segment in payload.segments and enrich in place.
-
-    describer 非 None 时，每张下载成功的图再同步走一次 VLM 客观描述，结果写进
-    ``seg["description"]``（投影据此渲染 ``<image ... desc="..."/>``）。描述与
-    下载在同一个 gather 里并发，相册不会串行叠加延迟。
-    """
+    """Download every image, then describe. 描述按每 5 张一次模型请求。"""
     segments = payload.get("segments")
     if not isinstance(segments, list) or not segments:
         return MediaProcessingResult()
@@ -82,43 +84,159 @@ async def attach_media_to_payload(
         return MediaProcessingResult()
 
     results = await asyncio.gather(
-        *(
-            _attach_image(index, segment, describer)
-            for index, segment in image_segs
-        ),
+        *(_download_image(index, segment) for index, segment in image_segs),
         return_exceptions=True,
     )
     failures: list[IngestFailureDetail] = []
-    for (index, _), result in zip(image_segs, results, strict=True):
-        if result is None:
-            continue
+    pending: list[tuple[int, dict[str, Any], bytes, str, str]] = []
+    for (index, segment), result in zip(image_segs, results, strict=True):
         if isinstance(result, IngestFailureDetail):
             failures.append(result)
             continue
         if isinstance(result, asyncio.CancelledError):
             raise result
-        logger.warning(
-            "[media] unexpected image preprocessing failure: index={} err={}",
-            index,
-            result,
-        )
-        failures.append(
-            IngestFailureDetail(
-                stage="image_processing",
-                error_code="image_processing_error",
-                reason="图片前置处理发生内部错误",
-                segment_index=index,
-                segment_type="image",
+        if isinstance(result, Exception):
+            logger.warning(
+                "[media] unexpected image preprocessing failure: index={} err={}",
+                index,
+                result,
             )
-        )
+            failures.append(
+                IngestFailureDetail(
+                    stage="image_processing",
+                    error_code="image_processing_error",
+                    reason="图片前置处理发生内部错误",
+                    segment_index=index,
+                    segment_type="image",
+                )
+            )
+            continue
+        content, mime, file_hash = result
+        pending.append((index, segment, content, mime, file_hash))
+
+    if not pending:
+        return MediaProcessingResult(failures=tuple(failures))
+
+    describe_failures = await _describe_pending(
+        pending,
+        describer=describer,
+        batch_describer=batch_describer,
+    )
+    failures.extend(describe_failures)
     return MediaProcessingResult(failures=tuple(failures))
 
 
-async def _attach_image(
+async def _describe_pending(
+    pending: list[tuple[int, dict[str, Any], bytes, str, str]],
+    *,
+    describer: ImageDescriber | None,
+    batch_describer: BatchImageDescriber | None,
+) -> list[IngestFailureDetail]:
+    failures: list[IngestFailureDetail] = []
+    if batch_describer is not None:
+        for start in range(0, len(pending), _VLM_BATCH_SIZE):
+            chunk = pending[start : start + _VLM_BATCH_SIZE]
+            items = [
+                (content, mime, file_hash)
+                for _, _, content, mime, file_hash in chunk
+            ]
+            try:
+                descriptions = await batch_describer(items)
+            except Exception as exc:
+                logger.warning("[media] batch description failed: {}", exc)
+                descriptions = [None] * len(chunk)
+            if len(descriptions) != len(chunk):
+                descriptions = list(descriptions) + [None] * (
+                    len(chunk) - len(descriptions)
+                )
+                descriptions = descriptions[: len(chunk)]
+            for (index, segment, _, _, file_hash), description in zip(
+                chunk, descriptions, strict=True
+            ):
+                failure = _apply_description(
+                    index, segment, file_hash, description
+                )
+                if failure is not None:
+                    failures.append(failure)
+        return failures
+
+    if describer is None:
+        for index, segment, _, _, file_hash in pending:
+            failures.append(
+                IngestFailureDetail(
+                    stage="image_description",
+                    error_code="image_describer_unavailable",
+                    reason="图片描述器未配置",
+                    segment_index=index,
+                    segment_type="image",
+                    file_hash=file_hash,
+                )
+            )
+        return failures
+
+    results = await asyncio.gather(
+        *(
+            _describe_one(describer, content, mime, file_hash)
+            for _, _, content, mime, file_hash in pending
+        ),
+        return_exceptions=True,
+    )
+    for (index, segment, _, _, file_hash), result in zip(
+        pending, results, strict=True
+    ):
+        if isinstance(result, Exception):
+            logger.warning(
+                "[media] image description failed: {} hash={}", result, file_hash
+            )
+            failures.append(
+                IngestFailureDetail(
+                    stage="image_description",
+                    error_code="image_description_failed",
+                    reason="图片描述生成失败",
+                    segment_index=index,
+                    segment_type="image",
+                    file_hash=file_hash,
+                )
+            )
+            continue
+        failure = _apply_description(index, segment, file_hash, result)
+        if failure is not None:
+            failures.append(failure)
+    return failures
+
+
+async def _describe_one(
+    describer: ImageDescriber,
+    content: bytes,
+    mime: str,
+    file_hash: str,
+) -> str | None:
+    return await describer(content, mime, file_hash)
+
+
+def _apply_description(
     index: int,
     seg: dict[str, Any],
-    describer: ImageDescriber | None = None,
+    file_hash: str,
+    description: str | None,
 ) -> IngestFailureDetail | None:
+    if not isinstance(description, str) or not description.strip():
+        return IngestFailureDetail(
+            stage="image_description",
+            error_code="image_description_empty",
+            reason="图片描述结果为空",
+            segment_index=index,
+            segment_type="image",
+            file_hash=file_hash,
+        )
+    seg["description"] = description
+    return None
+
+
+async def _download_image(
+    index: int,
+    seg: dict[str, Any],
+) -> tuple[bytes, str, str] | IngestFailureDetail:
     data = seg.get("data") or {}
     url = data.get("url") or data.get("file")
     if not isinstance(url, str) or not url.startswith(("http://", "https://")):
@@ -174,41 +292,7 @@ async def _attach_image(
     seg["downloaded"] = True
     seg["byte_size"] = len(content)
     seg["mime"] = mime
-
-    if describer is None:
-        return IngestFailureDetail(
-            stage="image_description",
-            error_code="image_describer_unavailable",
-            reason="图片描述器未配置",
-            segment_index=index,
-            segment_type="image",
-            file_hash=file_hash,
-        )
-    try:
-        description = await describer(content, mime, file_hash)
-    except Exception as exc:
-        logger.warning(
-            "[media] image description failed: {} hash={}", exc, file_hash
-        )
-        return IngestFailureDetail(
-            stage="image_description",
-            error_code="image_description_failed",
-            reason="图片描述生成失败",
-            segment_index=index,
-            segment_type="image",
-            file_hash=file_hash,
-        )
-    if not isinstance(description, str) or not description.strip():
-        return IngestFailureDetail(
-            stage="image_description",
-            error_code="image_description_empty",
-            reason="图片描述结果为空",
-            segment_index=index,
-            segment_type="image",
-            file_hash=file_hash,
-        )
-    seg["description"] = description
-    return None
+    return content, mime, file_hash
 
 
 async def _fetch(url: str) -> tuple[bytes, str]:
@@ -244,6 +328,7 @@ def _atomic_write(path: Path, content: bytes) -> None:
 
 __all__ = [
     "MEDIA_IMG_DIR",
+    "BatchImageDescriber",
     "ImageDescriber",
     "MediaProcessingResult",
     "attach_media_to_payload",
