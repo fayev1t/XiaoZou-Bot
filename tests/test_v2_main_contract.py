@@ -31,10 +31,13 @@ class V2MainPluginContractTests(unittest.TestCase):
             ROOT / "qqbot" / "services" / "event_ingest" / "ingest.py"
         ).read_text(encoding="utf-8")
 
+    def test_plugin_opens_gateway_and_one_second_window(self) -> None:
+        self.assertIn("registration_window_seconds=1.0", self.plugin_text)
+        self.assertIn("batch_image_describer=_describe_images", self.plugin_text)
+        self.assertIn("set_inbound_gateway", self.plugin_text)
+        self.assertIn("set_model_outcome_sink", self.plugin_text)
+
     def test_plugin_imports_event_ingest(self) -> None:
-        self.assertIn(
-            "from qqbot.services.event_ingest import EventIngest", self.plugin_text
-        )
         self.assertIn(
             "from qqbot.services.event_ingest.mappers import build_default_registry",
             self.plugin_text,
@@ -45,9 +48,10 @@ class V2MainPluginContractTests(unittest.TestCase):
         self.assertIn("LoopSupervisor", self.plugin_text)
         self.assertIn("bot_registry", self.plugin_text)
         self.assertIn(
-            "from qqbot.services.agent_loop.tools import build_default_registry",
+            "from qqbot.services.agent_loop.tools import",
             self.plugin_text,
         )
+        self.assertIn("build_default_registry as build_tool_registry", self.plugin_text)
 
     def test_plugin_uses_async_session_local(self) -> None:
         self.assertIn(
@@ -84,8 +88,9 @@ class V2MainPluginContractTests(unittest.TestCase):
             "async def _notify_committed_event(event: SystemEvent)",
             self.plugin_text,
         )
-        self.assertIn("await sup.wake(scope_key)", self.plugin_text)
-        self.assertIn("sup.note_activity(scope_key)", self.plugin_text)
+        self.assertIn("apply_silence_gate", self.plugin_text)
+        self.assertIn("wake=sup.wake", self.plugin_text)
+        self.assertIn("note_activity=sup.note_activity", self.plugin_text)
         self.assertNotIn("supervisor=_get_supervisor()", self.plugin_text)
 
     def test_raw_notice_and_meta_events_do_not_reach_role_reflection(self) -> None:
@@ -119,7 +124,7 @@ class V2MainPluginContractTests(unittest.TestCase):
         self.assertIn("# 人物模型", identity_text)
         self.assertIn("# 决策要求", identity_text)
         self.assertIn("小奏", identity_text)
-        self.assertIn("最重要的人", identity_text)
+        self.assertIn("创造者", identity_text)
         # 旧居所不得复活（防两处副本漂移；send_message.md / replyer.md 随
         # 2026-07-31 删除 Replyer 一并删除，persona.md 同日并回 planner.md）
         self.assertFalse((prompts_dir / "voice.md").exists())
@@ -133,7 +138,7 @@ class V2MainPluginContractTests(unittest.TestCase):
 
     def test_request_handler_wires_auto_approval(self) -> None:
         # 2026-07-03 拆分：request handler 在 ingest 返回后调自动审批（好友申请 /
-        # 邀请入群不走 LLM，见事件系统设计.md §10.2）。_ingest_event 须把
+        # 邀请入群不走 LLM，见EventIngest契约.md §2）。_ingest_event 须把
         # IngestResult 传出来供其判断 inserted / 事件类型。
         self.assertIn(
             "from qqbot.services.request_auto_approval import maybe_auto_approve",

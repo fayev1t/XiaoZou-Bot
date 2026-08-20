@@ -32,14 +32,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from qqbot.core.ids import new_event_id
 from qqbot.core.logging import get_logger
 from qqbot.core.time import china_now
+from qqbot.services.event_gateway.silence_gate import decide_silence_gate
 from qqbot.services.event_ingest.persistence import persist_event
 from qqbot.services.event_ingest.system_event import SystemEvent
 
 logger = get_logger(__name__)
-
-# 与 silence_watcher.SILENCE_EVENT_TYPE 同值；此处内联避免环形 import。
-# 静默事实本身不算"有动静"，写成功后不得 note_activity。
-_SILENCE_ELAPSED_TYPE = "runtime.silence_elapsed"
 
 SessionFactory = Callable[[], AsyncSession]
 EventAvailableNotifier = Callable[[str], Awaitable[None]]
@@ -268,9 +265,9 @@ async def announce(  # noqa: PLR0913
     ``wake`` 是朴素的 ``(scope_key) -> Awaitable[None]``，一律进攒批窗口。传
     None = 只写不叫。
 
-    ``note_activity`` 在**写成功**且事件为 agent_visible、且不是静默事实时同步
-    调用，用来重排静默计时器。静默叫醒自己写的 ``runtime.silence_elapsed`` 不
-    算动静（一段静默只响一次）。写失败不 note——没有新事实可算活动。
+    ``note_activity`` / ``wake`` 的规则与入口登记后的静默门同一套
+    （``decide_silence_gate``）：runtime_only 不叫；silence_elapsed 只叫不
+    note；其它可见事实叫并且重排计时器。写失败不 note。
 
     ``wake_on_write_failure``：
 
@@ -302,12 +299,12 @@ async def announce(  # noqa: PLR0913
             exc,
         )
 
-    if (
-        event_id is not None
-        and visibility == "agent_visible"
-        and event_type != _SILENCE_ELAPSED_TYPE
-        and note_activity is not None
-    ):
+    gate = decide_silence_gate(
+        event_type=event_type,
+        visibility=visibility,
+        scope_key=scope_key,
+    )
+    if event_id is not None and gate.note_activity and note_activity is not None:
         try:
             note_activity(scope_key)
         except Exception as exc:  # noqa: BLE001 — 武装失败不拖垮主路径
@@ -320,9 +317,9 @@ async def announce(  # noqa: PLR0913
 
     if wake is None:
         return event_id
-    # runtime_only 事实不进模型视野，为它开一拍没有意义。写失败时不走这条：
-    # 那种情况下叫醒是先前那句约定的兑现，与写成了什么无关。
-    if event_id is not None and visibility != "agent_visible":
+    # 写失败且 wake_on_write_failure：兑现「到点我会来」，不看静默门。
+    # 写成功则跟登记后的静默门同一套规则。
+    if event_id is not None and not gate.wake:
         return event_id
     try:
         await wake(scope_key)

@@ -144,23 +144,55 @@ class SilenceWatcher:
             return
 
         try:
-            # 统一的 persist-then-notify 入口（2026-08-04）。
-            # wake_on_write_failure=True 与 wait 同型：事件写失败仍然叫醒
-            # ——本体是「到点我会来」的约定，事件只是醒来后的说明文字。
-            await announce(
-                self._session_factory,
-                event_type=SILENCE_EVENT_TYPE,
-                scope_key=scope_key,
-                visibility="agent_visible",
-                correlation_id=None,
-                causation_id=None,
-                payload={"seconds": self._seconds},
-                wake=self._wake,
-                wake_on_write_failure=True,
-            )
+            await self._emit_silence_elapsed(scope_key)
         finally:
             # 响过即卸下：这段静默不再自动重排，等下一次 notify_activity。
             self._timers.pop(scope_key, None)
+
+    async def _emit_silence_elapsed(self, scope_key: str) -> None:
+        """到点产出静默事实。有入口网关就走登记+静默门；否则退回 announce。
+
+        写失败仍然叫醒（与 wait 同型：本体是「到点我会来」）。
+        """
+        from qqbot.services.event_gateway.outbound import get_inbound_gateway
+
+        gateway = get_inbound_gateway()
+        if gateway is not None:
+            try:
+                _scope, group_id, _user_id = parse_scope_key(scope_key)
+                result = await gateway.submit(
+                    "other",
+                    {
+                        "event_type": SILENCE_EVENT_TYPE,
+                        "scope": "group",
+                        "group_id": group_id,
+                        "visibility": "agent_visible",
+                        "seconds": self._seconds,
+                    },
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[silence] {} gateway submit failed (still waking): {}",
+                    scope_key,
+                    exc,
+                )
+                await self._wake(scope_key)
+                return
+            if getattr(result, "status", None) == "error":
+                await self._wake(scope_key)
+            return
+
+        await announce(
+            self._session_factory,
+            event_type=SILENCE_EVENT_TYPE,
+            scope_key=scope_key,
+            visibility="agent_visible",
+            correlation_id=None,
+            causation_id=None,
+            payload={"seconds": self._seconds},
+            wake=self._wake,
+            wake_on_write_failure=True,
+        )
 
     async def _recheck(self, scope_key: str) -> int:
         """回库看真实静默时长；返回还需再睡的秒数（0 = 可以响了）。"""

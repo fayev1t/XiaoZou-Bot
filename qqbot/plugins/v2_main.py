@@ -27,6 +27,7 @@ from nonebot import get_driver, on_message, on_metaevent, on_notice, on_request
 from nonebot.adapters import Bot, Event
 
 from qqbot.core.database import AsyncSessionLocal
+from qqbot.core.llm import set_model_outcome_sink
 from qqbot.core.logging import get_logger
 from qqbot.services.agent_loop import (
     LLMPlanner,
@@ -38,11 +39,19 @@ from qqbot.services.agent_loop.bot_role_sweep import (
     reflect_bot_role_from_meta,
     reflect_bot_role_from_notice,
 )
-from qqbot.services.agent_loop.image_description import describe_image
+from qqbot.services.agent_loop.image_description import (
+    describe_image,
+    describe_images,
+)
 from qqbot.services.agent_loop.meme_caption import caption_image
 from qqbot.services.agent_loop.tools import (
     build_default_registry as build_tool_registry,
 )
+from qqbot.services.event_gateway.outbound import (
+    schedule_model_outcome,
+    set_inbound_gateway,
+)
+from qqbot.services.event_gateway.silence_gate import apply_silence_gate
 from qqbot.services.event_ingest import EventIngest, IngestResult, SystemEvent
 from qqbot.services.event_ingest.mappers import build_default_registry
 from qqbot.services.request_auto_approval import maybe_auto_approve
@@ -90,19 +99,20 @@ async def _describe_image(data: bytes, mime: str, file_hash: str) -> str | None:
     )
 
 
+async def _describe_images(
+    items: list[tuple[bytes, str, str]],
+) -> list[str | None]:
+    return await describe_images(items, session_factory=AsyncSessionLocal)
+
+
 async def _notify_committed_event(event: SystemEvent) -> None:
-    """Translate a committed internal event into AgentLoop wake + silence arm."""
-    if event.scope == "group" and event.group_id is not None:
-        scope_key = f"group:{event.group_id}"
-    elif event.scope == "system":
-        scope_key = "system"
-    else:
-        return
+    """登记完成后再过静默门：叫不叫醒、重不重排计时器，不在注册层打 tag。"""
     sup = _get_supervisor()
-    # 可见事实落库才算动静；runtime_only 不武装静默计时器。
-    if event.visibility == "agent_visible":
-        sup.note_activity(scope_key)
-    await sup.wake(scope_key)
+    await apply_silence_gate(
+        event,
+        wake=sup.wake,
+        note_activity=sup.note_activity,
+    )
 
 
 def _get_ingest() -> EventIngest:
@@ -116,7 +126,11 @@ def _get_ingest() -> EventIngest:
             # 图片消息进入时间线前的必需内容。与 caption_image 同为 VLM 调用
             # 但职责相反——这条是客观转录，那条是收藏用途标注，刻意不合并。
             image_describer=_describe_image,
+            batch_image_describer=_describe_images,
+            registration_window_seconds=1.0,
         )
+        set_inbound_gateway(_ingest.gateway)
+        set_model_outcome_sink(schedule_model_outcome)
     return _ingest
 
 
