@@ -4,7 +4,7 @@
 poke / recall / ...）都遵循同一套出站约定，把重复部分收敛到这里：
 
 - **group_id 从 scope_key 注入**：群操作的目标群一律取当前 AgentLoop 的
-  scope，绝不让 LLM 用 arguments 传任意 group_id —— 隔离契约 §9。
+  scope，绝不让 LLM 用 arguments 传任意 group_id —— 事件系统设计 §11.2。
 - **Bot 实例从 bot_registry 取**（`get_bot()`）：与 send_message 同路。
 - **协议交互统一走 `OneBotGateway`**：`call_action` 只把网关 DTO 机械适配成
   ``ToolOutcome``。NapCat 明确拒绝保留 retcode/wording；Effect 没有响应时保守

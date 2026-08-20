@@ -9,8 +9,8 @@ external.message.group.*，有两道闸——
    v2_main 的四个 matcher 都不会接到它；
 ② 本 mapper 的 can_map 也只认 post_type=="message"。
 因此 bot 的发言在事件流里只有一种形态：send_messages 工具的
-agent.tool_called/tool_result 对（projection 渲染成 <tool-call
-name="send_messages">，那一行本身就是时间线上的发言记录；author 索引据其
+agent.tool_called/tool_result 对（projection 渲染成 `<工具>send_messages`
+行块，那一行块本身就是时间线上的发言记录；author 索引据其
 逐条回执里的 message_id+self_id 折出 reply 段的 from_self="true"。已删除的
 旧链路 send_message / runtime.reply_flushed 只在历史兼容渲染路径里还认，
 不再产生新事件）。

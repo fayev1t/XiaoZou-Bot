@@ -1,12 +1,12 @@
 """SendMessagesTool 合同（2026-07-31 删除 Replyer：Planner 亲自发言的出口）。
 
-钉住四组边界（重构提案-删除Replyer.md §4、§8）：
+钉住四组边界（v2.0/30-工具设计/发言链路设计.md §2–§4）：
 - 普通 Program Effect：不查任何前置状态——没有任何前置事件时
   调用照常执行；不写任何领域/runtime 事件（发送事实只活在 terminal 里）；
 - 静态校验与 meme preflight 失败无副作用（不碰 OneBot）；
 - 结果语义：sent → success；partial / failed / uncertain → failure，
-  status 与完整逐条 receipts 经 extra 平铺进 tool_failed payload，供投影
-  派生 `<my-reply>`；
+  status 与完整逐条 receipts 经 extra 平铺进 tool_failed payload，供投影渲染
+  该调用自己的 `<工具>send_messages` 行块（**不派生**第二份发言行）；
 - allowed_scopes 只有 group；回执脱敏（base64 不进事件流）。
 """
 
@@ -111,7 +111,7 @@ class SendMessagesToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.result["message_ids"], [111, 222])
         self.assertEqual(len(bot.calls), 2)
         self.assertEqual(bot.calls[0]["group_id"], 100)
-        # receipts 随 result 落 terminal，供投影派生 <my-reply>。
+        # receipts 随 result 落 terminal，供投影渲染 <工具>send_messages 行块。
         receipts = outcome.result["sent_messages"]
         self.assertEqual(
             [item["status"] for item in receipts], ["sent", "sent"]
@@ -299,7 +299,7 @@ class SendMessagesMetadataTests(unittest.TestCase):
         self.assertEqual(sorted(schema["properties"]), ["messages"])
 
     def test_usage_doc_records_uncertain_and_partial_semantics(self) -> None:
-        """§5.3：uncertain 表示可能已送达，新调用可能造成重复；partial 按
+        """发言链路设计 §5：uncertain 表示可能已送达，新调用可能造成重复；partial 按
         逐条 receipt 表示既成发送事实；调用行自己的回执就是发言记录（不派生
         <my-reply>）。完成事件不是发送参数，文档不使用 token 式措辞。"""
         doc = SendMessagesTool.usage_prompt

@@ -1,8 +1,8 @@
 """Contract tests for meme_store（agent_memes 表情包收藏读写）。
 
 Covers（表情包工具黑盒设计.md §存储；2026-07-06 起全局共享）：
-- 全局共享：所有读写固定用哨兵 scope_key = MEME_SCOPE_GLOBAL（隔离契约
-  §9.2 第 6 条例外），insert 落 'global'、get/load 按 'global' 过滤。
+- 全局共享：所有读写固定用哨兵 scope_key = MEME_SCOPE_GLOBAL（事件系统设计
+  §11.3 例外），insert 落 'global'、get/load 按 'global' 过滤。
 - insert_meme：INSERT ... ON CONFLICT (scope_key, file_hash) DO NOTHING；
   rowcount=1 → True（新插入），rowcount=0 → False（已存在，调用方折
   already_saved，**不覆盖**）；values 完整落所有列。

@@ -24,7 +24,7 @@ class ProgramValidationFeedback:
     column: int | None = None
 
 
-# ─── Projection-fed view dataclasses (任务与决策契约 §2.3, §4.1, §5.1) ───
+# ─── Projection-fed view dataclasses (任务与决策契约 §2.1、§8) ───
 
 
 @dataclass(frozen=True)
@@ -52,14 +52,14 @@ class MemeView:
     """一条表情包收藏（agent_memes 读出的视图）。
 
     Projector 经 meme_store.load_saved_memes 挂到 DecisionContext.saved_memes，
-    llm_planner 渲染成 <saved-memes> 里的一行 <meme hash="..." saved_at="...">
-    描述</meme>。description 由收录（meme.save）时的 caption LLM 调用生成，
-    是 Planner 经 send_messages 发图时选图的唯一依据；hash 与 timeline
-    <image hash="..."/> 同一值空间。
+    llm_planner 渲染成信封 `## 表情包收藏` 一节里的一行
+    ``<meme>hash12 (MM-DD): 描述``。description 由收录（meme.save）时的
+    caption LLM 调用生成，是 Planner 经 send_messages 发图时选图的唯一依据；
+    hash 与时间线 `<图 hash12 …>` 同一值空间（展示 12 位前缀，库存完整 64 位）。
 
     context_note 是收录时留档的聊天语境（表情包工具黑盒设计.md §2"留档备将来
     重生成"）：meme.recaption 不带新语境时沿用它重跑 caption。**不进 prompt**
-    ——<saved-memes> 只渲染 description。
+    ——`## 表情包收藏` 节只渲染 description。
     """
 
     file_hash: str
@@ -88,7 +88,7 @@ class ReflectionView:
 
 @dataclass(frozen=True)
 class TimelineItem:
-    """One renderable row in the LLM context (任务与决策契约 §2.3)."""
+    """One renderable row in the LLM context (任务与决策契约 §2.1)."""
 
     event_id: str
     occurred_at: datetime
@@ -119,7 +119,7 @@ class ProgressNote:
 
 @dataclass(frozen=True)
 class TaskView:
-    """Folded task state from agent.task_* events (任务与决策契约 §4.1)."""
+    """Folded task state from agent.task_* events (任务与决策契约 §8)."""
 
     task_id: str
     scope_key: str
@@ -138,7 +138,7 @@ class TaskView:
 @dataclass(frozen=True)
 class ToolResultView:
     """A folded view of an agent.tool_called and its eventual result/failure
-    (任务与决策契约 §5.1).
+    (任务与决策契约 §7.2、§11).
 
     成功/失败只靠内容区分：``error_kind is None`` 为成功（``result`` 有效），
     非 None 为失败（error_* 有效）。所属 decision 尚无 program terminal 且
@@ -172,7 +172,7 @@ class DecisionContext:
     # ─── 表情包收藏夹（meme_collection 管收藏；send_messages 发送）───
     # 全局共享的 agent_memes（2026-07-06 起全 bot 一份，created_at 倒序、
     # 封顶 meme_store.MAX_SAVED_MEMES 条），由 Projector.
-    # _augment_with_saved_memes 注入；渲染成 <saved-memes>，meme 工具凭
+    # _augment_with_saved_memes 注入；渲染成 `## 表情包收藏` 节，meme 工具凭
     # 其中的 hash 精确删除/换描述，并供发言时选图。空 = 不渲染。
     saved_memes: list[MemeView] = field(default_factory=list)
     # 2026-07-02 起不再有独立的 pending_tool_results 字段：工具结果只在
@@ -215,7 +215,7 @@ class DecisionContext:
     # 当前 tick 在该 group scope 下小奏自己的群角色（owner / admin / member）。
     # 由 Projector.fold_bot_role() 从 runtime.bot_role_observed 事件折出最新值，
     # AgentLoop 在 dispatch 时原样注入 tool_called.payload.bot_role。它有两个用途：
-    # ① 渲染成 <agent-input bot_role="..."> 供 LLM 判断自己能不能调需要角色的工具；
+    # ① 渲染成信封头部第二行 ``群角色 <role>`` 供 LLM 判断能不能调需要角色的工具；
     # ② 作为工具内 enforce_bot_admin 的**回退快照**——真正判权限时工具会先
     #    **实时**向 napcat 查 bot 当前角色（_effective_bot_role），查不到才回退到它。
     # None = 未观测到（启动初期 sweep 未跑完 / 该群从未写过 baseline）——渲染时不输出

@@ -105,8 +105,8 @@ class ToolOutcome:
     工具直接产出 outcome（成功 → ``result``；失败 → ``error_kind`` /
     ``error_message`` / ``extra``）。执行层只把它机械搬运成
     ``agent.tool_result`` / ``agent.tool_failed``，**不再 introspect 异常类型、不猜
-    error_kind**（契约 §6/§7.2）；Projection 据这两类事件渲染 ``<tool-call>``
-    （两态：complete + ``<result>`` / ``<error>``）。
+    error_kind**（契约 §6/§7.2）；Projection 据这两类事件渲染 ``<工具>`` 行
+    （两态：``完成`` + 结果行 / ``失败`` + 原因行）。
 
     ``error_kind`` 收敛成固定语义集（见 planner.md §输入信封格式规范 的 <error>、
     契约 §7.2）：

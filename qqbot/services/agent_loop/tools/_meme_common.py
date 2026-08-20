@@ -1,6 +1,6 @@
 """meme 工具的公共小件（与 _onebot_common 同定位）。
 
-- **hash 校验**：image_hash 是 12–64 位十六进制的 sha256 前缀（行文法 §7：
+- **hash 校验**：image_hash 是 12–64 位十六进制的 sha256 前缀（Part 3 §2.2：
   信封只展示 12 位前缀，LLM 从时间线 ``<图 hash12 …>`` 段或收藏
   ``<meme>hash12 …`` 行原样抄来；完整 64 位仍被接受——旧行/旧文档引用不
   失效），大小写归一为小写。非法 → invalid_arguments（返回失败 outcome，
@@ -24,7 +24,7 @@ from typing import Any
 from qqbot.services.agent_loop.tool_registry import ToolOutcome
 from qqbot.services.event_ingest.media import MEDIA_IMG_DIR
 
-# 12 位下限 = 行文法 §7 的展示前缀长度（48 bit，碰撞概率可忽略）；64 位
+# 12 位下限 = Part 3 §2.2 的展示前缀长度（48 bit，碰撞概率可忽略）；64 位
 # 上限 = 完整 sha256。中间长度同样接受（模型多抄了几位不该失败）。
 _HASH_PREFIX_RE = re.compile(r"^[0-9a-f]{12,64}$")
 
@@ -70,7 +70,7 @@ def media_path_for_hash(file_hash: str) -> Path:
 def resolve_media_hash(
     hash_prefix: str,
 ) -> tuple[str | None, ToolOutcome | None]:
-    """hash 前缀 → 磁盘上唯一匹配的完整 sha256（行文法 §7）。
+    """hash 前缀 → 磁盘上唯一匹配的完整 sha256（Part 3 §2.2）。
 
     返回三态：
     - ``(完整hash, None)``：唯一命中（完整 64 位输入直接原样返回，存在性

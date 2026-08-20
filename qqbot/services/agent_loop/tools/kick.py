@@ -1,7 +1,7 @@
 """KickTool — 把某个成员踢出当前群。
 
 仅 GroupAgentLoop 可用（allowed_scopes=("group",)）；group_id 锁定当前群——
-从 scope_key 注入、不由 LLM 传（隔离契约 §9：一个群的 agent 不能操作别的群）。
+从 scope_key 注入、不由 LLM 传（事件系统设计 §11.2：一个群的 agent 不能操作别的群）。
 
 权限/判定全在工具内（execute() 第一行 ``await self.enforce_access``，AgentLoop 不再
 闸门）：发起人 tier（required_permission=ADMIN——踢人须群管理员/群主授意，**实时**查

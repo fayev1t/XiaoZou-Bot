@@ -12,8 +12,9 @@
 delete_meme / recaption_meme 合并而来（应用户拍板"能力全集合在一个表情包
 工具中"）：Program API 只暴露一个函数，模型按 `action` 选操作。
 
-三个动作共享同一身份标识：`image_hash`（sha256，与 timeline
-<image hash="..."/>、收藏夹 <meme hash="..."> 同一值空间，LLM 原样照抄）。
+三个动作共享同一身份标识：`image_hash`（sha256，与时间线 `<图 hash12 …>`、
+收藏节 `<meme>hash12 …` 同一值空间；信封展示 12 位前缀，LLM 原样照抄，
+工具按前缀唯一匹配 —— 主线 Part 3 §2.2）。
 
   save       收录 timeline 里出现过的图片进全局收藏夹。定位 EventIngest
              已落盘的文件（内容寻址复用，不复制）→ 已收录直接 already_saved
@@ -32,7 +33,7 @@ delete_meme / recaption_meme 合并而来（应用户拍板"能力全集合在�
              未提供则沿用收录时留档的旧语境（"留档备将来重生成"的兑现点）。
              caption 失败不落表、旧描述保留。
 
-共享语义：收藏夹全 bot 一份、所有聊天 scope 共用（隔离契约 §9.2 第 6 条
+共享语义：收藏夹全 bot 一份、所有聊天 scope 共用（事件系统设计 §11.3
 例外，见 meme_store 模块 docstring）——任何会话收录/删除，其余会话都可见。
 
 失败语义（全程无 raise，error_kind 见黑盒设计 §8）：
@@ -101,7 +102,7 @@ MAX_SAVE_BATCH = 10
 
 
 def _ambiguous_prefix_failure(prefix: str) -> ToolOutcome:
-    """收藏夹内 hash 前缀多义（行文法 §7，几乎不可能但语义封死）。"""
+    """收藏夹内 hash 前缀多义（Part 3 §2.2，几乎不可能但语义封死）。"""
     return ToolOutcome.failure(
         "invalid_arguments",
         f"hash prefix {prefix} matches more than one saved meme; copy more "
@@ -293,7 +294,7 @@ class MemeCollectionTool(BaseTool):
         session_factory: Any,
         context: dict,
     ) -> ToolOutcome:
-        # 前缀 → 磁盘唯一完整 hash（行文法 §7）；磁盘存在性 = "bot 真的见
+        # 前缀 → 磁盘唯一完整 hash（Part 3 §2.2）；磁盘存在性 = "bot 真的见
         # 过这张图"。无命中 → hash 抄错 / 图当初没下载成功（<图> 无 hash 的
         # 那类），给 LLM 可自纠的精确失败。
         resolved, fail = resolve_media_hash(file_hash)

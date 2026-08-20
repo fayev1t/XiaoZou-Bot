@@ -13,8 +13,8 @@ look_at_image / 记忆压缩 / 网页正文提炼）的 system prompt 都从这�
 在哪一段旁边。现在位置、顺序、分隔符全部由根页自己写死，看得见即所得。
 `ASSEMBLY` 与 `SECTION_SEP` 一并删除——段间那行 `---` 现在是各页正文里的字符。
 
-**2026-07-31 删除 Replyer**（重构提案-删除Replyer.md）：`replyer.md` 根页随之
-删除，Planner 独自承担分析与最终措辞。
+**2026-07-31 删除 Replyer**（v2.0/30-工具设计/发言链路设计.md §7）：`replyer.md`
+根页随之删除，Planner 独自承担分析与最终措辞。
 
 **2026-07-31 共享资产并回根页**：`persona.md` / `system.md` /
 `group_chat_rules.md` 三份文件并进 `planner.md`，三个文件槽一并删除。删除

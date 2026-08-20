@@ -5,7 +5,7 @@
   当前拍的程序执行通道不被 sleep 占用。
 - 到点回调 _fire_wait：**先**写 runtime.wait_elapsed（agent_visible，回显
   note），**再** wake(scope_key)——醒来那拍的投影必能看到 hint。
-- 定时器仅存内存，进程重启即丢（best-effort，契约见 事件系统设计.md §4.3.2）。
+- 定时器仅存内存，进程重启即丢（best-effort，契约见 事件系统设计.md §5.2）。
 - 参数越界 / 类型错 → invalid_arguments；wake_scope/session 未注入 →
   internal_tool_error（不 raise、不假装约上了）。
 """

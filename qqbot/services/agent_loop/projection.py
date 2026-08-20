@@ -1,6 +1,6 @@
 """Projector — build DecisionContext from the agent_events stream.
 
-Contract: 开发文档/v2.0/任务与决策契约.md §2.3, §4.2, §5.1, §5.2
+Contract: 开发文档/v2.0 —— 任务与决策契约.md §2.1、§8、§11；主线 Part 3 §2-§3
 
 Strategy:
 - Fetch the newest agent_visible events for this scope (count-limited window).
@@ -20,8 +20,8 @@ Strategy:
 Folding and rendering are split into pure staticmethods so unit tests
 can drive them without a DB.
 
-Renderers emit compact **line-grammar** rows（行文法，重构提案-信封行文法
-草案二版，2026-08-03 起替换 XML 元素/属性渲染）。Each renderer:
+Renderers emit compact **line-grammar** rows（行文法，2026-08-03 起替换 XML
+元素/属性渲染；不变量与安全模型见主线 Part 3 §2）。Each renderer:
 - 只保留 XML 的承重基因：一切动态文本经 ``_esc_text``（`&`/`<`/`>`）转义，
   一切渲染器结构（行头 ``<m>``/``<t>``/``<工具>``…、行内段 ``<图 …>``…）
   以 ``<`` 开头——假行头/假段标记在**字符层**不可伪造。第二层防线是换行
@@ -296,7 +296,7 @@ class Projector:
     ) -> DecisionContext:
         """收藏夹注入：全局 agent_memes → ctx.saved_memes。
 
-        收藏夹全 bot 一份、所有聊天 scope 共用（隔离契约 §9.2 第 6 条例外，
+        收藏夹全 bot 一份、所有聊天 scope 共用（事件系统设计 §11.3 例外，
         见 meme_store 模块 docstring），查询不带 scope 过滤；scope_key 只用来
         判断"有没有聊天面"——system scope 没有（meme 工具的
         allowed_scopes 也不含它），跳过查询省一次 SQL。查询失败整段降级
@@ -756,7 +756,7 @@ class Projector:
         bot_user_id: str | None = None,
     ) -> list[TimelineItem]:
         """``bot_user_id`` 用于给行内出现的本账号 QQ 号打 ``*`` 后缀（服务端
-        标注，行文法 §4）；None 时不标（纯函数测试 / 启动初期），此时
+        标注，Part 3 §2.2）；None 时不标（纯函数测试 / 启动初期），此时
         reply 标记的 ``*`` 仍由 from_self 服务端事实兜底。"""
         tool_view_by_id = {tv.tool_call_id: tv for tv in tool_views}
         # 预扫一遍构建 reply 段引用所需的索引（被回复消息摘要 + 用户名映射），
@@ -769,9 +769,10 @@ class Projector:
         # 你说话）的根因修复。覆盖外部消息 + bot 自己已投递的发言（后者标
         # from_self="true"，无需比对 bot_qq 即知"别人引用的是你自己"）。
         author_by_msg_id = _build_author_index(events)
-        # 过期完成事件的渲染守卫（重构提案-删除Replyer.md §1.5）：写入侧已在
-        # scope 锁内复核，这里是投影侧的第二道防线——更低 revision 的
-        # completed、以及 cancelled 任务上迟到的 completed 不渲染。
+        # 过期完成事件的渲染守卫（reply/ReplyTask 2026-08-17 已删除，此处只
+        # 服务存量行）：写入侧当年已在 scope 锁内复核，这里是投影侧的第二道
+        # 防线——更低 revision 的 completed、以及 cancelled 任务上迟到的
+        # completed 不渲染。
         reply_task_guard = _build_reply_task_guard(events)
 
         items: list[TimelineItem] = []
@@ -1065,7 +1066,7 @@ class Projector:
         *,
         bot_user_id: str | None = None,
     ) -> str:
-        """通知行：``<通知>kind 模板句``（行文法 §5.4）。
+        """通知行：``<通知>kind 模板句``（Part 3 §3.1）。
 
         kind 保留 OneBot 原始枚举词作锚，正文是逐 kind 的模板句——比属性堆
         可读且更省。人物一律 ``名(QQ)`` 形态（近期消息反查名字，查不到只渲
@@ -1086,7 +1087,7 @@ class Projector:
 
         2026-07-03 拆分后实际会渲染的只有入群申请（``external.request.group.add``，
         scope=group 进目标群 timeline）：群内 LLM 看到后可提醒，管理员明确授权后
-        调 respond_to_group_join_request 回执 napcat（事件系统设计.md §10.2）。
+        调 respond_to_group_join_request 回执 napcat（EventIngest契约.md §2）。
         好友申请 / 邀请入群是 runtime_only（自动审批），永远不会走到这里；渲染
         逻辑仍按 type 前缀泛化，不对 kind 特判。
 
@@ -1101,12 +1102,12 @@ class Projector:
         if comment:
             parts.append(f"留言{_quote_excerpt(str(comment), limit=200)}")
         # group_id 恒为当前群（scope=group 进目标群 timeline），不渲染——
-        # 行文法 §5.5 裁定的冗余属性删除。
+        # Part 3 §3.1 裁定的冗余属性删除。
         return " ".join(parts)
 
     @staticmethod
     def _render_tool_call(ev: _EventSnapshot, tv: ToolResultView | None) -> str:
-        """工具行（行文法 §5.3）：
+        """工具行（Part 3 §3.2）：
 
         ``<工具>名 完成|失败[ kind k=v …]`` + 缩进的
         ``参数`` / ``结果``（成功，超限加 ``（截断）``）/ ``原因``（失败）行。
@@ -1227,7 +1228,7 @@ class Projector:
 
     @staticmethod
     def _render_context_recap(ev: _EventSnapshot) -> str:
-        """回忆行（runtime.context_compacted，行文法 §5.5）：头行 = 覆盖区间
+        """回忆行（runtime.context_compacted，Part 3 §3.1）：头行 = 覆盖区间
         + 条数，缩进正文 = 摘要全文 + 从属脚注；不渲染 recall_cues /
         内部字段。钉住/不占窗口预算等投影行为在裁剪层，不在此处。"""
         payload = ev.payload or {}
@@ -1305,8 +1306,8 @@ class Projector:
         """runtime.reply_task_completed → ``<等待结束>`` 极简行。
 
         只陈述"这段等待结束了"这一件事；没有授权 ID、unseen、consumed 或
-        expires_at——命名刻意不表达任何发言权限（重构提案-删除Replyer.md
-        §5.4）。2026-08-01 起连 analysis 正文也没有了：这一行的信息量本来
+        expires_at——命名刻意不表达任何发言权限（v2.0/30-工具设计/发言链路
+        设计.md §1）。2026-08-01 起连 analysis 正文也没有了：这一行的信息量本来
         就该低到只是一次叫醒，该说什么去读它上面的时间线。
         """
         payload = ev.payload or {}
@@ -1353,7 +1354,7 @@ def render_timeline_stream(items: Sequence[TimelineItem]) -> list[str]:
     （timespec=seconds，与旧行内 time= 同精度）的行共享同一时刻头：同拍
     派发的工具批次、同秒消息 burst 自然聚簇为"这一刻发生了这些"。
 
-    时刻头无闭合标签（行文法 §5.1）：首个时刻头与跨日的时刻头带完整日期
+    时刻头无闭合标签（Part 3 §3.1）：首个时刻头与跨日的时刻头带完整日期
     ``<t>YYYY-MM-DD HH:MM:SS``，同日内只 ``<t>HH:MM:SS``；时区全局固定
     Asia/Shanghai（envelope.md 约定），不逐节点渲染。前缀缓存：同秒追加
     从旧 XML 的"重写 ``</time>`` 闭合位置"变为**纯追加**，无任何重写点。
@@ -1381,7 +1382,7 @@ def render_timeline_stream(items: Sequence[TimelineItem]) -> list[str]:
     return parts
 
 
-# ─── 转义/净化 + JSON helpers（行文法 §3）───
+# ─── 转义/净化 + JSON helpers（Part 3 §2.1）───
 #
 # 双层防御：第一层字符级——一切动态文本经 _esc_text，渲染器结构一律 "<"
 # 开头，假结构在字符层不成立；第二层行级——多行容忍位缩进续行、单行位
@@ -1397,7 +1398,7 @@ def _esc_text(s: str) -> str:
 def _ml_text(s: str) -> str:
     """多行容忍位的正文净化：字符级转义 + 换行归一为「换行+两空格缩进」。
 
-    缩进续行从属于所在行（行文法 §2），保证动态内容永远到不了列 0。"""
+    缩进续行从属于所在行（Part 3 §2.1），保证动态内容永远到不了列 0。"""
     normalized = s.replace("\r\n", "\n").replace("\r", "\n")
     return _esc_text(normalized).replace("\n", "\n  ")
 
@@ -1443,7 +1444,7 @@ def _quote_excerpt(s: str, *, limit: int = 40) -> str:
 
 
 def _qq_disp(qq: object, bot_user_id: str | None) -> str:
-    """QQ 号显示：等于本账号时缀 ``*``（服务端标注，行文法 §4）。"""
+    """QQ 号显示：等于本账号时缀 ``*``（服务端标注，Part 3 §2.2）。"""
     text = str(qq)
     if bot_user_id and text == str(bot_user_id):
         return f"{text}*"
@@ -1467,7 +1468,7 @@ _HEX_HASH_RE = re.compile(r"[0-9a-fA-F]{12,64}")
 
 
 def _hash12(value: object) -> str:
-    """图片 sha256 的 12 位展示前缀（行文法 §7；工具按前缀唯一匹配）。
+    """图片 sha256 的 12 位展示前缀（Part 3 §2.2；工具按前缀唯一匹配）。
 
     hash 位也是动态文本——失败路径的气泡参数、上游消息段都可能携带任意
     字符串——必须先验形：合法十六进制才按前缀截取，否则按单行动态字段
@@ -1508,7 +1509,7 @@ def _safe_json(value) -> str:
         return _flatten(str(value))
 
 
-# ─── send_messages 气泡渲染（行文法 §5.3 特例）───
+# ─── send_messages 气泡渲染（Part 3 §3.2 特例）───
 #
 # 动机（2026-08-01 人话渲染裁定的延伸）：自己说过的话在 timeline 上的唯一
 # 形态就是这一行块，若渲染成 JSON 参数文本，同一份 prompt 里「我」的语言
@@ -1777,7 +1778,7 @@ def _render_reply_marker(
     *,
     bot_user_id: str | None = None,
 ) -> str:
-    """reply 段 → 行头 ``回复#ID(作者)「摘要」`` 标记（行文法 §5.2）。
+    """reply 段 → 行头 ``回复#ID(作者)「摘要」`` 标记（Part 3 §3.1）。
 
     作者位/摘要位各自可省（=未知）。作者信息量与旧 from_name/from_qq/
     from_self 三属性一一对应：``名(QQ)`` / ``(QQ)``，本账号缀 ``*``——这是
@@ -1786,7 +1787,7 @@ def _render_reply_marker(
 
     取值优先级（2026-07-22 出窗引用黑洞修复）：ingest 富化的 segment 顶层
     quoted 键 > 投影窗口内索引。quoted 在消息到达时由适配器已解析的
-    event.reply 固化（EventIngest契约 §6.4），不随窗口滚动丢失；旧库事件
+    event.reply 固化（EventIngest契约 §4），不随窗口滚动丢失；旧库事件
     无 quoted，仍靠窗口索引兜底。逐字段回退：quoted 缺个别子键时该字段仍
     可由索引补上。from_self 是服务端事实标注，bot_user_id 缺失时仍有效。
     """
@@ -2189,7 +2190,7 @@ def _notice_sentence(
     *,
     bot_user_id: str | None = None,
 ) -> str | None:
-    """按 notice kind 生成模板句（行文法 §5.4）。
+    """按 notice kind 生成模板句（Part 3 §3.1）。
 
     mapper 已存储的明细字段（禁言秒数 / 新旧名片 / 文件名与大小 / 拍一拍
     文案 / 表情统计 / 被撤回消息 ID / 荣誉类型…）全部进句子——被撤回的

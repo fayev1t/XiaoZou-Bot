@@ -4,10 +4,10 @@ Pure unit-level: every test calls Projector's staticmethods with a
 hand-built list of _EventSnapshot fixtures; no DB and no nonebot required.
 
 Contract sources:
-- 任务与决策契约.md §2.3 (timeline scoping & shape)
-- 任务与决策契约.md §4.2 (task folding via agent.task_* events)
-- 任务与决策契约.md §5.1 (rendering rules)
-- 任务与决策契约.md §5.2 (active_tasks: only pending/running)
+- 任务与决策契约.md §2.1 (timeline scoping & shape)
+- 任务与决策契约.md §8 (task folding via agent.task_* events)
+- 主线 Part 3 §3 (rendering rules)
+- 任务与决策契约.md §8 (active_tasks: only pending/running)
 """
 
 from __future__ import annotations
@@ -683,7 +683,7 @@ class BuildTimelineTests(unittest.TestCase):
         self.assertNotIn("「", rendered)
 
     def test_reply_segment_uses_ingest_quoted_outside_window(self) -> None:
-        # 出窗引用黑洞修复（EventIngest契约 §6.4）：被引消息不在窗口内，但
+        # 出窗引用黑洞修复（EventIngest契约 §4）：被引消息不在窗口内，但
         # ingest 富化的 quoted 键在 → from_*/excerpt 照常渲染，不再退化成
         # 裸 to_message_id。
         evs = [
@@ -928,7 +928,7 @@ class BuildTimelineTests(unittest.TestCase):
 
     def test_image_segment_uses_file_hash(self) -> None:
         # 富化字段（file_hash/local_path/...）由 event_ingest/media.py 写在
-        # segment 顶层（不在 data 内），见 EventIngest契约.md §6.1。
+        # segment 顶层（不在 data 内），见 EventIngest契约.md §5.1。
         evs = [
             _snap(
                 type="external.message.group.normal",
@@ -1904,9 +1904,8 @@ class BuildTimelineTests(unittest.TestCase):
         self.assertIn("tool_batch_id", rendered)
 
     def test_reply_emitted_produces_no_timeline_row(self) -> None:
-        # 架构一致性：发言统一表示为 send_message 工具的 <tool-call
-        # name="send_message">，agent.reply_emitted 本身不再渲染成独立的
-        # <agent-reply> 行。
+        # 架构一致性：发言统一表示为发送工具自己的调用行（现役 <工具>
+        # send_messages 行块），agent.reply_emitted 本身不渲染成独立行。
         evs = [
             _snap(
                 type="agent.reply_emitted",
@@ -1920,8 +1919,8 @@ class BuildTimelineTests(unittest.TestCase):
         self.assertEqual(items, [])
 
     def test_reply_is_represented_as_reply_tool_call(self) -> None:
-        # send_message 走和普通工具完全一样的 <tool-call> 渲染：content 在
-        # <args> 里，不再有 <agent-reply>。
+        # 发送工具走和普通工具完全一样的调用行渲染（现役 <工具> 行块，
+        # 内容在参数/回执里），不另起 <agent-reply>。
         called = _snap(
             type="agent.tool_called",
             payload={
@@ -2001,7 +2000,7 @@ class BuildTimelineTests(unittest.TestCase):
     ) -> None:
         # 兼容：改名前落库的发言事件 tool_name 仍是旧的 "reply"（事件表
         # append-only）。_build_author_index 两个名都认，旧发言在一个 lookback
-        # 窗口内仍能被标 from_self="true"。见 send_message工具黑盒设计 §12.2。
+        # 窗口内仍能被标 from_self="true"。见 v2.0/30-工具设计/发言链路设计.md §7。
         evs = [
             _snap(
                 type="agent.tool_called",
@@ -2125,8 +2124,8 @@ class BuildTimelineTests(unittest.TestCase):
         # 发言已同步：reply_emitted/delivered/failed 不再产生（历史遗留事件也
         # 只 skip）；idle_decision 是纯运营事件不进 timeline。decision_emitted
         # 的 reasoning 只留在运行日志与审计中，不论正文是否为空都不进投影。
-        # 发送结果由
-        # send_message 工具的 <tool-call>（succeeded/failed）表达，没有独立行。
+        # 发送结果由发送工具自己的调用行（现役 <工具> 完成|失败）表达，
+        # 没有独立行。
         evs = [
             _snap(type="agent.decision_emitted", payload={}),
             _snap(type="agent.idle_decision", payload={"reason": "x"}),
@@ -2162,7 +2161,7 @@ class BuildTimelineTests(unittest.TestCase):
 
 
 class LineGrammarInjectionSafetyTests(unittest.TestCase):
-    """行文法 §3 的双层注入不变量：动态文本造不出字面结构标记，且动态
+    """Part 3 §2.1 的双层注入不变量：动态文本造不出字面结构标记，且动态
     换行只能成为两空格缩进的续行；行头短字段不能注入定界符。"""
 
     def test_message_body_cannot_forge_rows_or_inline_markers(self) -> None:
@@ -2485,7 +2484,7 @@ class ProjectIntegrationTests(unittest.TestCase):
 
     def test_bot_user_id_propagates_into_decision_context(self) -> None:
         """Projector.project 收到 bot_user_id 时必须透传到 DecisionContext，
-        让 LLMPlanner 渲染 <agent-input bot_qq="..."> 属性。"""
+        让 LLMPlanner 渲染信封头部第二行的 ``本账号(QQ)``。"""
         context = Projector.project(
             [],
             scope_key="group:100",

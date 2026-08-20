@@ -11,7 +11,7 @@ triggered_by_event_id / bot_role 等）一律由程序执行器在 run() 的 con
 
 napcat 动作工具集（kick / ban / recall / get_* / ...）把 OneBot V11 能对 QQ
 做的事进一步工具化。群操作的 group_id 由 `_onebot_common.py` 从 scope_key 注入
-（隔离契约 §9，不让 LLM 跨群），协议请求统一交给 `program_api.OneBotGateway`；
+（事件系统设计 §11.2，不让 LLM 跨群），协议请求统一交给 `program_api.OneBotGateway`；
 `call_action` 只把标准响应/传输失败机械折成 ToolOutcome，不在 Tool 内解释下游
 wording。可见性靠 `allowed_scopes`（Program API 按 scope 过滤）；scope / 发起人
 tier（**实时**查群角色）/ bot 自身角色的判定全在工具内 execute() 首行的

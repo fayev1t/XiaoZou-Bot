@@ -2,15 +2,15 @@
 
 为什么需要它：
   同日起 Planner / Replyer 降级为纯文本模型，群里的图在 EventIngest 落盘时由
-  专用 VLM 转录成一段**客观描述**写进事件正文，投影渲染成
-  `<image hash="..." desc="..."/>`。那段描述是无语境的（ingest 时刻语境往往
+  专用 VLM 转录成一段**客观描述**写进事件正文，投影渲染成时间线里的
+  `<图 hash12 照片|贴图: 描述>` 段。那段描述是无语境的（ingest 时刻语境往往
   还不存在——先甩图、隔几条再补话是常态），所以它必然覆盖不到所有后续追问。
   本工具就是那条兜底路径：模型现场带着 timeline 语境提一个具体问题，重新看一
   次原图。**没有它，这次改动就是纯降级**；有了它，描述不够用时天花板还在。
 
 参数（刻意只有两个，理由见下）：
   image_hash  必填，12–64 位 sha256 前缀，从 timeline 的 <图 hash12 …> 段
-              原样抄（行文法 §7：信封展示 12 位前缀，磁盘按前缀唯一解析）
+              原样抄（Part 3 §2.2：信封展示 12 位前缀，磁盘按前缀唯一解析）
   question    必填，自由文本
 
   question 必填不是形式要求：不带问题的调用等于把 ingest 那次转录再跑一遍，
@@ -112,7 +112,7 @@ class LookAtImageTool(BaseTool):
         if failure is not None:
             return failure
         assert prefix is not None
-        # 前缀 → 磁盘唯一完整 hash（行文法 §7）。多义 → ambiguous 失败；
+        # 前缀 → 磁盘唯一完整 hash（Part 3 §2.2）。多义 → ambiguous 失败；
         # 无命中 → 与旧"读文件失败"同一 image_not_found 语义。
         image_hash, failure = resolve_media_hash(prefix)
         if failure is not None:

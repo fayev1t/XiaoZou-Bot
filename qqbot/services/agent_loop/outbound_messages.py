@@ -1,6 +1,6 @@
 """出站消息的共享校验、归一、准备、发送与回执整形。
 
-2026-07-31 删除 Replyer 时从三处迁出（重构提案-删除Replyer.md §4.2）：
+2026-07-31 删除 Replyer 时从三处迁出（v2.0/30-工具设计/发言链路设计.md §7）：
 
 - ``validate_content`` / ``invalid_args``：原 ``tools/send_message.py`` 的
   ``_validate_content``（该工具随校验迁出后删除）。OneBot 段白名单 + 结构 +
@@ -15,7 +15,7 @@
   base64/二进制脱敏）。删除的只是 Replyer 的 LLM 调用链，不重写已经工作的
   校验与发送逻辑。
 
-2026-08-14 出站气泡去协议化（send_message工具黑盒设计 §5/§6 同步改写）。此前
+2026-08-14 出站气泡去协议化（v2.0/30-工具设计/发言链路设计.md §2.1）。此前
 一个 chat 气泡是 ``{"kind":"chat","content":[{"type":"text","data":{"text":…}}]}``：
 ``data`` 包装、``type`` 判别、段顺序规则（reply 必须 content[0]）全部是 OneBot 11
 的协议知识，与"说一句话"无关，却要模型每次发言都正确复述一遍。现在气泡是领域
@@ -232,7 +232,7 @@ def _validate_at(data: dict, i: int) -> ToolOutcome | None:
 
 
 def _is_hash_prefix(value: Any) -> bool:
-    """12–64 位十六进制的 sha256 前缀（行文法 §7：信封展示 12 位前缀，
+    """12–64 位十六进制的 sha256 前缀（Part 3 §2.2：信封展示 12 位前缀，
     完整 64 位仍接受）。"""
     return (
         isinstance(value, str)
@@ -495,7 +495,7 @@ async def preflight_memes(
     静态校验之外可能变化的外部事实在这里查；失败返回
     ``([], (reason_code, message))``，一条都不发。
 
-    hash 按前缀唯一匹配（行文法 §7）：命中后把气泡的 ``image_hash`` 归一为
+    hash 按前缀唯一匹配（Part 3 §2.2）：命中后把气泡的 ``image_hash`` 归一为
     收藏记录的**完整** 64 位——回执、事件载荷与 from_self 作者索引继续以
     完整 hash 为准，只有信封展示是 12 位前缀。
     """

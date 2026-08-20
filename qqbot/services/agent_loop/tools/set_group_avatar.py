@@ -1,7 +1,7 @@
 """SetGroupAvatarTool —— 设置当前群的群头像。
 
 仅 GroupAgentLoop 可用（allowed_scopes=("group",)）；group_id 锁定当前群——
-从 scope_key 注入、不由 LLM 传（隔离契约 §9：一个群的 agent 不能操作别的群）。
+从 scope_key 注入、不由 LLM 传（事件系统设计 §11.2：一个群的 agent 不能操作别的群）。
 napcat 动作失败（bot 权限不足 / 图片非法等）由 call_action 折成
 upstream_action_failed **返回**；权限/角色/scope 判定在 execute() 首行
 enforce_access（先于任何 napcat 动作）返回对应失败 outcome。全程无 raise。

@@ -3,7 +3,7 @@
 定位见 models/agent_meme.py 顶部注释。
 
 **全局共享（2026-07-06 起）**：收藏夹是全 bot 一份、所有聊天 scope 共用——
-这是隔离契约（事件系统设计.md §9.2 第 6 条）明确允许的例外：收藏以公共值
+这是事件系统设计.md §11.3明确允许的例外：收藏以公共值
 file_hash 为键、不携带 scope 上下文，与图片文件落盘缓存同类。实现方式是
 scope_key 列固定写 MEME_SCOPE_GLOBAL 哨兵（列保留，表结构不变，主键
 (scope_key, file_hash) 退化为全局一图一条；将来要恢复分域只改本模块）。
@@ -11,9 +11,9 @@ scope_key 列固定写 MEME_SCOPE_GLOBAL 哨兵（列保留，表结构不变，
 
 对外接口（全部独立事务、每次新开 session，与 task_store 同风格）：
 
-  get_meme(factory, hash)          单条精确查。发送（meme.send）的权限
-                                   边界（只有收录过的才能发）与收录
-                                   （meme.save）的去重前查都走它。
+  get_meme(factory, hash)          单条精确查。发送（send_messages 的 meme
+                                   气泡）的权限边界（只有收录过的才能发）与
+                                   收录（meme.save）的去重前查都走它。
   insert_meme(factory, ...)        收录一条。ON CONFLICT DO NOTHING：
                                    并发重复保存时后到者静默不覆盖，
                                    返回 False（调用方按 already_saved
@@ -58,12 +58,12 @@ logger = get_logger(__name__)
 
 SessionFactory = Callable[[], AsyncSession]
 
-# 全局收藏的哨兵 scope_key：所有读写固定用它，隔离契约 §9.2 第 6 条例外的
+# 全局收藏的哨兵 scope_key：所有读写固定用它，事件系统设计 §11.3 例外的
 # 显式标注就落在这里。列本身保留（见模块 docstring）。
 MEME_SCOPE_GLOBAL = "global"
 
 # 表情包收藏节渲染上限：收藏夹随时间增长，prompt 只带最近收录的 N 条。
-# 超限的老表情包仍在表里（meme.send 凭 hash 仍可发送），只是不再进 prompt。
+# 超限的老表情包仍在表里（凭 hash 仍可作为 meme 气泡发送），只是不再进 prompt。
 # 全局共享后所有群共用一个池，比分群时代放宽到 100。
 MAX_SAVED_MEMES = 100
 
@@ -88,7 +88,7 @@ async def find_meme_by_prefix(
 ) -> tuple[MemeView | None, bool]:
     """按 hash 前缀（≥12 位十六进制，调用方已校验）唯一匹配一条全局收藏。
 
-    行文法 §7：信封展示 12 位前缀，工具回填按前缀查。返回
+    Part 3 §2.2：信封展示 12 位前缀，工具回填按前缀查。返回
     ``(命中的收藏, 是否多义)``：
     - 唯一命中 → ``(view, False)``；
     - 无命中 → ``(None, False)``；

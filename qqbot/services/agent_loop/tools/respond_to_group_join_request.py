@@ -25,7 +25,7 @@ napcat 处理申请用的 ``flag`` 凭证由本工具用 request_event_id 反查
 
 OneBot action：set_group_add_request(flag, sub_type="add", approve, reason)。
 
-契约：任务与决策契约.md §2.2；事件系统设计.md §4.1、§10.2。
+契约：任务与决策契约.md §5；事件系统设计.md §4.1、§10.2。
 """
 
 from __future__ import annotations
