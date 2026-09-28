@@ -8,10 +8,10 @@ System prompt 不再硬编码 —— 完全交给 prompts/catalog.py 装配。�
 Planner 是唯一的对话消费者，原先切成 `persona` / `system` / `group_chat_rules`
 三个文件槽的共享资产已并回该页，页里只剩 `{{envelope}}`（信封语法，纯格式规范，
 与投影层成对维护故仍是独立文件）与动态的 `{{tools_usage}}`（内容来自
-ToolRegistry，按 scope 过滤）。2026-08-01 起根页改用“角色决策规划器”框架：
-Planner 内部建立第三人称人物模型，最终措辞仍由同一层直接通过工具呈现。需要迭代
-人格、职责或参与规则时直接改 `planner.md`，改信封语法改
-`envelope.md`，改工具说明改 `tools/<name>.md`，都不需要碰 planner。
+ToolRegistry，按 scope 过滤）。2026-08-28 起根页是第一人称主体（你是小奏），
+不是角色规划器；最终措辞仍由同一层直接通过工具呈现。拍内决策框成是否执行
+已经写下的程序。需要迭代人格、职责或参与规则时直接改 `planner.md`，改信封
+语法改 `envelope.md`，改工具说明改 `tools/<name>.md`，都不需要碰 planner。
 
 每次 decide() 只调用模型一次，AgentLoop 每拍也只 decide 一次——2026-08-21 起
 「一个响应绑定一次模型执行」（渲染格式表 §一⑦）：静态校验归注册层

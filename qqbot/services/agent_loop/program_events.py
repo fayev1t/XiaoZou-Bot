@@ -42,6 +42,8 @@ class EffectCallHandle:
     tool_name: str
     call_site: str
     occurrence: int
+    dispatch_event_id: str | None = None
+    program_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,8 @@ async def begin_effect_call(  # noqa: PLR0913
     call_site: str,
     occurrence: int,
     occurred_at: datetime | None = None,
+    dispatch_event_id: str | None = None,
+    program_hash: str | None = None,
 ) -> EffectCallHandle:
     """Transaction 1: persist intent before any external side effect."""
     tool_call_id = new_event_id()
@@ -90,6 +94,8 @@ async def begin_effect_call(  # noqa: PLR0913
         "bot_role": bot_role,
         "program_call_site": call_site,
         "program_occurrence": occurrence,
+        "dispatch_event_id": dispatch_event_id,
+        "program_hash": program_hash,
     }
     writes = [
         AgentEventWrite(
@@ -116,6 +122,8 @@ async def begin_effect_call(  # noqa: PLR0913
         tool_name=tool_name,
         call_site=call_site,
         occurrence=occurrence,
+        dispatch_event_id=dispatch_event_id,
+        program_hash=program_hash,
     )
 
 
@@ -168,6 +176,8 @@ def _tool_terminal_write(
     common = {
         "tool_call_id": handle.tool_call_id,
         "tool_name": handle.tool_name,
+        "dispatch_event_id": handle.dispatch_event_id,
+        "program_hash": handle.program_hash,
     }
     if outcome.ok:
         return AgentEventWrite(
@@ -302,6 +312,8 @@ async def recover_interrupted_programs(
             payload={
                 "tool_call_id": payload.get("tool_call_id"),
                 "tool_name": payload.get("tool_name"),
+                "dispatch_event_id": payload.get("dispatch_event_id"),
+                "program_hash": payload.get("program_hash"),
                 "error_kind": "interrupted",
                 "error_message": (
                     "process stopped before this effect produced a terminal; "

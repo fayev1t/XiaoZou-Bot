@@ -5,15 +5,11 @@ Contract: 开发文档/v2.0 —— 任务与决策契约.md §2.1、§8、§11�
 Strategy:
 - Fetch the newest agent_visible events for this scope (count-limited window).
 - Fold `agent.task_note_written` latest-wins into the single `<task>` note.
-- Pair `agent.tool_called` with `agent.tool_result | agent.tool_failed`
-  into ToolResultView。所属 decision 尚无 program terminal 时，半截调用
-  折成 pending / 「已调用」；收口后的半截才是 interrupted。
-  视图**只**用于渲染 timeline 的 <tool> 行——2026-07-02 起不再有独立的
-  pending_tool_results 区，
-  工具结果在 timeline 单点呈现（旧的双重渲染是复读诱饵）。
-- Build the timeline from messages / notices / tool-call pairs / replies /
-  agent-visible runtime hints. Task-note and tool-result events are folded
-  upstream and do NOT produce timeline rows of their own.
+- Render tool calls and their terminal events separately at their own timestamps.
+  Correlate them by tool_call_id and dispatch_event_id; never rewrite an earlier
+  call with a later result or infer failure from another run's terminal.
+- Build the timeline from messages / notices / tool events / replies /
+  agent-visible runtime hints. Only task-note events are folded out of the stream.
 - Render `agent.decision_emitted.payload.program` as ``<action>`` plus
   the full source. The later ``<program_result>`` row is a separate event.
 
@@ -44,7 +40,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Callable, Iterable, Sequence
 
@@ -502,12 +498,7 @@ class Projector:
         pinned_event_id: str | None = None,
     ) -> DecisionContext:
         task_note = Projector.fold_task_note(events)
-        # tool_views 只喂给 timeline 渲染（<tool> 行按两态折叠）；不再
-        # 另出 pending_tool_results 区——同一调用双重渲染曾是复读的直接诱饵。
-        tool_views = Projector.fold_tool_results(events)
-        timeline = Projector.build_timeline(
-            events, tool_views=tool_views, bot_user_id=bot_user_id
-        )
+        timeline = Projector.build_timeline(events, bot_user_id=bot_user_id)
         # 裁到尾部 max_timeline_items 条 —— fetch 上限给得宽是为了 fold 任务/
         # 工具结果时能看到足够长的事件链，但塞给 LLM 的不必那么多。
         # timeline_anchor（上一拍窗口首行）有效时起点滞回钉住，见
@@ -663,44 +654,21 @@ class Projector:
     def fold_tool_results(
         events: Iterable[_EventSnapshot],
     ) -> list[ToolResultView]:
-        """Pair every tool call with its terminal result/failure.
-
-        所属 decision 尚无 program terminal 时，无终态的 ``tool_called`` 折成
-        ``pending``（渲染「已调用」）。窗口内已有 program terminal、调用本身
-        仍无 terminal，才防御性折成 ``interrupted`` / ``uncertain``。
-        """
-        closed_decisions = {
-            str(ev.causation_id)
-            for ev in events
-            if ev.type in ("agent.program_completed", "agent.program_failed")
-            and ev.causation_id
-        }
+        """Pair calls with observed terminals; absence alone never proves failure."""
         calls: dict[str, dict] = {}
         for ev in events:
             if ev.type == "agent.tool_called":
                 tc_id = ev.payload.get("tool_call_id")
                 if not tc_id:
                     continue
-                decision_id = str(ev.causation_id or "")
-                in_flight = decision_id and decision_id not in closed_decisions
-                if in_flight:
-                    error_kind = "pending"
-                    error_message = None
-                    error_extra = None
-                else:
-                    error_kind = "interrupted"
-                    error_message = (
-                        "tool call has no terminal; delivery state is uncertain"
-                    )
-                    error_extra = {"status": "uncertain"}
                 calls[tc_id] = {
                     "tool_call_id": tc_id,
                     "tool_name": ev.payload.get("tool_name", ""),
                     "arguments": dict(ev.payload.get("arguments") or {}),
                     "result": None,
-                    "error_kind": error_kind,
-                    "error_message": error_message,
-                    "error_extra": error_extra,
+                    "error_kind": "pending",
+                    "error_message": None,
+                    "error_extra": None,
                 }
             elif ev.type == "agent.tool_result":
                 tc_id = ev.payload.get("tool_call_id")
@@ -723,13 +691,20 @@ class Projector:
     def build_timeline(
         events: Sequence[_EventSnapshot],
         *,
-        tool_views: Sequence[ToolResultView],
+        tool_views: Sequence[ToolResultView] = (),
         bot_user_id: str | None = None,
     ) -> list[TimelineItem]:
         """``bot_user_id`` 用于给行内出现的本账号 QQ 号打 ``*`` 后缀（服务端
         标注，Part 3 §2.2）；None 时不标（纯函数测试 / 启动初期），此时
-        reply 标记的 ``*`` 仍由 from_self 服务端事实兜底。"""
-        tool_view_by_id = {tv.tool_call_id: tv for tv in tool_views}
+        reply 标记的 ``*`` 仍由 from_self 服务端事实兜底。
+
+        ``tool_views`` 保留给旧调用方；结果按事件渲染，不读取折叠视图。
+        """
+        calls_by_id = {
+            str(ev.payload.get("tool_call_id")): ev
+            for ev in events
+            if ev.type == "agent.tool_called" and ev.payload.get("tool_call_id")
+        }
         # 预扫一遍构建 reply 段引用所需的索引（被回复消息摘要 + 用户名映射），
         # 让单条消息渲染时无需再遍历全部事件。
         excerpt_by_msg_id = _build_excerpt_index(events)
@@ -775,12 +750,15 @@ class Projector:
                 # 工具形态去用 task()。
                 continue
             if ev.type in ("agent.tool_result", "agent.tool_failed"):
-                # rendered alongside the matching tool_called row。
-                # send_messages 也不例外（2026-07-31 实施后调整，维护者拍板）：
-                # 调用行的 <args> + <result> 逐条回执就是发言记录，不派生
-                # 第二行发言记录——同一句话两处渲染是复读诱饵。终态
-                # receipts 仍被 _build_author_index 消费（别人引用 bot 时标
-                # from_self）。
+                called = calls_by_id.get(str(ev.payload.get("tool_call_id")))
+                items.append(
+                    TimelineItem(
+                        event_id=ev.event_id,
+                        occurred_at=ev.occurred_at,
+                        kind="tool_result",
+                        render=Projector._render_tool_event(ev, called),
+                    )
+                )
                 continue
             if ev.type in (
                 "agent.reply_task_upserted",
@@ -865,17 +843,12 @@ class Projector:
                 continue
 
             if ev.type == "agent.tool_called":
-                tc_id = ev.payload.get("tool_call_id")
-                tv = tool_view_by_id.get(tc_id)
-                # 工具调用行一律不折叠：每一次调用及其终态都是 Planner 回看
-                # 自己做过什么的时间线记录。
                 items.append(
                     TimelineItem(
                         event_id=ev.event_id,
                         occurred_at=ev.occurred_at,
                         kind="tool_call",
-                        render=Projector._render_tool_call(ev, tv),
-                        related_event_ids=[],
+                        render=Projector._render_tool_event(ev),
                     )
                 )
             elif ev.type.startswith("external.message."):
@@ -1113,35 +1086,50 @@ class Projector:
         return " ".join(parts)
 
     @staticmethod
-    def _render_tool_call(ev: _EventSnapshot, tv: ToolResultView | None) -> str:
-        """工具行（Part 3 §3.2）：
+    def _render_tool_event(
+        ev: _EventSnapshot, called: _EventSnapshot | None = None
+    ) -> str:
+        """Render only this event's facts, retaining identity across window cuts."""
+        payload = dict(called.payload) if called is not None else {}
+        payload.update(ev.payload)
+        is_call = ev.type == "agent.tool_called"
+        error_kind = None
+        if is_call:
+            error_kind = "pending"
+        elif ev.type == "agent.tool_failed":
+            error_kind = str(payload.get("error_kind") or "unknown")
+        args = payload.get("arguments")
+        view = ToolResultView(
+            tool_call_id=str(payload.get("tool_call_id") or ""),
+            tool_name=str(payload.get("tool_name") or "?"),
+            arguments=args if isinstance(args, dict) else {},
+            result=None if is_call else payload.get("result"),
+            error_kind=error_kind,
+            error_message=payload.get("error_message"),
+            error_extra=(
+                _extract_error_extra(ev.payload)
+                if ev.type == "agent.tool_failed"
+                else None
+            ),
+        )
+        rendered = Projector._render_tool_call(replace(ev, payload=payload), view)
+        head, sep, body = rendered.partition("\n")
+        for label, key in (
+            ("call", "tool_call_id"),
+            ("ev", "dispatch_event_id"),
+            ("program", "program_hash"),
+        ):
+            value = payload.get(key)
+            if value:
+                head += f" {label}:{_head_field(str(value))}"
+        return head + sep + body
 
-        ``<tool>名 完成|失败[ kind k=v …]`` + 缩进的
-        ``参数`` / ``结果``（成功，超限加 ``（截断）``）/ ``原因``（失败）行。
-        发起时刻由外层 ``<t>`` 时刻头承载。
-
-        ``send_messages`` 特例（承接 2026-07-31「一次发送只渲染一处」与
-        2026-08-01 人话渲染两裁定）：参数/结果不渲 JSON，改为逐气泡一行
-        ``「内容」→回执``——回执三态 ``→#消息ID``（送达）/``→失败``/``→存疑``，
-        失败行头是 ``失败 <error_kind> [status=…]``。终态回执缺失（旧事件/
-        形状不识）时退回通用 JSON 行，事实不消失。
-        """
+    @staticmethod
+    def _render_tool_call(ev: _EventSnapshot, tv: ToolResultView) -> str:
+        """Render call arguments or terminal results, with human-readable receipts."""
         name = str(ev.payload.get("tool_name", "?"))
         args = ev.payload.get("arguments", {})
         args_line = f"  参数 {_esc_text(_safe_json(args))}"
-        if tv is None:
-            tv = ToolResultView(
-                tool_call_id=str(ev.payload.get("tool_call_id") or ""),
-                tool_name=name,
-                arguments=dict(args) if isinstance(args, dict) else {},
-                result=None,
-                error_kind="interrupted",
-                error_message=(
-                    "tool call has no terminal; delivery state is uncertain"
-                ),
-                error_extra={"status": "uncertain"},
-            )
-
         if name == "send_messages":
             special = _render_send_messages_call(args, tv)
             if special is not None:
@@ -1157,11 +1145,11 @@ class Projector:
                 result_json = result_json[: Projector.MAX_TOOL_RESULT_CHARS]
                 truncated = "（截断）"
             return (
-                f"<tool>{_esc_text(name)} 完成\n{args_line}\n"
+                f"<tool>{_esc_text(name)} 完成\n"
                 f"  结果 {_esc_text(result_json)}{truncated}"
             )
         head_extra = _error_head_suffix(tv.error_kind, tv.error_extra)
-        lines = [f"<tool>{_esc_text(name)} 失败{head_extra}", args_line]
+        lines = [f"<tool>{_esc_text(name)} 失败{head_extra}"]
         if tv.error_message:
             lines.append(f"  原因 {_ml_text(str(tv.error_message))}")
         return "\n".join(lines)
@@ -1846,7 +1834,7 @@ def _render_bubble_line(bubble: object, receipt: object = None) -> str | None:
     return body
 
 
-def _render_send_messages_call(args: object, tv: "ToolResultView | None") -> str | None:
+def _render_send_messages_call(args: object, tv: ToolResultView) -> str | None:
     """``<tool>send_messages`` 行块：头行 + 逐气泡行（终态带回执）。
 
     任一环节形状不识（旧事件 / 空 messages / 回执缺失且参数不识）→ None，
@@ -1855,7 +1843,7 @@ def _render_send_messages_call(args: object, tv: "ToolResultView | None") -> str
     if isinstance(args, dict) and isinstance(args.get("messages"), list):
         arg_bubbles = args["messages"] or None
 
-    if tv is not None and tv.error_kind == "pending":
+    if tv.error_kind == "pending":
         if not arg_bubbles:
             return None
         lines = ["<tool>send_messages 已调用"]
@@ -1864,18 +1852,6 @@ def _render_send_messages_call(args: object, tv: "ToolResultView | None") -> str
             if line is None:
                 return None
             lines.append(f"  {line}")
-        return "\n".join(lines)
-
-    if tv is None:
-        if not arg_bubbles:
-            return None
-        lines = ["<tool>send_messages 失败 interrupted status=uncertain"]
-        for bubble in arg_bubbles:
-            line = _render_bubble_line(bubble)
-            if line is None:
-                return None
-            lines.append(f"  {line}")
-        lines.append("  原因 调用没有终态，投递状态存疑")
         return "\n".join(lines)
 
     if tv.error_kind is None:
@@ -1926,7 +1902,15 @@ def _render_send_messages_call(args: object, tv: "ToolResultView | None") -> str
 # ``task_id`` 保留在集合里：新写入已不带它（2026-08-21 任务坍缩），但库里的
 # 存量失败行还有，不过滤会让老行在信封里多长出一个 task_id=... 的 k=v。
 _TOOL_FAILED_ENVELOPE_KEYS = frozenset(
-    {"tool_call_id", "tool_name", "task_id", "error_kind", "error_message"}
+    {
+        "tool_call_id",
+        "tool_name",
+        "task_id",
+        "error_kind",
+        "error_message",
+        "dispatch_event_id",
+        "program_hash",
+    }
 )
 
 

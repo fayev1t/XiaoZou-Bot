@@ -235,6 +235,7 @@ class ProgramExecutor:
         scope_key: str,
         correlation_id: str,
         decision_id: str,
+        dispatch_event_id: str | None = None,
         context: DecisionContext | None = None,
         supervisor: Any | None = None,
         caption_image: Any | None = None,
@@ -247,6 +248,7 @@ class ProgramExecutor:
         self._scope = scope_key.split(":", 1)[0]
         self._correlation_id = correlation_id
         self._decision_id = decision_id
+        self._dispatch_event_id = dispatch_event_id
         self._context = context
         self._supervisor = supervisor
         self._caption_image = caption_image
@@ -640,7 +642,8 @@ class _RuntimeState:
             bot_role=context.bot_role if context is not None else None,
             call_site=site.call_site,
             occurrence=site.occurrence,
-            occurred_at=context.now if context is not None else None,
+            dispatch_event_id=self.executor._dispatch_event_id,
+            program_hash=self.program.program_hash,
         )
         self.trace.effect_call_ids.append(handle.tool_call_id)
         started = time.monotonic()

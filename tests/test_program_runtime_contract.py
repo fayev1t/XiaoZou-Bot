@@ -731,5 +731,133 @@ class ProgramDynamicQuotaContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.info.details["scope"], "program")
 
 
+
+
+class EffectReceiptIdentityContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_runtime_does_not_backdate_calls_to_decision_context(self) -> None:
+        from datetime import timedelta
+
+        from qqbot.core.time import china_now
+        from qqbot.services.agent_loop.decision import DecisionContext
+
+        registry = _registry(_NotifyEffect)
+        program = preflight('notify(message="hello")', registry, "group")
+        context = DecisionContext(
+            scope_key="group:1",
+            correlation_id="CORR",
+            tick_seq=1,
+            now=china_now() - timedelta(minutes=5),
+        )
+        executor = ProgramExecutor(
+            registry=registry,
+            session_factory=object(),
+            scope_key="group:1",
+            correlation_id="CORR",
+            decision_id="ASSET",
+            dispatch_event_id="RUN",
+            context=context,
+        )
+        with (
+            patch(
+                "qqbot.services.agent_loop.program_runtime.begin_effect_call",
+                new=AsyncMock(return_value=_effect_handle("notify")),
+            ) as begin,
+            patch(
+                "qqbot.services.agent_loop.program_runtime.finish_effect_call",
+                new=AsyncMock(return_value="TERMINAL"),
+            ),
+        ):
+            await executor.execute(program)
+        kwargs = begin.await_args.kwargs
+        self.assertIsNone(kwargs.get("occurred_at"))  # writer uses actual clock
+        self.assertEqual(kwargs["dispatch_event_id"], "RUN")
+        self.assertEqual(kwargs["program_hash"], program.program_hash)
+        self.assertEqual(kwargs["decision_id"], "ASSET")
+
+    async def test_call_and_both_terminal_outcomes_keep_run_identity(self) -> None:
+        from qqbot.services.agent_loop.program_events import (
+            begin_effect_call,
+            finish_effect_call,
+        )
+
+        async def record(_factory: Any, **kwargs: Any) -> list[str]:
+            return [f"EVENT_{i}" for i, _ in enumerate(kwargs["events"])]
+
+        with patch(
+            "qqbot.services.agent_loop.program_events.write_agent_events",
+            new=AsyncMock(side_effect=record),
+        ) as write:
+            handle = await begin_effect_call(
+                object(),
+                scope_key="group:1",
+                correlation_id="CORR",
+                decision_id="ASSET",
+                tool_name="notify",
+                arguments={},
+                triggered_by_event_id=None,
+                bot_role=None,
+                call_site="1:0",
+                occurrence=1,
+                dispatch_event_id="RUN",
+                program_hash="abcdef123456",
+            )
+            intent = write.await_args.kwargs["events"][0]
+            self.assertIsNone(intent.occurred_at)
+            self.assertEqual(intent.causation_id, "ASSET")
+            for outcome in (ToolOutcome.success({}), ToolOutcome.failure("x", "bad")):
+                await finish_effect_call(
+                    object(),
+                    scope_key="group:1",
+                    correlation_id="CORR",
+                    handle=handle,
+                    outcome=outcome,
+                )
+                terminal = write.await_args.kwargs["events"][-1]
+                self.assertEqual(terminal.causation_id, handle.called_event_id)
+                for event in (intent, terminal):
+                    self.assertEqual(event.payload["dispatch_event_id"], "RUN")
+                    self.assertEqual(event.payload["program_hash"], "abcdef123456")
+                    self.assertEqual(event.payload["tool_call_id"], handle.tool_call_id)
+                self.assertIsNone(terminal.occurred_at)
+
+    async def test_recovery_preserves_the_interrupted_run_identity(self) -> None:
+        from types import SimpleNamespace
+
+        from qqbot.services.agent_loop.program_events import (
+            recover_interrupted_programs,
+        )
+
+        row = SimpleNamespace(
+            event_id="CALLED",
+            type="agent.tool_called",
+            causation_id="ASSET",
+            correlation_id="CORR",
+            payload={
+                "tool_call_id": "TC",
+                "tool_name": "notify",
+                "dispatch_event_id": "RUN_B",
+                "program_hash": "abcdef123456",
+            },
+        )
+        with (
+            patch(
+                "qqbot.services.agent_loop.program_events._load_recovery_rows",
+                new=AsyncMock(return_value=[row]),
+            ),
+            patch(
+                "qqbot.services.agent_loop.program_events.write_agent_event",
+                new=AsyncMock(return_value="FAILED"),
+            ) as write,
+        ):
+            report = await recover_interrupted_programs(object(), scope_key="group:1")
+        self.assertEqual(report.tool_calls_closed, 1)
+        event = write.await_args.kwargs
+        self.assertEqual(event["causation_id"], "CALLED")
+        self.assertEqual(event["payload"]["dispatch_event_id"], "RUN_B")
+        self.assertEqual(event["payload"]["program_hash"], "abcdef123456")
+        self.assertEqual(event["payload"]["tool_call_id"], "TC")
+        self.assertEqual(event["payload"]["error_kind"], "interrupted")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

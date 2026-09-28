@@ -54,8 +54,8 @@ class GetRecentThoughtsTool(BaseTool):
     program_kind = "effect"
     max_call_sites = 4
     description = (
-        "取回当前 scope 最近若干拍程序里的注释文本，按时间正序返回。"
-        "用于回想自己先前几拍分别在想什么；不含程序源码本身，"
+        "回看当前 scope 最近若干拍留下的工作记录，按时间正序返回。"
+        "用于回想自己先前几拍分别做过什么判断；不含程序源码本身，"
         "也不含任何查询结果或动作记录。"
     )
     usage_prompt = _USAGE_PROMPT
@@ -68,7 +68,7 @@ class GetRecentThoughtsTool(BaseTool):
                 "maximum": MAX_LIMIT,
                 "description": (
                     f"最多返回多少拍，取值 1–{MAX_LIMIT}，缺省 {DEFAULT_LIMIT}。"
-                    "无注释的拍不占名额。"
+                    "没有工作记录的拍不占名额。"
                 ),
             },
             "within_hours": {

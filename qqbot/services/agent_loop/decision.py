@@ -79,6 +79,7 @@ class TimelineItem:
         "message",
         "notice",
         "tool_call",
+        "tool_result",
         "system_hint",
         "request",
         "my_reply",

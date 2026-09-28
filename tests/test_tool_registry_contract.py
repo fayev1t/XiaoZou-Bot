@@ -92,6 +92,13 @@ class ToolRegistryContractTest(unittest.TestCase):
         self.assertIn("只有 return 的 JSON", rendered)
         self.assertFalse(hasattr(registry, "catalog"))
 
+    def test_recent_thoughts_prompt_uses_neutral_wording(self) -> None:
+        registry = build_default_registry()
+        spec = registry.spec("get_recent_thoughts")
+        assert spec is not None
+        self.assertNotIn("注释", spec.description)
+        self.assertNotIn("注释", spec.usage_prompt)
+
     def test_registration_rejects_invalid_metadata(self) -> None:
         registry = ToolRegistry()
 

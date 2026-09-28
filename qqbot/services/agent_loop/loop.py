@@ -662,6 +662,7 @@ class AgentLoop:
             scope_key=self._scope_key,
             correlation_id=item.correlation_id,
             decision_id=item.decision_id,
+            dispatch_event_id=item.dispatch_event_id,
             context=item.context,
             supervisor=self._supervisor,
             caption_image=self._caption_image,

@@ -19,8 +19,9 @@
 钉住四件事：
 1. 根页登记与各页的槽序列——它们是五个 LLM 调用点的 prompt 组成的唯一权威，
    改动必须是有意的（2026-07-31 删除 Replyer 后 Planner 是唯一对话消费者）；
-2. 分工的**语义**边界：Planner 先声明角色模拟职责，角色卡正文只在后续人物模型段
-   出现一份；纯记录/观察层的根页无槽。2026-07-30 删掉
+2. 分工的**语义**边界：Planner 先声明第一人称主体（你是小奏），角色卡正文只在
+   后续人物模型段出现一份；拍内决策是是否执行已写下的程序。纯记录/观察层的
+   根页无槽。2026-07-30 删掉
    kind/_FORBIDDEN_KINDS/_validate_assembly 之后，这类断言是唯一还抓得到内容
    漂移的手段——结构校验的粒度是"哪个文件进哪个消费者"，而真实发生过的事故是
    "人格正文被抄进另一个文件"，那种它一声不响；
@@ -182,7 +183,9 @@ class LayerBoundaryTests(unittest.TestCase):
             line.strip()
             for line in cls._persona_block().splitlines()
             if len(line.strip()) > 24
-            and line.strip().startswith(("你要持续模拟", "小奏", "她", "QQ 号"))
+            and line.strip().startswith(
+                ("你是小奏", "你是 QQ", "你对", "你的发言", "QQ 号")
+            )
         ]
 
     def test_persona_card_reaches_the_planner(self) -> None:
@@ -196,17 +199,22 @@ class LayerBoundaryTests(unittest.TestCase):
             self.assertIn(line, rendered)
         self.assertIsNone(SLOT_PATTERN.search(rendered))
 
-    def test_planner_frames_the_card_as_character_model(self) -> None:
-        """Planner 先钉角色模拟职责，再读取第三人称人物模型；最终措辞仍由
-        Planner 同层完成，不恢复 Replyer。"""
+    def test_planner_frames_as_first_person_subject(self) -> None:
+        """Planner 先钉第一人称主体，再读人物模型；拍内决策是是否执行已写下
+        的程序。最终措辞仍由同一层完成，不恢复 Replyer，也不回到角色模拟。"""
         rendered = build_library("planner").render(scope="group")
         first = self._persona_anchors()[0]
-        self.assertIn("角色决策规划器，不是通用问答助手", rendered)
-        self.assertNotIn("\n你是小奏，", rendered)
+        self.assertIn("你是小奏。", rendered)
+        self.assertIn("这不是角色扮演", rendered)
+        self.assertIn("这一拍真正的决策", rendered)
+        self.assertIn("它们不是待办清单", rendered)
+        self.assertNotIn("角色决策规划器", rendered)
+        self.assertNotIn("规划器视角", rendered)
+        self.assertNotIn("持续模拟", rendered)
         self.assertLess(
             rendered.index("# 身份与核心任务"), rendered.index(first)
         )
-        self.assertIn("只能是小奏本人此刻会说的话", rendered)
+        self.assertIn("话就是你会说的话", rendered)
 
     def test_persona_body_has_no_second_copy(self) -> None:
         """人格正文全系统只此一份。真实发生过的事故是"卡片被抄进另一个文件"
@@ -409,6 +417,17 @@ class FileAssemblyTests(unittest.TestCase):
         )
         self.assertLess(page.index("{{tools_usage}}"), page.index("# 输出协议"))
         self.assertIn(self._md("envelope.md"), rendered)
+
+    def test_prompt_assets_do_not_mention_program_comments(self) -> None:
+        """Planner 注入的静态提示词不引导模型讨论程序内部记录。"""
+        paths = [
+            _PROMPTS_DIR / "planner.md",
+            _PROMPTS_DIR / "envelope.md",
+            _PROMPTS_DIR.parent / "tools" / "get_recent_thoughts.md",
+        ]
+        for path in paths:
+            with self.subTest(file=path.name):
+                self.assertNotIn("注释", path.read_text(encoding="utf-8"))
 
     def test_planner_page_carries_every_merged_topic(self) -> None:
         """并页的主题必须逐个还在，且顺序即模型的阅读顺序：

@@ -62,6 +62,8 @@ class ProgramRecoveryContractTests(unittest.IsolatedAsyncioTestCase):
                     "tool_call_id": "TC1",
                     "tool_name": "notify",
                     "task_id": "T1",
+                    "dispatch_event_id": "RUN",
+                    "program_hash": "abcdef123456",
                 },
             ),
         ]
@@ -93,6 +95,8 @@ class ProgramRecoveryContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tool_kwargs["payload"]["status"], "uncertain")
         self.assertIn("not replayed", tool_kwargs["payload"]["error_message"])
         self.assertNotIn("task_id", tool_kwargs["payload"])
+        self.assertEqual(tool_kwargs["payload"]["dispatch_event_id"], "RUN")
+        self.assertEqual(tool_kwargs["payload"]["program_hash"], "abcdef123456")
         # 决策事件不收口：D1 没有 program terminal，收口器也不给它补一个。
         write_program.assert_not_awaited()
 
